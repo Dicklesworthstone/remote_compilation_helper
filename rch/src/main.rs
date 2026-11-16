@@ -4705,6 +4705,106 @@ fn gc_deadline(seconds: u64) -> Result<tokio::time::Instant> {
         })
 }
 
+/// Registry paths expand discovery only. Validate the entire response and the
+/// resulting command size before exposing any supplemental root to a caller.
+fn merge_worker_gc_roots(
+    roots: &mut rch_common::gc_roots::GcRootSet,
+    stdout: &str,
+) -> std::result::Result<usize, String> {
+    let inventory = rch_common::gc_roots::parse_source_claim_roots_inventory(stdout)?;
+    let mut merged = roots.clone();
+    merged.extend_source_claim_roots(&inventory)?;
+    rch_common::stale_target_reap::enumerate_targets_command_for_roots(&merged.scan_bases())?;
+    let added = merged.roots.len().saturating_sub(roots.roots.len());
+    *roots = merged;
+    Ok(added)
+}
+
+async fn discover_worker_gc_roots(
+    worker: &rch_common::WorkerConfig,
+    configured: &rch_common::gc_roots::GcRootSet,
+    deadline: tokio::time::Instant,
+    output_budget: &mut u64,
+) -> (rch_common::gc_roots::GcRootSet, serde_json::Value) {
+    let mut roots = configured.clone();
+    if transfer::WorkerPlatform::from_worker(worker).is_windows() {
+        return (
+            roots,
+            serde_json::json!({"status": "unsupported-platform"}),
+        );
+    }
+    let command = rch_common::gc_roots::source_claim_roots_command();
+    let report = match run_gc_surface_command(worker, &command, deadline, output_budget).await {
+        Ok(result) if result.success() => match merge_worker_gc_roots(&mut roots, &result.stdout) {
+            Ok(added) => serde_json::json!({"status": "ok", "added_roots": added}),
+            Err(error) => serde_json::json!({"status": "error", "error": error}),
+        },
+        Ok(result) => serde_json::json!({
+            "status": "error",
+            "error": format!(
+                "source-root discovery exited {}: {}",
+                result.exit_code, result.stderr.trim()
+            ),
+        }),
+        Err(error) => serde_json::json!({
+            "status": "error", "error": error.to_string(), "timed_out": error.timed_out,
+        }),
+    };
+    (roots, report)
+}
+
+fn gc_root_discovery_failed(report: &serde_json::Value) -> bool {
+    report["root_discovery"]["status"] == "error"
+}
+
+fn print_gc_root_discovery_warning(report: &serde_json::Value) {
+    if gc_root_discovery_failed(report) {
+        eprintln!(
+            "[rch] {}: source-root discovery unavailable; inventory covers configured roots only: {}",
+            report["id"].as_str().unwrap_or("?"),
+            report["root_discovery"]["error"].as_str().unwrap_or("unknown error")
+        );
+    }
+}
+
+/// POSIX roots share one traversal, temp scan and liveness snapshot. Windows
+/// retains its existing read-only per-root commands.
+fn gc_scan_commands(
+    bases: &[String],
+    windows: bool,
+) -> Vec<(String, std::result::Result<String, String>)> {
+    use rch_common::stale_target_reap as reap;
+
+    if windows {
+        bases
+            .iter()
+            .map(|base| (base.clone(), reap::enumerate_windows_targets_command(base)))
+            .collect()
+    } else {
+        vec![(
+            if bases.len() == 1 {
+                bases[0].clone()
+            } else {
+                "worker roots".to_string()
+            },
+            reap::enumerate_targets_command_for_roots(bases),
+        )]
+    }
+}
+
+fn gc_scan_root_reports(
+    label: &str,
+    stdout: &str,
+) -> Vec<rch_common::stale_target_reap::ScanRootReport> {
+    let mut reports = rch_common::stale_target_reap::parse_scan_root_reports(stdout);
+    if reports.is_empty() {
+        let mut report = rch_common::stale_target_reap::parse_scan_roots(stdout);
+        report.requested = Some(label.to_string());
+        reports.push(report);
+    }
+    reports
+}
+
 #[cfg(any(unix, test))]
 fn gc_ssh_timed_out(exit_code: Option<i32>, stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
@@ -5064,16 +5164,19 @@ async fn handle_gc(
     let tasks = workers.iter().map(|worker| async move {
         let surface = surface_ref;
         let windows = transfer::WorkerPlatform::from_worker(worker).is_windows();
-        let roots = surface.roots_for(worker);
+        let mut output_budget = GC_OUTPUT_LIMIT;
+        let (roots, root_discovery) = discover_worker_gc_roots(
+            worker, surface.roots_for(worker), deadline, &mut output_budget,
+        ).await;
         let bases = roots.scan_bases();
         if bases.is_empty() {
             return serde_json::json!({
                 "id": worker.id.as_str(), "ok": false, "phase": "roots",
                 "error": "no usable gc scan root for this worker's platform",
+                "root_discovery": root_discovery,
                 "rejected_roots": roots.rejected.iter().map(ToString::to_string).collect::<Vec<_>>(),
             });
         }
-        let mut output_budget = GC_OUTPUT_LIMIT;
         // ── enumerate every root (read-only) ───────────────────────────────
         let mut stdout = String::new();
         let mut failure: Option<serde_json::Value> = None;
@@ -5082,10 +5185,9 @@ async fn handle_gc(
             handles: true,
             processes: true,
         };
-        // A root whose guard bailed (missing, unresolvable, too shallow) exits
-        // before the gate snapshots run and so reports none; folding its empty
-        // answer in would mislabel a perfectly healthy worker. Count the runs
-        // that actually reported, and say "unavailable" when none did.
+        // Missing roots do not invalidate a shared snapshot for roots which
+        // were scanned. Count commands which actually report their gates; a
+        // worker with no snapshot remains unavailable.
         let mut gate_runs = 0usize;
         let mut temp_base: Option<String> = None;
         // (resolved path on the worker, label to report it under). Attribution
@@ -5094,47 +5196,43 @@ async fn handle_gc(
         // yields dirs whose paths never start with the configured string, and
         // every one of them would otherwise be filed under the wrong root.
         let mut attribution: Vec<(String, String)> = Vec::new();
-        for base in &bases {
-            let command = if windows {
-                match reap::enumerate_windows_targets_command(base) {
-                    Ok(command) => command,
-                    Err(error) => return serde_json::json!({
-                        "id": worker.id.as_str(), "ok": false, "phase": "roots", "error": error,
-                    }),
-                }
-            } else {
-                let command = reap::enumerate_targets_command(base);
-                if apply {
-                    // Enumeration is the first phase of this requested
-                    // mutation. Full TMPDIR must not prevent discovery before
-                    // the later collection transaction can release space.
+        for (base, command) in gc_scan_commands(&bases, windows) {
+            let command = match command {
+                Ok(command) if apply && !windows => {
+                    // A full temp filesystem must not block the discovery
+                    // phase of an explicitly requested collection.
                     reap::with_gc_recovery_reserve(reap::SOURCE_CLAIM_REGISTRY, &command)
-                } else {
-                    command
                 }
+                Ok(command) => command,
+                Err(error) => return serde_json::json!({
+                    "id": worker.id.as_str(), "ok": false, "phase": "roots",
+                    "error": error, "root_discovery": root_discovery,
+                }),
             };
             match run_gc_surface_command(worker, &command, deadline, &mut output_budget).await {
                 Ok(result) if result.success() => {
-                    let seen = reap::parse_scan_roots(&result.stdout);
-                    if seen.skipped.is_none() {
+                    if result.stdout.lines().any(|line| line.starts_with("RCH_GC_GATES ")) {
                         let gates = reap::parse_gate_availability(&result.stdout);
                         gates_available.handles &= gates.handles;
                         gates_available.processes &= gates.processes;
                         gate_runs += 1;
                     }
-                    if temp_base.is_none() {
-                        temp_base.clone_from(&seen.temp_base);
+                    for seen in gc_scan_root_reports(&base, &result.stdout) {
+                        let requested = seen.requested.as_deref().unwrap_or(&base);
+                        if temp_base.is_none() {
+                            temp_base.clone_from(&seen.temp_base);
+                        }
+                        if let Some(resolved) = seen.resolved.clone()
+                            && !attribution.iter().any(|(path, _)| *path == resolved)
+                        {
+                            attribution.push((resolved, requested.to_string()));
+                        }
+                        scanned_roots.push(serde_json::json!({
+                            "requested": requested,
+                            "resolved": seen.resolved,
+                            "skipped": seen.skipped,
+                        }));
                     }
-                    if let Some(resolved) = seen.resolved.clone()
-                        && !attribution.iter().any(|(path, _)| *path == resolved)
-                    {
-                        attribution.push((resolved, base.clone()));
-                    }
-                    scanned_roots.push(serde_json::json!({
-                        "requested": base,
-                        "resolved": seen.resolved,
-                        "skipped": seen.skipped,
-                    }));
                     stdout.push_str(&result.stdout);
                 }
                 Ok(result) => {
@@ -5164,7 +5262,8 @@ async fn handle_gc(
                 }
             }
         }
-        if let Some(error) = failure {
+        if let Some(mut error) = failure {
+            error["root_discovery"] = root_discovery;
             return error;
         }
         if gate_runs == 0 {
@@ -5502,6 +5601,8 @@ async fn handle_gc(
         serde_json::json!({
             "id": worker.id.as_str(),
             "inventory_only": windows,
+            "partial": root_discovery["status"] == "error",
+            "root_discovery": root_discovery,
             "scan_bases": bases,
             "rejected_roots": roots.rejected.iter().map(|root| serde_json::json!({
                 "path": root.path, "source": root.source.as_str(), "reason": root.reason,
@@ -5530,8 +5631,10 @@ async fn handle_gc(
             "retained_sources": retained_sources,
         })
     });
-    let worker_reports =
-        collect_gc_reports(tasks, |report| eprintln!("{}", gc_progress(report))).await;
+    let worker_reports = collect_gc_reports(tasks, |report| {
+        print_gc_root_discovery_warning(report);
+        eprintln!("{}", gc_progress(report));
+    }).await;
     let failed = gc_failed(&worker_reports);
     let timed_out_workers: Vec<&str> = worker_reports
         .iter()
@@ -5567,6 +5670,7 @@ async fn handle_gc(
         "pooled_idle_hours": surface.pooled_idle_hours,
         "cargo_cache_idle_days": surface.cache_idle_days,
         "worker_timeout_secs": worker_timeout,
+        "partial": worker_reports.iter().any(|report| report["ok"] != true || report["partial"] == true),
         "workers": worker_reports,
     });
 
@@ -5839,9 +5943,9 @@ struct CacheStatusScan {
     failure: Option<GcCommandError>,
 }
 
-/// Scan one worker's roots sequentially. The executor returns the remaining
-/// byte budget so both output streams share one budget across every command.
-/// Workers themselves are polled concurrently by `collect_gc_reports`.
+/// Batch POSIX discovery; retain sequential read-only scans on Windows. The
+/// executor returns the remaining shared stdout/stderr budget. Discovery and
+/// enumeration share the same worker deadline; workers run concurrently.
 async fn scan_cache_status_roots<F, Fut>(
     bases: &[String],
     windows: bool,
@@ -5858,8 +5962,6 @@ where
             ),
         >,
 {
-    use rch_common::stale_target_reap as reap;
-
     let mut scan = CacheStatusScan::default();
     if bases.is_empty() {
         scan.failure = Some(GcCommandError {
@@ -5869,12 +5971,7 @@ where
         });
         return scan;
     }
-    for base in bases {
-        let command = if windows {
-            reap::enumerate_windows_targets_command(base)
-        } else {
-            Ok(reap::enumerate_targets_command(base))
-        };
+    for (base, command) in gc_scan_commands(bases, windows) {
         let result = match command {
             Ok(command) => {
                 let (result, remaining) = execute(command, deadline, output_budget).await;
@@ -5923,10 +6020,10 @@ fn cache_status_worker_report(
     let scanned_roots: Vec<_> = scan
         .completed_roots
         .iter()
-        .map(|(base, stdout)| {
-            let seen = reap::parse_scan_roots(stdout);
+        .flat_map(|(base, stdout)| gc_scan_root_reports(base, stdout))
+        .map(|seen| {
             serde_json::json!({
-                "requested": base, "resolved": seen.resolved,
+                "requested": seen.requested, "resolved": seen.resolved,
                 "worker_temp_base": seen.temp_base, "skipped": seen.skipped,
             })
         })
@@ -5936,9 +6033,35 @@ fn cache_status_worker_report(
         .completed_roots
         .iter()
         .flat_map(|(base, stdout)| {
+            let reports = gc_scan_root_reports(base, stdout);
             reap::parse_target_entries(stdout)
                 .into_iter()
-                .map(move |entry| (base, entry))
+                .map(move |entry| {
+                    let root = reports
+                        .iter()
+                        // max_by_key keeps its last tie; reverse so aliases
+                        // retain the first requested label, as gc does.
+                        .rev()
+                        .filter_map(|report| {
+                            let resolved = report.resolved.as_deref()?;
+                            rch_common::gc_roots::path_is_under(&entry.path, resolved)
+                                .then_some((resolved.len(), report.requested.as_deref()?))
+                        })
+                        .max_by_key(|(length, _)| *length)
+                        .map(|(_, requested)| requested.to_string())
+                        .or_else(|| {
+                            if windows {
+                                return None;
+                            }
+                            reports.iter().find_map(|report| {
+                                let temp = report.temp_base.as_deref()?;
+                                rch_common::gc_roots::path_is_under(&entry.path, temp)
+                                    .then(|| temp.to_string())
+                            })
+                        })
+                        .unwrap_or_else(|| base.clone());
+                    (root, entry)
+                })
         })
         .filter(|(_, entry)| seen.insert(entry.path.clone()))
         .map(|(base, entry)| {
@@ -6025,29 +6148,38 @@ async fn handle_cache_status(
     let tasks = workers.iter().map(|worker| async move {
         let surface = surface_ref;
         let windows = transfer::WorkerPlatform::from_worker(worker).is_windows();
-        let roots = surface.roots_for(worker);
+        let mut output_budget = GC_OUTPUT_LIMIT;
+        let (roots, root_discovery) = discover_worker_gc_roots(
+            worker, surface.roots_for(worker), deadline, &mut output_budget,
+        ).await;
         let worker_bases = roots.scan_bases();
         let scan = scan_cache_status_roots(
             &worker_bases,
             windows,
             deadline,
-            GC_OUTPUT_LIMIT,
+            output_budget,
             |command, deadline, mut budget| async move {
                 let result = run_gc_surface_command(worker, &command, deadline, &mut budget).await;
                 (result, budget)
             },
         )
         .await;
-        cache_status_worker_report(
+        let mut report = cache_status_worker_report(
             worker.id.as_str(),
             windows,
-            roots,
+            &roots,
             &surface.policy,
             now_unix,
             scan,
-        )
+        );
+        report["partial"] = serde_json::json!(
+            report["partial"] == true || root_discovery["status"] == "error"
+        );
+        report["root_discovery"] = root_discovery;
+        report
     });
     let worker_reports = collect_gc_reports(tasks, |report| {
+        print_gc_root_discovery_warning(report);
         if !ctx.is_json() && workers.len() > 1 {
             eprintln!(
                 "[rch cache status] {}: {} ({} completed root(s))",
@@ -6086,7 +6218,7 @@ async fn handle_cache_status(
         "idle_hours": idle_hours,
         "pooled_idle_hours": pooled_idle_hours,
         "worker_timeout_secs": worker_timeout,
-        "partial": worker_reports.iter().any(|report| report["ok"] != true),
+        "partial": worker_reports.iter().any(|report| report["ok"] != true || report["partial"] == true),
         // Issue #53: the transfer-start janitor prunes pooled stores under
         // the SAME window on the next dispatch of that project, so "pooled
         // (kept)" below is exactly as durable as it claims.
@@ -6172,11 +6304,13 @@ async fn handle_cache_status(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            if report["partial"] == true {
+            if let Some(failed_root) = report["failed_root"].as_str() {
                 println!(
-                    "    totals cover completed roots only; enumeration failed at {}",
-                    report["failed_root"].as_str().unwrap_or("?")
+                    "    totals cover completed roots only; enumeration failed at {failed_root}"
                 );
+            }
+            if gc_root_discovery_failed(report) {
+                println!("    totals cover configured roots only; recorded source roots were unavailable");
             }
             if report["inventory_only"] == true {
                 println!(
@@ -7376,14 +7510,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cache_status_root_deadline_preserves_only_completed_inventory() {
-        let roots = ["/data/projects", "/data/second", "/data/unvisited"].map(String::from);
-        let evidence = "RCH_GC_ROOT resolved /data/projects\n\
-                        RCH_TARGET_ENTRY 1 1024 free free /data/projects/p/.rch-target-w-job-1\n";
+        // Windows still issues one read-only command per root.
+        let roots = ["C:/rch", "D:/rch", "E:/rch"].map(String::from);
+        let evidence = "RCH_GC_ROOT resolved C:/rch\n\
+                        RCH_TARGET_ENTRY 1 1024 free free C:/rch/p/.rch-target-w-job-1\n";
         let deadline = gc_deadline(1).unwrap();
         let mut calls = 0;
         let scan = scan_cache_status_roots(
             &roots,
-            false,
+            true,
             deadline,
             GC_OUTPUT_LIMIT,
             |_, received_deadline, mut budget| {
@@ -7418,7 +7553,7 @@ mod tests {
             scan.completed_roots,
             [(roots[0].clone(), evidence.to_string())]
         );
-        assert_eq!(scan.failed_root.as_deref(), Some("/data/second"));
+        assert_eq!(scan.failed_root.as_deref(), Some("D:/rch"));
         let failure = scan.failure.unwrap();
         assert!(failure.timed_out && failure.command_started, "{failure}");
     }
@@ -7426,15 +7561,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cache_status_output_budget_includes_stderr_and_never_resets_per_root() {
-        let roots = ["/data/projects", "/data/second", "/data/unvisited"].map(String::from);
-        let evidence = "RCH_TARGET_ENTRY 1 1024 free free /data/projects/p/.rch-target-w-job-1\n";
+        let roots = ["C:/rch", "D:/rch", "E:/rch"].map(String::from);
+        let evidence = "RCH_TARGET_ENTRY 1 1024 free free C:/rch/p/.rch-target-w-job-1\n";
         for remaining in [0, 3] {
             let deadline = gc_deadline(5).unwrap();
             let initial = evidence.len() as u64 + 4 + remaining;
             let mut observed_budgets = Vec::new();
             let scan = scan_cache_status_roots(
                 &roots,
-                false,
+                true,
                 deadline,
                 initial,
                 |_, deadline, mut budget| {
@@ -7464,7 +7599,7 @@ mod tests {
                 scan.completed_roots,
                 [(roots[0].clone(), evidence.to_string())]
             );
-            assert_eq!(scan.failed_root.as_deref(), Some("/data/second"));
+            assert_eq!(scan.failed_root.as_deref(), Some("D:/rch"));
             let failure = scan.failure.unwrap();
             assert!(!failure.timed_out);
             assert_eq!(failure.command_started, remaining != 0);
@@ -7474,6 +7609,104 @@ mod tests {
                 "exceeded"
             }));
         }
+    }
+
+    #[test]
+    fn gc_source_roots_merge_exact_paths_and_reject_partial_inventory() {
+        let mut roots = rch_common::gc_roots::derive_gc_roots(&Default::default(), &[]);
+        let mirror = "/private/tmp/claude-501/session/project";
+        let inventory = serde_json::json!({
+            "schema_version": 1, "roots": [mirror, mirror],
+        }).to_string();
+        assert_eq!(merge_worker_gc_roots(&mut roots, &inventory).unwrap(), 1);
+        let accepted = roots.scan_bases();
+        assert!(accepted.iter().any(|root| root == mirror));
+        assert!(!accepted.iter().any(|root| root == "/private/tmp"));
+        assert_eq!(merge_worker_gc_roots(&mut roots, &inventory).unwrap(), 0);
+
+        for invalid in [
+            r#"{"schema_version":1,"roots":["/private/tmp/another/project","/tmp"]}"#,
+            r#"{"schema_version":2,"roots":[]}"#,
+            r#"{"schema_version":1,"roots":["/private/tmp/another/project"]"#,
+        ] {
+            assert!(merge_worker_gc_roots(&mut roots, invalid).is_err());
+            assert_eq!(roots.scan_bases(), accepted);
+        }
+        // A valid wire inventory can still exceed the SSH argument budget.
+        // Reject the complete extension instead of silently dropping roots.
+        let oversized: Vec<_> = (0..80)
+            .map(|index| format!("/private/tmp/claude-{index}/{}", "x".repeat(512)))
+            .collect();
+        let oversized = serde_json::json!({
+            "schema_version": 1, "roots": oversized,
+        }).to_string();
+        assert!(merge_worker_gc_roots(&mut roots, &oversized).is_err());
+        assert_eq!(roots.scan_bases(), accepted);
+    }
+
+    /// Controlled transport proves batching and report attribution without
+    /// claiming to have contacted a worker or run a filesystem census.
+    #[tokio::test]
+    async fn cache_status_batches_recorded_roots_and_attributes_physical_paths() {
+        let mut roots = rch_common::gc_roots::derive_gc_roots(&Default::default(), &[]);
+        let configured = roots.scan_bases()[0].clone();
+        let mirror = "/private/tmp/claude-501/session/project";
+        merge_worker_gc_roots(&mut roots, &serde_json::json!({
+            "schema_version": 1, "roots": [mirror],
+        }).to_string()).unwrap();
+        let bases = roots.scan_bases();
+        let evidence = format!(
+            "RCH_GC_ROOT base {configured}\n\
+             RCH_GC_ROOT resolved /srv/projects\n\
+             RCH_GC_ROOT base {mirror}\n\
+             RCH_GC_ROOT resolved /srv/mirrors/session/project\n\
+             RCH_GC_ROOT base /dp/session/project\n\
+             RCH_GC_ROOT resolved /srv/mirrors/session/project\n\
+             RCH_GC_ROOT tmp /srv/tmp\n\
+             RCH_GC_GATES handles=1 handles_source=lsof procs=1\n\
+             RCH_TARGET_ENTRY 1 1024 free free /srv/projects/p/.rch-target-w-job-1\n\
+             RCH_TARGET_ENTRY 1 2048 free free /srv/mirrors/session/project/.rch-target-w-pool-key\n\
+             RCH_TARGET_ENTRY 1 2048 free free /srv/mirrors/session/project/.rch-target-w-pool-key\n\
+             RCH_TARGET_ENTRY 1 4096 free free /srv/tmp/rch-cargo-cache-w\n"
+        );
+        let deadline = gc_deadline(5).unwrap();
+        let budget = GC_OUTPUT_LIMIT - 100;
+        let mut calls = 0;
+        let scan = scan_cache_status_roots(
+            &bases, false, deadline, budget,
+            |command, received_deadline, received_budget| {
+                calls += 1;
+                assert_eq!(received_deadline, deadline);
+                assert_eq!(received_budget, budget);
+                for base in &bases {
+                    assert!(command.contains(base));
+                }
+                let remaining = received_budget - evidence.len() as u64;
+                std::future::ready((
+                    Ok(rch_common::CommandResult {
+                        exit_code: 0, stdout: evidence.clone(),
+                        stderr: String::new(), duration_ms: 1,
+                    }),
+                    remaining,
+                ))
+            },
+        ).await;
+        assert_eq!(calls, 1);
+        let report = cache_status_worker_report(
+            "worker", false, &roots,
+            &rch_common::stale_target_reap::GcPolicy {
+                idle_secs: 1, pooled_idle_secs: Some(1), cache_idle_secs: Some(1),
+            },
+            10_000_000, scan,
+        );
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["scanned_roots"].as_array().unwrap().len(), 3);
+        assert_eq!(report["scanned_roots"][1]["requested"], mirror);
+        assert_eq!(report["entries"].as_array().unwrap().len(), 3);
+        assert_eq!(report["entries"][0]["enumeration_root"], configured);
+        assert_eq!(report["entries"][1]["enumeration_root"], mirror);
+        assert_eq!(report["entries"][2]["enumeration_root"], "/srv/tmp");
+        assert_eq!(report["total_kb"], 7168);
     }
 
     #[cfg(unix)]

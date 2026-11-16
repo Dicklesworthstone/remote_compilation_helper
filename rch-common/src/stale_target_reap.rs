@@ -903,6 +903,12 @@ fn pooled_collect_gate(idle_minutes: u64) -> String {
 const SELECT_CANDIDATES: &str = "__gc_select() { \
     __sel_out=$1; shift; \
     while IFS= read -r __sel_d; do \
+      if [ -n \"${__gc_select_root:-}\" ]; then \
+        case \"$__sel_d\" in \"$__gc_select_root\"|\"$__gc_select_root\"/*) ;; \
+          *) if [ -z \"$__tmpscan\" ]; then continue; fi; \
+             case \"$__sel_d\" in \"$__tmpscan\"|\"$__tmpscan\"/*) ;; *) continue;; esac;; \
+        esac; \
+      fi; \
       __sel_b=${__sel_d##*/}; \
       for __sel_p in \"$@\"; do \
         case \"$__sel_b\" in $__sel_p) printf '%s\\n' \"$__sel_d\" >> \"$__sel_out\"; break;; esac; \
@@ -923,33 +929,41 @@ fn find_name_alternatives(names: &[&str]) -> String {
 /// The tree is walked once for all of them (bd-2bsz0): a depth-8 walk of a
 /// worker's mirror root took 350-440 s with a cold dentry cache, and the
 /// sweep used to repeat it in every pass.
-fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str, names: &[&str]) -> String {
-    // The tmp base is resolved by the SAME prelude that creates the durable
-    // per-worker Cargo caches and stages target dirs
-    // (`remote_cargo_home_base_prelude`), so the sweep cannot look somewhere
-    // other than where rch writes. It used to be a hand-copied `$TMPDIR` →
-    // `/data/tmp` → `/tmp` ladder here — the duplication that let ~700 GB of
-    // pooled/cache dirs sit unscanned while `rch gc` reported 0 MB.
+fn candidate_discovery_preamble(bases: &[&str], on_guard_exit: &str, names: &[&str]) -> String {
+    // Resolve the worker temp base exactly as cache creation does. One process
+    // census, temp-root walk and dedup serve the whole request; a missing root
+    // must not hide the remaining registered aliases.
     let tmp_base_prelude = crate::gc_roots::remote_cargo_home_base_prelude();
     let tmp_base_var = crate::gc_roots::RCH_CARGO_HOME_BASE_VAR;
+    let bases = bases
+        .iter()
+        .map(|base| format!("\"{base}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         "set -u; \
-         base=\"{escaped_base}\"; \
-         printf 'RCH_GC_ROOT base %s\\n' \"$base\"; \
-         if [ ! -d \"$base\" ]; then printf 'RCH_GC_ROOT_SKIPPED %s missing\\n' \"$base\"; {on_guard_exit}exit 0; fi; \
-         __rt=$(cd \"$base\" 2>/dev/null && pwd -P) || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; {on_guard_exit}exit 0; }}; \
-         [ -n \"$__rt\" ] || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; {on_guard_exit}exit 0; }}; \
-         case \"$__rt\" in */*/*) ;; *) printf 'RCH_GC_ROOT_SKIPPED %s too-shallow\\n' \"$__rt\"; {on_guard_exit}exit 0;; esac; \
-         printf 'RCH_GC_ROOT resolved %s\\n' \"$__rt\"; \
          {tmp_base_prelude}; \
          __tmpbase=\"${{{tmp_base_var}}}\"; \
          __tmpscan=\"\"; \
          case \"$__tmpbase\" in /*/*) __tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P) || __tmpscan=\"\";; esac; \
          case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac; \
-         printf 'RCH_GC_ROOT tmp %s\\n' \"$__tmpscan\"; \
          {gates}\
          __all=$(rch_gc_mktemp) || {{ {cleanup}{on_guard_exit}exit 0; }}; \
-         find \"$__rt\" -maxdepth 8 -type d \\( {name_alternatives} \\) -prune 2>/dev/null > \"$__all\"; \
+         __gc_resolved_roots=\"\"; __gc_select_root=\"\"; \
+         for base in {bases}; do \
+           printf 'RCH_GC_ROOT base %s\\n' \"$base\"; \
+           if [ ! -d \"$base\" ]; then printf 'RCH_GC_ROOT_SKIPPED %s missing\\n' \"$base\"; continue; fi; \
+           __rt=$(cd \"$base\" 2>/dev/null && pwd -P) || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; continue; }}; \
+           [ -n \"$__rt\" ] || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; continue; }}; \
+           case \"$__rt\" in */*/*) ;; *) printf 'RCH_GC_ROOT_SKIPPED %s too-shallow\\n' \"$base\"; continue;; esac; \
+           case \"$__rt\" in *[!A-Za-z0-9/._-]*|*..*) printf 'RCH_GC_ROOT_SKIPPED %s unsafe-resolved\\n' \"$base\"; continue;; esac; \
+           [ \"$base\" -ef \"$__rt\" ] || {{ printf 'RCH_GC_ROOT_SKIPPED %s changed-resolution\\n' \"$base\"; continue; }}; \
+           printf 'RCH_GC_ROOT resolved %s\\n' \"$__rt\"; \
+           case \" $__gc_resolved_roots \" in *\" $__rt \"*) continue;; esac; \
+           __gc_resolved_roots=\"$__gc_resolved_roots $__rt\"; \
+           find \"$__rt\" -maxdepth 8 -type d \\( {name_alternatives} \\) -prune 2>/dev/null >> \"$__all\"; \
+         done; \
+         printf 'RCH_GC_ROOT tmp %s\\n' \"$__tmpscan\"; \
          if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__all\"; \
            find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( {name_alternatives} \\) -prune 2>/dev/null >> \"$__all\"; fi; \
          {dedup}\
@@ -961,6 +975,32 @@ fn candidate_discovery_preamble(escaped_base: &str, on_guard_exit: &str, names: 
         dedup = dedup_candidate_file("__all"),
         name_alternatives = find_name_alternatives(names),
     )
+}
+
+// Bound the aggregate before quoting as well as each path. A large worker
+// inventory must never become an unlaunchable SSH command or be truncated.
+const MAX_DISCOVERY_ROOTS: usize = 1024;
+const MAX_DISCOVERY_ROOT_BYTES: usize = 32 * 1024;
+
+fn validate_discovery_roots(bases: &[String]) -> Result<Vec<&str>, String> {
+    if bases.is_empty() || bases.len() > MAX_DISCOVERY_ROOTS {
+        return Err("GC requires between 1 and 1024 scan roots".to_string());
+    }
+    let mut bytes = 0usize;
+    for base in bases {
+        if !is_safe_reap_base(base)
+            || base[1..].split('/').any(|part| part.is_empty() || part == ".")
+        {
+            return Err(format!("unsafe GC scan root {base:?}"));
+        }
+        bytes = bytes
+            .checked_add(base.len() + 3)
+            .ok_or_else(|| "GC scan root size overflow".to_string())?;
+        if bytes > MAX_DISCOVERY_ROOT_BYTES {
+            return Err("GC scan roots exceed the 32 KiB command budget".to_string());
+        }
+    }
+    Ok(bases.iter().map(String::as_str).collect())
 }
 
 /// Minimum non-zero pooled idle window in minutes (24h). Pooled dirs are warm
@@ -1011,7 +1051,7 @@ pub fn worker_sweep_command_with_registry(
     registry: &str,
 ) -> String {
     worker_sweep_script(
-        escaped_base,
+        &[escaped_base],
         idle_minutes,
         pooled_idle_minutes,
         max_cache_kb,
@@ -1057,7 +1097,7 @@ pub fn worker_sweep_command_under_pressure_with_registry(
     registry: &str,
 ) -> String {
     worker_sweep_script(
-        escaped_base,
+        &[escaped_base],
         idle_minutes,
         pooled_idle_minutes,
         max_cache_kb,
@@ -1066,8 +1106,33 @@ pub fn worker_sweep_command_under_pressure_with_registry(
     )
 }
 
+/// Sweep a validated set of worker roots with one discovery walk per physical
+/// root and one pair of process/descriptor snapshots for the entire request.
+///
+/// Missing roots do not hide later ones. Aliases and overlapping trees produce
+/// one candidate inventory, while byte caps and pressure eviction retain their
+/// existing per-root scope (including the shared worker temp base). Each
+/// removal still passes the source-ownership and live-process gates.
+pub fn worker_sweep_command_for_roots_under_pressure(
+    bases: &[String],
+    idle_minutes: u64,
+    pooled_idle_minutes: Option<u64>,
+    max_cache_kb: Option<u64>,
+    low_disk_permille: u64,
+) -> Result<String, String> {
+    let bases = validate_discovery_roots(bases)?;
+    Ok(worker_sweep_script(
+        &bases,
+        idle_minutes,
+        pooled_idle_minutes,
+        max_cache_kb,
+        (low_disk_permille != 0).then_some(low_disk_permille),
+        SOURCE_CLAIM_REGISTRY,
+    ))
+}
+
 fn worker_sweep_script(
-    escaped_base: &str,
+    bases: &[&str],
     idle_minutes: u64,
     pooled_idle_minutes: Option<u64>,
     max_cache_kb: Option<u64>,
@@ -1092,7 +1157,7 @@ fn worker_sweep_script(
     if pooled_idle_minutes.is_some() || low_disk_permille.is_some() {
         names.push(DEFAULT_TARGET_NAME);
     }
-    let preamble = candidate_discovery_preamble(escaped_base, guard, &names);
+    let preamble = candidate_discovery_preamble(bases, guard, &names);
     let pooled_pass = match pooled_idle_minutes {
         Some(window) => {
             let window = window.max(MIN_POOLED_IDLE_MINUTES);
@@ -1175,6 +1240,20 @@ fn worker_sweep_script(
     let pressure_pass = low_disk_permille
         .map(|permille| pressure_eviction_pass(idle_minutes, permille))
         .unwrap_or_default();
+    // Preserve the daemon's per-root cap. Combining unrelated roots before a
+    // byte-cap pass would silently turn N separate budgets into one shared
+    // budget and evict caches which were previously under their limit.
+    // Resolved roots contain only the checked, whitespace-free path grammar;
+    // word splitting cannot introduce another root or expand a shell glob.
+    let scoped_passes = if cap_pass.is_empty() && pressure_pass.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "for __rt in $__gc_resolved_roots; do \
+               __gc_select_root=$__rt; {cap_pass}{pressure_pass}\
+             done; __gc_select_root=\"\"; "
+        )
+    };
     format!(
         "{preamble}\
          {source_gate}\
@@ -1182,8 +1261,7 @@ fn worker_sweep_script(
          while IFS= read -r d; do {loop_body} done < \"$__tmpf\"; \
          rm -f \"$__tmpf\"; \
          {pooled_pass}\
-         {cap_pass}\
-         {pressure_pass}\
+         {scoped_passes}\
          rm -f \"$__all\"; \
          {gate_cleanup}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
@@ -1458,8 +1536,21 @@ const ENUMERATE_METADATA_FRAGMENT: &str = r#"__gc_enumerate_metadata() {
 
 #[must_use]
 pub fn enumerate_targets_command(escaped_base: &str) -> String {
+    enumerate_targets_script(&[escaped_base])
+}
+
+/// Enumerate all validated roots in one command, sharing liveness observations,
+/// worker-temp discovery and candidate deduplication. Exact root spellings are
+/// retained in the output so callers can attribute canonical paths correctly.
+/// A missing root is reported and skipped without hiding the remaining roots.
+pub fn enumerate_targets_command_for_roots(bases: &[String]) -> Result<String, String> {
+    let bases = validate_discovery_roots(bases)?;
+    Ok(enumerate_targets_script(&bases))
+}
+
+fn enumerate_targets_script(bases: &[&str]) -> String {
     let preamble = candidate_discovery_preamble(
-        escaped_base,
+        bases,
         "",
         &[
             ".rch-target-*-job-*",
@@ -2467,6 +2558,9 @@ pub struct ScanRootReport {
 /// root that silently bails is exactly how this bug hid.
 #[must_use]
 pub fn parse_scan_roots(stdout: &str) -> ScanRootReport {
+    if let Some(report) = parse_scan_root_reports(stdout).pop() {
+        return report;
+    }
     let mut report = ScanRootReport::default();
     for line in stdout.lines() {
         let line = line.trim();
@@ -2492,6 +2586,46 @@ pub fn parse_scan_roots(stdout: &str) -> ScanRootReport {
         *slot = (!value.is_empty()).then(|| value.to_string());
     }
     report
+}
+
+/// Parse every requested root from a combined enumeration/sweep. Each base
+/// marker starts one record; a skip belongs only to that request. The worker
+/// temp root is shared by the whole command and is copied into each report.
+#[must_use]
+pub fn parse_scan_root_reports(stdout: &str) -> Vec<ScanRootReport> {
+    let mut reports = Vec::new();
+    let mut current = None;
+    let mut temp_base = None;
+    for line in stdout.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("RCH_GC_ROOT base ") {
+            if let Some(report) = current.take() {
+                reports.push(report);
+            }
+            current = Some(ScanRootReport {
+                requested: (!value.is_empty()).then(|| value.to_string()),
+                ..ScanRootReport::default()
+            });
+        } else if let Some(value) = line.strip_prefix("RCH_GC_ROOT resolved ") {
+            if let Some(report) = &mut current {
+                report.resolved = (!value.is_empty()).then(|| value.to_string());
+            }
+        } else if let Some(value) = line.strip_prefix("RCH_GC_ROOT_SKIPPED ") {
+            if let Some(report) = &mut current {
+                report.skipped = (!value.is_empty()).then(|| value.to_string());
+            }
+        } else if line == "RCH_GC_ROOT tmp" {
+            temp_base = None;
+        } else if let Some(value) = line.strip_prefix("RCH_GC_ROOT tmp ") {
+            temp_base = Some(value.to_string());
+        }
+    }
+    if let Some(report) = current {
+        reports.push(report);
+    }
+    for report in &mut reports {
+        report.temp_base.clone_from(&temp_base);
+    }
+    reports
 }
 
 /// Whether both liveness-gate snapshots were available on this run, from the
@@ -5311,6 +5445,302 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             removed, 1,
             "a dir matched by both passes must be counted once; stdout: {stdout}"
         );
+    }
+
+    #[test]
+    fn combined_gc_commands_reject_unsafe_or_unbounded_roots() {
+        for roots in [
+            Vec::new(),
+            vec!["/".to_string()],
+            vec!["/tmp/cache/../source".to_string()],
+            vec!["/tmp/cache/./source".to_string()],
+            vec!["/tmp//cache".to_string()],
+            vec!["/tmp/cache/".to_string()],
+            vec!["/tmp/$(touch-owned-source)".to_string()],
+            vec!["/tmp/cache\n/other".to_string()],
+            vec!["/tmp/cache".to_string(); MAX_DISCOVERY_ROOTS + 1],
+            vec![format!("/tmp/{}", "a".repeat(4000)); 9],
+        ] {
+            assert!(enumerate_targets_command_for_roots(&roots).is_err());
+            assert!(
+                worker_sweep_command_for_roots_under_pressure(
+                    &roots,
+                    60,
+                    Some(MIN_POOLED_IDLE_MINUTES),
+                    None,
+                    0,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn combined_scan_reports_keep_each_request_and_skip_separate() {
+        let output = "RCH_GC_ROOT base /data/projects\n\
+            RCH_GC_ROOT resolved /data/projects\n\
+            RCH_GC_ROOT base /missing/source\n\
+            RCH_GC_ROOT_SKIPPED /missing/source missing\n\
+            RCH_GC_ROOT base /dp/project\n\
+            RCH_GC_ROOT resolved /data/projects/project\n\
+            RCH_GC_ROOT tmp /data/tmp\n\
+            RCH_GC_ROOT tmp-other /ignored\n";
+        let reports = parse_scan_root_reports(output);
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0].requested.as_deref(), Some("/data/projects"));
+        assert_eq!(reports[0].resolved.as_deref(), Some("/data/projects"));
+        assert!(reports[0].skipped.is_none());
+        assert_eq!(reports[1].requested.as_deref(), Some("/missing/source"));
+        assert!(reports[1].resolved.is_none());
+        assert_eq!(reports[1].skipped.as_deref(), Some("/missing/source missing"));
+        assert_eq!(reports[2].requested.as_deref(), Some("/dp/project"));
+        assert_eq!(reports[2].resolved.as_deref(), Some("/data/projects/project"));
+        assert!(reports[2].skipped.is_none());
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.temp_base.as_deref() == Some("/data/tmp"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_inventory_finds_exact_off_root_targets_once_without_broadening() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let configured = retained.join("projects");
+        let off_root = retained.join("private/tmp/session/scratchpad/project");
+        let alias = retained.join("project-alias");
+        let temporary = retained.join("worker-temp");
+        let configured_pool = configured.join("repo/.rch-target-w-pool-configured");
+        let off_root_pool = off_root.join(".rch-target-w-pool-scratch");
+        let temporary_pool = temporary.join("rch/project/hash/.rch-target-w-pool-temp");
+        let unrelated = retained.join("private/tmp/unrecorded/.rch-target-w-pool-other");
+        let source = off_root.join("src");
+        let nested_artifact = off_root_pool.join(".rch-target-w-pool-nested");
+        for path in [
+            &configured_pool,
+            &off_root_pool,
+            &temporary_pool,
+            &unrelated,
+            &source,
+            &nested_artifact,
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("sentinel"), b"preserved").unwrap();
+        }
+        symlink(&off_root, &alias).unwrap();
+        let roots: Vec<String> = [
+            retained.join("missing"),
+            configured.clone(),
+            off_root.clone(),
+            alias,
+            temporary.clone(),
+        ]
+        .iter()
+        .map(|path| path.to_str().unwrap().to_string())
+        .collect();
+        let command = enumerate_targets_command_for_roots(&roots).unwrap();
+        let output = Command::new("sh")
+            .args(["-c", &command])
+            .env("TMPDIR", &temporary)
+            .env("RCH_WKR_BIN", retained.join("absent-worker"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let entries = parse_target_entries(&stdout);
+        let listed: std::collections::BTreeSet<_> =
+            entries.iter().map(|entry| entry.path.clone()).collect();
+        let expected: std::collections::BTreeSet<_> =
+            [&configured_pool, &off_root_pool, &temporary_pool]
+                .into_iter()
+                .map(|path| std::fs::canonicalize(path).unwrap().to_str().unwrap().to_string())
+                .collect();
+        assert_eq!(listed, expected, "{stdout}");
+        assert_eq!(entries.len(), 3, "aliases and temp overlap must dedup");
+        assert_eq!(stdout.matches("RCH_GC_GATES ").count(), 1);
+        assert_eq!(stdout.matches("RCH_GC_ROOT tmp ").count(), 1);
+        let reports = parse_scan_root_reports(&stdout);
+        assert_eq!(reports.len(), roots.len());
+        assert!(reports[0].skipped.as_ref().unwrap().ends_with(" missing"));
+        assert_eq!(reports[2].resolved, reports[3].resolved);
+        for path in [unrelated, source, nested_artifact] {
+            assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"preserved");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_inventory_includes_an_exact_registered_managed_target_root() {
+        use std::process::Command;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let configured = retained.join("projects");
+        let temporary = retained.join("worker-temp");
+        let target = retained.join("off-root/.rch-target-w-pool-direct");
+        let nested = target.join(".rch-target-w-pool-nested");
+        for directory in [&configured, &temporary, &nested] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(target.join("artifact.o"), b"preserved").unwrap();
+
+        // Source-authority records contain exact auxiliary target pools as
+        // well as source mirrors. Discovery must inspect the root itself when
+        // its name is managed; excluding depth zero would hide these pools.
+        // This remains only inventory: the usual live-process, source-claim
+        // and idle checks separately decide whether a target can be removed.
+        let mut roots = crate::gc_roots::derive_gc_roots(
+            &crate::remediation_config::PooledTargetConfig {
+                remote_base: configured.to_str().unwrap().to_string(),
+                ..Default::default()
+            },
+            &[],
+        );
+        roots
+            .extend_source_claim_roots(&crate::gc_roots::SourceClaimRootsInventory {
+                schema_version: crate::gc_roots::SOURCE_CLAIM_ROOTS_SCHEMA_VERSION,
+                roots: vec![target.to_str().unwrap().to_string()],
+            })
+            .unwrap();
+        let command = enumerate_targets_command_for_roots(&roots.scan_bases()).unwrap();
+        let output = Command::new("sh")
+            .args(["-c", &command])
+            .env("TMPDIR", &temporary)
+            .env("RCH_WKR_BIN", retained.join("absent-worker"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let entries = parse_target_entries(&stdout);
+        assert_eq!(entries.len(), 1, "{stdout}");
+        assert_eq!(
+            entries[0].path,
+            std::fs::canonicalize(&target)
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        assert!(nested.is_dir(), "managed target discovery must prune its contents");
+        assert_eq!(std::fs::read(target.join("artifact.o")).unwrap(), b"preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_sweep_keeps_independent_roots_under_their_individual_cap() {
+        use std::process::Command;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let temporary = retained.join("worker-temp");
+        std::fs::create_dir(&temporary).unwrap();
+        let roots = [retained.join("first"), retained.join("second")];
+        let targets = roots
+            .iter()
+            .map(|root| root.join("project/.rch-target-w-pool-cache"))
+            .collect::<Vec<_>>();
+        let mut sizes = Vec::new();
+        for target in &targets {
+            std::fs::create_dir_all(target).unwrap();
+            std::fs::write(target.join("artifact.o"), vec![b'x'; 80 * 1024]).unwrap();
+            let output = Command::new("du").arg("-sk").arg(target).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            sizes.push(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
+            );
+        }
+        let budget = sizes.iter().copied().max().unwrap() + 1;
+        assert!(sizes.iter().sum::<u64>() > budget);
+        let bases = roots
+            .iter()
+            .map(|root| root.to_str().unwrap())
+            .collect::<Vec<_>>();
+        let command = worker_sweep_script(
+            &bases,
+            60,
+            None,
+            Some(budget),
+            None,
+            retained.join("claims-v1").to_str().unwrap(),
+        );
+        let output = Command::new("sh")
+            .args(["-c", &command])
+            .env("TMPDIR", &temporary)
+            .env("RCH_WKR_BIN", retained.join("absent-worker"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(parse_worker_reap_metrics(&stdout), Some((0, 0)));
+        assert!(
+            !stdout.contains("RCH_REAP_CAP initial"),
+            "separate root budgets must not turn into one shared budget: {stdout}"
+        );
+        assert_eq!(stdout.matches("RCH_GC_GATES ").count(), 1);
+        for target in targets {
+            assert!(target.join("artifact.o").is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_inventory_does_not_trim_a_physical_alias_into_another_root() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        let ordinary = retained.join("physical");
+        let with_newline = retained.join("physical\n");
+        let alias = retained.join("alias");
+        let temporary = retained.join("worker-temp");
+        for root in [&ordinary, &with_newline] {
+            let target = root.join(".rch-target-w-pool-cache");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("sentinel"), b"preserved").unwrap();
+        }
+        std::fs::create_dir(&temporary).unwrap();
+        symlink(&with_newline, &alias).unwrap();
+        let command =
+            enumerate_targets_command_for_roots(&[alias.to_str().unwrap().to_string()]).unwrap();
+        let output = Command::new("sh")
+            .args(["-c", &command])
+            .env("TMPDIR", &temporary)
+            .env("RCH_WKR_BIN", retained.join("absent-worker"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(parse_target_entries(&stdout).is_empty(), "{stdout}");
+        assert!(stdout.contains("changed-resolution"), "{stdout}");
+        for root in [ordinary, with_newline] {
+            assert_eq!(
+                std::fs::read(root.join(".rch-target-w-pool-cache/sentinel")).unwrap(),
+                b"preserved"
+            );
+        }
     }
 
     #[test]
