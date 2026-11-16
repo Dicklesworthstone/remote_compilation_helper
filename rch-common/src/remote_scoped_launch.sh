@@ -226,11 +226,18 @@ rch_scope_launch_child() {
         while :; do
             # This member must stop its pinned group after leader loss, even
             # with a live supervisor and no configured build deadline.
-            if ! rch_scope_launch_parent_alive || ! rch_remote_leader_matches; then
+            if ! rch_scope_launch_parent_alive; then
+                rch_scope_launch_message "RCH_SCOPED_COMPLETION_DETAIL:reason=watchdog-parent" >&3
+                rch_scope_launch_kill_self
+                exit 255
+            fi
+            if ! rch_remote_leader_matches; then
+                rch_scope_launch_message "RCH_SCOPED_COMPLETION_DETAIL:reason=watchdog-leader" >&3
                 rch_scope_launch_kill_self
                 exit 255
             fi
             if ! rch_scope_launch_clock; then
+                rch_scope_launch_message "RCH_SCOPED_COMPLETION_DETAIL:reason=watchdog-clock" >&3
                 rch_scope_launch_kill_self
                 exit 255
             fi

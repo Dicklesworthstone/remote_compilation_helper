@@ -483,4 +483,142 @@ rch_scope_launch_supervise "$RCH_RESULT_TEST_ROOT/receipt" 0 RCH_RESULT_TEST_DEA
             }
         }
     }
+
+    const WATCHDOG_FAULT: &str = r#"
+rch_fixture_watchdog_fault() {
+    [ "$RCH_WATCHDOG_TEST_MODE" = "$1" ] && [ -f "$RCH_WATCHDOG_TEST_ROOT/armed" ] || return 1
+    : > "$RCH_WATCHDOG_TEST_ROOT/injected" || exit 98
+}
+rch_scope_launch_parent_alive() {
+    rch_fixture_parent_alive || return 1
+    if rch_fixture_watchdog_fault parent; then return 1; fi
+}
+rch_remote_leader_matches() {
+    rch_fixture_leader_matches || return 1
+    if rch_fixture_watchdog_fault leader; then return 1; fi
+}
+rch_scope_launch_clock() {
+    rch_fixture_clock || return 1
+    if rch_fixture_watchdog_fault clock; then return 1; fi
+}
+"#;
+
+    fn run_watchdog(shell: &str, mode: &str) -> Output {
+        let directory = tempfile::Builder::new()
+            .prefix("scoped-watchdog-diagnostic-")
+            .disable_cleanup(true)
+            .tempdir()
+            .expect("watchdog diagnostic fixture directory");
+        let launch = include_str!("../src/remote_scoped_launch.sh");
+        let process = include_str!("../src/remote_process.sh");
+        let child_hooks = format!(
+            "\n{}{}{}{WATCHDOG_FAULT}",
+            alias(
+                launch,
+                "rch_scope_launch_parent_alive",
+                "rch_fixture_parent_alive",
+            ),
+            alias(
+                process,
+                "rch_remote_leader_matches",
+                "rch_fixture_leader_matches",
+            ),
+            alias(launch, "rch_scope_launch_clock", "rch_fixture_clock"),
+        );
+        // Fault only the in-group watchdog, after the actual payload starts.
+        // The outside supervisor retains all of its production observations.
+        let script = format!(
+            r#"{PROTOCOL}
+rch_policy_select_file() {{ rch_policy_file=; }}
+rch_launch_source="$rch_launch_source"{}
+exec 3>&2
+rch_scope_launch_supervise "$RCH_WATCHDOG_TEST_ROOT/receipt" "$RCH_WATCHDOG_TEST_LIMIT" \
+    RCH_WATCHDOG_TEST_DEADLINE 4343 /bin/sh -c '
+        printf "PAYLOAD_START\n"
+        : > "$RCH_WATCHDOG_TEST_ROOT/armed"
+        case "$RCH_WATCHDOG_TEST_MODE" in
+            signal) kill -KILL "$$";;
+            control) sleep 0.5;;
+            *) sleep 3;;
+        esac
+        printf "PAYLOAD_DONE\n"
+    '
+"#,
+            shell_escape::unix::escape(child_hooks.into()),
+        );
+        let output = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=KILL",
+                "15s",
+                shell,
+                "-c",
+                &script,
+                "rch-watchdog-observer",
+            ])
+            .env_remove("RCH_TIMING_SCALE")
+            .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
+            .env("RCH_WATCHDOG_TEST_ROOT", directory.path())
+            .env("RCH_WATCHDOG_TEST_MODE", mode)
+            .env(
+                "RCH_WATCHDOG_TEST_LIMIT",
+                if mode == "deadline" { "1" } else { "0" },
+            )
+            .output()
+            .expect("run the real watchdog with one failed check");
+        assert_eq!(
+            directory.path().join("injected").exists(),
+            matches!(mode, "parent" | "leader" | "clock"),
+            "watchdog fault missed its intended boundary: {shell}, {mode}: {output:?}",
+        );
+        output
+    }
+
+    #[test]
+    fn watchdog_reports_the_failed_check_without_changing_exit_status() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for mode in ["parent", "leader", "clock"] {
+                let output = run_watchdog(shell, mode);
+                assert_eq!(output.status.code(), Some(137), "{mode}: {output:?}");
+                assert_eq!(output.stdout, b"PAYLOAD_START\n", "{output:?}");
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    error.contains(&format!(
+                        "RCH_SCOPED_COMPLETION_DETAIL:reason=watchdog-{mode}"
+                    )),
+                    "{mode}: {output:?}",
+                );
+                assert!(!error.contains("RCH_WATCHDOG_TEST_DEADLINE"));
+                assert!(!error.contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_payload_exit_and_deadline_are_not_reported_as_watchdog_faults() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for mode in ["control", "signal", "deadline"] {
+                let output = run_watchdog(shell, mode);
+                assert_eq!(
+                    output.status.code(),
+                    Some(if mode == "control" { 0 } else { 137 }),
+                    "{mode}: {output:?}",
+                );
+                assert_eq!(
+                    output.stdout,
+                    if mode == "control" {
+                        b"PAYLOAD_START\nPAYLOAD_DONE\n".as_slice()
+                    } else {
+                        b"PAYLOAD_START\n".as_slice()
+                    },
+                );
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(!error.contains("reason=watchdog-"), "{mode}: {output:?}");
+                assert_eq!(
+                    error.contains("RCH_WATCHDOG_TEST_DEADLINE"),
+                    mode == "deadline",
+                    "{mode}: {output:?}",
+                );
+            }
+        }
+    }
 }
