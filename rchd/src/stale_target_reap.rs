@@ -40,6 +40,7 @@
 
 use crate::config::StaleTargetReapConfig;
 use crate::workers::{WorkerPool, WorkerState, ensure_posix_gc_worker};
+use rch_common::gc_roots::{self, GcRootSet};
 use rch_common::stale_target_reap;
 use rch_common::{CommandResult, SshClient, SshOptions, WorkerId};
 use std::sync::Arc;
@@ -113,6 +114,7 @@ pub struct ReapCycleStats {
 /// periodic sweep passes rchd's placement line, so the repo-mirror targets it
 /// owns, most of what a zeroed worker can still reclaim, are evicted until the
 /// worker is back above it.
+#[cfg(test)]
 fn build_sweep_command(
     escaped_base: &str,
     idle_minutes: u64,
@@ -160,9 +162,12 @@ fn sweep_timeout(interval_mins: u64) -> Duration {
 /// builds it shares the disk with. `ionice` is Linux-only; fall back to `nice`.
 fn deprioritized(cmd: &str) -> String {
     let quoted = shell_single_quote(cmd);
+    // Embed the safety wrapper once to preserve shell argument headroom as
+    // discovered roots grow. Select the priority argv before invoking it.
     format!(
-        "if command -v ionice >/dev/null 2>&1; then nice -n 19 ionice -c3 sh -c {quoted}; \
-         else nice -n 19 sh -c {quoted}; fi"
+        "set -- nice -n 19; \
+         if command -v ionice >/dev/null 2>&1; then set -- \"$@\" ionice -c3; fi; \
+         \"$@\" sh -c {quoted}"
     )
 }
 
@@ -193,6 +198,27 @@ fn ensure_sweep_command_success(result: &CommandResult) -> anyhow::Result<()> {
         result.exit_code,
         stderr
     )
+}
+
+/// Extend a configured root set only after the complete successful worker
+/// reply has passed the shared wire and path validation. A failed command's
+/// stdout cannot grant supplemental scan scope, even if it contains valid JSON.
+fn merge_source_inventory_roots(
+    mut roots: GcRootSet,
+    result: &CommandResult,
+) -> anyhow::Result<GcRootSet> {
+    anyhow::ensure!(
+        result.success(),
+        "source-claim root inventory exited with code {}: {}",
+        result.exit_code,
+        result.stderr.trim()
+    );
+    let inventory = gc_roots::parse_source_claim_roots_inventory(&result.stdout)
+        .map_err(anyhow::Error::msg)?;
+    roots
+        .extend_source_claim_roots(&inventory)
+        .map_err(anyhow::Error::msg)?;
+    Ok(roots)
 }
 
 /// Periodic worker-side stale-target reaper.
@@ -338,7 +364,7 @@ impl StaleTargetReaper {
     /// Scan configured mirror, pool, and extra roots using the same validation
     /// and normalization as `rch gc`. Reject the complete set on any invalid
     /// root before a caller can dispatch a partially configured sweep.
-    fn scan_bases(&self) -> anyhow::Result<Vec<String>> {
+    fn scan_roots(&self) -> anyhow::Result<GcRootSet> {
         let pooled = rch_common::remediation_config::PooledTargetConfig {
             remote_base: self.config.remote_base.clone(),
             store_base: self.config.store_base.clone(),
@@ -356,7 +382,11 @@ impl StaleTargetReaper {
                 .collect::<Vec<_>>()
                 .join("; ")
         );
-        Ok(roots.scan_bases())
+        Ok(roots)
+    }
+
+    fn scan_bases(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.scan_roots()?.scan_bases())
     }
 
     /// Run the sweep script on a single worker and return its metrics.
@@ -374,48 +404,67 @@ impl StaleTargetReaper {
         ensure_posix_gc_worker(&config)?;
         let worker_id = config.id.clone();
 
-        // Validate every configured root before dispatching the first command,
-        // including calls through run_cycle() that bypass start().
-        let bases = self.scan_bases()?;
-        let mut metrics = ReapMetrics::default();
-        for base in bases {
-            let cmd = build_sweep_command(
-                &base,
+        // Validate the complete configured-only command before any network
+        // request. Supplemental discovery can fail on an older or busy worker;
+        // that must not disable the configured roots or produce a partial set.
+        let configured_roots = self.scan_roots()?;
+        let configured_bases = configured_roots.scan_bases();
+        let build_command = |bases: &[String]| {
+            stale_target_reap::worker_sweep_command_for_roots_under_pressure(
+                bases,
                 idle_minutes,
                 pooled_idle_minutes_from_hours(self.config.pooled_idle_hours),
                 max_cache_kb_from_gb(self.config.max_cache_gb),
-                // The same line the cache sweep evicts to: critical placement
-                // ratio plus headroom.
                 crate::cache_cleanup::placement_low_disk_permille(),
-            );
-            let cmd = stale_target_reap::with_gc_recovery_reserve(
-                stale_target_reap::SOURCE_CLAIM_REGISTRY,
-                &cmd,
-            );
-
-            debug!(worker = %worker_id, idle_minutes, base = %base, "Starting stale-target sweep");
-
-            let result = admission
-                .run(self.run_remote(&config, &deprioritized(&cmd)))
-                .await
-                .ok_or_else(|| {
-                    anyhow::anyhow!("stale-target sweep cancelled by worker state change")
-                })??;
-            ensure_sweep_command_success(&result)?;
-
-            let base_metrics = parse_reap_metrics(&result.stdout).unwrap_or_default();
-            metrics.removed += base_metrics.removed;
-            metrics.freed_bytes += base_metrics.freed_bytes;
-            log_reap_audit(&worker_id, &result.stdout);
-            debug!(
-                worker = %worker_id,
-                base = %base,
-                removed = base_metrics.removed,
-                freed_bytes = base_metrics.freed_bytes,
-                exit = result.exit_code,
-                "Stale-target sweep finished for base"
-            );
-        }
+            )
+            .map_err(anyhow::Error::msg)
+        };
+        let configured_command = build_command(&configured_bases)?;
+        let inventory_command = gc_roots::source_claim_roots_command();
+        let discovery = admission
+            .run(self.run_remote(&config, &inventory_command))
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("source-claim root discovery cancelled by worker state change")
+            })?;
+        let combined = discovery.and_then(|result| {
+            let roots = merge_source_inventory_roots(configured_roots, &result)?;
+            let bases = roots.scan_bases();
+            let command = build_command(&bases)?;
+            Ok((command, bases.len()))
+        });
+        let (command, root_count) = match combined {
+            Ok(combined) => combined,
+            Err(error) => {
+                warn!(
+                    worker = %worker_id,
+                    %error,
+                    configured_roots = configured_bases.len(),
+                    "Source-claim root discovery unavailable; sweeping configured roots only"
+                );
+                (configured_command, configured_bases.len())
+            }
+        };
+        let command = stale_target_reap::with_gc_recovery_reserve(
+            stale_target_reap::SOURCE_CLAIM_REGISTRY,
+            &command,
+        );
+        debug!(
+            worker = %worker_id,
+            idle_minutes,
+            root_count,
+            "Starting combined stale-target sweep"
+        );
+        let result = admission
+            .run(self.run_remote(&config, &deprioritized(&command)))
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("stale-target sweep cancelled by worker state change")
+            })??;
+        ensure_sweep_command_success(&result)?;
+        let metrics = parse_reap_metrics(&result.stdout)
+            .ok_or_else(|| anyhow::anyhow!("stale-target sweep did not report complete metrics"))?;
+        log_reap_audit(&worker_id, &result.stdout);
 
         debug!(
             worker = %worker_id,
@@ -487,6 +536,52 @@ mod tests {
             "M removed=it's\ndone\n"
         );
         assert!(deprioritized(cmd).contains("nice -n 19"));
+    }
+
+    #[test]
+    fn deprioritized_combined_sweep_fits_one_shell_argument_at_root_budget() {
+        // 256 * (125 path bytes + 3 quote/separator bytes) fills the complete
+        // 32 KiB root budget. Include every sweep policy and the recovery
+        // reserve so this checks the actual dispatch payload, not a toy body.
+        // Distinct high-entropy safe names keep the reserve's zlib transport
+        // from hiding growth behind a repeated compressible path prefix.
+        const ALPHABET: &[u8; 64] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let bases = (0..256)
+            .map(|index| {
+                let mut name = String::with_capacity(115);
+                for _ in 0..115 {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    name.push(char::from(ALPHABET[(state & 63) as usize]));
+                }
+                format!("/data/{name}/{index:03}")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bases.iter().map(|base| base.len() + 3).sum::<usize>(),
+            32 * 1024
+        );
+        let sweep = stale_target_reap::worker_sweep_command_for_roots_under_pressure(
+            &bases,
+            720,
+            Some(7 * 24 * 60),
+            Some(250 * 1024 * 1024),
+            150,
+        )
+        .unwrap();
+        let reserved = stale_target_reap::with_gc_recovery_reserve(
+            stale_target_reap::SOURCE_CLAIM_REGISTRY,
+            &sweep,
+        );
+        let command = deprioritized(&reserved);
+        assert!(
+            command.len() < 128 * 1024,
+            "combined dispatch exceeds the Linux per-argument limit: {} bytes",
+            command.len()
+        );
     }
 
     /// The production sweep bound to an empty registry under the fixture.
@@ -1031,6 +1126,178 @@ mod tests {
             reaper.scan_bases().unwrap(),
             vec!["/data/projects", "/mnt/pools", "/srv/old-rch", "/opt/rch"],
             "preserve explicit roots in order, normalize and deduplicate without inventing roots"
+        );
+    }
+
+    fn source_inventory_result(stdout: &str, exit_code: i32) -> CommandResult {
+        CommandResult {
+            exit_code,
+            stdout: stdout.to_string(),
+            stderr: if exit_code == 0 {
+                String::new()
+            } else {
+                "worker inventory unavailable".to_string()
+            },
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn source_inventory_preserves_configured_roots_and_exact_discovered_scope() {
+        let reaper = StaleTargetReaper::new(
+            WorkerPool::new(),
+            StaleTargetReapConfig {
+                remote_base: "/data/projects".into(),
+                store_base: Some("/mnt/rch-pools".into()),
+                gc_extra_roots: vec!["/srv/old-rch".into()],
+                ..Default::default()
+            },
+        );
+        let configured = reaper.scan_roots().unwrap();
+        let result = source_inventory_result(
+            r#"{"schema_version":1,"roots":["/data/projects","/private/tmp/rch-work/mirror-a","/data/projects/a/b/c/d/e/f/g/h/i/mirror-b","/private/tmp/rch-work/mirror-a"]}"#,
+            0,
+        );
+        let combined = merge_source_inventory_roots(configured.clone(), &result).unwrap();
+        assert_eq!(
+            combined.scan_bases(),
+            vec![
+                "/data/projects",
+                "/mnt/rch-pools",
+                "/srv/old-rch",
+                "/private/tmp/rch-work/mirror-a",
+                "/data/projects/a/b/c/d/e/f/g/h/i/mirror-b",
+            ],
+            "keep explicit order, exact mirrors and deep roots; deduplicate only equal paths"
+        );
+        assert_eq!(
+            configured.scan_bases(),
+            vec!["/data/projects", "/mnt/rch-pools", "/srv/old-rch"],
+            "the complete configured set remains available for fallback"
+        );
+        assert_eq!(
+            combined
+                .attribute("/private/tmp/rch-work/mirror-a/.rch-target-w-pool-a")
+                .unwrap()
+                .source,
+            gc_roots::GcRootSource::SourceClaimRegistry
+        );
+        assert_eq!(
+            combined
+                .attribute("/data/projects/a/b/c/d/e/f/g/h/i/mirror-b/.rch-target-w-pool-b")
+                .unwrap()
+                .source,
+            gc_roots::GcRootSource::SourceClaimRegistry,
+            "a configured ancestor must not erase a deeper registered mirror"
+        );
+        assert!(combined.attribute("/private/tmp/unrelated").is_none());
+        assert_eq!(
+            combined.roots.last().unwrap().source,
+            gc_roots::GcRootSource::WorkerTempBase
+        );
+        let empty = source_inventory_result(r#"{"schema_version":1,"roots":[]}"#, 0);
+        assert_eq!(
+            merge_source_inventory_roots(configured.clone(), &empty).unwrap(),
+            configured
+        );
+    }
+
+    #[test]
+    fn source_inventory_errors_never_grant_partial_supplemental_scope() {
+        let configured = StaleTargetReaper::new(
+            WorkerPool::new(),
+            StaleTargetReapConfig::default(),
+        )
+        .scan_roots()
+        .unwrap();
+        let valid = r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a"]}"#;
+        let failed = source_inventory_result(valid, 2);
+        let error = merge_source_inventory_roots(configured.clone(), &failed).unwrap_err();
+        assert!(error.to_string().contains("exited with code 2"));
+        assert!(error.to_string().contains("worker inventory unavailable"));
+
+        let responses = [
+            ("truncated", r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a"]"#),
+            ("unsafe later root", r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a","/private/tmp/../etc"]}"#),
+            ("unknown version", r#"{"schema_version":2,"roots":["/private/tmp/rch-work/mirror-a"]}"#),
+            ("unknown field", r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a"],"partial":true}"#),
+            ("extra output", r#"{"schema_version":1,"roots":[]}{"schema_version":1,"roots":[]}"#),
+        ];
+        for (case, stdout) in responses {
+            let result = source_inventory_result(stdout, 0);
+            assert!(
+                merge_source_inventory_roots(configured.clone(), &result).is_err(),
+                "{case}"
+            );
+        }
+        let oversized = format!(
+            "{}{}",
+            valid,
+            " ".repeat(gc_roots::SOURCE_CLAIM_ROOTS_MAX_BYTES)
+        );
+        assert!(
+            merge_source_inventory_roots(
+                configured.clone(),
+                &source_inventory_result(&oversized, 0)
+            )
+            .is_err(),
+            "even otherwise valid JSON must respect the complete response bound"
+        );
+        assert!(
+            stale_target_reap::worker_sweep_command_for_roots_under_pressure(
+                &configured.scan_bases(),
+                720,
+                Some(1440),
+                Some(1024),
+                0,
+            )
+            .is_ok(),
+            "rejected supplemental roots must leave a complete configured sweep available"
+        );
+    }
+
+    #[test]
+    fn source_inventory_command_bound_refuses_all_supplemental_roots_together() {
+        let configured = StaleTargetReaper::new(
+            WorkerPool::new(),
+            StaleTargetReapConfig {
+                remote_base: "/data/projects".into(),
+                store_base: Some("/mnt/rch-pools".into()),
+                ..Default::default()
+            },
+        )
+        .scan_roots()
+        .unwrap();
+        let inventory = gc_roots::SourceClaimRootsInventory {
+            schema_version: gc_roots::SOURCE_CLAIM_ROOTS_SCHEMA_VERSION,
+            roots: (0..400)
+                .map(|index| format!("/private/tmp/{}/mirror-{index}", "a".repeat(96)))
+                .collect(),
+        };
+        let stdout = serde_json::to_string(&inventory).unwrap();
+        assert!(stdout.len() < gc_roots::SOURCE_CLAIM_ROOTS_MAX_BYTES);
+        let combined = merge_source_inventory_roots(
+            configured.clone(),
+            &source_inventory_result(&stdout, 0),
+        )
+        .unwrap();
+        assert_eq!(combined.scan_bases().len(), 402);
+        let build = |roots: &GcRootSet| {
+            stale_target_reap::worker_sweep_command_for_roots_under_pressure(
+                &roots.scan_bases(),
+                720,
+                Some(1440),
+                Some(1024),
+                0,
+            )
+        };
+        assert!(
+            build(&combined).is_err(),
+            "a valid inventory can exceed the smaller SSH command budget; never truncate it"
+        );
+        assert!(
+            build(&configured).is_ok(),
+            "the configured mirror and relocated pool remain sweepable together"
         );
     }
 

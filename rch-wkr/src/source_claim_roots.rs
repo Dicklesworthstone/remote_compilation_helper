@@ -79,6 +79,7 @@ mod unix {
     use std::path::Path;
 
     const MAX_ENTRIES: usize = 65_536;
+    const MAX_ROOT_PROBES: usize = 65_536;
     const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
     const MAX_TOTAL_RECORD_BYTES: u64 = 64 * 1024 * 1024;
     const FILE_FLAGS: OFlags = OFlags::RDONLY
@@ -92,6 +93,8 @@ mod unix {
         entries: usize,
         record_bytes: u64,
         root_bytes: usize,
+        root_probes: usize,
+        seen_roots: BTreeSet<String>,
     }
 
     impl Default for Budget {
@@ -100,6 +103,8 @@ mod unix {
                 entries: MAX_ENTRIES,
                 record_bytes: MAX_TOTAL_RECORD_BYTES,
                 root_bytes: 0,
+                root_probes: MAX_ROOT_PROBES,
+                seen_roots: BTreeSet::new(),
             }
         }
     }
@@ -189,6 +194,18 @@ mod unix {
                 is_safe_source_claim_root(root),
                 "unsafe source-claim inventory root: {root:?}"
             );
+            // Historical receipts repeatedly name the same roots. Remember
+            // missing paths too, so neither repetition nor retired roots can
+            // cause unbounded filesystem probes under the registry lock.
+            // The aggregate record-byte limit also bounds retained key bytes.
+            if budget.seen_roots.contains(root) {
+                continue;
+            }
+            budget.root_probes = budget
+                .root_probes
+                .checked_sub(1)
+                .context("source-claim inventory exceeds its root probe bound")?;
+            budget.seen_roots.insert(root.to_owned());
             // Preserve the authenticated lexical spelling, including legitimate
             // /dp and Darwin /tmp aliases. The ordinary scan resolves it and
             // rechecks current ownership before considering individual targets.
@@ -474,6 +491,40 @@ mod unix {
                     .display()
                     .to_string()
             ));
+        }
+
+        #[test]
+        fn repeated_existing_and_retired_roots_share_a_bounded_probe_budget() {
+            let fixture = Fixture::new();
+            let missing = fixture.source.with_file_name("retired-project");
+            fixture.claim("", "ab01", &[&fixture.source, &missing, &missing]);
+            fixture.claim("released", "ab02", &[&missing, &fixture.source]);
+            fixture.claim("cancelled", "ab03", &[&fixture.source, &missing]);
+            let result = inventory_with(
+                &[fixture.registry.to_str().unwrap()],
+                Budget {
+                    root_probes: 2,
+                    ..Budget::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(result.roots, vec![fixture.source.display().to_string()]);
+
+            // A new missing path must still consume the bound even though it
+            // would not increase the successful output's root count.
+            let another_missing = fixture.source.with_file_name("another-retired-project");
+            fixture.claim("released", "ab04", &[&another_missing]);
+            let error = inventory_with(
+                &[fixture.registry.to_str().unwrap()],
+                Budget {
+                    root_probes: 2,
+                    ..Budget::default()
+                },
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("root probe bound"));
         }
 
         #[test]
