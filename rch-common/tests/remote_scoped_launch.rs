@@ -273,3 +273,214 @@ mod native_transport {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+mod native_result_recovery {
+    use std::process::{Command, Output};
+
+    use rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT as PROTOCOL;
+
+    // These tests launch and drain real process groups. Only one supervisor
+    // observation is faulted, after the real leader publishes its result.
+    // The child receives the unchanged production protocol and no test hooks.
+    fn alias(source: &str, name: &str, replacement: &str) -> String {
+        let declaration = format!("{name}() ");
+        assert_eq!(source.matches(&declaration).count(), 1);
+        let (_, definition) = source.split_once(&declaration).unwrap();
+        let closing = if definition.starts_with('{') {
+            "\n}"
+        } else {
+            assert!(definition.starts_with('('));
+            "\n)"
+        };
+        let end = definition.find(closing).unwrap() + closing.len();
+        format!("{replacement}() {}\n", &definition[..end])
+    }
+
+    const OBSERVATION_FAULT: &str = r#"
+# Isolate optional host policy; all process identity and cleanup remain real.
+rch_policy_select_file() { rch_policy_file=; }
+rch_fixture_fault() {
+    [ "$RCH_RESULT_TEST_MODE" != control ] || return 1
+    [ ! -e "$RCH_RESULT_TEST_ROOT/injected" ] || return 1
+    if [ "$RCH_RESULT_TEST_MODE" = before-admission ]; then
+        [ "${__sl_admitted:-0}" = 0 ] && [ -n "${__sl_child_start:-}" ] || return 1
+        rch_fixture_attempt=0
+        while [ ! -f "$__sl_record" ]; do
+            rch_fixture_attempt=$((rch_fixture_attempt + 1))
+            [ "$rch_fixture_attempt" -lt 500 ] || exit 98
+            sleep 0.01 || exit 98
+        done
+        (umask 077; printf 'RCH_SCOPED_RESULT_V1:%s:%s:%s:0\n' \
+            "$__sl_build" "$__sl_child" "$__sl_child_start" > "$__sl_control/result") || exit 98
+    else
+        [ "${__sl_admitted:-0}" = 1 ] || return 1
+        rch_fixture_ready="$__sl_control/result"
+        [ "$RCH_RESULT_TEST_MODE" != missing ] || rch_fixture_ready="$RCH_RESULT_TEST_ROOT/started"
+        rch_fixture_attempt=0
+        while [ ! -f "$rch_fixture_ready" ]; do
+            rch_fixture_attempt=$((rch_fixture_attempt + 1))
+            [ "$rch_fixture_attempt" -lt 500 ] || exit 98
+            sleep 0.01 || exit 98
+        done
+    fi
+    : > "$RCH_RESULT_TEST_ROOT/injected" || exit 98
+    case "$RCH_RESULT_TEST_MODE" in
+        wrong-build)
+            printf 'RCH_SCOPED_RESULT_V1:4243:%s:%s:0\n' \
+                "$__sl_child" "$__sl_child_start" > "$__sl_control/result";;
+        wrong-birth)
+            printf 'RCH_SCOPED_RESULT_V1:%s:%s:%s:0\n' \
+                "$__sl_build" "$__sl_child" "$((__sl_child_start + 1))" > "$__sl_control/result";;
+        malformed) printf 'extra\n' >> "$__sl_control/result";;
+        mode) chmod 644 "$__sl_control/result";;
+        hardlink) ln "$__sl_control/result" "$RCH_RESULT_TEST_ROOT/result-alias";;
+        record) printf 'damaged record\n' > "$__sl_record";;
+        deadline) printf 'deadline\n' > "$__sl_control/deadline";;
+        cancelled) kill -TERM "$$";;
+    esac
+    return 0
+}
+rch_scope_launch_clock() {
+    if [ "$RCH_RESULT_TEST_MODE" != process ] && rch_fixture_fault; then return 1; fi
+    rch_fixture_clock
+}
+rch_scope_launch_process() {
+    if [ "$1" = "${__sl_child:-}" ] && [ "$RCH_RESULT_TEST_MODE" = process ] &&
+        rch_fixture_fault; then return 2; fi
+    rch_fixture_process "$@"
+}
+rch_remote_cancel_loaded() {
+    rch_fixture_cancel "$@"
+    rch_fixture_cleanup=$?
+    # Simulate unavailable final evidence only after actually draining the
+    # owned group, so even the negative control leaves no live fixture work.
+    if [ "$RCH_RESULT_TEST_MODE:$rch_fixture_cleanup" = cleanup:0 ]; then return 44; fi
+    return "$rch_fixture_cleanup"
+}
+exec 3>&2
+rch_scope_launch_supervise "$RCH_RESULT_TEST_ROOT/receipt" 0 RCH_RESULT_TEST_DEADLINE 4242 \
+    /bin/sh -c '
+        printf "PAYLOAD_START\n"
+        : > "$RCH_RESULT_TEST_ROOT/started"
+        if [ "$RCH_RESULT_TEST_MODE" = missing ]; then sleep 30; fi
+        printf "PAYLOAD_DONE\n"
+        exit "$RCH_RESULT_TEST_STATUS"
+    '
+"#;
+
+    fn run(shell: &str, mode: &str, payload_status: i32) -> (tempfile::TempDir, Output) {
+        let directory = tempfile::Builder::new()
+            .prefix("scoped-result-recovery-")
+            .disable_cleanup(true)
+            .tempdir()
+            .expect("result recovery fixture directory");
+        let launch = include_str!("../src/remote_scoped_launch.sh");
+        let process = include_str!("../src/remote_process.sh");
+        let script = format!(
+            "{PROTOCOL}\n{}{}{}{OBSERVATION_FAULT}",
+            alias(launch, "rch_scope_launch_clock", "rch_fixture_clock"),
+            alias(launch, "rch_scope_launch_process", "rch_fixture_process"),
+            alias(process, "rch_remote_cancel_loaded", "rch_fixture_cancel"),
+        );
+        // timeout owns a separate observer group even inside PID namespaces.
+        // Its guard is outside the production deadlines being exercised.
+        let output = Command::new("/usr/bin/timeout")
+            .args([
+                "--signal=KILL",
+                "15s",
+                shell,
+                "-c",
+                &script,
+                "rch-result-observer",
+            ])
+            .env_remove("RCH_TIMING_SCALE")
+            .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
+            .env("RCH_RESULT_TEST_ROOT", directory.path())
+            .env("RCH_RESULT_TEST_MODE", mode)
+            .env("RCH_RESULT_TEST_STATUS", payload_status.to_string())
+            .output()
+            .expect("run the real supervisor with a single observation fault");
+        assert_eq!(
+            directory.path().join("injected").exists(),
+            mode != "control",
+            "fault did not reach its intended boundary: {shell}, {mode}: {output:?}",
+        );
+        (directory, output)
+    }
+
+    #[test]
+    fn finished_payload_keeps_its_status_after_a_failed_observation() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for mode in ["control", "clock", "process"] {
+                for status in [0, 37] {
+                    let (directory, output) = run(shell, mode, status);
+                    assert_eq!(output.status.code(), Some(status), "{mode}: {output:?}");
+                    assert_eq!(output.stdout, b"PAYLOAD_START\nPAYLOAD_DONE\n");
+                    assert!(output.stderr.is_empty(), "{mode}: {output:?}");
+                    let result = std::fs::read_to_string(
+                        directory.path().join("receipt.supervisor.v1/result"),
+                    )
+                    .unwrap();
+                    assert!(result.starts_with("RCH_SCOPED_RESULT_V1:4242:"));
+                    assert!(result.ends_with(&format!(":{status}\n")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn result_recovery_keeps_admission_identity_and_cleanup_requirements() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for mode in [
+                "before-admission",
+                "missing",
+                "wrong-build",
+                "wrong-birth",
+                "malformed",
+                "mode",
+                "hardlink",
+                "record",
+                "cleanup",
+            ] {
+                let (directory, output) = run(shell, mode, 0);
+                assert_eq!(output.status.code(), Some(255), "{mode}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"),
+                    "{mode}: {output:?}",
+                );
+                assert!(directory.path().join("receipt.supervisor.v1").is_dir());
+                if mode == "before-admission" {
+                    assert!(output.stdout.is_empty(), "{output:?}");
+                    assert!(!directory.path().join("receipt.supervisor.v1/go").exists());
+                } else if mode == "missing" {
+                    assert_eq!(output.stdout, b"PAYLOAD_START\n");
+                    assert!(
+                        !directory
+                            .path()
+                            .join("receipt.supervisor.v1/result")
+                            .exists()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_and_cancellation_still_override_a_finished_payload() {
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for (mode, expected) in [("deadline", 137), ("cancelled", 143)] {
+                let (_, output) = run(shell, mode, 0);
+                assert_eq!(output.status.code(), Some(expected), "{mode}: {output:?}");
+                assert_eq!(output.stdout, b"PAYLOAD_START\nPAYLOAD_DONE\n");
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(!error.contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"));
+                assert_eq!(
+                    error.contains("RCH_RESULT_TEST_DEADLINE"),
+                    mode == "deadline"
+                );
+            }
+        }
+    }
+}

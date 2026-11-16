@@ -509,6 +509,11 @@ RCH_SCOPED_COMPLETION_DETAIL:reason=$__sl_reason,admitted=$__sl_admitted,cleanup
     case "$__sl_reason" in
         result) return "$__sl_status";;
         unknown)
+            # Cleanup proved the admitted writer gone and its record intact.
+            # A failed loop observation must not discard its valid result.
+            if [ "$__sl_admitted" = 1 ] && rch_scope_launch_read_result; then
+                return "$__sl_status"
+            fi
             rch_scope_launch_message "RCH_SCOPED_COMPLETION_UNCONFIRMED
 RCH_SCOPED_COMPLETION_DETAIL:reason=unknown,admitted=$__sl_admitted,cleanup=0,record=0"
             return 255;;
