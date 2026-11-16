@@ -63,6 +63,8 @@ pub struct FairQueue {
     /// Per-tenant last STAMPED virtual finish (pending items included)
     /// so successive enqueues stack their virtual finishes.
     last_stamped: Vec<(TenantKey, u128)>,
+    /// Fair service reached by the queue, retained across idle periods.
+    service_frontier: u128,
     /// The hard starvation bound in ticks.
     pub starvation_bound: u64,
     /// Deadline lookahead: items due within this window preempt.
@@ -78,6 +80,7 @@ impl FairQueue {
             weights: Vec::new(),
             virtual_time: Vec::new(),
             last_stamped: Vec::new(),
+            service_frontier: 0,
             starvation_bound,
             deadline_window,
         }
@@ -130,7 +133,12 @@ impl FairQueue {
             .iter()
             .find(|(t, _)| *t == tenant)
             .map_or(0, |(_, v)| *v);
-        let start = self.virtual_time_of(&tenant).max(stamped);
+        // New and returning tenants begin at the current service position;
+        // time spent absent must not accumulate free priority over live work.
+        let start = self
+            .virtual_time_of(&tenant)
+            .max(stamped)
+            .max(self.service_frontier);
         let scaled_cost = u128::from(cost.max(1)) << VIRTUAL_FRACTION_BITS;
         let charge = scaled_cost.div_ceil(u128::from(self.weight_of(&tenant)));
         let virtual_finish = start.saturating_add(charge);
@@ -174,20 +182,24 @@ impl FairQueue {
                 .map(|(pos, _)| pos)
         });
         // 3. Weighted fair order: smallest virtual finish.
-        let pos = urgent.unwrap_or_else(|| {
-            self.items
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, i)| (i.virtual_finish, i.enqueued_at))
-                .map(|(p, _)| p)
-                .expect("nonempty")
-        });
+        let fair_pos = self
+            .items
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, i)| (i.virtual_finish, i.enqueued_at))
+            .map(|(p, _)| p)
+            .expect("nonempty");
+        let fair_finish = self.items[fair_pos].virtual_finish;
+        let pos = urgent.unwrap_or(fair_pos);
         let item = self.items.remove(pos);
         // Consume the charge fixed at admission, even for override winners.
         // Recomputing cost at the current weight would reprice pending work.
         // An older item served after an urgent one must not rewind the clock.
         let new_vt = self.virtual_time_of(&item.tenant).max(item.virtual_finish);
         self.advance_virtual_time(&item.tenant, new_vt);
+        // A priority override pays its own full charge without imposing that
+        // debt on unrelated arrivals or repricing already queued work.
+        self.service_frontier = self.service_frontier.max(fair_finish);
         Some(item)
     }
 }
@@ -218,6 +230,65 @@ mod tests {
         let first8: Vec<FairItem> = (0..8).map(|_| q.dequeue(1).unwrap()).collect();
         let dev_slots = first8.iter().filter(|i| i.tenant.agent == "dev").count();
         assert_eq!(dev_slots, 6, "weight 3:1 gives ~3x the early slots");
+    }
+
+    #[test]
+    fn new_and_returning_tenants_share_service_without_idle_credit() {
+        for previously_active in [false, true] {
+            for newcomer_weight in [1, 3] {
+                let mut q = FairQueue::new(u64::MAX, 0);
+                let incumbent = tenant("incumbent", false);
+                let newcomer = tenant("newcomer", false);
+                if previously_active {
+                    q.enqueue(newcomer.clone(), "earlier-work", 12, 0, None);
+                    assert_eq!(q.dequeue(0).unwrap().label, "earlier-work");
+                }
+                // An idle queue must retain the service already provided to
+                // the incumbent, rather than granting historical credit.
+                for _ in 0..64 {
+                    q.enqueue(incumbent.clone(), "warmup", 12, 0, None);
+                    assert_eq!(q.dequeue(0).unwrap().label, "warmup");
+                }
+                q.set_weight(newcomer.clone(), newcomer_weight);
+                q.enqueue(incumbent, "incumbent-work", 12, 0, None);
+                q.enqueue(newcomer.clone(), "newcomer-work", 12, 0, None);
+                let mut newcomer_slots = 0_u64;
+                for serviced in 1..=32 {
+                    let item = q.dequeue(0).unwrap();
+                    if item.tenant == newcomer {
+                        newcomer_slots += 1;
+                    }
+                    // Keep both tenants continuously demanding service so
+                    // admission is tested across changing queue membership.
+                    q.enqueue(item.tenant, &item.label, item.cost, 0, None);
+                    if serviced % (newcomer_weight + 1) == 0 {
+                        assert_eq!(
+                            newcomer_slots,
+                            serviced * newcomer_weight / (newcomer_weight + 1),
+                            "returning={previously_active}, weight={newcomer_weight}, serviced={serviced}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn priority_winners_do_not_charge_their_debt_to_arriving_tenants() {
+        for (starvation_bound, deadline, now) in [(u64::MAX, Some(1), 1), (5, None, 10)] {
+            let mut q = FairQueue::new(starvation_bound, 10);
+            let priority = tenant("priority", false);
+            q.enqueue(priority.clone(), "priority-work", 1_000, 0, deadline);
+            q.enqueue(tenant("pending", false), "already-pending", 1, now, None);
+            assert_eq!(q.dequeue(now).unwrap().label, "priority-work");
+            q.enqueue(priority, "charged-followup", 1, now, None);
+            q.enqueue(tenant("arriving", false), "new-arrival", 1, now, None);
+            // Existing stamps retain their order, and the large priority
+            // charge belongs only to the tenant that consumed it.
+            assert_eq!(q.dequeue(now).unwrap().label, "already-pending");
+            assert_eq!(q.dequeue(now).unwrap().label, "new-arrival");
+            assert_eq!(q.dequeue(now).unwrap().label, "charged-followup");
+        }
     }
 
     #[test]
