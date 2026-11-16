@@ -4,7 +4,7 @@
 //! and committed manifest. The only intermediate frame exposes one exact,
 //! continuous stderr prefix; the wrapper flushes it before acknowledging it.
 //! That exposure is irreversible even if the install writer later returns.
-//! All socket phases AND prefix delivery use the original install deadline.
+//! All socket phases AND transcript delivery use the original install deadline.
 //! Freshly published remote results additionally retain their execution
 //! protocol and exact captured-result identity throughout installation.
 
@@ -133,18 +133,24 @@ fn check_live(deadline: Instant, owned: &impl Fn() -> bool) -> io::Result<()> {
 /// bounded without unsafe fd manipulation or another dependency. A failed
 /// wait is terminal for this wrapper process: it exits silently, terminating
 /// any unfinished writer instead of attempting to log through the same pipe.
-fn deliver_prefix(
+pub(super) fn deliver_transcript(
     mut sink: impl Write + Send + 'static,
     bytes: Vec<u8>,
     deadline: Instant,
     owned: &impl Fn() -> bool,
 ) -> io::Result<()> {
     check_live(deadline, owned)?;
+    // Successful quiet compiles are the common cache hit. There is nothing to
+    // flush or relay, so keep them on the caller's thread while still checking
+    // the original deadline and owner.
+    if bytes.is_empty() {
+        return Ok(());
+    }
     let (sender, receiver) = mpsc::sync_channel(1);
     #[cfg(test)]
     let panic_relay = super::panic_fixture_selected("metadata-relay");
     std::thread::Builder::new()
-        .name("rabs-metadata-stderr".into())
+        .name("rabs-transcript-stderr".into())
         .spawn(move || {
             #[cfg(test)]
             if panic_relay {
@@ -201,7 +207,7 @@ pub(super) fn outcome(
         &accepted,
         deadline,
         owned,
-        accepted_install_reply,
+        |line| accepted_install_reply(line, deadline),
         "cache-hit",
     ))
 }
@@ -246,7 +252,7 @@ pub(super) fn remote_install(
         &accepted,
         deadline,
         owned,
-        |line| super::remote::completion(line, key),
+        |line| super::remote::completion(line, key, deadline),
         "remote",
     )
 }
@@ -308,7 +314,7 @@ fn receive(
             // Sticky BEFORE any write attempt: even a partial stderr write,
             // panic, lost caller or ACK cannot make local compilation safe.
             exposed = true;
-            if deliver_prefix(io::stderr(), prefix, deadline, owned).is_err() {
+            if deliver_transcript(io::stderr(), prefix, deadline, owned).is_err() {
                 return Live::FailClosedSilently;
             }
             #[cfg(test)]
@@ -354,6 +360,8 @@ fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -378,6 +386,96 @@ mod tests {
     }
 
     #[test]
+    fn final_transcript_delivery_stops_on_deadline_or_caller_loss() {
+        for cancelled in [false, true] {
+            let (mut sink, peer) = UnixStream::pair().unwrap();
+            sink.set_nonblocking(true).unwrap();
+            loop {
+                match sink.write(&[0x5a; 8192]) {
+                    Ok(written) => assert_ne!(written, 0),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("fill owned socket: {error}"),
+                }
+            }
+            sink.set_nonblocking(false).unwrap();
+            let owner = Arc::new(AtomicBool::new(true));
+            let relay_owner = Arc::clone(&owner);
+            let (done, outcome) = mpsc::channel();
+            let relay = std::thread::spawn(move || {
+                let deadline = Instant::now()
+                    + if cancelled {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::from_millis(150)
+                    };
+                let result =
+                    deliver_transcript(sink, b"terminal transcript".to_vec(), deadline, &|| {
+                        relay_owner.load(Ordering::Acquire)
+                    });
+                done.send(result).unwrap();
+            });
+            assert!(matches!(
+                outcome.recv_timeout(Duration::from_millis(25)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            if cancelled {
+                owner.store(false, Ordering::Release);
+            }
+            let result = outcome.recv_timeout(Duration::from_secs(3));
+            // Unblock even a regressed writer before asserting so the native
+            // test never leaves a blocked detached thread in the test runner.
+            drop(peer);
+            relay.join().unwrap();
+            let error = result
+                .expect("terminal delivery must remain bounded")
+                .unwrap_err();
+            if cancelled {
+                assert!(error.to_string().contains("caller disappeared"));
+            } else {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            }
+        }
+    }
+
+    #[test]
+    fn final_transcript_delivery_preserves_large_binary_output() {
+        let (sink, mut peer) = UnixStream::pair().unwrap();
+        let transcript: Vec<_> = (0..MAX_CAPTURE_BYTES).map(|at| (at % 256) as u8).collect();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        deliver_transcript(
+            sink,
+            transcript.clone(),
+            Instant::now() + Duration::from_secs(5),
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(reader.join().unwrap(), transcript);
+    }
+
+    #[test]
+    fn quiet_cache_hits_still_require_a_live_caller_and_install_budget() {
+        let expired = Instant::now();
+        assert_eq!(
+            deliver_transcript(io::sink(), Vec::new(), expired, &|| true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        let error = deliver_transcript(
+            io::sink(),
+            Vec::new(),
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("caller disappeared"));
+    }
+
+    #[test]
     fn prefix_delivery_checks_flush_and_original_caller_before_ack() {
         for fail_flush in [true, false] {
             let owner = Arc::new(AtomicBool::new(true));
@@ -385,7 +483,7 @@ mod tests {
                 owner: Arc::clone(&owner),
                 fail_flush,
             };
-            let result = deliver_prefix(
+            let result = deliver_transcript(
                 sink,
                 b"metadata prefix".to_vec(),
                 Instant::now() + Duration::from_secs(2),
@@ -414,7 +512,7 @@ mod tests {
     #[test]
     fn a_panicked_prefix_writer_cannot_confirm_exposure() {
         assert!(
-            deliver_prefix(
+            deliver_transcript(
                 PanickingWriter,
                 b"metadata prefix".to_vec(),
                 Instant::now() + Duration::from_secs(2),
@@ -468,7 +566,10 @@ mod tests {
             let line = format!(
                 "{{\"kind\":\"rustc-decision\",\"decision\":\"serve-failed\",\"writer_returned\":true,{fields}}}"
             );
-            assert!(matches!(accepted_install_reply(&line), Live::FailClosed(_)));
+            assert!(matches!(
+                accepted_install_reply(&line, Instant::now()),
+                Live::FailClosed(_)
+            ));
         }
     }
 }

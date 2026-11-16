@@ -93,6 +93,10 @@ impl Fixture {
     /// Stop just after the wrapper's hello, before sending any reply. The
     /// parent shell remains the original caller while waiting for its child.
     fn new() -> Self {
+        Self::with_blocked_stderr(false)
+    }
+
+    fn with_blocked_stderr(blocked: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let socket = root.path().join("edge.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -125,7 +129,11 @@ impl Fixture {
                 .env("RABS_SINGLEFLIGHT_WAIT_MS", "30000")
                 .stdin(Stdio::null())
                 .stdout(std::fs::File::create(&stdout).unwrap())
-                .stderr(std::fs::File::create(root.path().join("stderr")).unwrap())
+                .stderr(if blocked {
+                    Stdio::piped()
+                } else {
+                    Stdio::from(std::fs::File::create(root.path().join("stderr")).unwrap())
+                })
                 .spawn()
                 .unwrap(),
         );
@@ -244,6 +252,42 @@ fn caller_loss_after_acceptance_fails_closed_without_waiting_for_install_timeout
         "rustc-accept"
     );
     fixture.parent.cancel();
+    fixture.assert_cancelled();
+}
+
+#[test]
+fn caller_loss_interrupts_a_blocked_terminal_transcript_without_compiler_retry() {
+    let mut fixture = Fixture::with_blocked_stderr(true);
+    fixture.request();
+    fixture.send(HIT.as_bytes()).unwrap();
+    assert_eq!(
+        read_frame(fixture.peer.as_mut().unwrap())["kind"],
+        "rustc-accept"
+    );
+    let served = json!({
+        "kind": "rustc-decision", "decision": "served",
+        "compiler_skip_authorized": true, "stderr_hex": "78".repeat(1024 * 1024),
+    })
+    .to_string()
+        + "\n";
+    fixture.send(served.as_bytes()).unwrap();
+    let mut stderr = fixture.parent.0.stderr.take().unwrap();
+    let mut first = [0];
+    stderr.read_exact(&mut first).unwrap();
+    assert_eq!(first, [b'x'], "terminal replay really started");
+    // Keep the pipe open, then kill only the original caller. Its wrapper must
+    // notice independently of both pipe closure and the 30-second deadline.
+    fixture.parent.cancel();
+    let limit = Instant::now() + Duration::from_secs(2);
+    while !stopped(fixture.wrapper_pid) && Instant::now() < limit {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let cancelled = stopped(fixture.wrapper_pid);
+    // Release the sink before assertions so even the old blocking writer can
+    // exit on failure; this test never leaves an orphaned wrapper behind.
+    drop(stderr);
+    wait_until(|| stopped(fixture.wrapper_pid));
+    assert!(cancelled, "terminal replay ignored the lost caller");
     fixture.assert_cancelled();
 }
 

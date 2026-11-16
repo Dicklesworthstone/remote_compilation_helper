@@ -177,7 +177,7 @@ pub(super) fn outcome(
     ))
 }
 
-pub(super) fn completion(line: &str, key: &str) -> Live {
+pub(super) fn completion(line: &str, key: &str, install_deadline: Instant) -> Live {
     let Some(reply) = reply_json::parse(line) else {
         return Live::FailClosed("malformed remote installation answer".into());
     };
@@ -203,13 +203,20 @@ pub(super) fn completion(line: &str, key: &str) -> Live {
         .and_then(hex_decode)
         .map_or_else(
             || Live::FailClosed("malformed remote compiler transcript".into()),
-            Live::Served,
+            |stderr| Live::Served {
+                stderr,
+                install_deadline,
+            },
         )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completion(line: &str, key: &str) -> Live {
+        super::completion(line, key, Instant::now() + Duration::from_secs(2))
+    }
 
     #[test]
     fn remote_fallback_requires_both_execution_and_writer_settlement() {
@@ -243,7 +250,7 @@ mod tests {
     fn current_remote_result_is_distinct_from_a_cache_hit() {
         let valid = r#"{"kind":"rustc-decision","decision":"remote-complete","remote_protocol":1,"action_key":"this-action","writer_returned":true,"compiler_skip_authorized":true,"stderr_hex":"6f6b0a"}"#;
         assert!(
-            matches!(completion(valid, "this-action"), Live::Served(bytes) if bytes == b"ok\n")
+            matches!(completion(valid, "this-action"), Live::Served { stderr, .. } if stderr == b"ok\n")
         );
         assert!(matches!(
             completion(valid, "other-action"),

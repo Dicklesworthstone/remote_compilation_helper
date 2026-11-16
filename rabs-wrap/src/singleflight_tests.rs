@@ -136,7 +136,7 @@ fn cold_remote_toolchain_retries_before_accepting_private_execution_and_installa
         &|| true,
     );
     daemon.join().unwrap();
-    assert!(matches!(outcome, Ok(Live::Served(ref transcript)) if transcript == b"ok\n"));
+    assert!(matches!(outcome, Ok(Live::Served { ref stderr, .. }) if stderr == b"ok\n"));
 }
 
 #[test]
@@ -303,7 +303,7 @@ fn a_prepared_hit_still_requires_acceptance_and_completed_installation() {
         None,
         &|| true,
     );
-    assert!(matches!(result, Ok(Live::Served(bytes)) if bytes == b"hi"));
+    assert!(matches!(result, Ok(Live::Served { stderr, .. }) if stderr == b"hi"));
     daemon.join().unwrap();
 }
 

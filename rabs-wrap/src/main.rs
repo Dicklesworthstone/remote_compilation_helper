@@ -686,7 +686,12 @@ enum Live {
     PassThrough,
     /// Every declared output is installed and verified: replay stderr and
     /// exit 0 WITHOUT running the compiler.
-    Served(Vec<u8>),
+    Served {
+        stderr: Vec<u8>,
+        /// Installation includes final transcript delivery. A terminal reply
+        /// cannot replace the original deadline with a fresh output budget.
+        install_deadline: Instant,
+    },
     /// Run the compiler as the admitted attempt with exactly `env`, then
     /// report completion on `session`.
     Execute {
@@ -722,7 +727,8 @@ fn caller_still_owned(owner: Option<supervision::Owner>) -> bool {
 
 fn stop_if_caller_lost(owner: Option<supervision::Owner>) {
     if !caller_still_owned(owner) {
-        eprintln!("rabs-wrap: original compiler caller disappeared; refusing further work");
+        // The vanished caller may have left an open, unread stderr pipe.
+        // Reporting cancellation through it must not strand this wrapper.
         std::process::exit(1);
     }
 }
@@ -807,7 +813,7 @@ fn live_outcome(
 /// Decode an answer after the wrapper accepted a hit. This deliberately
 /// returns `Live`, never `Result`: malformed replies must not reach the breaker's
 /// ordinary error path, which runs the compiler over an uncertain output tree.
-fn accepted_install_reply(line: &str) -> Live {
+fn accepted_install_reply(line: &str, install_deadline: Instant) -> Live {
     let Some(answer) = reply_json::parse(line) else {
         return Live::FailClosed("malformed install answer".into());
     };
@@ -827,7 +833,10 @@ fn accepted_install_reply(line: &str) -> Live {
                 .and_then(hex_decode)
                 .map_or_else(
                     || Live::FailClosed("malformed served transcript".into()),
-                    Live::Served,
+                    |stderr| Live::Served {
+                        stderr,
+                        install_deadline,
+                    },
                 )
         }
         Some("serve-failed")
@@ -1496,12 +1505,21 @@ fn run_wrapper_inner(
         stop_if_caller_lost(owner);
         match decision {
             Live::PassThrough => {}
-            Live::Served(stderr) => {
+            Live::Served {
+                stderr,
+                install_deadline,
+            } => {
                 panic_fence.forbid_retry();
                 // The daemon installed and verified every declared output;
                 // this is the compiler's exact transcript for this out-dir.
-                let mut sink = io::stderr();
-                if sink.write_all(&stderr).and_then(|()| sink.flush()).is_err() {
+                // The final transcript can back up just like early metadata.
+                // Preserve the original install budget and caller identity;
+                // partial delivery is terminal and never runs another compiler.
+                if metadata::deliver_transcript(io::stderr(), stderr, install_deadline, &|| {
+                    caller_still_owned(owner)
+                })
+                .is_err()
+                {
                     std::process::exit(1);
                 }
                 std::process::exit(0);
@@ -1528,9 +1546,20 @@ fn run_wrapper_inner(
             }
             Live::FailClosed(reason) => {
                 panic_fence.forbid_retry();
-                eprintln!(
-                    "rabs-wrap: {reason}; refusing to run rustc over a possibly changing output tree"
-                );
+                // An unexposed protocol failure still has to terminate when
+                // Cargo stops reading. Best-effort reporting gets a bounded
+                // drain of its own, never another execution or install budget.
+                if let Some(deadline) = Instant::now().checked_add(OUTPUT_DRAIN_BUDGET) {
+                    let _ = metadata::deliver_transcript(
+                        io::stderr(),
+                        format!(
+                            "rabs-wrap: {reason}; refusing to run rustc over a possibly changing output tree\n"
+                        )
+                        .into_bytes(),
+                        deadline,
+                        &|| caller_still_owned(owner),
+                    );
+                }
                 std::process::exit(1);
             }
             Live::FailClosedSilently => std::process::exit(1),
@@ -1546,6 +1575,10 @@ fn run_wrapper_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accepted_install_reply(line: &str) -> Live {
+        super::accepted_install_reply(line, Instant::now() + Duration::from_secs(2))
+    }
 
     fn delivered_stream(bytes: &[u8]) -> CompilerStream {
         CompilerStream {
@@ -1892,7 +1925,7 @@ mod tests {
         let served = accepted_install_reply(
             r#"{"kind":"rustc-decision","decision":"served","compiler_skip_authorized":true,"stderr_hex":"6f6b0a"}"#,
         );
-        assert!(matches!(served, Live::Served(bytes) if bytes == b"ok\n"));
+        assert!(matches!(served, Live::Served { stderr, .. } if stderr == b"ok\n"));
     }
 
     #[test]
@@ -2016,7 +2049,7 @@ mod tests {
             );
             let replay = accepted_install_reply(&served);
             assert!(
-                matches!(replay, Live::Served(bytes) if bytes == b"ok\n"),
+                matches!(replay, Live::Served { stderr, .. } if stderr == b"ok\n"),
                 "valid ignored JSON must preserve authorized replay: {ignored}"
             );
         }

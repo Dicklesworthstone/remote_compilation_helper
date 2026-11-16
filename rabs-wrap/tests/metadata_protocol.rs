@@ -794,6 +794,68 @@ fn refuse_blocked_prefix(lane: Lane) {
 }
 
 #[test]
+fn terminal_transcripts_cannot_escape_the_install_deadline_or_retry_the_compiler() {
+    for lane in [Lane::Cached, Lane::PublishedRemote] {
+        for early_metadata in [false, true] {
+            let fixture = Fixture::new();
+            // Fixture serialization is not part of the install budget. The
+            // 1 MiB frame is ready before the wrapper even connects.
+            let terminal = lane
+                .served(&vec![b'x'; 1024 * 1024], early_metadata)
+                .to_string();
+            let daemon = fixture.daemon(move |peer| {
+                lane.accept(peer);
+                if early_metadata {
+                    peer.send(&lane.notice(PREFIX));
+                    lane.ack(peer);
+                }
+                peer.raw(&terminal);
+            });
+            let mut child = ChildGuard(
+                fixture
+                    .command()
+                    .env("RABS_INSTALL_WAIT_MS", "500")
+                    .spawn()
+                    .unwrap(),
+            );
+            // The full result has arrived, but Cargo has stopped reading. A
+            // terminal receipt does not complete delivery of the transcript or
+            // allow this wrapper to hold Cargo's job slot indefinitely.
+            let limit = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < limit,
+                    "terminal transcript escaped its deadline: {lane:?}, early={early_metadata}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(status.code(), Some(1));
+            let mut partial = Vec::new();
+            child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_end(&mut partial)
+                .unwrap();
+            let tail = if early_metadata {
+                partial.strip_prefix(PREFIX).expect("the accepted prefix")
+            } else {
+                partial.as_slice()
+            };
+            assert!(!tail.is_empty());
+            assert!(tail.len() < 1024 * 1024);
+            assert!(tail.iter().all(|byte| *byte == b'x'));
+            assert!(!fixture.marker.exists(), "partial delivery cannot retry");
+            daemon.join().unwrap();
+        }
+    }
+}
+
+#[test]
 fn a_closed_cargo_stderr_pipe_cannot_ack_or_run_the_compiler() {
     for lane in [Lane::Cached, Lane::PublishedRemote] {
         refuse_closed_prefix(lane);
