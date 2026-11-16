@@ -786,12 +786,13 @@ try:
                 api["require_native_elf"](name, reader.read(64), machine)
     else:
         paths = {name: Path(source_path) / name
-                 for name in ("cargo-rabs", "rabs-recover", "rabs-wrap", "rabsd", "rabs-wkr",
+                 for name in ("cargo-rabs", "rabs-cargo", "rabs-recover", "rabs-wrap", "rabsd", "rabs-wkr",
                               "rabs-cargo-root", "rabs-delivery-cas")}
     probe_tool = shutil.which("true")
     if probe_tool is None:
         raise RuntimeError("wrapper verification requires an external true executable")
-    for name, arguments in (("cargo-rabs", ["--help"]), ("rabs-recover", ["--help"]),
+    for name, arguments in (("cargo-rabs", ["--help"]), ("rabs-cargo", ["--help"]),
+                            ("rabs-recover", ["--help"]),
                             ("rabs-delivery-cas", ["--help"]), ("rabsd", ["--version"]),
                             ("rabs-wkr", ["--version"]), ("rabs-cargo-root", ["--version"]),
                             ("rabs-wrap", [probe_tool, "-vV"])):
@@ -834,7 +835,7 @@ install_rabs_toolset() {
     if ! python3 -I "$installer" "$source_option" "$source_path" --bin-dir "$bin_dir"; then
         die "Requested RABS installation failed; inspect the reported error before retrying. For an existing unmanaged installation, choose a separate RCH_RABS_INSTALL_DIR."
     fi
-    success "Installed cargo-rabs, rabs-wrap, rabsd, rabs-wkr, rabs-cargo-root, rabs-recover and rabs-delivery-cas"
+    success "Installed cargo-rabs, rabs-cargo, rabs-wrap, rabsd, rabs-wkr, rabs-cargo-root, rabs-recover and rabs-delivery-cas"
 }
 
 # Bind native source builds and installation to the same output layout. Cargo
@@ -873,7 +874,7 @@ build_rabs_toolset() {
     local project_dir="$1"
     info "Building the requested RABS toolset..."
     if ! cargo build --locked --profile wrapper-release -p rabs-wrap -p rabs-cli \
-        --bin rabs-wrap --bin rabs-recover \
+        --bin rabs-wrap --bin rabs-cargo --bin rabs-recover \
         --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS wrapper/operator build failed; installation stopped"
     fi

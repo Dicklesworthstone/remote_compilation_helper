@@ -353,6 +353,7 @@ class SSHDeploymentTests(unittest.TestCase):
             shutil.copy2(self.bundle / name, scripts / name)
         target = checkout / "target" / "selected-platform"
         for name, profile in [("rabs-wrap", "wrapper-release"), ("rabs-recover", "wrapper-release"),
+                              ("rabs-cargo", "wrapper-release"),
                               ("rabsd", "daemon-release"),
                               ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release"),
                               ("rabs-delivery-cas", "daemon-release")]:

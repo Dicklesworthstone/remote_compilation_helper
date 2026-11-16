@@ -343,6 +343,72 @@ EOF
     fi
 }
 
+# Compiler/activation doubles exercise the real source-build orchestration.
+# They do not compile Rust, activate generations, or start an interpreter.
+@test "RABS source build includes the native Cargo frontend in the wrapper profile" {
+    run bash -euc '
+        export RCH_INSTALLER_LIB=1
+        source "$INSTALL_SCRIPT"
+        USE_GUM=false
+        USE_COLOR=false
+        WITH_RABS=true
+        SOURCE_BUILD_TARGET_DIR="$TEST_DIR/custom target"
+        SOURCE_BUILD_HOST=x86_64-unknown-linux-gnu
+        TARGET_DIR="$SOURCE_BUILD_TARGET_DIR/$SOURCE_BUILD_HOST"
+        calls=0
+        cargo() {
+            calls=$((calls + 1))
+            printf "%s\n" "$@" > "$TEST_DIR/cargo-$calls"
+        }
+        install_rabs_toolset() {
+            printf "%s\n" "$@" > "$TEST_DIR/installation"
+        }
+        build_rabs_toolset "$TEST_DIR/checkout"
+        [[ $calls == 2 ]]
+    '
+    [[ "$status" -eq 0 ]]
+    grep -Fx -- 'rabs-cargo' "$TEST_DIR/cargo-1"
+    grep -Fx -- 'rabs-recover' "$TEST_DIR/cargo-1"
+    grep -Fx -- 'rabs-wrap' "$TEST_DIR/cargo-1"
+    grep -Fx -- 'wrapper-release' "$TEST_DIR/cargo-1"
+    grep -Fx -- 'daemon-release' "$TEST_DIR/cargo-2"
+    grep -Fx -- "$TEST_DIR/custom target" "$TEST_DIR/cargo-1"
+    grep -Fx -- "$TEST_DIR/custom target" "$TEST_DIR/cargo-2"
+    grep -Fx -- "$TEST_DIR/checkout/scripts/install-rabs" "$TEST_DIR/installation"
+    grep -Fx -- '--from-build' "$TEST_DIR/installation"
+    grep -Fx -- "$TEST_DIR/custom target/x86_64-unknown-linux-gnu" "$TEST_DIR/installation"
+}
+
+@test "RABS source build refuses activation when the native Cargo frontend fails to build" {
+    run bash -euc '
+        export RCH_INSTALLER_LIB=1
+        source "$INSTALL_SCRIPT"
+        USE_GUM=false
+        USE_COLOR=false
+        WITH_RABS=true
+        SOURCE_BUILD_TARGET_DIR="$TEST_DIR/custom target"
+        SOURCE_BUILD_HOST=x86_64-unknown-linux-gnu
+        TARGET_DIR="$SOURCE_BUILD_TARGET_DIR/$SOURCE_BUILD_HOST"
+        calls=0
+        cargo() {
+            calls=$((calls + 1))
+            printf "%s\n" "$@" > "$TEST_DIR/cargo-$calls"
+            for argument in "$@"; do
+                if [[ $argument == rabs-cargo ]]; then return 23; fi
+            done
+        }
+        install_rabs_toolset() {
+            printf "%s\n" "$@" > "$TEST_DIR/installation"
+        }
+        build_rabs_toolset "$TEST_DIR/checkout"
+    '
+    [[ "$status" -ne 0 ]]
+    [[ "$output" == *"RABS wrapper/operator build failed"* ]]
+    [[ -f "$TEST_DIR/cargo-1" ]]
+    [[ ! -e "$TEST_DIR/cargo-2" ]]
+    [[ ! -e "$TEST_DIR/installation" ]]
+}
+
 # ============================================================================
 # Service installation flags
 # ============================================================================

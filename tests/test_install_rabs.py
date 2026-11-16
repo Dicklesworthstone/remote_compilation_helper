@@ -217,6 +217,7 @@ class InstallTests(unittest.TestCase):
             shutil.copy2(self.bundle / name, scripts / name)
         build = self.root / "custom-target" / "x86_64-unknown-linux-gnu"
         for name, profile in [("rabs-wrap", "wrapper-release"), ("rabs-recover", "wrapper-release"),
+                              ("rabs-cargo", "wrapper-release"),
                               ("rabsd", "daemon-release"),
                               ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release"),
                               ("rabs-delivery-cas", "daemon-release")]:
@@ -474,7 +475,7 @@ class MainInstallerTests(unittest.TestCase):
     def test_incomplete_requested_release_fails_and_keeps_the_previous_generation(self):
         self.assert_success(self.main("--with-rabs", "--offline", str(self.archive())))
         before = self.assert_complete_generation()
-        for missing in ("rabsd", "cargo-rabs", "install-rabs", "rabs-recover", "rabs-delivery-cas"):
+        for missing in ("rabsd", "cargo-rabs", "install-rabs", "rabs-recover", "rabs-cargo", "rabs-delivery-cas"):
             with self.subTest(missing=missing):
                 result = self.main("--with-rabs", "--offline", str(self.archive(exclude={missing})))
                 self.assertNotEqual(result.returncode, 0)
@@ -541,7 +542,7 @@ esac
         # Retained executable outputs must not stand in for this invocation's
         # artifacts. The Cargo double below overwrites only its selected paths.
         stale_marker = b"\nretained source build output\n"
-        for name in ("rch", "rabs-wrap", "rabs-recover"):
+        for name in ("rch", "rabs-wrap", "rabs-recover", "rabs-cargo"):
             (target / "wrapper-release" / name).write_bytes(
                 (self.bundle / name).read_bytes() + stale_marker)
             (target / "wrapper-release" / name).chmod(0o755)
@@ -575,7 +576,7 @@ output="$target_dir${target:+/$target}/$profile"
 mkdir -p "$output"
 for package in $packages; do
     case "$package" in
-        rabs-cli) names='rabs-recover' ;;
+        rabs-cli) names='rabs-recover rabs-cargo' ;;
         rabs-wkr) names='rabs-wkr rabs-cargo-root' ;;
         rabsd) names='rabsd rabs-delivery-cas' ;;
         *) names=$package ;;
@@ -606,7 +607,7 @@ done
             "build --locked --profile daemon-release -p rchd -p rch-wkr"
             " --bin rchd --bin rch-wkr" + layout,
             "build --locked --profile wrapper-release -p rabs-wrap -p rabs-cli"
-            " --bin rabs-wrap --bin rabs-recover" + layout,
+            " --bin rabs-wrap --bin rabs-cargo --bin rabs-recover" + layout,
             "build --locked --profile daemon-release -p rabsd -p rabs-wkr"
             " --bin rabsd --bin rabs-wkr --bin rabs-cargo-root --bin rabs-delivery-cas" + layout,
         ])
@@ -773,7 +774,7 @@ class PackageTests(unittest.TestCase):
         for profile in ("wrapper-release", "daemon-release"):
             (build / profile).mkdir(parents=True)
         for name in installer.NATIVE_TOOLS:
-            profile = "wrapper-release" if name in ("rabs-wrap", "rabs-recover") else "daemon-release"
+            profile = "wrapper-release" if name in ("rabs-wrap", "rabs-recover", "rabs-cargo") else "daemon-release"
             shutil.copy2(self.bundle / name, build / profile / name)
         code, stdout, error = self.main("--from-build", str(build), "--package", str(self.output),
                                        "--target", self.target)

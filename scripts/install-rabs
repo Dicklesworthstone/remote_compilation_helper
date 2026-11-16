@@ -53,7 +53,7 @@ import zlib
 
 
 PYTHON_TOOLS = ("cargo-rabs",)
-NATIVE_TOOLS = ("rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root", "rabs-delivery-cas", "rabs-recover")
+NATIVE_TOOLS = ("rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root", "rabs-delivery-cas", "rabs-recover", "rabs-cargo")
 TOOLS = PYTHON_TOOLS + NATIVE_TOOLS
 VERSIONS = ".rabs-versions"
 CURRENT = ".rabs-current"
@@ -161,6 +161,7 @@ def source_files(bundle, build):
         root = Path(build).absolute()
         paths = {
             "cargo-rabs": Path(__file__).resolve().with_name("cargo-rabs"),
+            "rabs-cargo": root / "wrapper-release" / "rabs-cargo",
             "rabs-recover": root / "wrapper-release" / "rabs-recover",
             "rabs-wrap": root / "wrapper-release" / "rabs-wrap",
             "rabsd": root / "daemon-release" / "rabsd",
