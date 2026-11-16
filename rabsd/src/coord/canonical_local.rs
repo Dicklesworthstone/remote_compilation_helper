@@ -1134,6 +1134,52 @@ fn resolve_run_selection(
     run_build_selection(&selection, &metadata, package_id.as_deref())
 }
 
+/// Synchronous capture and planning need cancellation before the operation's
+/// coordinator exists. Keep the same stop flag through capture, execution and
+/// delivery, and join the signal bridge before releasing the command owner.
+pub(super) struct OperationCancellation {
+    pub(super) stopped: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl OperationCancellation {
+    pub(super) fn start() -> io::Result<Self> {
+        let shutdown = Arc::new(ShutdownController::new());
+        shutdown.listen_for_signals();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let child_stop = Arc::clone(&stopped);
+        let child_done = Arc::clone(&done);
+        let thread = std::thread::Builder::new()
+            .name("rabs-canonical-signals".into())
+            .spawn(move || {
+                while !child_done.load(Ordering::Acquire) {
+                    if shutdown.is_shutting_down() {
+                        child_stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })?;
+        Ok(Self {
+            stopped,
+            done,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for OperationCancellation {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        self.stopped.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Run the explicit local profile with the SAME release policy and build
 /// identity as the normal daemon. This entry point intentionally has no
 /// implicit advisory-policy overload.
@@ -1163,12 +1209,13 @@ pub fn run_profile_with_release(
     if profile.service_socket.is_some() {
         return service::run_client_profile(path, release_mode, build_identity);
     }
+    let cancellation = OperationCancellation::start()?;
     run_operation(
         profile,
         release_mode,
         build_identity,
         None,
-        Arc::new(AtomicBool::new(false)),
+        Arc::clone(&cancellation.stopped),
         OperationOutput::Inherit,
         None,
     )

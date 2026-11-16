@@ -1570,7 +1570,7 @@ mod tests {
 
         // Obtain a real compiler wait status before changing our disposition.
         let status = std::process::Command::new("/bin/sh")
-            .args(["-c", "kill -USR1 \"$\"; exit 99"])
+            .args(["-c", "kill -USR1 \"$$\"; exit 99"])
             .env_clear()
             .status()
             .unwrap();

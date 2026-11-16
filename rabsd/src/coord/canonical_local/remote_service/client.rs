@@ -2,6 +2,7 @@
 
 mod output;
 
+use super::super::OperationCancellation;
 use super::super::remote_artifacts::{InstalledTarget, ReceivedTarget};
 use super::super::remote_operation::RemoteOperationSettings;
 use super::wire::{
@@ -25,7 +26,6 @@ use crate::edge::diagnostic_rewrite::{
 use crate::edge::live_facts::read_stable;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::runtime::RuntimeBuilder;
-use asupersync::signal::ShutdownController;
 use output::{ControlledOutput, OutputDeadline};
 use rabs_asupersync::daemon_runtime::block_on_top_level;
 use rabs_asupersync::worker_transport::{
@@ -51,9 +51,7 @@ use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 // Presentation can expand paths, but cannot turn a bounded remote transcript
@@ -258,51 +256,6 @@ fn require_absent(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Synchronous local capture also needs cancellation before the network
-/// runtime exists. This owned signal bridge stops and joins with the command.
-struct ClientCancellation {
-    stopped: Arc<AtomicBool>,
-    done: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl ClientCancellation {
-    fn start() -> io::Result<Self> {
-        let shutdown = Arc::new(ShutdownController::new());
-        shutdown.listen_for_signals();
-        let stopped = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
-        let child_stop = Arc::clone(&stopped);
-        let child_done = Arc::clone(&done);
-        let thread = std::thread::Builder::new()
-            .name("rabs-remote-client-signals".into())
-            .spawn(move || {
-                while !child_done.load(Ordering::Acquire) {
-                    if shutdown.is_shutting_down() {
-                        child_stop.store(true, Ordering::Release);
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            })?;
-        Ok(Self {
-            stopped,
-            done,
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for ClientCancellation {
-    fn drop(&mut self) {
-        self.done.store(true, Ordering::Release);
-        self.stopped.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 /// Capture local inputs once, submit to the pinned coordinator once, and
 /// install only a sealed successful artifact result at the local destination.
 /// No transport failure starts another execution or selects local fallback.
@@ -318,7 +271,7 @@ pub fn run_client_profile(
     let pin = config.validate()?;
     let tls = config.tls.files()?;
     tls.local_identity().map_err(io::Error::other)?;
-    let cancellation = ClientCancellation::start()?;
+    let cancellation = OperationCancellation::start()?;
     let stopped = &cancellation.stopped;
     let owner = tempfile::Builder::new()
         .prefix("canonical-remote-capture-")
@@ -1769,7 +1722,7 @@ mod tests {
     use std::future::Future;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, symlink};
     use std::pin::{Pin, pin};
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::task::{Context, Poll};
 
     fn private() -> tempfile::TempDir {

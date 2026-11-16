@@ -184,7 +184,7 @@ fn assert_captured_compiler_signal(signal: i32) {
         &fixture.compiler,
         format!(
             "#!/bin/sh\nprintf 'run\\n' >> runs\nprintf '%s' \"$MODE_TOKEN\" > artifact\n\
-             printf 'diagnostic\\n' >&2\nkill -{signal} \"$\"\nexit 99\n"
+             printf 'diagnostic\\n' >&2\nkill -{signal} \"$$\"\nexit 99\n"
         ),
     )
     .unwrap();

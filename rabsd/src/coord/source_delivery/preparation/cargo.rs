@@ -2536,6 +2536,132 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn standalone_planning_case(mode: &str, scratch: &Path) {
+        use crate::coord::canonical_local::OperationCancellation;
+        use rustix::process::{Signal, getpid, kill_process};
+        use std::sync::atomic::Ordering;
+
+        let cancellation = OperationCancellation::start().unwrap();
+        let cancelled = || cancellation.stopped.load(Ordering::Acquire);
+        let control = PreparationControl::new(&cancelled, None);
+        let group_path = scratch.join("planning-group");
+        let signal = match mode {
+            "interrupt" => Some(Signal::INT),
+            "terminate" => Some(Signal::TERM),
+            "success" => None,
+            _ => panic!("unknown isolated planning case"),
+        };
+        let sender = signal.map(|signal| {
+            let group_path = group_path.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !fs::read_to_string(&group_path)
+                    .ok()
+                    .is_some_and(|text| text.parse::<u32>().is_ok())
+                {
+                    assert!(Instant::now() < deadline, "planning child did not start");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                // Deliver to the isolated caller, not to its separate planning
+                // group. Only the command's cancellation bridge can drain it.
+                kill_process(getpid(), signal).unwrap();
+            })
+        });
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                if signal.is_some() {
+                    "trap '' TERM; /bin/sleep 5 & printf '%s' \"$$\" > \"$1\"; wait"
+                } else {
+                    "/bin/sleep 5 & printf '%s' \"$$\" > \"$1\"; printf captured"
+                },
+                "fixture",
+            ])
+            .arg(&group_path);
+        let started = Instant::now();
+        let result =
+            bounded_command_controlled(command, scratch, Duration::from_secs(5), 1024, &control);
+        if let Some(sender) = sender {
+            sender.join().unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+            assert!(cancelled(), "signal must reach the original operation flag");
+            assert_eq!(
+                control.checkpoint().unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
+        } else {
+            assert_eq!(result.unwrap(), b"captured");
+            assert!(
+                !cancelled(),
+                "normal planning completion cannot cancel delivery"
+            );
+            control.checkpoint().unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let group: u32 = fs::read_to_string(group_path).unwrap().parse().unwrap();
+        assert!(
+            rabs_asupersync::process_groups::members_from_proc(group).is_empty(),
+            "standalone planning must drain its independent process group"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn isolated_standalone_planning(test: &str, modes: &[&str]) {
+        if let Some(mode) = std::env::var_os("RABS_TEST_LOCAL_PLANNING_CASE") {
+            let scratch = std::env::var_os("RABS_TEST_LOCAL_PLANNING_ROOT").unwrap();
+            standalone_planning_case(mode.to_str().unwrap(), Path::new(&scratch));
+            return;
+        }
+        for mode in modes {
+            let scratch = tempfile::tempdir().unwrap().keep();
+            let mut isolated = Command::new(std::env::current_exe().unwrap());
+            isolated
+                .args(["--exact", test, "--nocapture"])
+                .env("RABS_TEST_LOCAL_PLANNING_CASE", mode)
+                .env("RABS_TEST_LOCAL_PLANNING_ROOT", &scratch);
+            let result = bounded_command(isolated, &scratch, Duration::from_secs(8), 64 * 1024);
+            // A finite fixture also closes itself if a missing signal bridge
+            // kills the isolated caller before its own drain can run. Do not
+            // signal a numeric group after that caller has been reaped.
+            if result.is_err()
+                && let Some(group) = fs::read_to_string(scratch.join("planning-group"))
+                    .ok()
+                    .and_then(|text| text.parse::<u32>().ok())
+            {
+                let deadline = Instant::now() + Duration::from_secs(6);
+                while !rabs_asupersync::process_groups::members_from_proc(group).is_empty() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "finite planning fixture remained live"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            result.unwrap_or_else(|error| panic!("isolated {mode} planning failed: {error}"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_planning_signals_cancel_and_drain_before_runtime_start() {
+        isolated_standalone_planning(
+            "coord::source_delivery::preparation::cargo::tests::standalone_planning_signals_cancel_and_drain_before_runtime_start",
+            &["interrupt", "terminate"],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_planning_success_preserves_uncancelled_delivery() {
+        isolated_standalone_planning(
+            "coord::source_delivery::preparation::cargo::tests::standalone_planning_success_preserves_uncancelled_delivery",
+            &["success"],
+        );
+    }
+
     #[test]
     fn cancellation_while_waiting_for_root_admission_never_spawns_planning_work() {
         use std::cell::Cell;
