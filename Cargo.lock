@@ -5205,9 +5205,9 @@ version = "2.1.36"
 dependencies = [
  "nix",
  "rabs-protocol",
- "rustix",
  "serde_json",
  "sha2 0.11.0",
+ "signal-hook 0.4.4",
  "tempfile",
 ]
 

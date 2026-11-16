@@ -19,13 +19,14 @@ publish = false
 rabs-protocol = { path = "../rabs-protocol" }
 
 [target.'cfg(unix)'.dependencies]
-# Match execvp's effective-user executable search without unsafe code or a
-# helper process. Mode-bit guesses can select a compiler the caller cannot run.
-rustix = { version = "1.1.4", features = ["fs"] }
+# Native effective-user executable checks and process-group observation.
 # Kernel threads can have PGID 0. Rustix's Pid-returning getpgid cannot represent
 # that valid value; nix preserves it without unsafe code here. All visible PIDs
 # are still enumerated and matching members receive both full terminal sweeps.
-nix = { version = "0.31.3", default-features = false, features = ["process"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "signal"] }
+# Restore terminal signal defaults (including Rust's ignored SIGPIPE) without
+# unsafe code or a subprocess. The same locked dependency is used by rch-wkr.
+signal-hook = { version = "0.4.4", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.25.0"

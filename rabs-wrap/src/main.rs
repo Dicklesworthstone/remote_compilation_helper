@@ -380,7 +380,8 @@ fn compiler_for_observation(
     search: Option<&OsStr>,
     cwd: &Path,
 ) -> Option<PathBuf> {
-    use rustix::fs::{Access, AtFlags, CWD, accessat};
+    use nix::fcntl::{AT_FDCWD, AtFlags};
+    use nix::unistd::{AccessFlags, faccessat};
 
     let program = Path::new(compiler);
     if program.is_absolute() {
@@ -407,7 +408,7 @@ fn compiler_for_observation(
         if !metadata.is_file() {
             return Ok(false);
         }
-        match accessat(CWD, path, Access::EXEC_OK, AtFlags::EACCESS) {
+        match faccessat(AT_FDCWD, path, AccessFlags::X_OK, AtFlags::AT_EACCESS) {
             Ok(()) => Ok(true),
             Err(error) => {
                 let error = io::Error::from(error);
@@ -1265,11 +1266,13 @@ fn exit_like(status: std::process::ExitStatus) -> ! {
         std::process::exit(code);
     }
     if let Some(signal) = status.signal() {
-        // Re-raise on ourselves (no unsafe, no extra dependency): the
-        // parent then observes the compiler's signal, not an exit code.
-        let _ = std::process::Command::new("kill")
-            .args(["-s", &signal.to_string(), &std::process::id().to_string()])
-            .status();
+        // Rust ignores SIGPIPE, and the caller can leave signals blocked or
+        // handled. Restore the default, unblock this signal, and raise it
+        // natively, without a PATH lookup or a helper process.
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
+        // Some terminal signals are outside signal-hook's default-action
+        // table. Still try native delivery before the last-resort exit code.
+        let _ = signal_hook::low_level::raise(signal);
         std::process::exit(128 + signal);
     }
     std::process::exit(1);
@@ -1555,6 +1558,62 @@ mod tests {
     fn compiler_status(code: i32) -> std::process::ExitStatus {
         use std::os::unix::process::ExitStatusExt;
         std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn exit_like_pending_signal_child() {
+        let Some(marker) = std::env::var_os("RABS_EXIT_LIKE_PENDING_MARKER") else {
+            return;
+        };
+        use nix::sys::signal::{SigSet, Signal};
+        use std::os::unix::process::ExitStatusExt;
+
+        // Obtain a real compiler wait status before changing our disposition.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -USR1 \"$\"; exit 99"])
+            .env_clear()
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(Signal::SIGUSR1 as i32));
+
+        // A pending signal must not run this old handler when exit_like resets
+        // the mask: the default disposition has to be restored first.
+        signal_hook::flag::register_conditional_shutdown(
+            Signal::SIGUSR1 as i32,
+            66,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .unwrap();
+        SigSet::from(Signal::SIGUSR1).thread_block().unwrap();
+        signal_hook::low_level::raise(Signal::SIGUSR1 as i32).unwrap();
+        std::fs::write(marker, b"compiler-waited").unwrap();
+        exit_like(status);
+    }
+
+    #[test]
+    fn exit_like_restores_default_before_unblocking_a_pending_signal() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("compiler-waited");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::exit_like_pending_signal_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RABS_EXIT_LIKE_PENDING_MARKER", &marker)
+            .env("PATH", "")
+            .output()
+            .unwrap();
+        assert_eq!(std::fs::read(marker).unwrap(), b"compiler-waited");
+        assert_eq!(
+            output.status.signal(),
+            Some(nix::sys::signal::Signal::SIGUSR1 as i32),
+            "{output:?}"
+        );
+        assert_eq!(output.status.code(), None);
     }
 
     #[test]

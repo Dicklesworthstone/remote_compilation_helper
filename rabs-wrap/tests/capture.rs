@@ -176,6 +176,67 @@ impl Fixture {
     }
 }
 
+fn assert_captured_compiler_signal(signal: i32) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = Fixture::new(0);
+    std::fs::write(
+        &fixture.compiler,
+        format!(
+            "#!/bin/sh\nprintf 'run\\n' >> runs\nprintf '%s' \"$MODE_TOKEN\" > artifact\n\
+             printf 'diagnostic\\n' >&2\nkill -{signal} \"$\"\nexit 99\n"
+        ),
+    )
+    .unwrap();
+    let daemon = fixture.daemon(true, move |peer| {
+        let report = read(peer).unwrap();
+        assert_eq!(report["kind"], "rustc-complete");
+        assert_eq!(report["attempt"], ATTEMPT);
+        assert_eq!(report["capture_protocol"], 1);
+        assert!(report["exit_code"].is_null());
+        assert_eq!(report["signal"], signal);
+        send(peer, captured());
+        let ack = read(peer).unwrap();
+        assert_eq!(ack["kind"], "rustc-capture-ack");
+        assert_eq!(ack["attempt"], ATTEMPT);
+        assert_eq!(ack["capture"], CAPTURE);
+        assert!(read(peer).is_none(), "no repeated compiler or capture");
+    });
+    let mut command = fixture.command(5000);
+    command.env("PATH", "");
+    let output = Running(Some(command.spawn().unwrap())).output();
+    daemon.join().unwrap();
+    assert_eq!(output.status.signal(), Some(signal), "{output:?}");
+    assert_eq!(output.status.code(), None);
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"diagnostic\n");
+    assert_eq!(
+        std::fs::read(fixture.root.path().join("runs")).unwrap(),
+        b"run\n"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.path().join("artifact")).unwrap(),
+        b"constructed"
+    );
+}
+
+#[test]
+fn admitted_compiler_signals_preserve_wait_status_without_path_helpers() {
+    use signal_hook::consts::signal::{SIGKILL, SIGPIPE, SIGTERM};
+
+    for signal in [SIGTERM, SIGKILL, SIGPIPE] {
+        assert_captured_compiler_signal(signal);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admitted_compiler_keeps_native_delivery_outside_default_action_table() {
+    // signal-hook treats SIGIO as ignored; Linux's default action terminates.
+    // The native raise fallback must preserve that kernel behavior as well.
+    assert_captured_compiler_signal(signal_hook::consts::signal::SIGIO);
+}
+
 #[test]
 fn wrapper_retains_cargo_output_lifetime_until_capture_is_complete() {
     let fixture = Fixture::new(0);
