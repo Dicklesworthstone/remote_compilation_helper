@@ -19,6 +19,7 @@ mod result_probe;
 mod scoped_launch;
 mod source_admission;
 mod source_claim_link;
+mod source_claim_roots;
 mod source_control;
 mod source_freshness;
 mod source_lock;
@@ -179,6 +180,12 @@ enum Commands {
     /// Internal no-copy publication of verified source cancellation records.
     #[command(hide = true)]
     SourceClaimLink {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+    /// Internal read-only inventory of registered worker source roots.
+    #[command(hide = true)]
+    SourceClaimRoots {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
@@ -515,6 +522,9 @@ fn main() -> Result<()> {
     if let Commands::SourceClaimLink { arguments } = &cli.command {
         std::process::exit(source_claim_link::main(arguments));
     }
+    if let Commands::SourceClaimRoots { arguments } = &cli.command {
+        std::process::exit(source_claim_roots::main(arguments));
+    }
     if let Commands::SourceRelease { arguments } = &cli.command {
         std::process::exit(source_release::main(arguments));
     }
@@ -672,6 +682,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::SourceClaimLink { .. } => {
             anyhow::bail!("source-claim-link requires the synchronous worker entry point")
+        }
+        Commands::SourceClaimRoots { .. } => {
+            anyhow::bail!("source-claim-roots requires the synchronous worker entry point")
         }
         Commands::SourceRelease { .. } => {
             anyhow::bail!("source-release requires the synchronous worker entry point")

@@ -2,7 +2,7 @@
 //!
 //! # Why this module exists
 //!
-//! rch creates long-lived, multi-GB runtime state on a worker in exactly three
+//! rch creates long-lived, multi-GB runtime state on a worker in four
 //! places, and every one of them is derived from a value that already lives
 //! somewhere else in this crate:
 //!
@@ -17,6 +17,9 @@
 //!    `$TMPDIR` → `/data/tmp` → `/tmp`. Both the durable per-worker Cargo
 //!    caches ([`RCH_CARGO_CACHE_PREFIX`], issue #42)
 //!    and staged `.rch-target-*` dirs live under it.
+//! 4. **Historical source roots** — exact paths in the worker source-claim
+//!    registry, including session mirrors outside today's configured bases.
+//!    These add discovery hints; they never authorize collection by themselves.
 //!
 //! Before this module the GC scan set was a **second, hardcoded list**: the
 //! surface config built `[remote_base, store_base]` by hand and the reap script
@@ -42,6 +45,82 @@
 
 use crate::remediation_config::PooledTargetConfig;
 use crate::stale_target_reap::is_safe_reap_base;
+
+/// Version of the worker's read-only source-claim root inventory.
+pub const SOURCE_CLAIM_ROOTS_SCHEMA_VERSION: u32 = 1;
+/// Bound discovery before allocating or sending an unbounded scan command.
+pub const SOURCE_CLAIM_ROOTS_MAX_ROOTS: usize = 1024;
+/// Includes JSON framing, not just the sum of path lengths.
+pub const SOURCE_CLAIM_ROOTS_MAX_BYTES: usize = 256 * 1024;
+
+/// Exact project roots retained in the worker's authenticated source registry.
+///
+/// These are discovery hints only. An old claim never proves that a current
+/// target is idle or unowned; the ordinary GC gates must still admit it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceClaimRootsInventory {
+    pub schema_version: u32,
+    pub roots: Vec<String>,
+}
+
+/// Accept only exact absolute spellings that the existing POSIX scanner can
+/// safely embed. Do not trim, canonicalize, or infer a broader parent here.
+#[must_use]
+pub fn is_safe_source_claim_root(path: &str) -> bool {
+    is_safe_reap_base(path)
+        && path
+            .split('/')
+            .skip(1)
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+impl SourceClaimRootsInventory {
+    /// Validate all paths before using any supplemental root. Wire readers
+    /// additionally bound the complete JSON framing before decoding it.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != SOURCE_CLAIM_ROOTS_SCHEMA_VERSION {
+            return Err("unsupported source-claim roots inventory version".into());
+        }
+        if self.roots.len() > SOURCE_CLAIM_ROOTS_MAX_ROOTS {
+            return Err("source-claim roots inventory exceeds the root limit".into());
+        }
+        if self.roots.iter().any(|root| !is_safe_source_claim_root(root)) {
+            return Err(
+                "source-claim roots inventory contains an unsafe or non-normalized path".into(),
+            );
+        }
+        if self.roots.iter().map(String::len).sum::<usize>() > SOURCE_CLAIM_ROOTS_MAX_BYTES {
+            return Err("source-claim roots inventory exceeds the byte limit".into());
+        }
+        Ok(())
+    }
+}
+
+/// Decode one complete worker response. A malformed or oversized response is
+/// not an empty inventory and must be reported by the caller.
+pub fn parse_source_claim_roots_inventory(stdout: &str) -> Result<SourceClaimRootsInventory, String> {
+    if stdout.len() > SOURCE_CLAIM_ROOTS_MAX_BYTES {
+        return Err("source-claim roots inventory exceeds the byte limit".into());
+    }
+    let inventory: SourceClaimRootsInventory = serde_json::from_str(stdout)
+        .map_err(|error| format!("invalid source-claim roots inventory: {error}"))?;
+    inventory.validate()?;
+    Ok(inventory)
+}
+
+/// Locate the deployed worker and request its bounded read-only inventory.
+/// Missing/older binaries refuse explicitly; there is no shell implementation
+/// of registry ownership or record authentication to drift from the worker.
+#[must_use]
+pub fn source_claim_roots_command() -> String {
+    format!(
+        "{}\n\
+         rch_wkr_locate || {{ echo RCH_SOURCE_CLAIM_ROOTS_UNAVAILABLE >&2; exit 127; }}\n\
+         \"$RCH_WKR\" source-claim-roots inventory",
+        crate::wkr_locate::WKR_LOCATE_SHELL
+    )
+}
 
 /// The build base used by the Windows tar transport. Keep discovery and
 /// creation tied to one constant: the dispatcher's POSIX configuration does
@@ -142,6 +221,8 @@ pub enum GcRootSource {
     ConfiguredExtra,
     /// A `--root` flag on this invocation.
     CommandLine,
+    /// An exact historical source root reported by the worker's registry.
+    SourceClaimRegistry,
     /// The worker temp base, resolved on the worker at sweep time by
     /// [`remote_cargo_home_base_prelude`].
     WorkerTempBase,
@@ -157,6 +238,7 @@ impl GcRootSource {
             Self::PooledStoreBase => "pooled_store_base",
             Self::ConfiguredExtra => "configured_extra",
             Self::CommandLine => "command_line",
+            Self::SourceClaimRegistry => "source_claim_registry",
             Self::WorkerTempBase => "worker_temp_base",
         }
     }
@@ -170,6 +252,7 @@ impl GcRootSource {
             Self::PooledStoreBase => "[remediation.pooled_target] store_base",
             Self::ConfiguredExtra => "[remediation.pooled_target] gc_extra_roots",
             Self::CommandLine => "--root",
+            Self::SourceClaimRegistry => "worker source-claim registry (discovery only)",
             Self::WorkerTempBase => "$TMPDIR → /data/tmp → /tmp (resolved on the worker)",
         }
     }
@@ -246,6 +329,37 @@ pub struct GcRootSet {
 }
 
 impl GcRootSet {
+    /// Add authenticated discovery hints without broadening them to ancestors.
+    /// Keep nested roots: the normal root walk has a depth limit, so a deeply
+    /// nested registered mirror may still be invisible beneath a configured
+    /// ancestor. Physical aliases are deduplicated by candidate enumeration.
+    pub fn extend_source_claim_roots(
+        &mut self,
+        inventory: &SourceClaimRootsInventory,
+    ) -> Result<(), String> {
+        inventory.validate()?;
+        let mut seen: std::collections::HashSet<String> =
+            self.roots.iter().map(|root| root.path.clone()).collect();
+        let mut position = self
+            .roots
+            .iter()
+            .position(GcRoot::is_worker_resolved)
+            .unwrap_or(self.roots.len());
+        for path in &inventory.roots {
+            if seen.insert(path.clone()) {
+                self.roots.insert(
+                    position,
+                    GcRoot {
+                        path: path.clone(),
+                        source: GcRootSource::SourceClaimRegistry,
+                    },
+                );
+                position += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// The client-resolvable roots, i.e. every root except the worker temp
     /// base. These are the paths handed to the remote enumeration/sweep
     /// scripts as `$base`.
@@ -444,6 +558,108 @@ mod tests {
 
     fn cfg() -> PooledTargetConfig {
         PooledTargetConfig::default()
+    }
+
+    #[test]
+    fn registry_discovery_adds_exact_off_root_mirrors_without_broadening() {
+        let mut roots = derive_gc_roots(&cfg(), &[]);
+        let inventory = parse_source_claim_roots_inventory(
+            r#"{"schema_version":1,"roots":["/private/tmp/claude-501/project/session","/data/projects","/private/tmp/claude-501/project/session","/data/projects/repo/deep/member"]}"#,
+        )
+        .unwrap();
+        roots.extend_source_claim_roots(&inventory).unwrap();
+        assert_eq!(
+            roots.scan_bases(),
+            [
+                "/data/projects",
+                "/private/tmp/claude-501/project/session",
+                "/data/projects/repo/deep/member",
+            ]
+        );
+        assert_eq!(roots.roots[0].source, GcRootSource::PooledRemoteBase);
+        assert_eq!(roots.roots[1].source, GcRootSource::SourceClaimRegistry);
+        assert!(roots.roots.last().unwrap().is_worker_resolved());
+        assert!(
+            roots
+                .attribute("/private/tmp/unrelated/.rch-target-w-pool-x")
+                .is_none()
+        );
+        assert_eq!(
+            roots
+                .attribute("/private/tmp/claude-501/project/session/.rch-target-w-pool-x")
+                .unwrap()
+                .source,
+            GcRootSource::SourceClaimRegistry
+        );
+    }
+
+    #[test]
+    fn registry_discovery_rejects_the_whole_invalid_inventory_without_mutation() {
+        for path in [
+            "/",
+            "relative",
+            "/private/tmp/../etc",
+            "/private/./tmp",
+            "/private//tmp",
+            "/private/tmp/",
+            " /private/tmp",
+            "/private/tmp ",
+            "/tmp/$(id)",
+            "/tmp/line\nbreak",
+            "C:/rch",
+            "/tmp/with space",
+        ] {
+            let mut roots = derive_gc_roots(&cfg(), &[]);
+            let before = roots.clone();
+            let inventory = SourceClaimRootsInventory {
+                schema_version: SOURCE_CLAIM_ROOTS_SCHEMA_VERSION,
+                roots: vec!["/private/tmp/valid-project".into(), path.into()],
+            };
+            assert!(
+                roots.extend_source_claim_roots(&inventory).is_err(),
+                "{path:?}"
+            );
+            assert_eq!(
+                roots, before,
+                "valid prefix must not escape a refused inventory"
+            );
+            assert!(
+                parse_source_claim_roots_inventory(&serde_json::to_string(&inventory).unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn registry_discovery_requires_complete_bounded_versioned_json() {
+        for response in [
+            "",
+            "{}",
+            "{\"schema_version\":1,\"roots\":[",
+            r#"{"schema_version":2,"roots":[]}"#,
+            r#"{"schema_version":1,"roots":[],"truncated":true}"#,
+            r#"{"schema_version":1,"schema_version":1,"roots":[]}"#,
+            r#"{"schema_version":1,"roots":["/private/tmp/valid"]} trailing"#,
+        ] {
+            assert!(
+                parse_source_claim_roots_inventory(response).is_err(),
+                "{response:?}"
+            );
+        }
+        let too_many = SourceClaimRootsInventory {
+            schema_version: SOURCE_CLAIM_ROOTS_SCHEMA_VERSION,
+            roots: vec!["/private/tmp/project".into(); SOURCE_CLAIM_ROOTS_MAX_ROOTS + 1],
+        };
+        assert!(too_many.validate().is_err());
+        assert!(
+            parse_source_claim_roots_inventory(&" ".repeat(SOURCE_CLAIM_ROOTS_MAX_BYTES + 1)).is_err()
+        );
+        let empty =
+            parse_source_claim_roots_inventory(r#"{"schema_version":1,"roots":[]}"#).unwrap();
+        assert!(
+            empty.roots.is_empty(),
+            "a successful empty inventory is explicit"
+        );
     }
 
     #[test]
