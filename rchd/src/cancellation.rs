@@ -141,9 +141,10 @@ pub struct CancellationRecord {
     #[serde(skip)]
     pub hook_process_identity: Option<String>,
     pub remote_pgid_file: Option<String>,
-    /// The reservation was abandoned (see [`provably_abandoned_unlaunched`]):
-    /// without a record path it needs no remote kill; with one, a record the
-    /// original admitted worker no longer has confirms that nothing runs under it.
+    /// The reservation was abandoned by exact pre-sync evidence or the silence
+    /// policy (see [`provably_unlaunched_before_sync`] and
+    /// [`provably_abandoned_unlaunched`]). Without a record path it needs no
+    /// remote kill; with one, the original worker must confirm record absence.
     #[serde(skip)]
     pub abandoned_unlaunched: bool,
 }
@@ -152,17 +153,79 @@ pub struct CancellationRecord {
 /// min default) and the worker orphan reaper (240 min).
 const ABANDONED_UNLAUNCHED_AFTER: Duration = Duration::from_secs(6 * 3600);
 
-/// The same judgement for a build that never started its remote command (its
-/// heartbeat phase is still `sync_up`). Nothing can be running remotely for
-/// it, so there is no remote lifetime cap to wait out once the wrapper is
-/// provably gone. A wrapper SIGKILLed in sync_up otherwise held its slots for
-/// the full 6h (bd-axhoi: 4 slots on vmi1152480 for 4.6h, the stuck
-/// detector's cancellation unable to confirm a remote kill for a build that
-/// had no remote process).
+/// The conservative silence bound for a build that never reported starting
+/// its remote command. Exact pre-sync Unix ownership can be retired sooner;
+/// legacy, Windows, and already-recorded process ownership keep this policy.
 const ABANDONED_BEFORE_REMOTE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 fn remote_cancellation_required(record: &CancellationRecord) -> bool {
     record.remote_pgid_file.is_some() || (!record.abandoned_unlaunched && record.slots > 0)
+}
+
+/// A dead Unix wrapper can relinquish admission immediately before it owns
+/// remote source or a process record. Every real Unix execution route persists
+/// a nonempty source-recovery intent before transfer or launch; Windows does
+/// not, and heartbeats alone are best effort. Bind the original Unix endpoint
+/// and the existing, unclaimed client journal to this exact native process and
+/// build. Missing, replaced, malformed, or source-owning evidence is not proof.
+fn provably_unlaunched_before_sync(
+    build: &crate::history::ActiveBuildState,
+    lease_dir: &std::path::Path,
+) -> bool {
+    use rch_common::job_identity::{DurableJobLease, JobLifecycleState};
+    use rch_common::process_identity::ProcessIdentity;
+
+    if build.location != rch_common::BuildLocation::Remote
+        || build.heartbeat_phase != rch_common::BuildHeartbeatPhase::SyncUp
+        || build.remote_pgid_file.is_some()
+        || build.hook_pid <= 1
+    {
+        return false;
+    }
+    let Some(endpoint) = build.worker_endpoint.as_ref() else {
+        return false;
+    };
+    if endpoint.config.id.as_str() != build.worker_id.as_str()
+        || rch_common::declared_os(&endpoint.config.tags).as_deref() == Some("windows")
+    {
+        return false;
+    }
+    let Some(wrapper) = build
+        .local_wrapper_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    let Some(identity) = build
+        .hook_process_identity
+        .as_deref()
+        .and_then(ProcessIdentity::from_record)
+    else {
+        return false;
+    };
+    if wrapper_process_state(build.hook_pid, build.hook_process_identity.as_deref())
+        != WrapperProcessState::Exited
+    {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(lease_dir.join(format!("{wrapper}.json"))) else {
+        return false;
+    };
+    let Ok(lease) = serde_json::from_slice::<DurableJobLease>(&bytes) else {
+        return false;
+    };
+    lease.schema_version == 1
+        && lease.identity.local_wrapper_id == wrapper
+        && lease.identity.remote_build_id == Some(build.id)
+        && lease.worker_id.as_deref() == Some(build.worker_id.as_str())
+        && lease.wrapper_pid == build.hook_pid
+        && lease.owner_identity().as_ref() == Some(&identity)
+        && lease.state == JobLifecycleState::Running
+        && lease.phase == "sync_up"
+        && !lease.terminal_acknowledged
+        && lease.exit_code.is_none()
+        && lease.recovery.is_none()
 }
 
 /// A reservation whose wrapper is gone (or was never recorded) and that has
@@ -486,9 +549,10 @@ impl CancellationOrchestrator {
                 };
             };
             let abandoned_unlaunched =
-                provably_abandoned_unlaunched(&build, Instant::now(), |wrapper| {
-                    client_lease_owns_source(&ctx.client_lease_dir, wrapper)
-                });
+                provably_unlaunched_before_sync(&build, &ctx.client_lease_dir)
+                    || provably_abandoned_unlaunched(&build, Instant::now(), |wrapper| {
+                        client_lease_owns_source(&ctx.client_lease_dir, wrapper)
+                    });
             let record = CancellationRecord {
                 build_id,
                 worker_id: build.worker_id,
@@ -558,6 +622,13 @@ impl CancellationOrchestrator {
                     slots_released: 0,
                 };
             }
+            // Admission was only a snapshot. Recheck both current build and
+            // client custody before the daemon-owned task acts on that proof.
+            record.abandoned_unlaunched =
+                provably_unlaunched_before_sync(&current, &context.client_lease_dir)
+                    || provably_abandoned_unlaunched(&current, Instant::now(), |wrapper| {
+                        client_lease_owns_source(&context.client_lease_dir, wrapper)
+                    });
             record.hook_pid = current.hook_pid;
             record.worker_endpoint = current.worker_endpoint;
             record.remote_pgid_file = current.remote_pgid_file;
@@ -2434,6 +2505,313 @@ wait
             "a lease still owning worker source keeps it"
         );
         assert!(provably_abandoned_unlaunched(&build, now, no_lease));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn pre_sync_immediate_release_requires_verified_exit_and_no_remote_ownership() {
+        use rch_common::job_identity::{DurableJobLease, JobIdentity};
+
+        let journals = tempfile::Builder::new()
+            .prefix("pre-sync-journals-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let identity = JobIdentity::new_local();
+        let history = BuildHistory::new(10);
+        let worker = crate::workers::WorkerState::new(rch_common::WorkerConfig {
+            id: WorkerId::new("worker-a"),
+            ..Default::default()
+        });
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let build = history
+            .try_start_active_build_with_waiter(
+                "pre-sync".into(),
+                "worker-a".into(),
+                "sh -c 'sleep 30'".into(),
+                child.id(),
+                Some(identity.local_wrapper_id.clone()),
+                2,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
+        let mut lease = DurableJobLease::new(
+            identity.clone(),
+            child.id(),
+            None,
+            None,
+            1,
+            true,
+            false,
+            "blake3:pre-sync-fixture".into(),
+        );
+        lease.admit(build.id, build.worker_id.clone(), 1);
+        lease.process_birth = build
+            .hook_process_identity
+            .as_deref()
+            .and_then(rch_common::process_identity::ProcessIdentity::from_record);
+        let path = journals
+            .path()
+            .join(format!("{}.json", identity.local_wrapper_id));
+        let bytes = serde_json::to_vec(&lease).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let eligible = |build: &crate::history::ActiveBuildState| {
+            provably_unlaunched_before_sync(build, journals.path())
+        };
+        let live_rejected = !eligible(&build);
+        // Reap before asserting so an unsupported inspection environment cannot
+        // leave the fixture running. Birth/exit are observed by production code.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(live_rejected, "a live wrapper still owns its reservation");
+        assert!(build.hook_process_identity.is_some());
+        assert!(
+            eligible(&build),
+            "a verified dead wrapper with no process record or source needs no silence period"
+        );
+        let empty_journals = tempfile::Builder::new()
+            .prefix("pre-sync-missing-journals-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        assert!(
+            !provably_unlaunched_before_sync(&build, empty_journals.path()),
+            "missing custody is not proof that source was never claimed"
+        );
+
+        for identity in [None, Some("unverified legacy birth".into())] {
+            let mut unknown = build.clone();
+            unknown.hook_process_identity = identity;
+            assert!(
+                !eligible(&unknown),
+                "legacy or missing birth evidence keeps the existing silence policy"
+            );
+        }
+        for wrapper in [None, Some(String::new())] {
+            let mut no_wrapper = build.clone();
+            no_wrapper.local_wrapper_id = wrapper;
+            assert!(!eligible(&no_wrapper));
+        }
+        let mut unknown_endpoint = build.clone();
+        unknown_endpoint.worker_endpoint = None;
+        assert!(!eligible(&unknown_endpoint));
+        let mut different_endpoint = build.clone();
+        different_endpoint
+            .worker_endpoint
+            .as_mut()
+            .unwrap()
+            .config
+            .id = WorkerId::new("other-worker");
+        assert!(!eligible(&different_endpoint));
+        let mut windows = build.clone();
+        windows
+            .worker_endpoint
+            .as_mut()
+            .unwrap()
+            .config
+            .tags
+            .push("os:windows".into());
+        assert!(
+            !eligible(&windows),
+            "Windows launch does not require durable Unix source ownership"
+        );
+        let mut local = build.clone();
+        local.location = rch_common::BuildLocation::Local;
+        assert!(!eligible(&local));
+        let mut no_pid = build.clone();
+        no_pid.hook_pid = 0;
+        assert!(!eligible(&no_pid));
+        let mut record_reported = build.clone();
+        record_reported.remote_pgid_file = Some("/worker/.rch-run/1.pgid".into());
+        assert!(
+            !eligible(&record_reported),
+            "a reported path still requires remote settlement"
+        );
+        for phase in [
+            rch_common::BuildHeartbeatPhase::Execute,
+            rch_common::BuildHeartbeatPhase::SyncDown,
+            rch_common::BuildHeartbeatPhase::Finalize,
+        ] {
+            let mut started = build.clone();
+            started.heartbeat_phase = phase;
+            assert!(
+                !eligible(&started),
+                "missing process evidence after execution is not proof of no work"
+            );
+        }
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn pre_sync_dead_wrapper_releases_reserved_slots_without_silence() {
+        use rch_common::job_identity::{DurableJobLease, JobIdentity};
+
+        for reason in [CancelReason::User, CancelReason::StuckDetector] {
+            for force in [false, true] {
+                let pool = WorkerPool::new();
+                let config = rch_common::WorkerConfig {
+                    id: WorkerId::new("pre-sync-worker"),
+                    total_slots: 4,
+                    ..Default::default()
+                };
+                pool.add_worker(config.clone()).await;
+                let worker = pool.get(&config.id).await.unwrap();
+                assert!(worker.reserve_slots(3).await);
+                let history = Arc::new(BuildHistory::new(100));
+                let ctx = make_test_context(pool, history.clone());
+                let mut wrapper = std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap();
+                let identity = JobIdentity::new_local();
+                let mut lease = DurableJobLease::new(
+                    identity.clone(),
+                    wrapper.id(),
+                    None,
+                    None,
+                    1,
+                    true,
+                    false,
+                    "blake3:pre-sync-fixture".into(),
+                );
+                let active = history
+                    .try_start_active_build_with_waiter(
+                        "pre-sync".into(),
+                        config.id.to_string(),
+                        "sh -c 'sleep 30'".into(),
+                        wrapper.id(),
+                        Some(identity.local_wrapper_id.clone()),
+                        2,
+                        rch_common::BuildLocation::Remote,
+                        None,
+                        crate::disk_pressure::DiskHeadroomAdmission::default(),
+                        Some(worker.endpoint_snapshot().await),
+                    )
+                    .unwrap()
+                    .unwrap();
+                lease.admit(active.id, config.id.to_string(), 1);
+                lease.process_birth = active
+                    .hook_process_identity
+                    .as_deref()
+                    .and_then(rch_common::process_identity::ProcessIdentity::from_record);
+                let heartbeat = history.record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                    build_id: active.id,
+                    worker_id: config.id.clone(),
+                    hook_pid: Some(wrapper.id()),
+                    local_wrapper_id: Some(identity.local_wrapper_id.clone()),
+                    remote_pgid_file: None,
+                    phase: rch_common::BuildHeartbeatPhase::SyncUp,
+                    detail: Some("source_validation".into()),
+                    progress_counter: None,
+                    progress_percent: None,
+                });
+                wrapper.kill().unwrap();
+                wrapper.wait().unwrap();
+                assert!(heartbeat.is_some(), "the first heartbeat was accepted");
+                assert!(
+                    lease.process_birth.is_some(),
+                    "native wrapper birth recorded"
+                );
+                let lease_path = ctx
+                    .client_lease_dir
+                    .join(format!("{}.json", identity.local_wrapper_id));
+                std::fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+
+                let owner = CancellationOrchestrator::new(test_config(), test_events());
+                let mut source_owner = lease.clone();
+                source_owner.recovery = Some(serde_json::json!({
+                    "version": 2,
+                    "source_roots": [{"remote_root": "/worker/owned-source"}],
+                    "retired": false,
+                }));
+                let mut uncertain_journals = vec![
+                    ("source owner", serde_json::to_vec(&source_owner).unwrap()),
+                    ("unreadable", b"unreadable journal evidence".to_vec()),
+                ];
+                for mismatch in [
+                    "wrapper",
+                    "build",
+                    "worker",
+                    "pid",
+                    "birth",
+                    "schema",
+                    "phase",
+                    "terminal",
+                    "result",
+                    "empty recovery",
+                ] {
+                    let mut replaced = lease.clone();
+                    match mismatch {
+                        "wrapper" => {
+                            replaced.identity.local_wrapper_id =
+                                JobIdentity::new_local().local_wrapper_id;
+                        }
+                        "build" => replaced.identity.remote_build_id = Some(active.id + 1),
+                        "worker" => replaced.worker_id = Some("other-worker".into()),
+                        "pid" => replaced.wrapper_pid = std::process::id(),
+                        "birth" => {
+                            replaced.process_birth.as_mut().unwrap().boot_id =
+                                uuid::Uuid::new_v4().to_string();
+                        }
+                        "schema" => replaced.schema_version += 1,
+                        "phase" => replaced.phase = "execute".into(),
+                        "terminal" => replaced.acknowledge_terminal(2),
+                        "result" => replaced.exit_code = Some(0),
+                        "empty recovery" => replaced.recovery = Some(serde_json::json!({})),
+                        _ => unreachable!(),
+                    }
+                    uncertain_journals.push((mismatch, serde_json::to_vec(&replaced).unwrap()));
+                }
+                for (evidence, uncertain) in uncertain_journals {
+                    std::fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+                    let cancellation = owner.cancel_build(&ctx, active.id, reason, force);
+                    tokio::pin!(cancellation);
+                    // Admit cancellation, then change the source evidence before
+                    // its daemon-owned task runs. It must reload that evidence.
+                    assert_cancellation_pending(cancellation.as_mut()).await;
+                    std::fs::write(&lease_path, &uncertain).unwrap();
+                    let retained = cancellation.await;
+                    assert_eq!(retained.status, "failed", "{evidence}: {retained:?}");
+                    assert_eq!(retained.slots_released, 0);
+                    assert_eq!(worker.used_slots(), 3);
+                    assert!(history.active_build(active.id).is_some());
+                    assert!(history.recent(10).is_empty());
+                    assert_eq!(std::fs::read(&lease_path).unwrap(), uncertain);
+                }
+                std::fs::write(&lease_path, serde_json::to_vec(&lease).unwrap()).unwrap();
+                let response = owner.cancel_build(&ctx, active.id, reason, force).await;
+                assert_eq!(response.status, "cancelled", "{response:?}");
+                assert_eq!(response.slots_released, 2);
+                assert_eq!(worker.used_slots(), 1, "unrelated capacity stays reserved");
+                assert!(history.active_build(active.id).is_none());
+                let terminal = history.recent(10);
+                assert_eq!(terminal.len(), 1);
+                assert_eq!(terminal[0].exit_code, 130);
+                let metadata = terminal[0].cancellation.as_ref().unwrap();
+                assert_eq!(metadata.origin, reason.to_string());
+                assert!(!metadata.remote_kill_attempted);
+                assert!(metadata.cleanup_ok);
+                assert_eq!(metadata.final_state, "completed");
+                let repeated = owner.cancel_build(&ctx, active.id, reason, force).await;
+                assert_eq!(repeated.slots_released, 0);
+                assert_eq!(worker.used_slots(), 1);
+                assert_eq!(history.recent(10).len(), 1);
+                assert_eq!(
+                    serde_json::from_slice::<DurableJobLease>(&std::fs::read(&lease_path).unwrap())
+                        .unwrap(),
+                    lease,
+                    "the daemon leaves the original client journal for normal recovery"
+                );
+            }
+        }
     }
 
     /// A replacement may have no record while the original worker still does.
