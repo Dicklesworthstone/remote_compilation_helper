@@ -128,8 +128,8 @@ pub struct CancellationRecord {
     /// A local failure after this proof must not quarantine a healthy worker.
     pub remote_kill_confirmed: bool,
     /// The worker answered that it holds no process record for the build.
-    /// Not proof of death for a recent build, but an answering worker is
-    /// observable: it must not enter a process-observation bypass.
+    /// Not proof of death on its own, but an answering worker is observable:
+    /// it must not enter a process-observation bypass.
     #[serde(skip)]
     pub remote_record_absent: bool,
     pub cleanup_ok: bool,
@@ -141,8 +141,8 @@ pub struct CancellationRecord {
     #[serde(skip)]
     pub hook_process_identity: Option<String>,
     pub remote_pgid_file: Option<String>,
-    /// The reservation was abandoned by exact pre-sync evidence or the silence
-    /// policy (see [`provably_unlaunched_before_sync`] and
+    /// The reservation was abandoned by exact pre-source evidence or the silence
+    /// policy (see [`provably_unlaunched_before_source`] and
     /// [`provably_abandoned_unlaunched`]). Without a record path it needs no
     /// remote kill; with one, the original worker must confirm record absence.
     #[serde(skip)]
@@ -154,8 +154,8 @@ pub struct CancellationRecord {
 const ABANDONED_UNLAUNCHED_AFTER: Duration = Duration::from_secs(6 * 3600);
 
 /// The conservative silence bound for a build that never reported starting
-/// its remote command. Exact pre-sync Unix ownership can be retired sooner;
-/// unverified, Windows, and already-recorded process ownership keep this policy.
+/// its remote command. Exact pre-source Unix ownership can be retired sooner;
+/// unverified, Windows, and source-owning jobs keep this policy.
 const ABANDONED_BEFORE_REMOTE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 fn remote_cancellation_required(record: &CancellationRecord) -> bool {
@@ -163,14 +163,17 @@ fn remote_cancellation_required(record: &CancellationRecord) -> bool {
 }
 
 /// A dead Unix wrapper can relinquish admission immediately before it owns
-/// remote source or a process record. Every real Unix execution route persists
-/// a nonempty source-recovery intent before transfer or launch; Windows does
-/// not, and heartbeats alone are best effort. Bind the original Unix endpoint
-/// and the existing client journal to this exact native process and wrapper.
-/// Admission may still be awaiting the client's durable acknowledgement;
-/// otherwise the journal must name this exact build and worker. Missing,
-/// mismatched, malformed, or source-owning evidence is not proof.
-fn provably_unlaunched_before_sync(
+/// remote source. Every real Unix execution route persists a nonempty
+/// source-recovery intent before transfer or launch; Windows does not, and
+/// heartbeats alone are best effort. The process-record path is reported at
+/// `sync_start`, before that intent: a path still requires the original worker
+/// to confirm absence or termination, but does not require a silence period.
+/// Bind the original Unix endpoint and the existing client journal to this
+/// exact native process and wrapper. Admission may still be awaiting the
+/// client's durable acknowledgement, in which case no process-record path may
+/// have been reported; otherwise the journal must name this exact build and
+/// worker. Missing, mismatched, malformed, or source-owning evidence is not proof.
+fn provably_unlaunched_before_source(
     build: &crate::history::ActiveBuildState,
     lease_dir: &std::path::Path,
 ) -> bool {
@@ -179,7 +182,6 @@ fn provably_unlaunched_before_sync(
 
     if build.location != rch_common::BuildLocation::Remote
         || build.heartbeat_phase != rch_common::BuildHeartbeatPhase::SyncUp
-        || build.remote_pgid_file.is_some()
         || build.hook_pid <= 1
     {
         return false;
@@ -229,7 +231,8 @@ fn provably_unlaunched_before_sync(
                 && lease.phase == "sync_up"
         }
         (None, None) => {
-            lease.state == JobLifecycleState::Queued
+            build.remote_pgid_file.is_none()
+                && lease.state == JobLifecycleState::Queued
                 && matches!(
                     lease.phase.as_str(),
                     "admission" | "selection_pending" | "selection_unconfirmed"
@@ -568,7 +571,7 @@ impl CancellationOrchestrator {
                 };
             };
             let abandoned_unlaunched =
-                provably_unlaunched_before_sync(&build, &ctx.client_lease_dir)
+                provably_unlaunched_before_source(&build, &ctx.client_lease_dir)
                     || provably_abandoned_unlaunched(&build, Instant::now(), |wrapper| {
                         client_lease_owns_source(&ctx.client_lease_dir, wrapper)
                     });
@@ -644,7 +647,7 @@ impl CancellationOrchestrator {
             // Admission was only a snapshot. Recheck both current build and
             // client custody before the daemon-owned task acts on that proof.
             record.abandoned_unlaunched =
-                provably_unlaunched_before_sync(&current, &context.client_lease_dir)
+                provably_unlaunched_before_source(&current, &context.client_lease_dir)
                     || provably_abandoned_unlaunched(&current, Instant::now(), |wrapper| {
                         client_lease_owns_source(&context.client_lease_dir, wrapper)
                     });
@@ -2528,7 +2531,7 @@ wait
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn pre_sync_immediate_release_requires_verified_exit_and_no_remote_ownership() {
+    async fn pre_source_immediate_release_requires_verified_exit_and_no_remote_ownership() {
         use rch_common::job_identity::{DurableJobLease, JobIdentity};
 
         let journals = tempfile::Builder::new()
@@ -2582,7 +2585,7 @@ wait
         let bytes = serde_json::to_vec(&lease).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         let eligible = |build: &crate::history::ActiveBuildState| {
-            provably_unlaunched_before_sync(build, journals.path())
+            provably_unlaunched_before_source(build, journals.path())
         };
         let live_rejected = !eligible(&build);
         // Reap before asserting so an unsupported inspection environment cannot
@@ -2601,7 +2604,7 @@ wait
             .tempdir()
             .unwrap();
         assert!(
-            !provably_unlaunched_before_sync(&build, empty_journals.path()),
+            !provably_unlaunched_before_source(&build, empty_journals.path()),
             "missing custody is not proof that source was never claimed"
         );
 
@@ -2650,8 +2653,27 @@ wait
         let mut record_reported = build.clone();
         record_reported.remote_pgid_file = Some("/worker/.rch-run/1.pgid".into());
         assert!(
+            eligible(&record_reported),
+            "sync_start reports the path before source custody or execution"
+        );
+        let mut pending = lease.clone();
+        pending.identity.remote_build_id = None;
+        pending.worker_id = None;
+        pending.state = rch_common::job_identity::JobLifecycleState::Queued;
+        pending.phase = "selection_pending".into();
+        std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        assert!(eligible(&build), "pending admission without a path remains safe");
+        assert!(
             !eligible(&record_reported),
-            "a reported path still requires remote settlement"
+            "a journal without admission IDs cannot claim a reported process-record path"
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        let mut record = test_record(CancellationState::Requested, 0, false);
+        record.abandoned_unlaunched = eligible(&record_reported);
+        record.remote_pgid_file = record_reported.remote_pgid_file;
+        assert!(
+            remote_cancellation_required(&record),
+            "a reported path still requires original-worker settlement"
         );
         for phase in [
             rch_common::BuildHeartbeatPhase::Execute,
@@ -2877,6 +2899,151 @@ wait
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sync_start_dead_wrapper_releases_only_after_original_worker_record_absence() {
+        use rch_common::job_identity::{DurableJobLease, JobIdentity};
+
+        if let Some(root) =
+            std::env::var_os("RCH_ADMIN_CANCEL_TEST_ROOT").map(std::path::PathBuf::from)
+        {
+            for reason in [CancelReason::User, CancelReason::StuckDetector] {
+                for force in [false, true] {
+                    let case = root.join(format!("{reason}-{force}"));
+                    std::fs::create_dir_all(case.join("original")).unwrap();
+                    std::fs::write(root.join("case-root"), case.to_str().unwrap()).unwrap();
+                    std::fs::write(root.join("mode"), "worker-root").unwrap();
+                    let pool = WorkerPool::new();
+                    let config = rch_common::WorkerConfig {
+                        id: WorkerId::new("sync-start-worker"),
+                        host: "original.example".into(),
+                        user: "original-user".into(),
+                        identity_file: "/original/key".into(),
+                        total_slots: 4,
+                        ..Default::default()
+                    };
+                    pool.add_worker(config.clone()).await;
+                    let worker = pool.get(&config.id).await.unwrap();
+                    assert!(worker.reserve_slots(3).await);
+                    let history = Arc::new(BuildHistory::new(100));
+                    let ctx = make_test_context(pool, history.clone());
+                    let mut wrapper = CancellationOwnedChild(
+                        std::process::Command::new("/bin/sleep")
+                            .arg("30")
+                            .spawn()
+                            .unwrap(),
+                    );
+                    let identity = JobIdentity::new_local();
+                    let active = history
+                        .try_start_active_build_with_waiter(
+                            "sync-start".into(),
+                            config.id.to_string(),
+                            "sh -c 'sleep 30'".into(),
+                            wrapper.0.id(),
+                            Some(identity.local_wrapper_id.clone()),
+                            2,
+                            rch_common::BuildLocation::Remote,
+                            None,
+                            crate::disk_pressure::DiskHeadroomAdmission::default(),
+                            Some(worker.endpoint_snapshot().await),
+                        )
+                        .unwrap()
+                        .unwrap();
+                    let mut lease = DurableJobLease::new(
+                        identity.clone(),
+                        wrapper.0.id(),
+                        None,
+                        None,
+                        1,
+                        true,
+                        false,
+                        "blake3:sync-start-fixture".into(),
+                    );
+                    lease.admit(active.id, config.id.to_string(), 1);
+                    lease.process_birth = active
+                        .hook_process_identity
+                        .as_deref()
+                        .and_then(rch_common::process_identity::ProcessIdentity::from_record);
+                    assert!(lease.process_birth.is_some());
+                    history
+                        .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                            build_id: active.id,
+                            worker_id: config.id.clone(),
+                            hook_pid: Some(wrapper.0.id()),
+                            local_wrapper_id: Some(identity.local_wrapper_id.clone()),
+                            remote_pgid_file: Some("owned-build.pgid".into()),
+                            phase: rch_common::BuildHeartbeatPhase::SyncUp,
+                            detail: Some("sync_start".into()),
+                            progress_counter: None,
+                            progress_percent: None,
+                        })
+                        .unwrap();
+                    wrapper.0.kill().unwrap();
+                    wrapper.0.wait().unwrap();
+                    std::fs::write(root.join("build-id"), active.id.to_string()).unwrap();
+                    let lease_path = ctx
+                        .client_lease_dir
+                        .join(format!("{}.json", identity.local_wrapper_id));
+                    let owner = CancellationOrchestrator::new(test_config(), test_events());
+
+                    // The worker runs the production cancellation script against
+                    // a genuinely absent record. Source custody still prevents
+                    // that answer from settling a recent build.
+                    let mut source_owner = lease.clone();
+                    source_owner.recovery = Some(serde_json::json!({
+                        "version": 2,
+                        "source_roots": ["/worker/owned-source"],
+                        "retired": false,
+                    }));
+                    let source_bytes = serde_json::to_vec(&source_owner).unwrap();
+                    std::fs::write(&lease_path, &source_bytes).unwrap();
+                    let retained = owner.cancel_build(&ctx, active.id, reason, force).await;
+                    assert_eq!(retained.status, "failed", "{retained:?}");
+                    assert_eq!(retained.slots_released, 0);
+                    assert_eq!(worker.used_slots(), 3);
+                    assert!(history.active_build(active.id).is_some());
+                    assert!(history.recent(10).is_empty());
+                    assert_eq!(std::fs::read(&lease_path).unwrap(), source_bytes);
+
+                    let bytes = serde_json::to_vec(&lease).unwrap();
+                    std::fs::write(&lease_path, &bytes).unwrap();
+                    let released = owner.cancel_build(&ctx, active.id, reason, force).await;
+                    assert_eq!(released.status, "cancelled", "{released:?}");
+                    assert!(active.started_at_mono.elapsed() < ABANDONED_BEFORE_REMOTE_AFTER);
+                    assert_eq!(released.slots_released, 2);
+                    assert_eq!(worker.used_slots(), 1, "unrelated capacity stays reserved");
+                    assert!(history.active_build(active.id).is_none());
+                    let terminal = history.recent(10);
+                    assert_eq!(terminal.len(), 1);
+                    assert_eq!(terminal[0].exit_code, 130);
+                    let metadata = terminal[0].cancellation.as_ref().unwrap();
+                    assert_eq!(metadata.origin, reason.to_string());
+                    assert!(metadata.remote_kill_attempted);
+                    assert!(metadata.cleanup_ok);
+                    assert_eq!(metadata.final_state, "completed");
+                    let argv = std::fs::read_to_string(root.join("ssh-argv")).unwrap();
+                    assert!(
+                        argv.lines()
+                            .any(|arg| arg == "original-user@original.example")
+                    );
+                    assert!(argv.lines().any(|arg| arg == "/original/key"));
+                    assert_eq!(std::fs::read(&lease_path).unwrap(), bytes);
+                    let repeated = owner.cancel_build(&ctx, active.id, reason, force).await;
+                    assert_eq!(repeated.slots_released, 0);
+                    assert_eq!(worker.used_slots(), 1);
+                    assert_eq!(history.recent(10).len(), 1);
+                }
+            }
+            std::fs::write(root.join("child-completed"), "ok").unwrap();
+            return;
+        }
+
+        run_admin_cancel_fixture(
+            "cancellation::tests::sync_start_dead_wrapper_releases_only_after_original_worker_record_absence",
+        )
+        .await;
     }
 
     /// A replacement may have no record while the original worker still does.

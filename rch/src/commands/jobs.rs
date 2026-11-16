@@ -438,6 +438,49 @@ fn same_unfinished_owner_without_recovery(
         && !latest.terminal_acknowledged
 }
 
+/// Recovery may ask the daemon to settle an unlaunched Unix preparation,
+/// but must not turn observation of a dead client into cancellation of work
+/// that could be running remotely. The daemon rechecks its original endpoint
+/// and journal before releasing anything; keep that journal unclaimed here.
+#[cfg(unix)]
+fn abandoned_preparation_can_be_cancelled(lease: &DurableJobLease, status: &Value) -> bool {
+    use rch_common::job_identity::JobLifecycleState;
+    use rch_common::process_identity::ProcessIdentity;
+
+    if status["status"] != "active"
+        || lease.schema_version != 1
+        || lease.state != JobLifecycleState::Running
+        || lease.phase != "sync_up"
+        || lease.terminal_acknowledged
+        || lease.exit_code.is_some()
+        || lease.recovery.is_some()
+        || lease.wrapper_pid <= 1
+    {
+        return false;
+    }
+    let Some(identity) = lease.owner_identity() else {
+        return false;
+    };
+    let active = &status["active"];
+    let Ok(endpoint) = serde_json::from_value::<rch_common::WorkerConfig>(
+        active["worker_endpoint"]["config"].clone(),
+    ) else {
+        return false;
+    };
+    validate_identity(lease, active).is_ok()
+        && active["location"] == "remote"
+        && active["heartbeat_phase"] == "sync_up"
+        && active["hook_pid"].as_u64() == Some(u64::from(lease.wrapper_pid))
+        && active["hook_process_identity"]
+            .as_str()
+            .and_then(ProcessIdentity::from_record)
+            .as_ref()
+            == Some(&identity)
+        && lease.worker_id.as_deref() == Some(endpoint.id.as_str())
+        && rch_common::declared_os(&endpoint.tags).as_deref() != Some("windows")
+        && owner_presence(lease) == OwnerPresence::Absent
+}
+
 fn completed_cancellation_report(lease: &DurableJobLease, code: i32) -> Value {
     // Remote completion is not evidence that local artifact retrieval or
     // terminal acknowledgement finished. Leave the owner's journal intact.
@@ -829,6 +872,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
         }
         std::process::exit(code);
     }
+    let mut preparation_cancel_requested = false;
     loop {
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
@@ -945,7 +989,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             emit(ctx, &reply)?;
             return Ok(());
         }
-        let status = within_job_deadline(deadline, "job status", async {
+        let mut status = within_job_deadline(deadline, "job status", async {
             query(&lease).await.map_err(|error| {
                 if cancel {
                     cancellation_unconfirmed_error(&lease, error)
@@ -1002,6 +1046,50 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
                 &json!({"status":"cancelled", "identity":lease.identity, "wrapper_stop_requested":true}),
             )?;
             return Ok(());
+        }
+        if recover && abandoned_preparation_can_be_cancelled(&lease, &status) {
+            if preparation_cancel_requested {
+                // An acknowledged cancellation may still be publishing its
+                // terminal record. Observe it within the original deadline,
+                // without sending another cancellation every polling tick.
+                wait_for_job_poll(deadline).await?;
+                continue;
+            }
+            // Status I/O can race a final journal update. Reload without
+            // claiming custody: the daemon's no-launch proof binds the dead
+            // original owner, not this recovery process.
+            let latest = DurableLeaseWriter::load(&wrapper_id)?.snapshot();
+            if !same_unfinished_owner_without_recovery(&lease, &latest)
+                || !abandoned_preparation_can_be_cancelled(&latest, &status)
+            {
+                wait_for_job_poll(deadline).await?;
+                continue;
+            }
+            let id = latest
+                .identity
+                .remote_build_id
+                .context("preparation recovery requires an admitted build")?;
+            let response =
+                within_job_deadline(deadline, "abandoned preparation cancellation", async {
+                    super::helpers::send_daemon_cancellation(
+                        &format!("POST /builds/{id}/cancel?local_wrapper_id={wrapper_id}\n"),
+                        deadline,
+                    )
+                    .await
+                    .map_err(|error| cancellation_unconfirmed_error(&latest, error))
+                })
+                .await?;
+            let reply = parse_cancellation_response(&latest, &response)?;
+            match validate_admitted_cancellation(&latest, &reply)? {
+                AdmittedCancellation::AlreadyCompleted(_) => status = reply,
+                AdmittedCancellation::StopWrapper => {
+                    preparation_cancel_requested = true;
+                    // Only a full same-identity terminal receipt can retire
+                    // the journal. The normal completed branch does that on
+                    // the next observation; no local stop receipt is needed.
+                    continue;
+                }
+            }
         }
         if recover && process_matches(&lease) && lease.recovery.is_some() {
             // The live wrapper's retrieval select consumes this exact-identity
@@ -2494,6 +2582,308 @@ mod tests {
             "local_wrapper_id": lease.identity.local_wrapper_id,
             "record": {"id": 42, "worker_id": "worker-a", "exit_code": code},
         })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn preparation_status(lease: &DurableJobLease) -> Value {
+        let worker = rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("worker-a"),
+            ..Default::default()
+        };
+        json!({
+            "status": "active",
+            "active": {
+                "id": lease.identity.remote_build_id,
+                "worker_id": lease.worker_id,
+                "local_wrapper_id": lease.identity.local_wrapper_id,
+                "hook_pid": lease.wrapper_pid,
+                "hook_process_identity": lease.owner_identity().unwrap().to_record(),
+                "location": "remote",
+                "heartbeat_phase": "sync_up",
+                "remote_pgid_file": null,
+                "worker_endpoint": {"config": worker},
+            },
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn preparation_recovery_requires_dead_exact_unlaunched_unix_owner() {
+        use rch_common::process_identity::{ProcessObservation, observe_process};
+
+        let mut wrapper = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let birth = observe_process(wrapper.id());
+        let mut lease = admitted_lease();
+        lease.wrapper_pid = wrapper.id();
+        if let ProcessObservation::Present(birth) = &birth {
+            lease.process_birth = Some(birth.clone());
+        }
+        let status = lease.owner_identity().map(|_| preparation_status(&lease));
+        let live_allowed = status
+            .as_ref()
+            .is_some_and(|status| abandoned_preparation_can_be_cancelled(&lease, status));
+        wrapper.kill().unwrap();
+        wrapper.wait().unwrap();
+        assert!(!live_allowed, "recovery must not cancel a live wrapper");
+        assert!(matches!(birth, ProcessObservation::Present(_)));
+        let status = status.unwrap();
+        assert!(abandoned_preparation_can_be_cancelled(&lease, &status));
+        let mut planned_path = status.clone();
+        planned_path["active"]["remote_pgid_file"] = json!("/worker/.rch-run/42.pgid");
+        assert!(abandoned_preparation_can_be_cancelled(
+            &lease,
+            &planned_path
+        ));
+
+        for (pointer, value) in [
+            ("/status", json!("not_found")),
+            ("/active/id", json!(43)),
+            ("/active/worker_id", json!("other-worker")),
+            ("/active/local_wrapper_id", json!("other-wrapper")),
+            ("/active/hook_pid", json!(std::process::id())),
+            ("/active/hook_process_identity", Value::Null),
+            ("/active/location", json!("local")),
+            ("/active/heartbeat_phase", json!("execute")),
+            ("/active/worker_endpoint", Value::Null),
+            ("/active/worker_endpoint/config/id", json!("other-worker")),
+            ("/active/worker_endpoint/config/tags", json!(["os:windows"])),
+        ] {
+            let mut changed = status.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !abandoned_preparation_can_be_cancelled(&lease, &changed),
+                "accepted {pointer}"
+            );
+        }
+        for change in ["birth", "phase", "result", "terminal", "recovery", "schema"] {
+            let mut changed = lease.clone();
+            match change {
+                "birth" => changed.process_birth = None,
+                "phase" => changed.phase = "execute".into(),
+                "result" => changed.exit_code = Some(0),
+                "terminal" => changed.acknowledge_terminal(2),
+                "recovery" => changed.recovery = Some(json!({})),
+                "schema" => changed.schema_version += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                !abandoned_preparation_can_be_cancelled(&changed, &status),
+                "accepted {change}"
+            );
+        }
+        let mut unknown = lease;
+        unknown.wrapper_pid = std::process::id();
+        unknown.process_birth = None;
+        assert_eq!(owner_presence(&unknown), OwnerPresence::Unknown);
+        assert!(!abandoned_preparation_can_be_cancelled(&unknown, &status));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn recover_abandoned_preparation_uses_daemon_receipt_before_journal_settlement() {
+        use crate::ui::context::{ColorChoice, OutputConfig, OutputMode};
+        use crate::ui::writer::OutputWriter;
+        use rch_common::process_identity::{ProcessObservation, observe_process};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        const CHILD_DIRECTORY: &str = "RCH_TEST_PREPARATION_RECOVERY";
+        const CHILD_WRAPPER: &str = "RCH_TEST_PREPARATION_WRAPPER";
+        const CHILD_CASE: &str = "RCH_TEST_PREPARATION_CASE";
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let case = std::env::var(CHILD_CASE).unwrap();
+            let ctx = OutputContext::with_writers(
+                OutputConfig {
+                    force_mode: Some(OutputMode::Json),
+                    color: ColorChoice::Never,
+                    ..Default::default()
+                },
+                OutputWriter::new(
+                    std::fs::File::create_new(directory.join("report.json")).unwrap(),
+                    false,
+                ),
+                OutputWriter::stderr(),
+            );
+            let result = run_unix(
+                Some(JobsAction::Recover {
+                    wrapper_id: std::env::var(CHILD_WRAPPER).unwrap(),
+                    timeout_secs: if case == "timeout" { 1 } else { 5 },
+                    cargo_json: false,
+                    daemon_managed: None,
+                    daemon_local_only: false,
+                }),
+                &ctx,
+            )
+            .await;
+            if let Err(error) = result {
+                std::fs::write(
+                    directory.join("error.json"),
+                    serde_json::to_vec(&crate::top_level_api_error(&error)).unwrap(),
+                )
+                .unwrap();
+            }
+            return;
+        }
+
+        for case in ["cancelled", "completed", "failed", "foreign", "timeout"] {
+            let directory = tempfile::Builder::new()
+                .prefix("rch-recover-prep-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let state = directory.path().join("state");
+            let journals = state.join("job-leases");
+            let config = directory.path().join("config");
+            std::fs::create_dir_all(&journals).unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            let mut wrapper = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let birth = observe_process(wrapper.id());
+            let mut lease = admitted_lease();
+            lease.wrapper_pid = wrapper.id();
+            wrapper.kill().unwrap();
+            wrapper.wait().unwrap();
+            let ProcessObservation::Present(birth) = birth else {
+                panic!("native wrapper birth could not be observed");
+            };
+            lease.process_birth = Some(birth);
+            let lease_path = journals.join(format!("{}.json", lease.identity.local_wrapper_id));
+            let original = serde_json::to_vec_pretty(&lease).unwrap();
+            write_private_job_evidence(&lease_path, &original);
+
+            let socket = directory.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let active = preparation_status(&lease);
+            let terminal = completion(&lease, if case == "completed" { 101 } else { 130 });
+            let cancel_reply = match case {
+                "completed" => terminal.clone(),
+                "failed" => json!({
+                    "status": "failed", "build_id": 42, "worker_id": "worker-a",
+                    "message": "Cancellation unconfirmed; reservations retained", "slots_released": 0,
+                }),
+                "foreign" => json!({
+                    "status": "cancelled", "build_id": 42, "worker_id": "other-worker",
+                }),
+                _ => json!({
+                    "status": "cancelled", "build_id": 42, "worker_id": "worker-a",
+                    "slots_released": 1,
+                }),
+            };
+            let expected_query = format!(
+                "GET /builds/42?local_wrapper_id={}\n",
+                lease.identity.local_wrapper_id
+            );
+            let expected_cancel = format!(
+                "POST /builds/42/cancel?local_wrapper_id={}\n",
+                lease.identity.local_wrapper_id
+            );
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+            let observed_path = lease_path.clone();
+            let observed_bytes = original.clone();
+            let server = tokio::spawn(async move {
+                let mut queries = 0;
+                let mut cancellations = 0;
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        biased;
+                        _ = &mut stop_rx => break,
+                        connection = listener.accept() => connection.unwrap(),
+                    };
+                    let mut request = String::new();
+                    stream.read_to_string(&mut request).await.unwrap();
+                    assert_eq!(
+                        std::fs::read(&observed_path).unwrap(),
+                        observed_bytes,
+                        "the journal changed before a terminal receipt"
+                    );
+                    let response = if request == expected_query {
+                        queries += 1;
+                        if case == "cancelled" && queries >= 3 {
+                            &terminal
+                        } else {
+                            &active
+                        }
+                    } else {
+                        assert_eq!(request, expected_cancel, "unexpected daemon operation");
+                        cancellations += 1;
+                        assert_eq!(
+                            cancellations, 1,
+                            "an acknowledged cancellation was repeated"
+                        );
+                        &cancel_reply
+                    };
+                    stream
+                        .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                (queries, cancellations)
+            });
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "commands::jobs::tests::recover_abandoned_preparation_uses_daemon_receipt_before_journal_settlement", "--nocapture"])
+                .env_clear()
+                .env(CHILD_DIRECTORY, directory.path())
+                .env(CHILD_WRAPPER, &lease.identity.local_wrapper_id)
+                .env(CHILD_CASE, case)
+                .env("RCH_STATE_HOME", &state)
+                .env("RCH_CONFIG_DIR", &config)
+                .env("RCH_SOCKET_PATH", &socket)
+                .current_dir(directory.path())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(10), child.output())
+                .await
+                .expect("recovery fixture exceeded its operation budget")
+                .unwrap();
+            stop_tx.send(()).unwrap();
+            let (queries, cancellations) = server.await.unwrap();
+            assert!(output.status.success(), "{case}: {output:?}");
+            assert_eq!(cancellations, 1, "{case}");
+            assert!(queries >= 1);
+            assert!(!lease_path.with_extension("cancel").exists());
+            if matches!(case, "cancelled" | "completed") {
+                assert!(!directory.path().join("error.json").exists());
+                let report: Value = serde_json::from_slice(
+                    &std::fs::read(directory.path().join("report.json")).unwrap(),
+                )
+                .unwrap();
+                let code = if case == "completed" { 101 } else { 130 };
+                assert_eq!(report["status"], "completed");
+                assert_eq!(report["exit_code"], code);
+                assert_eq!(report["terminal_acknowledged"], true);
+                let settled: DurableJobLease =
+                    serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+                assert_eq!(settled.identity, lease.identity);
+                assert_eq!(settled.exit_code, Some(code));
+                assert!(settled.terminal_acknowledged);
+                assert_eq!(queries, if case == "completed" { 1 } else { 3 });
+            } else {
+                let error: Value = serde_json::from_slice(
+                    &std::fs::read(directory.path().join("error.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    error["code"],
+                    if case == "timeout" {
+                        "RCH-E303"
+                    } else {
+                        "RCH-E323"
+                    }
+                );
+                assert_eq!(std::fs::read(&lease_path).unwrap(), original);
+                assert!(
+                    std::fs::read(directory.path().join("report.json"))
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
     }
 
     #[test]
