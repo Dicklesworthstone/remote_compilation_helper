@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 const HELP: &str = "Run an explicitly configured canonical Cargo operation.
 
-Usage: rabs-cargo (--local PROFILE | --remote PROFILE) [OPTIONS] [--] [COMMAND ARGS...]
+Usage: rabs-cargo (--local PROFILE | --remote PROFILE) [OPTIONS] [--] [+TOOLCHAIN] [COMMAND ARGS...]
 
 Options:
   --local PROFILE        Local canonical driver, optionally using its service_socket
@@ -31,7 +31,11 @@ environment and physical roots remain explicit profile settings. With no
 command, retain the profile's command and selection. An explicit command
 replaces both, including an empty selection for ordinary Cargo defaults.
 
-Profiles require an explicit toolchain_root. Remote profiles may use output_root
+Profiles select toolchain_root or toolchain: rustup. A leading +TOOLCHAIN requires
+the Rustup profile and a Cargo command. Discovery honors the caller's directory
+and environment, never installs a toolchain, and retains only its physical root.
+CARGO_RABS_RUSTUP can select the discovery executable instead of PATH.
+Remote profiles may use output_root
 for a fresh output destination per invocation, or one absent output_destination.
 Run and executing bench through a service require explicit closed stdin or a
 captured stdin_file. Test defaults to EOF and can explicitly select input when
@@ -55,6 +59,9 @@ fn run(arguments: &[OsString]) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
+        if let Some(result) = cargo_profile::run_rustup_guard(arguments) {
+            return result.map_err(|error| error.to_string());
+        }
         match cargo_cli::parse(arguments).map_err(|error| error.to_string())? {
             cargo_cli::Invocation::Help => {
                 write!(io::stdout().lock(), "{HELP}").map_err(|_| "output unavailable".into())

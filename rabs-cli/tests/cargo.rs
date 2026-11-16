@@ -52,6 +52,16 @@ fn driver_fixture(path: &Path) {
     new_file(path, adapter.as_bytes(), 0o700);
 }
 
+fn rustup_fixture(path: &Path) {
+    // Keep libtest's status text off the discovery pipe. The Rust fixture
+    // writes its controlled protocol reply through the inherited descriptor.
+    let adapter = format!(
+        "#!/bin/sh\nexec 3>&1\nexec {} --exact native_rustup_discovery_fixture --ignored --nocapture -- \"$@\" >/dev/null\n",
+        quote(std::env::current_exe().unwrap().as_os_str())
+    );
+    new_file(path, adapter.as_bytes(), 0o700);
+}
+
 struct Fixture {
     root: PathBuf,
     source: PathBuf,
@@ -155,6 +165,7 @@ impl Fixture {
             .arg(if remote { "--remote" } else { "--local" })
             .arg(if remote { &self.remote } else { &self.local })
             .env_remove("CARGO_RABS_DAEMON")
+            .env_remove("CARGO_RABS_RUSTUP")
             .env_remove("RABS_REMOTE_ARTIFACT_REUSE_ROOT")
             .env("RABS_CARGO_TEST_REPORT", &self.report)
             .env(
@@ -180,6 +191,31 @@ impl Fixture {
         let mut command = self.command_using(remote, Path::new(BINARY));
         command.arg("--rabsd").arg(&self.daemon);
         command
+    }
+
+    fn rustup_command(&self, remote: bool) -> Command {
+        rewrite_json(if remote { &self.remote } else { &self.local }, |profile| {
+            profile.as_object_mut().unwrap().remove("toolchain_root");
+            profile["toolchain"] = "rustup".into();
+        });
+        let rustup = self.root.join("rustup fixture");
+        rustup_fixture(&rustup);
+        let mut command = self.command(remote);
+        command
+            .env("CARGO_RABS_RUSTUP", rustup)
+            .env(
+                "RABS_CARGO_TEST_RUSTUP_PATH",
+                self.toolchain.join("bin/rustc"),
+            )
+            .env(
+                "RABS_CARGO_TEST_RUSTUP_REPORT",
+                self.root.join("rustup-report.json"),
+            );
+        command
+    }
+
+    fn rustup_report(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.root.join("rustup-report.json")).unwrap()).unwrap()
     }
 
     fn report(&self) -> Value {
@@ -269,6 +305,8 @@ fn native_cargo_driver_fixture() {
         "argv":arguments, "profile":profile, "retained":retained, "stdin":input,
         "pid":std::process::id(), "active":std::env::var("CARGO_RABS_CANONICAL_ACTIVE").unwrap(),
         "unrelated":std::env::var("RABS_CARGO_TEST_UNRELATED").unwrap(),
+        "rustup_auto_install":std::env::var("RUSTUP_AUTO_INSTALL").ok(),
+        "rustup_toolchain":std::env::var("RUSTUP_TOOLCHAIN").ok(),
     });
     new_file(
         Path::new(&std::env::var_os("RABS_CARGO_TEST_REPORT").unwrap()),
@@ -281,6 +319,97 @@ fn native_cargo_driver_fixture() {
         panic!("driver signal termination must propagate");
     }
     std::process::exit(47);
+}
+
+#[test]
+#[ignore = "Rust Rustup protocol fixture, invoked only by discovery tests"]
+fn native_rustup_discovery_fixture() {
+    let mut arguments = std::env::args_os();
+    let arguments: Vec<_> = arguments
+        .by_ref()
+        .skip_while(|value| value != "--")
+        .skip(1)
+        .map(|value| value.into_string().unwrap())
+        .collect();
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    let report = json!({
+        "argv":arguments, "cwd":std::env::current_dir().unwrap(), "stdin":input,
+        "auto_install":std::env::var("RUSTUP_AUTO_INSTALL").ok(),
+        "selected":std::env::var("RUSTUP_TOOLCHAIN").ok(),
+        "home":std::env::var("RUSTUP_HOME").ok(), "pid":std::process::id(),
+    });
+    new_file(
+        Path::new(&std::env::var_os("RABS_CARGO_TEST_RUSTUP_REPORT").unwrap()),
+        &serde_json::to_vec(&report).unwrap(),
+        0o600,
+    );
+    let mode = std::env::var("RABS_CARGO_TEST_RUSTUP_MODE").unwrap_or_default();
+    if mode == "fail" {
+        eprintln!("private discovery error must not be copied to frontend output");
+        std::process::exit(19);
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .open("/proc/self/fd/3")
+        .unwrap();
+    if mode == "oversized" {
+        let _ = output.write_all(&vec![b'x'; 8192]);
+        std::process::exit(0);
+    }
+    if mode == "binary" {
+        output.write_all(b"/toolchain/bin/rustc\xff\n").unwrap();
+        std::process::exit(0);
+    }
+    let path = std::env::var("RABS_CARGO_TEST_RUSTUP_PATH").unwrap();
+    if mode != "empty" {
+        output.write_all(path.as_bytes()).unwrap();
+        if mode != "no-newline" {
+            output.write_all(b"\n").unwrap();
+        }
+    }
+    if mode == "multiple" {
+        output.write_all(b"/unrequested/bin/rustc\n").unwrap();
+    }
+    if mode == "hang" {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+    if mode == "pipe-held" {
+        let child_report = std::env::var_os("RABS_CARGO_TEST_RUSTUP_CHILD").unwrap();
+        let _child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_rustup_descendant_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !Path::new(&child_report).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "discovery descendant did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Exit while the child is still owned so this fixture deliberately
+        // leaves a descendant holding the probe output after its leader exits.
+        std::process::exit(0);
+    }
+    std::process::exit(0);
+}
+
+#[test]
+#[ignore = "in-group pipe holder for the Rustup cleanup regression"]
+fn native_rustup_descendant_fixture() {
+    new_file(
+        Path::new(&std::env::var_os("RABS_CARGO_TEST_RUSTUP_CHILD").unwrap()),
+        std::process::id().to_string().as_bytes(),
+        0o600,
+    );
+    std::thread::sleep(std::time::Duration::from_secs(30));
+    std::process::exit(0);
 }
 
 #[test]
@@ -298,6 +427,337 @@ fn help_version_and_release_identity_do_not_need_profiles_or_a_driver() {
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(value["tool"], "rabs-cargo");
         }
+    }
+}
+
+#[test]
+fn rustup_discovery_preserves_caller_context_and_retains_only_the_physical_sdk() {
+    for remote in [false, true] {
+        let fixture = Fixture::new();
+        let caller = fixture.root.join("original caller");
+        private_directory(&caller);
+        let mut command = fixture.rustup_command(remote);
+        command
+            .current_dir(&caller)
+            .env("RUSTUP_TOOLCHAIN", "caller-selected-nightly")
+            .env("RUSTUP_HOME", fixture.root.join("caller rustup home"))
+            .env("RUSTUP_AUTO_INSTALL", "1");
+        if remote {
+            command.env("RABS_CARGO_TEST_RUSTUP_MODE", "no-newline");
+        }
+        let report = fixture.handed_off(command.output().unwrap());
+        let discovery = fixture.rustup_report();
+        assert_eq!(discovery["argv"], json!(["which", "rustc"]));
+        assert_eq!(discovery["cwd"], json!(caller));
+        assert_eq!(discovery["auto_install"], "0");
+        assert_eq!(discovery["selected"], "caller-selected-nightly");
+        assert_eq!(
+            discovery["home"],
+            json!(fixture.root.join("caller rustup home"))
+        );
+        assert_eq!(discovery["stdin"], json!([]));
+        assert_eq!(
+            report["rustup_auto_install"], "1",
+            "discovery must not change driver environment"
+        );
+        assert_eq!(report["rustup_toolchain"], "caller-selected-nightly");
+        assert_eq!(
+            report["profile"]["toolchain_root"],
+            json!(fixture.toolchain)
+        );
+        assert!(report["profile"].get("toolchain").is_none());
+        assert_eq!(
+            fs::read_dir(if remote {
+                &fixture.staging
+            } else {
+                &fixture.operations
+            })
+            .unwrap()
+            .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn rustup_cli_override_precedes_environment_and_runtime_tails_remain_literal() {
+    let fixture = Fixture::new();
+    let mut command = fixture.rustup_command(false);
+    command
+        .env("RUSTUP_TOOLCHAIN", "environment-choice")
+        .args([
+            "--",
+            "+nightly-2026-08-31",
+            "run",
+            "--",
+            "+literal",
+            "--toolchain",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let input = b"\0workload payload\xff";
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let report = fixture.handed_off(child.wait_with_output().unwrap());
+    let discovery = fixture.rustup_report();
+    assert_eq!(
+        discovery["argv"],
+        json!(["which", "--toolchain", "nightly-2026-08-31", "rustc"])
+    );
+    assert_eq!(discovery["selected"], "environment-choice");
+    assert_eq!(
+        discovery["stdin"],
+        json!([]),
+        "discovery cannot consume program input"
+    );
+    assert_eq!(report["stdin"], json!(input));
+    assert_eq!(
+        report["profile"]["selection"]["run_args"],
+        json!(["+literal", "--toolchain"])
+    );
+}
+
+#[test]
+fn rustup_lookup_supports_relative_override_and_ordered_relative_or_empty_path_entries() {
+    for variant in ["relative-override", "relative-path", "empty-path"] {
+        let fixture = Fixture::new();
+        let mut command = fixture.rustup_command(false);
+        command.current_dir(&fixture.root);
+        if variant == "relative-override" {
+            command.env("CARGO_RABS_RUSTUP", "rustup fixture");
+        } else {
+            let denied = fixture.root.join("denied");
+            private_directory(&denied);
+            new_file(&denied.join("rustup"), b"not executable", 0o600);
+            let selected = if variant == "relative-path" {
+                let relative = fixture.root.join("relative");
+                private_directory(&relative);
+                relative
+            } else {
+                fixture.root.clone()
+            };
+            rustup_fixture(&selected.join("rustup"));
+            command.env_remove("CARGO_RABS_RUSTUP").env(
+                "PATH",
+                if variant == "relative-path" {
+                    "missing:denied:relative"
+                } else {
+                    "missing:denied:"
+                },
+            );
+        }
+        let report = fixture.handed_off(command.arg("check").output().unwrap());
+        assert_eq!(
+            report["profile"]["toolchain_root"],
+            json!(fixture.toolchain)
+        );
+        assert_eq!(fixture.rustup_report()["cwd"], json!(fixture.root));
+    }
+}
+
+#[test]
+fn ambiguous_toolchain_intent_and_invalid_profiles_do_not_launch_discovery() {
+    for case in 0..9 {
+        let fixture = Fixture::new();
+        let mut command = fixture.rustup_command(case >= 6);
+        let profile = if case >= 6 {
+            &fixture.remote
+        } else {
+            &fixture.local
+        };
+        match case {
+            0 => rewrite_json(profile, |value| {
+                value["toolchain_root"] = json!(fixture.toolchain)
+            }),
+            1 => rewrite_json(profile, |value| {
+                value.as_object_mut().unwrap().remove("toolchain");
+            }),
+            2 => rewrite_json(profile, |value| value["toolchain"] = "nightly".into()),
+            3 => {
+                rewrite_json(profile, |value| {
+                    value.as_object_mut().unwrap().remove("toolchain");
+                    value["toolchain_root"] = json!(fixture.toolchain);
+                });
+                command.args(["+nightly", "build"]);
+            }
+            4 => rewrite_json(profile, |value| {
+                value["unknown_execution_control"] = true.into()
+            }),
+            5 => {
+                fs::set_permissions(&fixture.operations, fs::Permissions::from_mode(0o755)).unwrap()
+            }
+            6 => rewrite_json(profile, |value| {
+                value["tls"]["private_key"] = json!(fixture.root.join("missing-key"))
+            }),
+            7 => rewrite_json(profile, |value| {
+                value["output_destination"] = json!(fixture.outputs.join("ambiguous"))
+            }),
+            8 => rewrite_json(profile, |value| value["coordinator_pin"] = "invalid".into()),
+            _ => unreachable!(),
+        }
+        fixture.refused(command.output().unwrap());
+        assert!(
+            !fixture.root.join("rustup-report.json").exists(),
+            "case {case} launched discovery before validation"
+        );
+    }
+}
+
+#[test]
+fn invalid_rustup_executables_and_replies_refuse_before_backend_execution() {
+    for mode in ["fail", "oversized", "binary", "multiple", "empty"] {
+        let fixture = Fixture::new();
+        let stderr = fixture.refused(
+            fixture
+                .rustup_command(false)
+                .env("RABS_CARGO_TEST_RUSTUP_MODE", mode)
+                .output()
+                .unwrap(),
+        );
+        assert!(!stderr.contains("private discovery error"));
+    }
+    for selected in ["", "/missing/rustup", BINARY] {
+        let fixture = Fixture::new();
+        fixture.refused(
+            fixture
+                .rustup_command(false)
+                .env("CARGO_RABS_RUSTUP", selected)
+                .output()
+                .unwrap(),
+        );
+        assert!(!fixture.root.join("rustup-report.json").exists());
+    }
+    for path in [
+        "relative/bin/rustc",
+        "/toolchain/../elsewhere/bin/rustc",
+        "/toolchain/bin/cargo",
+    ] {
+        let fixture = Fixture::new();
+        fixture.refused(
+            fixture
+                .rustup_command(false)
+                .env("RABS_CARGO_TEST_RUSTUP_PATH", path)
+                .output()
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
+fn discovered_toolchains_keep_the_ordinary_directory_and_executable_contract() {
+    for case in 0..4 {
+        let fixture = Fixture::new();
+        let mut command = fixture.rustup_command(false);
+        match case {
+            0 => {
+                let alias = fixture.root.join("linked toolchain");
+                symlink(&fixture.toolchain, &alias).unwrap();
+                command.env("RABS_CARGO_TEST_RUSTUP_PATH", alias.join("bin/rustc"));
+            }
+            1 => fs::set_permissions(
+                fixture.toolchain.join("bin/rustc"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap(),
+            2 => fs::set_permissions(
+                fixture.toolchain.join("bin/cargo"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap(),
+            3 => {
+                let sdk = fixture.root.join("symlinked compiler sdk");
+                private_directory(&sdk);
+                private_directory(&sdk.join("bin"));
+                new_file(&sdk.join("bin/cargo"), b"unused compiler fixture", 0o700);
+                symlink(fixture.toolchain.join("bin/rustc"), sdk.join("bin/rustc")).unwrap();
+                command.env("RABS_CARGO_TEST_RUSTUP_PATH", sdk.join("bin/rustc"));
+            }
+            _ => unreachable!(),
+        }
+        fixture.refused(command.output().unwrap());
+    }
+}
+
+fn assert_process_stopped(pid: u32) {
+    let path = format!("/proc/{pid}/status");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match fs::read_to_string(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(status)
+                if status.lines().any(|line| {
+                    line.starts_with("State:")
+                        && line
+                            .split_whitespace()
+                            .nth(1)
+                            .is_some_and(|state| matches!(state, "Z" | "X"))
+                }) =>
+            {
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => panic!("cannot inspect discovery process {pid}: {error}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "discovery process {pid} remained alive"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn stalled_rustup_and_descendant_output_writers_share_the_five_second_deadline() {
+    for mode in ["hang", "pipe-held"] {
+        let fixture = Fixture::new();
+        let descendant = fixture.root.join("rustup-child.pid");
+        let started = std::time::Instant::now();
+        let stderr = fixture.refused(
+            fixture
+                .rustup_command(false)
+                .env("RABS_CARGO_TEST_RUSTUP_MODE", mode)
+                .env("RABS_CARGO_TEST_RUSTUP_CHILD", &descendant)
+                .output()
+                .unwrap(),
+        );
+        assert!(stderr.contains("timed out"), "{stderr}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_process_stopped(fixture.rustup_report()["pid"].as_u64().unwrap() as u32);
+        if mode == "pipe-held" {
+            assert_process_stopped(fs::read_to_string(descendant).unwrap().parse().unwrap());
+        }
+    }
+}
+
+#[test]
+fn terminating_the_frontend_drains_its_independently_owned_rustup_process() {
+    use rustix::process::{Pid, Signal, kill_process};
+    for signal in [Signal::INT, Signal::TERM, Signal::KILL] {
+        let fixture = Fixture::new();
+        let child = fixture
+            .rustup_command(false)
+            .env("RABS_CARGO_TEST_RUSTUP_MODE", "hang")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let discovery = loop {
+            if let Ok(bytes) = fs::read(fixture.root.join("rustup-report.json"))
+                && let Ok(report) = serde_json::from_slice::<Value>(&bytes)
+            {
+                break report;
+            }
+            assert!(std::time::Instant::now() < deadline, "Rustup did not start");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        kill_process(Pid::from_child(&child), signal).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.signal().is_some(), "{output:?}");
+        assert_process_stopped(discovery["pid"].as_u64().unwrap() as u32);
+        assert!(!fixture.report.exists());
+        assert_eq!(fs::read_dir(&fixture.operations).unwrap().count(), 0);
     }
 }
 
@@ -601,7 +1061,13 @@ fn test_input_preserves_closed_defaults_and_distinguishes_cargo_no_run_from_a_ha
         let report = fixture.handed_off(
             fixture
                 .command(remote)
-                .args(["--stdin-file", "inputs/request.bin", "test", "--", "--no-run"])
+                .args([
+                    "--stdin-file",
+                    "inputs/request.bin",
+                    "test",
+                    "--",
+                    "--no-run",
+                ])
                 .output()
                 .unwrap(),
         );

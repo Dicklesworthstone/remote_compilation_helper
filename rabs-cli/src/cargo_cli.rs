@@ -22,6 +22,7 @@ pub(crate) struct Options {
     pub profile: OsString,
     pub daemon: Option<OsString>,
     pub input: Option<Input>,
+    pub toolchain: Option<String>,
     pub selected: Option<(CompilationCommand, CompilationSelection)>,
 }
 
@@ -32,6 +33,15 @@ pub(crate) enum Invocation {
 
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, reason)
+}
+
+pub(crate) fn valid_toolchain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 1024
+        && !name.starts_with(['+', '-'])
+        && !name
+            .chars()
+            .any(|value| value.is_whitespace() || value.is_control())
 }
 
 pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
@@ -117,6 +127,24 @@ pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
     }
     let mode = mode.ok_or_else(|| invalid("select --local PROFILE or --remote PROFILE"))?;
     let profile = profile.ok_or_else(|| invalid("profile path is missing"))?;
+    let toolchain = if arguments
+        .get(at)
+        .is_some_and(|argument| argument.as_encoded_bytes().starts_with(b"+"))
+    {
+        let selector = arguments[at]
+            .to_str()
+            .ok_or_else(|| invalid("Rustup toolchain selector must be UTF-8"))?;
+        let name = &selector[1..];
+        if !valid_toolchain_name(name) || at + 1 == arguments.len() {
+            return Err(invalid(
+                "+toolchain requires one bounded literal selector before a Cargo command",
+            ));
+        }
+        at += 1;
+        Some(name.to_owned())
+    } else {
+        None
+    };
     let selected = if at == arguments.len() {
         None
     } else {
@@ -127,6 +155,7 @@ pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
         profile,
         daemon,
         input,
+        toolchain,
         selected,
     })))
 }
@@ -309,6 +338,56 @@ mod tests {
         };
         assert!(options.selected.is_none());
         assert!(options.input.is_none());
+        assert!(options.toolchain.is_none());
+    }
+
+    #[test]
+    fn leading_toolchain_selection_does_not_interpret_program_arguments() {
+        for separator in [false, true] {
+            let mut arguments = vec!["--local", "p.json"];
+            if separator {
+                arguments.push("--");
+            }
+            arguments.extend([
+                "+nightly-2026-08-31",
+                "run",
+                "--",
+                "+literal",
+                "--toolchain",
+            ]);
+            let Invocation::Run(options) = parse_strings(&arguments).unwrap() else {
+                panic!("expected invocation")
+            };
+            assert_eq!(options.toolchain.as_deref(), Some("nightly-2026-08-31"));
+            let (command, selection) = options.selected.unwrap();
+            assert_eq!(command, CompilationCommand::Run);
+            assert_eq!(selection.run_args, ["+literal", "--toolchain"]);
+        }
+        for selector in [
+            "+",
+            "++nightly",
+            "+-nightly",
+            "+night ly",
+            "+nightly\n",
+            "+nightly\u{85}",
+        ] {
+            assert!(parse_strings(&["--local", "p", selector, "build"]).is_err());
+        }
+        assert!(parse_strings(&["--local", "p", "+nightly"]).is_err());
+        assert!(parse_strings(&["--local", "p", "+one", "+two", "build"]).is_err());
+        assert!(
+            parse_strings(&["--local", "p", &format!("+{}", "a".repeat(1025)), "build"]).is_err()
+        );
+        use std::os::unix::ffi::OsStringExt;
+        assert!(
+            parse(&[
+                "--local".into(),
+                "p".into(),
+                OsString::from_vec(b"+nightly\xff".to_vec()),
+                "build".into(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

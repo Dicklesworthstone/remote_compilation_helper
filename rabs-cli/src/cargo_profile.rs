@@ -7,16 +7,22 @@ use rustix::fs::{Mode as FileMode, OFlags};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 const MAX_PROFILE: u64 = 64 * 1024;
+const RUSTUP_DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
+const RUSTUP_REAP_BUDGET: Duration = Duration::from_millis(250);
+const MAX_RUSTUP_PATH_BYTES: usize = 4097;
+const RUSTUP_GUARD: &str = "--rabs-internal-rustup-discovery-v1";
+const MAX_RUSTUP_REPLY_BYTES: usize = 16 * 1024;
 const LOGICAL_FIELDS: &[&str] = &[
     "command",
     "selection",
@@ -281,8 +287,10 @@ fn logical(
         require(requested.is_none(), "choose stdin or stdin_file, not both")?;
         require(
             command == CompilationCommand::Run
-                || (matches!(command, CompilationCommand::Test | CompilationCommand::Bench)
-                    && !selection.no_run),
+                || (matches!(
+                    command,
+                    CompilationCommand::Test | CompilationCommand::Bench
+                ) && !selection.no_run),
             "captured stdin_file requires run, test or bench execution",
         )?;
         require(
@@ -391,19 +399,461 @@ fn executable(path: &Path) -> io::Result<()> {
     let file = open_regular(path)?;
     require(
         file.metadata()?.mode() & 0o111 != 0
-            && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok(),
+            && rustix::fs::accessat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::Access::EXEC_OK,
+                rustix::fs::AtFlags::EACCESS,
+            )
+            .is_ok(),
         "selected native tools must be executable ordinary files",
     )
 }
 
-fn validate(
+fn rustup_executable(current: &Path) -> io::Result<PathBuf> {
+    // Keep PATH order, relative/empty entries and the selected alias spelling.
+    // Rustup's invocation location and environment choose the toolchain; the
+    // profile directory and the later native daemon must never do that lookup.
+    let available = |path: &Path| -> io::Result<bool> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() {
+            return Ok(false);
+        }
+        match rustix::fs::accessat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        ) {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                let error = io::Error::from(error);
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::PermissionDenied
+                ) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    };
+    let selected = if let Some(path) = std::env::var_os("CARGO_RABS_RUSTUP") {
+        require(!path.is_empty(), "CARGO_RABS_RUSTUP must not be empty")?;
+        let path = std::path::absolute(path)?;
+        require(available(&path)?, "CARGO_RABS_RUSTUP is not executable")?;
+        path
+    } else {
+        let search = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+        let mut selected = None;
+        for directory in std::env::split_paths(&search) {
+            let candidate = std::path::absolute(directory.join("rustup"))?;
+            if available(&candidate)? {
+                selected = Some(candidate);
+                break;
+            }
+        }
+        selected.ok_or_else(|| {
+            invalid("Rustup is not installed; select CARGO_RABS_RUSTUP or toolchain_root")
+        })?
+    };
+    let selected_metadata = fs::metadata(&selected)?;
+    let own = fs::metadata(current)?;
+    require(
+        (selected_metadata.dev(), selected_metadata.ino()) != (own.dev(), own.ino()),
+        "CARGO_RABS_RUSTUP resolves to this frontend",
+    )?;
+    Ok(selected)
+}
+
+struct RustupChild {
+    child: Child,
+    owned: bool,
+}
+
+impl RustupChild {
+    fn waitable(&mut self) -> io::Result<bool> {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        match waitid(
+            WaitId::Pid(Pid::from_child(&self.child)),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(status) => Ok(status.is_some()),
+            Err(rustix::io::Errno::INTR) => Ok(false),
+            Err(error) => {
+                if error == rustix::io::Errno::CHILD {
+                    // Without a retained child status this numeric PGID is no
+                    // longer ours to signal. Never retry cleanup through it.
+                    self.owned = false;
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    fn finish(&mut self) -> io::Result<ExitStatus> {
+        use rustix::process::{Pid, Signal, kill_process_group};
+        require(self.owned, "Rustup discovery lost child ownership")?;
+        let result = (|| {
+            self.waitable()?;
+            // NOWAIT keeps the leader's PID reserved even after it exits.
+            // Kill remaining in-group writers before reaping that identity.
+            let signal = kill_process_group(Pid::from_child(&self.child), Signal::KILL);
+            if signal.is_err_and(|error| error != rustix::io::Errno::SRCH) {
+                let _ = self.child.kill();
+            }
+            let until = Instant::now() + RUSTUP_REAP_BUDGET;
+            loop {
+                if self.waitable()? {
+                    let status = self.child.wait()?;
+                    return match signal {
+                        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(status),
+                        Err(error) => Err(error.into()),
+                    };
+                }
+                if Instant::now() >= until {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Rustup discovery cleanup could not be confirmed",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })();
+        // No numeric signaling after a reap, or after a failed bounded cleanup.
+        // A cleanup failure is an explicit refusal, never a discovered SDK.
+        self.owned = false;
+        result
+    }
+}
+
+impl Drop for RustupChild {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = self.finish();
+        }
+    }
+}
+
+fn require_child_ownership() -> io::Result<()> {
+    // An inherited ignored SIGCHLD auto-reaps the leader and removes the PID
+    // reuse fence. No discovery process may be started under that policy.
+    let mut status = String::new();
+    File::open("/proc/self/status")?
+        .take(64 * 1024)
+        .read_to_string(&mut status)?;
+    let ignored = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .ok_or_else(|| invalid("Rustup discovery cannot establish child ownership"))?;
+    require(
+        ignored & (1_u64 << (rustix::process::Signal::CHILD.as_raw() - 1)) == 0,
+        "ignored SIGCHLD prevents Rustup discovery ownership",
+    )
+}
+
+fn capture_rustup_toolchain(
+    executable: &Path,
+    selector: Option<&str>,
+    cancelled: &mut impl FnMut() -> bool,
+) -> io::Result<PathBuf> {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl};
+    require_child_ownership()?;
+    require(!cancelled(), "Rustup discovery caller disappeared")?;
+    let mut command = Command::new(executable);
+    command.arg("which");
+    if let Some(selector) = selector {
+        command.args(["--toolchain", selector]);
+    }
+    command
+        .arg("rustc")
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let started = Instant::now();
+    let mut owner = RustupChild {
+        child: command.spawn()?,
+        owned: true,
+    };
+    let mut stdout = owner
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("Rustup discovery stdout is unavailable"))?;
+    fcntl_setfl(&stdout, fcntl_getfl(&stdout)? | OFlags::NONBLOCK)?;
+    let mut bytes = Vec::new();
+    let mut eof = false;
+    let outcome = (|| -> io::Result<()> {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            if cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Rustup discovery caller disappeared",
+                ));
+            }
+            if started.elapsed() >= RUSTUP_DISCOVERY_BUDGET {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Rustup toolchain discovery timed out",
+                ));
+            }
+            if !eof {
+                let count = buffer.len().min(MAX_RUSTUP_PATH_BYTES + 1 - bytes.len());
+                match stdout.read(&mut buffer[..count]) {
+                    Ok(0) => eof = true,
+                    Ok(count) => {
+                        bytes.extend_from_slice(&buffer[..count]);
+                        require(
+                            bytes.len() <= MAX_RUSTUP_PATH_BYTES,
+                            "Rustup toolchain path exceeds its output bound",
+                        )?;
+                        // Drain a bounded ready prefix without polling delay.
+                        continue;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if owner.waitable()? && eof {
+                return Ok(());
+            }
+            std::thread::sleep(
+                Duration::from_millis(2)
+                    .min(RUSTUP_DISCOVERY_BUDGET.saturating_sub(started.elapsed())),
+            );
+        }
+    })();
+    drop(stdout);
+    let status = owner.finish()?;
+    outcome?;
+    require(
+        status.success(),
+        "Rustup could not resolve an installed rustc; select an installed toolchain or toolchain_root",
+    )?;
+    let path =
+        std::str::from_utf8(&bytes).map_err(|_| invalid("Rustup toolchain path must be UTF-8"))?;
+    let path = path.strip_suffix('\n').unwrap_or(path);
+    require(
+        !path.chars().any(char::is_control),
+        "Rustup must return exactly one toolchain path",
+    )?;
+    let compiler = plain_absolute(path)?;
+    let bin = compiler
+        .parent()
+        .ok_or_else(|| invalid("Rustup compiler has no parent"))?;
+    require(
+        compiler.file_name() == Some(OsStr::new("rustc"))
+            && bin.file_name() == Some(OsStr::new("bin")),
+        "Rustup must select a physical toolchain bin/rustc",
+    )?;
+    Ok(bin
+        .parent()
+        .ok_or_else(|| invalid("Rustup toolchain root is unavailable"))?
+        .to_owned())
+}
+
+/// A tiny independent owner keeps Rustup's process group bounded if the caller
+/// receives SIGINT, SIGTERM or SIGKILL. Its direct-parent relation cannot be
+/// recreated by PID reuse. Closing the private control pipe also cancels a
+/// failed discovery while its frontend is still alive. No signal thread or
+/// async runtime enters this command's dependency cone.
+pub(crate) fn run_rustup_guard(arguments: &[OsString]) -> Option<io::Result<()>> {
+    if arguments
+        .first()
+        .is_none_or(|argument| argument != RUSTUP_GUARD)
+    {
+        return None;
+    }
+    Some((|| {
+        use rustix::fs::{fcntl_getfl, fcntl_setfl};
+        require(
+            matches!(arguments.len(), 3 | 4),
+            "invalid Rustup discovery guard request",
+        )?;
+        let parent = arguments[1]
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+            .ok_or_else(|| invalid("invalid Rustup discovery parent"))?;
+        let executable = Path::new(&arguments[2]);
+        require(
+            executable.is_absolute(),
+            "Rustup discovery executable must be absolute",
+        )?;
+        let selector = arguments
+            .get(3)
+            .map(|value| {
+                value
+                    .to_str()
+                    .filter(|name| crate::cargo_cli::valid_toolchain_name(name))
+                    .ok_or_else(|| invalid("invalid Rustup discovery selector"))
+            })
+            .transpose()?;
+        let mut input = io::stdin();
+        fcntl_setfl(&input, fcntl_getfl(&input)? | OFlags::NONBLOCK)?;
+        let mut cancelled = || {
+            if rustix::process::getppid().is_none_or(|pid| pid.as_raw_pid() as u32 != parent) {
+                return true;
+            }
+            match input.read(&mut [0_u8; 1]) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    false
+                }
+                // No data is ever sent; EOF or any unexpected byte revokes the
+                // private control capability, without consuming workload input.
+                _ => true,
+            }
+        };
+        let result = capture_rustup_toolchain(executable, selector, &mut cancelled)
+            .map_err(|error| error.to_string());
+        serde_json::to_writer(io::stdout().lock(), &result).map_err(io::Error::other)
+    })())
+}
+
+struct RustupGuard {
+    child: Child,
+    control: Option<ChildStdin>,
+    finished: bool,
+}
+
+impl RustupGuard {
+    fn finish(&mut self) -> io::Result<ExitStatus> {
+        self.control.take();
+        // The guard observes revocation and drains its own retained group.
+        // Never kill that owner before it can perform the child's cleanup.
+        let until = Instant::now() + RUSTUP_REAP_BUDGET + Duration::from_millis(100);
+        self.finished = true;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Rustup discovery guard cleanup could not be confirmed",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+impl Drop for RustupGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.finish();
+        }
+    }
+}
+
+fn discover_rustup_toolchain(selector: Option<&str>, current: &Path) -> io::Result<PathBuf> {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl};
+    let executable = rustup_executable(current)?;
+    require_child_ownership()?;
+    let mut command = Command::new(current);
+    command
+        .arg(RUSTUP_GUARD)
+        .arg(std::process::id().to_string())
+        .arg(executable);
+    if let Some(selector) = selector {
+        command.arg(selector);
+    }
+    command
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let started = Instant::now();
+    let mut child = command.spawn()?;
+    let control = child.stdin.take();
+    let mut guard = RustupGuard {
+        child,
+        control,
+        finished: false,
+    };
+    let mut stdout = guard
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("Rustup guard stdout is unavailable"))?;
+    fcntl_setfl(&stdout, fcntl_getfl(&stdout)? | OFlags::NONBLOCK)?;
+    let budget = RUSTUP_DISCOVERY_BUDGET + RUSTUP_REAP_BUDGET + Duration::from_millis(250);
+    let mut bytes = Vec::new();
+    let result = (|| {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            if started.elapsed() >= budget {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Rustup discovery guard exceeded its deadline",
+                ));
+            }
+            let count = buffer.len().min(MAX_RUSTUP_REPLY_BYTES + 1 - bytes.len());
+            match stdout.read(&mut buffer[..count]) {
+                Ok(0) => return Ok(()),
+                Ok(count) => {
+                    bytes.extend_from_slice(&buffer[..count]);
+                    require(
+                        bytes.len() <= MAX_RUSTUP_REPLY_BYTES,
+                        "Rustup guard reply exceeds its bound",
+                    )?;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(
+                        Duration::from_millis(2).min(budget.saturating_sub(started.elapsed())),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })();
+    drop(stdout);
+    let status = guard.finish()?;
+    result?;
+    require(status.success(), "Rustup discovery guard failed")?;
+    let result: Result<PathBuf, String> = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("Rustup discovery guard returned an invalid reply"))?;
+    result.map_err(io::Error::other)
+}
+
+fn validate_profile(
     profile: &mut Map<String, Value>,
     options: &Options,
 ) -> io::Result<(PathBuf, Option<PathBuf>, CompilationCommand)> {
-    require(
-        !profile.contains_key("toolchain"),
-        "native frontend requires explicit toolchain_root; resolve toolchain selectors before launch",
-    )?;
     let (version, physical) = match options.mode {
         Mode::Local => (
             "canonical-compile-local-v1",
@@ -411,6 +861,7 @@ fn validate(
                 "version",
                 "source_root",
                 "toolchain_root",
+                "toolchain",
                 "state_root",
                 "operation_root",
                 "wrapper",
@@ -429,6 +880,7 @@ fn validate(
                 "tls",
                 "source_root",
                 "toolchain_root",
+                "toolchain",
                 "staging_root",
                 "output_root",
                 "output_destination",
@@ -472,10 +924,16 @@ fn validate(
         logical(settings, options, true)?
     };
     let source = plain_absolute(string(profile, "source_root")?)?;
-    let toolchain = plain_absolute(string(profile, "toolchain_root")?)?;
     open_directory(&source)?;
-    open_directory(&toolchain)?;
-    let mut roots = vec![source.clone(), toolchain.clone()];
+    let toolchain = profile
+        .get("toolchain_root")
+        .map(|_| plain_absolute(string(profile, "toolchain_root")?))
+        .transpose()?;
+    if let Some(toolchain) = &toolchain {
+        open_directory(toolchain)?;
+    }
+    let mut roots = vec![source.clone()];
+    roots.extend(toolchain.iter().cloned());
     if let Some(home) = profile
         .get("cargo_home_source")
         .filter(|value| !value.is_null())
@@ -505,8 +963,10 @@ fn validate(
     if matches!(command, CompilationCommand::Test | CompilationCommand::Doc) {
         tools.push("rustdoc");
     }
-    for name in tools {
-        executable(&toolchain.join("bin").join(name))?;
+    if let Some(toolchain) = &toolchain {
+        for name in tools {
+            executable(&toolchain.join("bin").join(name))?;
+        }
     }
     let (operation_root, output_root) = match options.mode {
         Mode::Local => {
@@ -520,8 +980,7 @@ fn validate(
             require(
                 !roots
                     .iter()
-                    .enumerate()
-                    .any(|(index, root)| index != 1 && wrapper.starts_with(root)),
+                    .any(|root| toolchain.as_ref() != Some(root) && wrapper.starts_with(root)),
                 "wrapper must be outside captured source and mutable operation roots",
             )?;
             if let Some(socket) = profile
@@ -535,7 +994,9 @@ fn validate(
                 )?;
                 require(
                     !socket.starts_with(&source)
-                        && !socket.starts_with(&toolchain)
+                        && toolchain
+                            .as_ref()
+                            .is_none_or(|root| !socket.starts_with(root))
                         && !socket.starts_with(&operation)
                         && profile
                             .get("cargo_home_source")
@@ -698,6 +1159,35 @@ fn validate(
     Ok((operation_root, output_root, command))
 }
 
+fn validate(
+    profile: &mut Map<String, Value>,
+    options: &Options,
+    current: &Path,
+) -> io::Result<(PathBuf, Option<PathBuf>, CompilationCommand)> {
+    require(
+        profile.contains_key("toolchain") != profile.contains_key("toolchain_root"),
+        "profile requires exactly one of toolchain_root or toolchain",
+    )?;
+    if let Some(selection) = profile.get("toolchain") {
+        require(
+            selection == "rustup",
+            "toolchain must be rustup or use an explicit toolchain_root",
+        )?;
+        // All known source, output, credential and command intent is checked
+        // before launching discovery. Only SDK-specific checks need its answer.
+        validate_profile(profile, options)?;
+        let root = discover_rustup_toolchain(options.toolchain.as_deref(), current)?;
+        profile.remove("toolchain");
+        profile.insert("toolchain_root".into(), serde_json::to_value(root)?);
+    } else {
+        require(
+            options.toolchain.is_none(),
+            "+toolchain requires a toolchain: rustup profile",
+        )?;
+    }
+    validate_profile(profile, options)
+}
+
 fn driver(options: &Options, current: &Path) -> io::Result<PathBuf> {
     let selected = options
         .daemon
@@ -766,7 +1256,7 @@ pub(crate) fn run(options: &Options, current: &Path) -> io::Result<()> {
     }
     let daemon = driver(options, current)?;
     let mut profile = read_profile(Path::new(&options.profile))?;
-    let (root, outputs, command) = validate(&mut profile, options)?;
+    let (root, outputs, command) = validate(&mut profile, options, current)?;
     let parent = private_directory(&root)?;
     let operation = tempfile::Builder::new()
         .prefix(&format!("cargo-{}-", command.as_str()))

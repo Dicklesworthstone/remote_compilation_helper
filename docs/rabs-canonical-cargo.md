@@ -91,10 +91,26 @@ and executing `bench`; `test` defaults to EOF and also accepts captured input.
 `--stdin inherit` is available for direct local `run`, executing `test`, and
 executing `bench`, subject to the driver's noninteractive-input rules.
 
-The profile must provide an explicit physical `toolchain_root`. Rustup discovery
-and leading `+toolchain` selectors belong to the existing `cargo rabs` launcher
-and are not accepted by `rabs-cargo`. The existing backend still performs source,
-toolchain, environment, namespace, authentication, and output validation.
+The profile selects exactly one of an explicit physical `toolchain_root` or
+`"toolchain": "rustup"`. The Rustup option resolves the installed compiler in the
+caller's original working directory and environment, honoring `RUSTUP_TOOLCHAIN`
+and Rustup's directory overrides and toolchain files. A leading `+toolchain`
+before the Cargo command overrides that selection:
+
+```sh
+rabs-cargo --remote REMOTE.json -- +nightly-2026-08-31 build --workspace
+```
+
+The selector requires a `"toolchain": "rustup"` profile and a following Cargo
+command; arguments such as `run -- +nightly` remain literal program arguments.
+`CARGO_RABS_RUSTUP` may select the discovery executable, otherwise the caller's
+`PATH` selects it. Discovery disables automatic installation, has a five-second
+deadline and a bounded path response, and reaps its supervised child. Returned
+toolchain ancestors must be ordinary directories, with ordinary executable
+`bin/cargo` and `bin/rustc` files. Only the resolved `toolchain_root` reaches the
+retained native profile; the backend does not rediscover Rustup. The existing
+backend still performs source, toolchain, environment, namespace, authentication,
+and output validation.
 
 The command resolves `rabsd` beside its own physical executable, or uses an
 explicit `--rabsd PATH` or `CARGO_RABS_DAEMON` setting. It retains a private
