@@ -1,7 +1,7 @@
 use super::*;
 use crate::blob_store::{BlobStoreLayout, DurabilityPolicy, PutLimits, put_if_absent};
 use crate::digest_set::{DigestRequest, digest_set};
-use crate::metadata_store::{QuarantineScope, RusqliteEngine, SqlMetadataStore};
+use crate::metadata_store::{QuarantineScope, RusqliteEngine, SqlEngine, SqlMetadataStore};
 use rabs_protocol::raw_bytes::RawBytes;
 use std::io::{Seek, Write};
 use std::sync::{Arc, Mutex, mpsc};
@@ -53,6 +53,16 @@ impl Fixture {
         };
         self.outputs.push(output.clone());
         output
+    }
+
+    fn replica(&mut self, output: &PlannedActionOutput, name: &str, bytes: &[u8]) -> String {
+        let path = self.root.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let path = path.to_str().unwrap().to_owned();
+        self.store
+            .add_location(&output.object, &path, Some(2), RAW_PROFILE_V1, true)
+            .unwrap();
+        path
     }
 
     fn select(&mut self) -> SelectedActionOutputs {
@@ -172,6 +182,378 @@ fn a_later_corrupt_object_never_exposes_the_earlier_metadata_head() {
         std::fs::read(&tail.destination).unwrap(),
         b"previous output"
     );
+    assert_eq!(fixture.stages(), 0);
+}
+
+#[test]
+fn corrupt_replicas_fail_over_and_their_quarantines_survive_reopen() {
+    for mode in [
+        MaterializationMode::PrivateCopy,
+        MaterializationMode::VerifiedCowReflink,
+    ] {
+        let mut fixture = Fixture::new();
+        let metadata_path = fixture.root.path().join("meta.sqlite");
+        fixture.store =
+            SqlMetadataStore::open(RusqliteEngine::open(&metadata_path).unwrap()).unwrap();
+        let bytes = b"verified replica bytes";
+        let output = fixture.add("a.rlib", OutputRole::Materializable, bytes);
+        fixture.old(&output);
+        let primary = fixture.store.object_locations(&output.object).unwrap()[0]
+            .0
+            .clone();
+        std::fs::write(&primary, b"corrupt primary").unwrap();
+        let corrupt = fixture.replica(&output, "replica-01-corrupt", b"corrupt replica");
+        let healthy = fixture.replica(&output, "replica-02-healthy", bytes);
+        let selected = SelectedActionOutputs::select(
+            &mut fixture.store,
+            &fixture.outputs,
+            mode,
+            fixture.freshness,
+        )
+        .unwrap();
+        let preparations = std::cell::Cell::new(0);
+        let prepared = selected
+            .stage(&|_, _| {
+                preparations.set(preparations.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(preparations.get(), 1, "only verified bytes are prepared");
+        assert_eq!(
+            std::fs::read(&output.destination).unwrap(),
+            b"previous output"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .object_locations(&output.object)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(fixture.stages(), 1);
+
+        let receipt = prepared.install(&mut fixture.store).unwrap();
+        assert_eq!(receipt.installed.len(), 1);
+        assert_eq!(receipt.installed[0].bytes, bytes.len() as u64);
+        assert_eq!(std::fs::read(&output.destination).unwrap(), bytes);
+        assert_eq!(fixture.stages(), 0);
+        std::fs::write(&output.destination, b"subscriber mutation").unwrap();
+        assert_eq!(std::fs::read(&healthy).unwrap(), bytes);
+
+        drop(fixture.store);
+        fixture.store =
+            SqlMetadataStore::open(RusqliteEngine::open(&metadata_path).unwrap()).unwrap();
+        fixture.store.intern_domain(output.object.domain);
+        assert_eq!(
+            fixture.store.object_locations(&output.object).unwrap(),
+            vec![(healthy.clone(), RAW_PROFILE_V1.to_owned(), true)]
+        );
+        for (path, quarantined) in [(&primary, 1), (&corrupt, 1), (&healthy, 0)] {
+            assert_eq!(
+                fixture
+                    .store
+                    .query(
+                        "SELECT quarantined FROM object_locations \
+                         WHERE object_key = ?1 AND store_path = ?2",
+                        &[
+                            SqlValue::Text(digest_key(&output.object)),
+                            SqlValue::Text(path.clone()),
+                        ],
+                    )
+                    .unwrap(),
+                vec![vec![SqlValue::Int(quarantined)]]
+            );
+        }
+        assert!(
+            crate::materialization::inspect_quarantine(
+                &mut fixture.store,
+                QuarantineScope::LogicalObject,
+                &digest_key(&output.object),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(std::fs::read(primary).unwrap(), b"corrupt primary");
+        assert_eq!(std::fs::read(corrupt).unwrap(), b"corrupt replica");
+    }
+}
+
+#[test]
+fn corrupt_and_unreadable_replicas_preserve_the_corruption_error_without_exposure() {
+    let mut fixture = Fixture::new();
+    let output = fixture.add("a.rlib", OutputRole::Materializable, b"codegen");
+    fixture.old(&output);
+    let primary = fixture.store.object_locations(&output.object).unwrap()[0]
+        .0
+        .clone();
+    std::fs::write(&primary, b"corrupt primary").unwrap();
+    let corrupt = fixture.replica(&output, "replica-01-corrupt", b"corrupt replica");
+    let missing = fixture.root.path().join("replica-02-missing");
+    fixture
+        .store
+        .add_location(
+            &output.object,
+            missing.to_str().unwrap(),
+            Some(2),
+            RAW_PROFILE_V1,
+            true,
+        )
+        .unwrap();
+    let preparations = std::cell::Cell::new(0);
+    let failure = fixture
+        .select()
+        .stage(&|_, _| {
+            preparations.set(preparations.get() + 1);
+            Ok(())
+        })
+        .unwrap_err()
+        .settle(&mut fixture.store);
+    assert!(matches!(
+        failure.error,
+        MaterializeError::ContentMismatch { path, .. } if path == primary
+    ));
+    assert!(failure.installed.is_empty());
+    assert_eq!(preparations.get(), 0);
+    assert_eq!(
+        std::fs::read(&output.destination).unwrap(),
+        b"previous output"
+    );
+    assert_eq!(
+        fixture.store.object_locations(&output.object).unwrap(),
+        vec![(
+            missing.to_str().unwrap().to_owned(),
+            RAW_PROFILE_V1.to_owned(),
+            true
+        )]
+    );
+    assert_eq!(std::fs::read(primary).unwrap(), b"corrupt primary");
+    assert_eq!(std::fs::read(corrupt).unwrap(), b"corrupt replica");
+    assert_eq!(fixture.stages(), 0);
+}
+
+#[test]
+fn explicit_settlement_contains_corruption_when_prepared_outputs_are_abandoned() {
+    let mut fixture = Fixture::new();
+    let bytes = b"codegen";
+    let output = fixture.add("a.rlib", OutputRole::Materializable, bytes);
+    fixture.old(&output);
+    let primary = fixture.store.object_locations(&output.object).unwrap()[0]
+        .0
+        .clone();
+    std::fs::write(&primary, b"corrupt primary").unwrap();
+    let healthy = fixture.replica(&output, "replica-healthy", bytes);
+    let mut prepared = fixture.select().stage(&|_, _| Ok(())).unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .object_locations(&output.object)
+            .unwrap()
+            .len(),
+        2
+    );
+    prepared.settle_corruption(&mut fixture.store).unwrap();
+    assert_eq!(
+        fixture.store.object_locations(&output.object).unwrap(),
+        vec![(healthy.clone(), RAW_PROFILE_V1.to_owned(), true)]
+    );
+    assert_eq!(fixture.stages(), 1);
+    assert_eq!(
+        std::fs::read(&output.destination).unwrap(),
+        b"previous output"
+    );
+    drop(prepared);
+    assert_eq!(fixture.stages(), 0);
+    assert_eq!(
+        std::fs::read(output.destination).unwrap(),
+        b"previous output"
+    );
+    assert_eq!(std::fs::read(primary).unwrap(), b"corrupt primary");
+    assert_eq!(std::fs::read(healthy).unwrap(), bytes);
+}
+
+#[test]
+fn a_later_output_or_preparation_failure_retains_every_earlier_corruption() {
+    for fail_preparation in [false, true] {
+        let mut fixture = Fixture::new();
+        let head = fixture.add("a.rmeta", OutputRole::ProvisionalMetadata, b"metadata");
+        let tail = fixture.add("a.d", OutputRole::DepInfo, b"dep-info");
+        fixture.old(&head);
+        fixture.old(&tail);
+        let head_primary = fixture.store.object_locations(&head.object).unwrap()[0]
+            .0
+            .clone();
+        let tail_primary = fixture.store.object_locations(&tail.object).unwrap()[0]
+            .0
+            .clone();
+        std::fs::write(&head_primary, b"corrupt head").unwrap();
+        std::fs::write(&tail_primary, b"corrupt tail").unwrap();
+        let healthy_head = fixture.replica(&head, "replica-head", b"metadata");
+        if fail_preparation {
+            fixture.replica(&tail, "replica-tail-01", b"dep-info");
+            fixture.replica(&tail, "replica-tail-02", b"dep-info");
+        }
+        let head_preparations = std::cell::Cell::new(0);
+        let tail_preparations = std::cell::Cell::new(0);
+        let failure = fixture
+            .select()
+            .stage(&|output, _| {
+                if output.role == OutputRole::DepInfo {
+                    tail_preparations.set(tail_preparations.get() + 1);
+                    return Err(std::io::Error::other("subscriber derivation failed"));
+                }
+                head_preparations.set(head_preparations.get() + 1);
+                Ok(())
+            })
+            .unwrap_err()
+            .settle(&mut fixture.store);
+        if fail_preparation {
+            assert!(matches!(
+                failure.error,
+                MaterializeError::Io {
+                    step: "prepare-staging-metadata",
+                    ..
+                }
+            ));
+            assert_eq!(tail_preparations.get(), 1, "derivation must not be retried");
+            assert_eq!(
+                fixture.store.object_locations(&tail.object).unwrap().len(),
+                2
+            );
+        } else {
+            assert!(matches!(
+                failure.error,
+                MaterializeError::ContentMismatch { path, .. } if path == tail_primary
+            ));
+            assert_eq!(tail_preparations.get(), 0);
+            assert!(
+                fixture
+                    .store
+                    .object_locations(&tail.object)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(head_preparations.get(), 1);
+        assert!(failure.installed.is_empty());
+        assert_eq!(
+            fixture.store.object_locations(&head.object).unwrap(),
+            vec![(healthy_head, RAW_PROFILE_V1.to_owned(), true)]
+        );
+        for output in [&head, &tail] {
+            assert_eq!(
+                std::fs::read(&output.destination).unwrap(),
+                b"previous output"
+            );
+        }
+        assert_eq!(std::fs::read(head_primary).unwrap(), b"corrupt head");
+        assert_eq!(std::fs::read(tail_primary).unwrap(), b"corrupt tail");
+        assert_eq!(fixture.stages(), 0);
+    }
+}
+
+#[test]
+fn quarantine_write_failure_refuses_installation_and_still_contains_other_bad_replicas() {
+    for healthy_replica in [false, true] {
+        let mut fixture = Fixture::new();
+        let output = fixture.add("a.rlib", OutputRole::Materializable, b"codegen");
+        fixture.old(&output);
+        let primary = fixture.store.object_locations(&output.object).unwrap()[0]
+            .0
+            .clone();
+        std::fs::write(&primary, b"corrupt primary").unwrap();
+        let corrupt = fixture.replica(&output, "replica-01-corrupt", b"corrupt replica");
+        let healthy =
+            healthy_replica.then(|| fixture.replica(&output, "replica-02-healthy", b"codegen"));
+        fixture
+            .store
+            .engine_mut()
+            .execute(
+                "CREATE TRIGGER refuse_primary_quarantine \
+                 BEFORE UPDATE OF quarantined ON object_locations \
+                 WHEN NEW.quarantined = 1 AND NEW.store_path = \
+                   (SELECT MIN(store_path) FROM object_locations) \
+                 BEGIN SELECT RAISE(ABORT, 'quarantine unavailable'); END",
+                &[],
+            )
+            .unwrap();
+        let failure = match fixture.select().stage(&|_, _| Ok(())) {
+            Ok(prepared) => {
+                assert!(healthy_replica);
+                prepared.install(&mut fixture.store).unwrap_err()
+            }
+            Err(failure) => {
+                assert!(!healthy_replica);
+                failure.settle(&mut fixture.store)
+            }
+        };
+        assert!(matches!(failure.error, MaterializeError::Store(_)));
+        assert!(failure.installed.is_empty());
+        let remaining = fixture.store.object_locations(&output.object).unwrap();
+        assert_eq!(remaining.len(), 1 + usize::from(healthy_replica));
+        assert!(remaining.iter().any(|(path, _, _)| path == &primary));
+        assert!(!remaining.iter().any(|(path, _, _)| path == &corrupt));
+        if let Some(healthy) = healthy {
+            assert!(remaining.iter().any(|(path, _, _)| path == &healthy));
+        }
+        assert_eq!(
+            std::fs::read(&output.destination).unwrap(),
+            b"previous output"
+        );
+        assert_eq!(std::fs::read(primary).unwrap(), b"corrupt primary");
+        assert_eq!(std::fs::read(corrupt).unwrap(), b"corrupt replica");
+        assert_eq!(fixture.stages(), 0);
+    }
+}
+
+#[test]
+fn failed_explicit_settlement_keeps_observations_for_a_later_retry() {
+    let mut fixture = Fixture::new();
+    let output = fixture.add("a.rlib", OutputRole::Materializable, b"codegen");
+    fixture.old(&output);
+    let primary = fixture.store.object_locations(&output.object).unwrap()[0]
+        .0
+        .clone();
+    std::fs::write(&primary, b"corrupt primary").unwrap();
+    let healthy = fixture.replica(&output, "replica-healthy", b"codegen");
+    let mut prepared = fixture.select().stage(&|_, _| Ok(())).unwrap();
+    fixture
+        .store
+        .engine_mut()
+        .execute(
+            "CREATE TRIGGER refuse_quarantine BEFORE UPDATE OF quarantined ON object_locations \
+             WHEN NEW.quarantined = 1 BEGIN SELECT RAISE(ABORT, 'quarantine unavailable'); END",
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        prepared.settle_corruption(&mut fixture.store),
+        Err(MaterializeError::Store(_))
+    ));
+    assert_eq!(
+        fixture
+            .store
+            .object_locations(&output.object)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        std::fs::read(&output.destination).unwrap(),
+        b"previous output"
+    );
+    fixture
+        .store
+        .engine_mut()
+        .execute("DROP TRIGGER refuse_quarantine", &[])
+        .unwrap();
+    prepared.install(&mut fixture.store).unwrap();
+    assert_eq!(std::fs::read(output.destination).unwrap(), b"codegen");
+    assert_eq!(
+        fixture.store.object_locations(&output.object).unwrap(),
+        vec![(healthy, RAW_PROFILE_V1.to_owned(), true)]
+    );
+    assert_eq!(std::fs::read(primary).unwrap(), b"corrupt primary");
     assert_eq!(fixture.stages(), 0);
 }
 

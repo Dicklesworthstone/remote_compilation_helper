@@ -111,7 +111,7 @@ impl CoordLive {
             (selected, None)
         };
         drop(store);
-        let prepared = match output_install::stage_for_install(selected, &plan) {
+        let mut prepared = match output_install::stage_for_install(selected, &plan) {
             Ok(prepared) => prepared,
             Err(failure) => {
                 let mut store = cas
@@ -130,12 +130,17 @@ impl CoordLive {
         // the store lock, then fence coordinator ownership under that lock just
         // before the first rename. The action lease is deliberately retired;
         // it is not resurrected or mistaken for publication authority here.
-        verify_request().map_err(decline)?;
-        self.require_request_owner(coordinator).map_err(decline)?;
+        // Preserve any corrupt-replica observations even when this unlocked
+        // validation refuses the request. No destination has been exposed.
+        let request_valid = verify_request()
+            .map_err(decline)
+            .and_then(|()| self.require_request_owner(coordinator).map_err(decline));
         let mut store = cas
             .store()
             .lock()
             .map_err(|_| decline(ServeError::StoreUnavailable))?;
+        prepared.settle_corruption(&mut *store).map_err(decline)?;
+        request_valid?;
         require_active_owner(&mut *store, coordinator).map_err(decline)?;
         crate::coord::native_archives::require_manifest(&mut *store, result.manifest())
             .map_err(decline)?;
@@ -184,7 +189,7 @@ impl CoordLive {
                         result.manifest(),
                     )?;
                 }
-                let prepared = match output_install::stage_for_install(tail, &plan) {
+                let mut prepared = match output_install::stage_for_install(tail, &plan) {
                     Ok(prepared) => prepared,
                     Err(failure) => {
                         let mut store = cas
@@ -196,14 +201,22 @@ impl CoordLive {
                         );
                     }
                 };
-                verify_request()?;
-                verify_installed_head(&plan, &files).map_err(|error| error.to_string())?;
-                self.require_request_owner(coordinator)
-                    .map_err(|error| error.to_string())?;
+                let request_valid = verify_request()
+                    .and_then(|()| {
+                        verify_installed_head(&plan, &files).map_err(|error| error.to_string())
+                    })
+                    .and_then(|()| {
+                        self.require_request_owner(coordinator)
+                            .map_err(|error| error.to_string())
+                    });
                 let mut store = cas
                     .store()
                     .lock()
                     .map_err(|_| ServeError::StoreUnavailable.to_string())?;
+                prepared
+                    .settle_corruption(&mut *store)
+                    .map_err(|error| error.to_string())?;
+                request_valid?;
                 require_active_owner(&mut *store, coordinator)
                     .map_err(|error| error.to_string())?;
                 crate::coord::native_archives::require_manifest(&mut *store, result.manifest())?;

@@ -13,7 +13,8 @@
 //!   content id is not the object's identity, and only then renames it
 //!   into place. Unverified bytes are never installed, and a partially
 //!   written file is never visible at the destination path. A corrupt
-//!   replica is durably quarantined without deleting its forensic bytes.
+//!   replica is durably quarantined without deleting its forensic bytes, then
+//!   other replicas are independently verified before one can be installed.
 //!
 //! [`MaterializationMode::VerifiedCowReflink`] attempts Linux FICLONE
 //! only after a private filesystem probe verifies content and metadata
@@ -163,7 +164,7 @@ pub enum MaterializeError {
         /// The error text.
         error: String,
     },
-    /// The metadata store refused a lookup.
+    /// A metadata lookup or mutation failed.
     Store(String),
     /// An action-level plan declared the same destination path twice
     /// (K004): refused before any installation begins, because two
@@ -227,8 +228,8 @@ fn io_err(step: &'static str) -> impl Fn(std::io::Error) -> MaterializeError {
 /// Materialize `object` at `destination`.
 ///
 /// The bytes are verified against the object's identity BEFORE the file
-/// becomes visible: a corrupt CAS copy is a typed refusal, never an
-/// installed artifact. The destination is replaced atomically (staging
+/// becomes visible. Corrupt replicas are quarantined and skipped; exhaustion
+/// returns a typed refusal. The destination is replaced atomically (staging
 /// file + rename), so a reader either sees the previous file or the
 /// complete new one.
 ///
@@ -295,6 +296,7 @@ fn materialize_object_prepared(
     std::fs::create_dir_all(&parent).map_err(io_err("create-destination-dir"))?;
 
     let mut last: Option<MaterializeError> = None;
+    let mut corruption = None;
     for source in raw {
         match copy_verified(
             &source,
@@ -306,20 +308,25 @@ fn materialize_object_prepared(
             &prepare_metadata,
         ) {
             Ok((bytes, _reflinked)) => return Ok(bytes),
-            // Preserve the immediate corruption refusal, but also persist
-            // containment so subsequent requests do not repeatedly select
-            // the same bad copy. A healthy replica becomes eligible on the
-            // next request; this request never silently hides corruption.
+            // A bad location does not invalidate the logical object. Persist
+            // containment BEFORE trying another independently verified copy;
+            // inability to record the corruption must still stop delivery.
             Err(error @ MaterializeError::ContentMismatch { .. }) => {
                 store
                     .set_location_quarantined(object, &source, true)
                     .map_err(|quarantine| MaterializeError::Store(format!("{quarantine:?}")))?;
-                return Err(error);
+                corruption.get_or_insert(error);
             }
-            Err(error) => last = Some(error),
+            Err(error @ MaterializeError::Unreadable { .. }) => last = Some(error),
+            // Destination writes and subscriber preparation are not replica
+            // failures. Retrying them against another copy cannot repair them
+            // and may repeat a fallible subscriber transformation.
+            Err(error) => return Err(error),
         }
     }
-    Err(last.unwrap_or(MaterializeError::NoUsableCopy { object: key }))
+    Err(corruption
+        .or(last)
+        .unwrap_or(MaterializeError::NoUsableCopy { object: key }))
 }
 
 /// A CAS copy must be an ordinary file, never a stream/device or a symlink.
@@ -850,10 +857,10 @@ fn validate_action_destinations(outputs: &[PlannedActionOutput]) -> Result<(), M
 /// freshness view (risk R6: incoherent hit mtimes cause rebuild storms
 /// or false freshness) and repeated hits stay storm-free.
 ///
-/// Fail-fast: the first refusal aborts the action and returns the
-/// installed prefix plus the error. A corrupt CAS copy refuses
-/// immediately (`ContentMismatch`) rather than trying another location
-/// — silently substituting a second copy would hide store corruption.
+/// An unmaterializable output aborts the action and returns the installed
+/// prefix plus the error. Corrupt locations are durably quarantined before
+/// another replica is independently verified; exhaustion preserves the
+/// `ContentMismatch` diagnostic. A destination/preparation failure is terminal.
 ///
 /// # Errors
 /// [`ActionMaterializeFailure`] with the installed prefix; duplicate,
@@ -1903,6 +1910,198 @@ mod tests {
             Err(MaterializeError::NoUsableCopy { .. })
         ));
         assert_eq!(fs::read(&destination).unwrap(), b"old output");
+    }
+
+    #[test]
+    fn corrupt_replicas_fail_over_to_verified_bytes_and_stay_quarantined_after_reopen() {
+        for mode in [
+            MaterializationMode::PrivateCopy,
+            MaterializationMode::VerifiedCowReflink,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bytes = b"replicated artifact bytes";
+            let (mut store, _layout, object) = store_with_object(dir.path(), bytes);
+            let primary = store.object_locations(&object).unwrap()[0].0.clone();
+            let bad_replica = dir.path().join("replica-bad");
+            let good_replica = dir.path().join("replica-good");
+            fs::write(&primary, b"corrupt primary").unwrap();
+            fs::write(&bad_replica, b"corrupt replica").unwrap();
+            fs::write(&good_replica, bytes).unwrap();
+            for path in [&bad_replica, &good_replica] {
+                store
+                    .add_location(
+                        &object,
+                        path.to_str().unwrap(),
+                        Some(2),
+                        RAW_PROFILE_V1,
+                        true,
+                    )
+                    .unwrap();
+            }
+            let destination = dir.path().join("subscriber/artifact");
+            let preparations = std::cell::Cell::new(0);
+            let written =
+                materialize_object_prepared(&mut store, &object, &destination, mode, |_| {
+                    preparations.set(preparations.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(written, bytes.len() as u64);
+            assert_eq!(preparations.get(), 1, "only verified bytes may be prepared");
+            assert_eq!(fs::read(&destination).unwrap(), bytes);
+            assert_eq!(fs::read(&primary).unwrap(), b"corrupt primary");
+            assert_eq!(fs::read(&bad_replica).unwrap(), b"corrupt replica");
+            fs::write(&destination, b"subscriber mutation").unwrap();
+            assert_eq!(fs::read(&good_replica).unwrap(), bytes);
+
+            drop(store);
+            let engine = RusqliteEngine::open(&dir.path().join("meta.sqlite")).unwrap();
+            let mut reopened = SqlMetadataStore::open(engine).unwrap();
+            reopened.intern_domain(object.domain);
+            let locations = reopened.object_locations(&object).unwrap();
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations[0].0, good_replica.to_str().unwrap());
+            assert!(
+                inspect_quarantine(
+                    &mut reopened,
+                    crate::metadata_store::QuarantineScope::LogicalObject,
+                    &digest_key(&object),
+                )
+                .unwrap()
+                .is_none(),
+                "a corrupt location must not quarantine a healthy logical object"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_replicas_preserve_corruption_error_and_previous_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _layout, object) = store_with_object(dir.path(), b"valid bytes");
+        let primary = store.object_locations(&object).unwrap()[0].0.clone();
+        let corrupt = dir.path().join("replica-corrupt");
+        let absent = dir.path().join("replica-missing");
+        fs::write(&primary, b"corrupt primary").unwrap();
+        fs::write(&corrupt, b"corrupt replica").unwrap();
+        for path in [&corrupt, &absent] {
+            store
+                .add_location(
+                    &object,
+                    path.to_str().unwrap(),
+                    Some(2),
+                    RAW_PROFILE_V1,
+                    true,
+                )
+                .unwrap();
+        }
+        let destination = dir.path().join("artifact");
+        fs::write(&destination, b"previous artifact").unwrap();
+        let failure = materialize_object(
+            &mut store,
+            &object,
+            &destination,
+            MaterializationMode::PrivateCopy,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            MaterializeError::ContentMismatch { path, .. } if path == primary
+        ));
+        assert_eq!(fs::read(destination).unwrap(), b"previous artifact");
+        let remaining = store.object_locations(&object).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, absent.to_str().unwrap());
+        assert_eq!(fs::read(corrupt).unwrap(), b"corrupt replica");
+    }
+
+    #[test]
+    fn failed_quarantine_write_stops_before_healthy_replica_preparation() {
+        use crate::metadata_store::SqlEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"valid bytes";
+        let (mut store, _layout, object) = store_with_object(dir.path(), bytes);
+        let primary = store.object_locations(&object).unwrap()[0].0.clone();
+        let healthy = dir.path().join("replica-healthy");
+        fs::write(&primary, b"corrupt primary").unwrap();
+        fs::write(&healthy, bytes).unwrap();
+        store
+            .add_location(
+                &object,
+                healthy.to_str().unwrap(),
+                Some(2),
+                RAW_PROFILE_V1,
+                true,
+            )
+            .unwrap();
+        store
+            .engine_mut()
+            .execute(
+                "CREATE TRIGGER refuse_quarantine BEFORE UPDATE OF quarantined ON object_locations \
+                 WHEN NEW.quarantined = 1 BEGIN SELECT RAISE(ABORT, 'quarantine unavailable'); END",
+                &[],
+            )
+            .unwrap();
+        let destination = dir.path().join("artifact");
+        fs::write(&destination, b"previous artifact").unwrap();
+        let preparations = std::cell::Cell::new(0);
+        let failure = materialize_object_prepared(
+            &mut store,
+            &object,
+            &destination,
+            MaterializationMode::PrivateCopy,
+            |_| {
+                preparations.set(preparations.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(failure, MaterializeError::Store(_)));
+        assert_eq!(preparations.get(), 0);
+        assert_eq!(fs::read(destination).unwrap(), b"previous artifact");
+        assert_eq!(store.object_locations(&object).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn subscriber_preparation_failure_is_not_retried_on_another_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"valid bytes";
+        let (mut store, _layout, object) = store_with_object(dir.path(), bytes);
+        let replica = dir.path().join("replica-healthy");
+        fs::write(&replica, bytes).unwrap();
+        store
+            .add_location(
+                &object,
+                replica.to_str().unwrap(),
+                Some(2),
+                RAW_PROFILE_V1,
+                true,
+            )
+            .unwrap();
+        let destination = dir.path().join("artifact");
+        fs::write(&destination, b"previous artifact").unwrap();
+        let preparations = std::cell::Cell::new(0);
+        let failure = materialize_object_prepared(
+            &mut store,
+            &object,
+            &destination,
+            MaterializationMode::PrivateCopy,
+            |_| {
+                preparations.set(preparations.get() + 1);
+                Err(std::io::Error::other("subscriber preparation failed"))
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            MaterializeError::Io {
+                step: "prepare-staging-metadata",
+                ..
+            }
+        ));
+        assert_eq!(preparations.get(), 1);
+        assert_eq!(fs::read(destination).unwrap(), b"previous artifact");
+        assert_eq!(store.object_locations(&object).unwrap().len(), 2);
     }
 
     #[test]

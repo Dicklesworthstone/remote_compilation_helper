@@ -3,8 +3,9 @@
 //! Selection and installation require metadata access; private copying does not.
 //! A selected location is NOT serving authority. Callers must retain destination
 //! ownership and recheck their action/release/lease gates after staging. This
-//! layer additionally rechecks logical quarantine and the selected raw location
-//! before publishing any prepared file. It never installs unverified bytes.
+//! layer additionally persists observed replica corruption, then rechecks logical
+//! quarantine and the selected raw location before publishing any prepared file.
+//! It never installs unverified bytes.
 
 use super::{
     ActionMaterializationReceipt, ActionMaterializeFailure, MaterializationMode, MaterializeError,
@@ -253,24 +254,36 @@ pub struct SelectedActionOutputs {
 }
 
 /// A staging failure retains the exact object/location attribution needed to
-/// durably quarantine a corrupt replica. The caller must settle it under the
+/// durably quarantine every corrupt replica. The caller must settle it under the
 /// original store lock before returning the failure. No destination was installed.
 #[derive(Debug)]
 pub struct PreparationFailure {
     error: MaterializeError,
-    corrupt: Option<(TypedDigest, String)>,
+    corrupt: Vec<(TypedDigest, String)>,
+}
+
+fn quarantine_locations(
+    store: &mut dyn RabsMetadataStore,
+    corrupt: &[(TypedDigest, String)],
+) -> Result<(), MaterializeError> {
+    let mut failure = None;
+    for (object, path) in corrupt {
+        if let Err(error) = store.set_location_quarantined(object, path, true) {
+            // Keep trying the other observed locations even if one update is
+            // unavailable. No destination may be exposed after ANY failure.
+            failure.get_or_insert_with(|| MaterializeError::Store(format!("{error:?}")));
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 impl PreparationFailure {
     /// Persist corruption containment, then return the original typed error.
     /// An unavailable quarantine write takes precedence over an ordinary error.
     pub fn settle(self, store: &mut dyn RabsMetadataStore) -> ActionMaterializeFailure {
-        let mut error = self.error;
-        if let Some((object, path)) = self.corrupt
-            && let Err(failure) = store.set_location_quarantined(&object, &path, true)
-        {
-            error = MaterializeError::Store(format!("{failure:?}"));
-        }
+        let error = quarantine_locations(store, &self.corrupt)
+            .err()
+            .unwrap_or(self.error);
         ActionMaterializeFailure {
             installed: Vec::new(),
             error,
@@ -376,9 +389,10 @@ impl SelectedActionOutputs {
 
     /// Copy, hash, derive and freshness-stamp private files WITHOUT metadata
     /// access. The existing materializer is the sole byte-verification/CoW path.
-    /// Retain the returned owner until the caller rechecks action authority.
-    // The failure carries the typed error plus the corrupt location that
-    // `settle` must quarantine; it is returned once, on the failure path.
+    /// Both results retain every observed corrupt location. On success, call
+    /// [`PreparedActionOutputs::settle_corruption`] under the metadata lock before
+    /// any later authority refusal can discard the owner. On failure, call
+    /// [`PreparationFailure::settle`]. Installation also settles defensively.
     #[allow(clippy::result_large_err)]
     pub fn stage(
         self,
@@ -387,67 +401,65 @@ impl SelectedActionOutputs {
         let mut out = PreparedActionOutputs {
             prepared: Vec::with_capacity(self.selected.len()),
             started: Instant::now(),
+            corrupt: Vec::new(),
         };
-        for selected in self.selected {
-            let output = selected.output;
-            let parent = output
-                .destination
-                .parent()
-                .ok_or_else(|| PreparationFailure {
-                    error: MaterializeError::UnsafeDestination {
+        let result = (|| -> Result<(), MaterializeError> {
+            for selected in self.selected {
+                let output = selected.output;
+                let parent = output.destination.parent().ok_or_else(|| {
+                    MaterializeError::UnsafeDestination {
                         path: output.destination.to_string_lossy().into_owned(),
-                    },
-                    corrupt: None,
+                    }
                 })?;
-            let mut last = MaterializeError::NoUsableCopy {
-                object: digest_key(&output.object),
-            };
-            let mut ready = None;
-            for source in selected.locations {
-                let mut stage =
-                    PrivateStage::create(parent).map_err(|error| PreparationFailure {
-                        error,
-                        corrupt: None,
-                    })?;
-                let result = copy_verified(
-                    &source,
-                    &output.object,
-                    &digest_key(&output.object),
-                    &stage.directory,
-                    &stage.path,
-                    self.mode,
-                    &|file| {
-                        prepare(&output, file)?;
-                        file.set_modified(self.freshness)
-                    },
-                );
-                match result {
-                    Ok((bytes, _)) => {
-                        stage.retain().map_err(|error| PreparationFailure {
-                            error,
-                            corrupt: None,
-                        })?;
-                        ready = Some(PreparedOutput {
-                            output: output.clone(),
-                            source,
-                            bytes,
-                            stage,
-                        });
-                        break;
+                let mut last = MaterializeError::NoUsableCopy {
+                    object: digest_key(&output.object),
+                };
+                let mut corruption = None;
+                let mut ready = None;
+                for source in selected.locations {
+                    let mut stage = PrivateStage::create(parent)?;
+                    let result = copy_verified(
+                        &source,
+                        &output.object,
+                        &digest_key(&output.object),
+                        &stage.directory,
+                        &stage.path,
+                        self.mode,
+                        &|file| {
+                            prepare(&output, file)?;
+                            file.set_modified(self.freshness)
+                        },
+                    );
+                    match result {
+                        Ok((bytes, _)) => {
+                            stage.retain()?;
+                            ready = Some(PreparedOutput {
+                                output: output.clone(),
+                                source,
+                                bytes,
+                                stage,
+                            });
+                            break;
+                        }
+                        Err(error @ MaterializeError::ContentMismatch { .. }) => {
+                            out.corrupt.push((output.object.clone(), source));
+                            corruption.get_or_insert(error);
+                        }
+                        Err(error @ MaterializeError::Unreadable { .. }) => last = error,
+                        // Destination writes and subscriber derivation must
+                        // stop, rather than run again against another replica.
+                        Err(error) => return Err(error),
                     }
-                    Err(error @ MaterializeError::ContentMismatch { .. }) => {
-                        return Err(PreparationFailure {
-                            error,
-                            corrupt: Some((output.object.clone(), source)),
-                        });
-                    }
-                    Err(error) => last = error,
                 }
+                out.prepared.push(ready.ok_or(corruption.unwrap_or(last))?);
             }
-            out.prepared.push(ready.ok_or(PreparationFailure {
-                error: last,
-                corrupt: None,
-            })?);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return Err(PreparationFailure {
+                error,
+                corrupt: std::mem::take(&mut out.corrupt),
+            });
         }
         Ok(out)
     }
@@ -463,10 +475,12 @@ struct PreparedOutput {
 
 /// Verified private bytes, not serving permission. No public path or writable
 /// file handle is exposed. Dropping the owner abandons only its private staging.
+/// Settle observed corruption under the metadata lock before abandoning it.
 #[derive(Debug)]
 pub struct PreparedActionOutputs {
     prepared: Vec<PreparedOutput>,
     started: Instant,
+    corrupt: Vec<(TypedDigest, String)>,
 }
 
 impl Drop for PreparedActionOutputs {
@@ -478,8 +492,23 @@ impl Drop for PreparedActionOutputs {
 }
 
 impl PreparedActionOutputs {
-    /// Recheck every quarantine/location and staged generation before the FIRST
-    /// destination write. The caller holds its store lock and destination claim
+    /// Persist every corrupt replica found while staging, without installing
+    /// outputs or granting serving authority. Call immediately after reacquiring
+    /// metadata access, BEFORE any later authority/cancellation check can discard
+    /// this owner. Installation repeats it defensively for direct callers.
+    /// A failed write retains the observations for an explicit retry.
+    pub fn settle_corruption(
+        &mut self,
+        store: &mut dyn RabsMetadataStore,
+    ) -> Result<(), MaterializeError> {
+        quarantine_locations(store, &self.corrupt)?;
+        self.corrupt.clear();
+        Ok(())
+    }
+
+    /// Persist observed corrupt replicas, then recheck every quarantine/location
+    /// and staged generation before the FIRST destination write.
+    /// The caller holds its store lock and destination claim
     /// across these checks and installation, after rerunning its serving gates.
     /// No payload reads or hashing occur here. A rename failure reports the exact
     /// installed prefix; it NEVER grants fallback execution authority.
@@ -487,6 +516,11 @@ impl PreparedActionOutputs {
         mut self,
         store: &mut dyn RabsMetadataStore,
     ) -> Result<ActionMaterializationReceipt, ActionMaterializeFailure> {
+        self.settle_corruption(store)
+            .map_err(|error| ActionMaterializeFailure {
+                installed: Vec::new(),
+                error,
+            })?;
         for prepared in &self.prepared {
             let mut validate = || -> Result<(), MaterializeError> {
                 if !usable_locations(store, &prepared.output.object)?.contains(&prepared.source) {

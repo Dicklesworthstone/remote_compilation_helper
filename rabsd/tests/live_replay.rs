@@ -681,6 +681,9 @@ fn live_manifest_loader_uses_a_good_replica_but_respects_logical_quarantine() {
     use rabs_cas::metadata_store::QuarantineScope;
     let (dir, cas, _coord, offer) = live_manifest_fixture();
     let key = digest_key(&offer.manifest_id.0);
+    let (domain, hex) = key.split_once(':').unwrap();
+    let alternate_key = format!("{domain}:{}", hex.to_ascii_uppercase());
+    assert_ne!(alternate_key, key);
     let bad_replica = dir.path().join("000-bad-replica");
     std::fs::write(&bad_replica, b"corrupted replica").unwrap();
     let mut store = cas.store().lock().unwrap();
@@ -697,6 +700,10 @@ fn live_manifest_loader_uses_a_good_replica_but_respects_logical_quarantine() {
         load_manifest(&mut *store, &key),
         Some(offer.manifest.clone())
     );
+    assert_eq!(
+        load_manifest(&mut *store, &alternate_key),
+        Some(offer.manifest.clone())
+    );
     assert!(
         store
             .object_locations(&offer.manifest_id.0)
@@ -708,6 +715,10 @@ fn live_manifest_loader_uses_a_good_replica_but_respects_logical_quarantine() {
         .add_quarantine(QuarantineScope::LogicalObject, &key, "suspect manifest")
         .unwrap();
     assert!(load_manifest(&mut *store, &key).is_none());
+    assert!(
+        load_manifest(&mut *store, &alternate_key).is_none(),
+        "equivalent digest spelling cannot bypass logical object quarantine"
+    );
 }
 
 #[test]

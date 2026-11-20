@@ -401,6 +401,98 @@ fn changed_request_after_staging_declines_before_first_destination_write() {
 }
 
 #[test]
+fn request_owned_failover_quarantines_bad_replica_before_request_refusal() {
+    for metadata in [false, true] {
+        let fixture = Fixture::new();
+        let destination = fixture.root.path().join("declined-after-replica-failover");
+        std::fs::create_dir_all(destination.join("out")).unwrap();
+        std::fs::write(destination.join("out/lib.rlib"), b"original output").unwrap();
+        let owner = if metadata {
+            fixture.capture_with_metadata(true)
+        } else {
+            fixture.capture()
+        };
+        let object = object_id(ARTIFACT.as_slice()).unwrap();
+        let bad = fixture.root.path().join("000-corrupt-archive-replica");
+        std::fs::write(&bad, b"corrupt archive copy").unwrap();
+        {
+            let mut store = fixture.cas.store().lock().unwrap();
+            store
+                .add_location(
+                    &object,
+                    bad.to_str().unwrap(),
+                    Some(1),
+                    rabs_cas::blob_store::RAW_PROFILE_V1,
+                    true,
+                )
+                .unwrap();
+            let locations = store.object_locations(&object).unwrap();
+            assert_eq!(locations.len(), 2);
+            assert_eq!(locations[0].0, bad.to_str().unwrap());
+        }
+        let checks = Cell::new(0);
+        let refuse_at = if metadata { 4 } else { 2 };
+        let verify = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == refuse_at {
+                Err("source generation changed after replica failover".into())
+            } else {
+                Ok(())
+            }
+        };
+        let mut metadata_calls = 0;
+        let result = if metadata {
+            fixture.install_with_metadata(owner, &destination, verify, &mut |_| {
+                metadata_calls += 1;
+                Ok(())
+            })
+        } else {
+            fixture.install(owner, &destination, verify)
+        };
+        let reason = match result {
+            Err(RequestOwnedInstallError::MetadataExposed(reason)) if metadata => reason,
+            Err(RequestOwnedInstallError::Declined(reason)) if !metadata => reason,
+            other => panic!("request refusal after successful staging: {other:?}"),
+        };
+        assert!(reason.contains("source generation changed after replica failover"));
+        assert_eq!(checks.get(), refuse_at);
+        assert_eq!(metadata_calls, usize::from(metadata));
+        assert_eq!(
+            std::fs::read(destination.join("out/lib.rlib")).unwrap(),
+            b"original output"
+        );
+        if metadata {
+            assert_eq!(
+                std::fs::read(destination.join("out/lib.rmeta")).unwrap(),
+                METADATA
+            );
+        }
+        {
+            let mut store = fixture.cas.store().lock().unwrap();
+            assert_eq!(
+                store
+                    .query(
+                        "SELECT quarantined FROM object_locations \
+                         WHERE object_key = ?1 AND store_path = ?2",
+                        &[
+                            SqlValue::Text(digest_key(&object)),
+                            SqlValue::Text(bad.to_str().unwrap().into()),
+                        ],
+                    )
+                    .unwrap(),
+                vec![vec![SqlValue::Int(1)]],
+                "a refused installation must retain the corrupt replica observation"
+            );
+            let locations = store.object_locations(&object).unwrap();
+            assert_eq!(locations.len(), 1);
+            assert_eq!(std::fs::read(&locations[0].0).unwrap(), *ARTIFACT);
+        }
+        assert_eq!(fixture.active_capture_pins(), 0);
+        fixture.assert_unpublished();
+    }
+}
+
+#[test]
 fn coordinator_replacement_during_staging_fences_fresh_result() {
     let fixture = Fixture::new();
     let destination = fixture.root.path().join("stale-coordinator");

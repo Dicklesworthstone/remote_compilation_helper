@@ -4663,7 +4663,7 @@ impl CoordLive {
             (selected, None)
         };
         drop(store);
-        let prepared = match output_install::stage_for_install(selected, &plan) {
+        let mut prepared = match output_install::stage_for_install(selected, &plan) {
             Ok(prepared) => prepared,
             Err(failure) => {
                 let mut store = cas
@@ -4693,6 +4693,12 @@ impl CoordLive {
             .store()
             .lock()
             .map_err(|_| ServeError::StoreUnavailable)?;
+        prepared.settle_corruption(&mut *store).map_err(|error| {
+            ServeError::Materialize(ActionMaterializeFailure {
+                installed: Vec::new(),
+                error,
+            })
+        })?;
         if let Some(refusal) = context.recheck(self, &mut *store, None)? {
             return Ok(refusal);
         }
@@ -4963,7 +4969,7 @@ pub fn load_manifest(
     if !store
         .query(
             "SELECT 1 FROM quarantines WHERE scope = 'logical-object' AND subject = ?1 LIMIT 1",
-            &[SqlValue::Text(manifest_key.to_owned())],
+            &[SqlValue::Text(digest_key(&object))],
         )
         .ok()?
         .is_empty()

@@ -424,6 +424,93 @@ fn published_producer_metadata_rechecks_gates_and_keeps_all_post_head_failures_s
 }
 
 #[test]
+fn metadata_tail_failover_quarantines_bad_replica_before_authority_refusal() {
+    for producer in [false, true] {
+        let fixture = Fixture::with_comparisons(if producer { 0 } else { 2 });
+        let destination = fixture.root.path().join("revoked-after-replica-failover");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("libfixture.rlib"), b"original archive").unwrap();
+        let object = &fixture
+            .offer
+            .manifest
+            .logical_outputs
+            .iter()
+            .find(|output| output.role == OutputRole::Materializable)
+            .unwrap()
+            .object
+            .0;
+        let bad = fixture.root.path().join("000-corrupt-archive-replica");
+        std::fs::write(&bad, b"corrupt archive copy").unwrap();
+        {
+            let mut store = fixture.cas.store().lock().unwrap();
+            store
+                .add_location(object, bad.to_str().unwrap(), Some(1), RAW_PROFILE_V1, true)
+                .unwrap();
+            let locations = store.object_locations(object).unwrap();
+            assert_eq!(locations.len(), 2);
+            assert_eq!(locations[0].0, bad.to_str().unwrap());
+        }
+        let mut calls = 0;
+        let mut ready = |_: &[PathBuf]| {
+            calls += 1;
+            // The tail remains unread until the metadata ACK. Its first copy
+            // is still eligible here; the subsequent copy must discover and
+            // settle corruption even though the coordinator is now revoked.
+            assert_eq!(
+                fixture
+                    .cas
+                    .store()
+                    .lock()
+                    .unwrap()
+                    .object_locations(object)
+                    .unwrap()[0]
+                    .0,
+                bad.to_str().unwrap()
+            );
+            fixture.coord.mark_down();
+            Ok(())
+        };
+        let result = if producer {
+            fixture.produce(&destination, Some(&mut ready))
+        } else {
+            fixture.install(&destination, Some(&mut ready))
+        };
+        assert!(
+            matches!(result, Err(ServeError::MetadataExposed { installed, .. })
+                if installed == vec![destination.join("libfixture.rmeta"), destination.join("fixture.d")])
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            std::fs::read(destination.join("libfixture.rlib")).unwrap(),
+            b"original archive"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("libfixture.rmeta")).unwrap(),
+            HEAD
+        );
+        let mut store = fixture.cas.store().lock().unwrap();
+        assert_eq!(
+            store
+                .query(
+                    "SELECT quarantined FROM object_locations \
+                     WHERE object_key = ?1 AND store_path = ?2",
+                    &[
+                        SqlValue::Text(digest_key(object)),
+                        SqlValue::Text(bad.to_str().unwrap().into()),
+                    ],
+                )
+                .unwrap(),
+            vec![vec![SqlValue::Int(1)]]
+        );
+        let locations = store.object_locations(object).unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(std::fs::read(&locations[0].0).unwrap(), *TAIL);
+        drop(store);
+        assert_eq!(fixture.installs(), i64::from(!producer));
+    }
+}
+
+#[test]
 fn changed_or_missing_metadata_head_after_ack_never_installs_a_tail_or_reports_success() {
     for producer in [false, true] {
         for archive in [false, true] {

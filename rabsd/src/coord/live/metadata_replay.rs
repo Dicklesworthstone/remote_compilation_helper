@@ -9,6 +9,7 @@ use super::{
     output_install, workspace_ancestors,
 };
 use crate::edge::live_facts::digest_stable;
+use rabs_cas::materialization::ActionMaterializeFailure;
 use rabs_cas::materialization::staged::SelectedActionOutputs;
 use rabs_cas::metadata_store::{RabsMetadataStore, digest_key};
 use rabs_cas::publication::authority_digest;
@@ -199,7 +200,7 @@ pub(super) fn finish(
         let cas = coord.cas.as_ref().ok_or(ServeError::NoStore)?;
         // Even an empty tail must recheck the gates after the callback: emitting
         // metadata does not authorize success after a concurrent revocation.
-        let prepared = match output_install::stage_for_install(tail, plan) {
+        let mut prepared = match output_install::stage_for_install(tail, plan) {
             Ok(prepared) => prepared,
             Err(failure) => {
                 let mut store = cas
@@ -211,11 +212,18 @@ pub(super) fn finish(
         };
         // Staging bulk archives can be slow; retain the same complete head
         // contract through that second unlocked interval, even for an empty tail.
-        verify_installed_head(plan, &files)?;
+        let head_valid = verify_installed_head(plan, &files);
         let mut store = cas
             .store()
             .lock()
             .map_err(|_| ServeError::StoreUnavailable)?;
+        prepared.settle_corruption(&mut *store).map_err(|error| {
+            ServeError::Materialize(ActionMaterializeFailure {
+                installed: Vec::new(),
+                error,
+            })
+        })?;
+        head_valid?;
         if let Some(permit) = permit
             && live_replay_permit_or_continuation(
                 &mut *store,
