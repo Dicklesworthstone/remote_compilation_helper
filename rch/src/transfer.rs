@@ -4322,19 +4322,29 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
             let known_non_cargo = rch_common::classify_command(command)
                 .kind
                 .is_some_and(|kind| kind.command_base() != "cargo");
-            let clears_environment = shell_words::split(command).is_ok_and(|tokens| {
-                tokens.iter().any(|token| {
-                    matches!(token.as_str(), "-i" | "--ignore-environment" | "-S")
-                        || token.starts_with("--split-string")
-                })
-            });
             let home = if self.compilation_kind == Some(CompilationKind::Job) {
                 // Job admission permits scripts with Cargo-looking argument
                 // data. Keep accounting for the isolated cache that the shell
                 // creates, while resolving only the job's actual env prefix.
                 crate::hook::job_disk_home_override(command)
-            } else if known_non_cargo && !command.contains("CARGO_HOME") && !clears_environment {
-                Ok(None)
+            } else if known_non_cargo {
+                // A native compiler's -S or CARGO_HOME macro is argument data,
+                // not an environment prefix. Other build tools and wrappers
+                // may launch nested commands; retain their conservative scope
+                // check rather than treating those argv tails as inert.
+                crate::hook::compiler_disk_home_override(command).or_else(|error| {
+                    let clears_environment = shell_words::split(command).is_ok_and(|tokens| {
+                        tokens.iter().any(|token| {
+                            matches!(token.as_str(), "-i" | "--ignore-environment" | "-S")
+                                || token.starts_with("--split-string")
+                        })
+                    });
+                    if !command.contains("CARGO_HOME") && !clears_environment {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    }
+                })
             } else {
                 crate::hook::cargo_disk_home_override(command)
             };
@@ -14537,6 +14547,121 @@ Number of files transferred: 42
             guarded,
             "wrapper paths cannot select an unaccounted cache"
         );
+    }
+
+    /// Decode the actual worker argv emitted by the disk wrapper. This checks
+    /// the monitor's JSON input and budgets without substituting a fake worker
+    /// or claiming that a compiler or supervisor ran.
+    fn disk_supervisor_argv_for_test(pipeline: &TransferPipeline, command: &str) -> Vec<String> {
+        let wrapped = pipeline.wrap_with_disk_budget(command, &[], 20);
+        let invocation = wrapped
+            .lines()
+            .find(|line| line.starts_with("\"$RCH_WKR\" disk-supervise "))
+            .expect("native disk-supervise invocation");
+        shell_words::split(invocation).expect("literal disk-supervise argv")
+    }
+
+    #[test]
+    fn non_cargo_disk_cache_plan_preserves_compiler_flags_and_literal_home() {
+        let worker = WorkerId::new("cache/worker");
+        for (requested, home) in [
+            ("gcc -S cargo_bridge.c", None),
+            ("/usr/bin/gcc -S cargo_bridge.c", None),
+            ("cc -S cargo_bridge.c", None),
+            ("c++ -S cargo_bridge.cpp", None),
+            ("gcc -c 'cargo bridge.c' -DCARGO_HOME=relative", None),
+            (
+                "rustc -C link-arg=CARGO_HOME=relative cargo_bridge.rs",
+                None,
+            ),
+            ("time -f CARGO_HOME=/format gcc -S cargo_bridge.c", None),
+            ("time -f '-i' gcc -S cargo_bridge.c", None),
+            (
+                "CARGO_HOME='/worker/cache with spaces' gcc -S cargo_bridge.c",
+                Some("/worker/cache with spaces"),
+            ),
+            (
+                "env -u CARGO_HOME CARGO_HOME='/worker/cache with spaces' gcc -S cargo_bridge.c",
+                Some("/worker/cache with spaces"),
+            ),
+            (
+                "env -i CARGO_HOME=/worker/cache clang -DCARGO_HOME=payload -S cargo_bridge.c",
+                Some("/worker/cache"),
+            ),
+            // The original conservative handling of other launchers remains
+            // valid when their payload cannot change the selected cache home.
+            ("timeout 10 gcc -c cargo_bridge.c", None),
+            ("sh -c 'gcc -c cargo_bridge.c'", None),
+            ("nix build cargo_package", None),
+        ] {
+            let kind = rch_common::classify_command(requested)
+                .kind
+                .expect("admitted compiler command");
+            assert_ne!(kind.command_base(), "cargo", "{requested}");
+            let source = Path::new("/tmp/non-cargo-cache-plan");
+            let pipeline = disk_budget_test_pipeline(source, None, 20)
+                .with_compilation_kind(Some(kind))
+                .with_cargo_disk_cache(requested, &worker);
+            let argv = disk_supervisor_argv_for_test(&pipeline, requested);
+            assert_eq!(argv.len(), 11, "{requested}: {argv:?}");
+            assert_eq!(argv[2], "8388608", "growth budget: {requested}");
+            assert_eq!(argv[3], "1048576", "headroom: {requested}");
+            assert_eq!(argv[7..10], ["standalone", "sh", "-lc"]);
+            assert_eq!(argv[10], requested, "compiler argv must be unchanged");
+            let plan: serde_json::Value = serde_json::from_str(&argv[6]).unwrap();
+            assert_eq!(plan["cargo_cache_required"], true, "{requested}");
+            assert_eq!(plan["cargo_cache"]["verified"], true, "{requested}");
+            assert_eq!(
+                plan["cargo_cache"]["additional_home"],
+                serde_json::json!(home)
+            );
+            assert_eq!(plan["cargo_cache"]["name"], "rch-cargo-cache-cache-worker");
+            let outputs = plan["output"].as_array().expect("accounted output roots");
+            assert!(outputs.contains(&serde_json::json!(source)));
+            assert!(outputs.contains(&serde_json::json!(pipeline.remote_cargo_target_dir())));
+            assert_eq!(plan["probe"], plan["output"]);
+
+            let isolated = crate::hook::add_cargo_isolation(
+                requested,
+                &worker,
+                pipeline.uses_managed_cargo_cache(),
+            );
+            let launched = pipeline.build_remote_command(&isolated, None);
+            assert!(launched.contains("\"cargo_cache_required\":true"));
+            assert!(launched.contains("\"verified\":true"));
+        }
+    }
+
+    #[test]
+    fn non_cargo_disk_cache_plan_keeps_unresolved_prefix_refusals() {
+        let worker = WorkerId::new("cache/worker");
+        for requested in [
+            "env -i gcc -S cargo_bridge.c",
+            "env -u CARGO_HOME gcc -S cargo_bridge.c",
+            "env --unset=CARGO_HOME clang -S cargo_bridge.c",
+            "env CARGO_HOME=/one env -i gcc cargo_bridge.c",
+            "CARGO_HOME=relative gcc -S cargo_bridge.c",
+            "CARGO_HOME=$HOME/cache rustc cargo_bridge.rs",
+            "env -S 'CARGO_HOME=/worker/cache gcc -S cargo_bridge.c'",
+            "env -u CARGO_HOME cargo check",
+            "CARGO_HOME=relative cargo check",
+            "sh -c 'CARGO_HOME=/untracked gcc -S cargo_bridge.c'",
+            "timeout 10 env CARGO_HOME=/untracked gcc -S cargo_bridge.c",
+            "nix develop -c env CARGO_HOME=/untracked cargo check",
+        ] {
+            let pipeline =
+                disk_budget_test_pipeline(Path::new("/tmp/cache-plan-refusal"), None, 20)
+                    .with_compilation_kind(rch_common::classify_command(requested).kind)
+                    .with_cargo_disk_cache(requested, &worker);
+            let argv = disk_supervisor_argv_for_test(&pipeline, requested);
+            assert_eq!(argv[2], "8388608", "{requested}");
+            assert_eq!(argv[3], "1048576", "{requested}");
+            assert_eq!(argv[10], requested, "{requested}");
+            let plan: serde_json::Value = serde_json::from_str(&argv[6]).unwrap();
+            assert_eq!(plan["cargo_cache_required"], true, "{requested}");
+            assert_eq!(plan["cargo_cache"]["verified"], false, "{requested}");
+            assert!(plan["cargo_cache"]["additional_home"].is_null());
+        }
     }
 
     #[test]

@@ -6948,7 +6948,8 @@ use remote_result::{
 // overrides directly from `super::cargo_target_dir`.
 mod cargo_target_dir;
 pub(crate) use cargo_target_dir::{
-    cargo_disk_home_override, job_disk_home_override, sanitize_cargo_home_token,
+    cargo_disk_home_override, compiler_disk_home_override, job_disk_home_override,
+    sanitize_cargo_home_token,
 };
 use cargo_target_dir::{
     resolve_forwarded_cargo_target_dir, rewrite_cargo_target_dir_command_for_remote,
