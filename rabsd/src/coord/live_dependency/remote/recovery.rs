@@ -151,16 +151,15 @@ impl Drop for ResultDirectory {
             let path = directory.keep();
             // Reporting must not panic during unwind. This is an observation,
             // not a receipt authorizing recovery, reexecution or publication.
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "{}",
-                json!({
+            crate::edge::server::report_log_line(
+                &json!({
                     "v": 1,
                     "kind": "rabs-remote-recovery-retained",
                     "directory": path.to_string_lossy(),
                     "reason": reason,
                     "reexecute": false,
-                }),
+                })
+                .to_string(),
             );
         }
     }
@@ -248,6 +247,64 @@ mod tests {
             serde_json::to_vec(&request()).unwrap(),
         );
         assert!(path.join("recovery.json").is_file());
+    }
+
+    #[cfg(all(target_os = "linux", panic = "unwind"))]
+    #[test]
+    fn stalled_retention_notice_preserves_recovery_and_finishes_unwinding() {
+        crate::controlled_output::with_stalled_stderr(
+            concat!(
+                module_path!(),
+                "::stalled_retention_notice_preserves_recovery_and_finishes_unwinding"
+            ),
+            || {
+                let parent = crate::test_util::private_tempdir();
+                let sentinel = parent.path().join("unrelated-result");
+                std::fs::write(&sentinel, b"untouched").unwrap();
+                for unwind in [false, true] {
+                    let directory = recorded(parent.path());
+                    let path = directory.path().to_path_buf();
+                    let request_before = std::fs::read(path.join("request.json")).unwrap();
+                    let recovery_before = std::fs::read(path.join("recovery.json")).unwrap();
+                    std::fs::create_dir_all(path.join("delivery/diagnostics")).unwrap();
+                    std::fs::write(path.join("delivery/diagnostics/stderr"), b"partial\0\xff")
+                        .unwrap();
+                    if unwind {
+                        let outcome = std::panic::catch_unwind(move || {
+                            let _directory = directory;
+                            // Skip the panic hook's separate stderr write so
+                            // this exercises the actual retention destructor.
+                            std::panic::resume_unwind(Box::new("lost remote transport"));
+                        });
+                        assert!(outcome.is_err());
+                    } else {
+                        drop(directory);
+                    }
+                    assert_eq!(
+                        std::fs::read(path.join("request.json")).unwrap(),
+                        request_before
+                    );
+                    assert_eq!(
+                        std::fs::read(path.join("recovery.json")).unwrap(),
+                        recovery_before
+                    );
+                    assert_eq!(
+                        std::fs::read(path.join("delivery/diagnostics/stderr")).unwrap(),
+                        b"partial\0\xff"
+                    );
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                        0
+                    );
+                }
+                assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+                let mut completed = recorded(parent.path());
+                let completed_path = completed.path().to_path_buf();
+                completed.execution_finished();
+                drop(completed);
+                assert!(!completed_path.exists(), "confirmed scratch still retires");
+            },
+        );
     }
 
     #[test]

@@ -83,13 +83,13 @@ fn checkpoint(cancelled: &impl Fn() -> bool) -> io::Result<()> {
 }
 
 fn cache_warning(stage: &str, error: &io::Error) {
-    eprintln!(
-        "{}",
-        serde_json::json!({
+    crate::edge::server::report_log_line(
+        &serde_json::json!({
             "kind":"canonical-remote-source-cache-warning",
             "stage":stage,
             "message":error.to_string().chars().take(1024).collect::<String>(),
         })
+        .to_string(),
     );
 }
 
@@ -912,6 +912,17 @@ mod tests {
         // The cache warning path cannot convert an incomplete/incorrect
         // execution source into a sealed receiver.
         assert!(changed.finish(|| false).is_err());
+    }
+
+    #[test]
+    fn stalled_cache_notice_preserves_verified_source_handoff_and_invalid_byte_refusal() {
+        crate::controlled_output::with_stalled_stderr(
+            concat!(
+                module_path!(),
+                "::stalled_cache_notice_preserves_verified_source_handoff_and_invalid_byte_refusal"
+            ),
+            cache_storage_failure_does_not_hide_a_verified_source_or_authorize_invalid_bytes,
+        );
     }
 
     #[test]

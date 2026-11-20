@@ -779,13 +779,13 @@ fn deliver_assigned(
         .check_pending()
         .map_err(|error| assignment.before_dispatch(error))?;
     if peer.supported() {
-        eprintln!(
-            "{}",
-            json!({
+        crate::edge::server::report_log_line(
+            &json!({
                 "kind":"rabsd-worker-standby-dispatch", "worker":worker,
                 "request_id":assignment.request["request_id"],
                 "completed_heartbeats":peer.completed_heartbeats(),
             })
+            .to_string(),
         );
     }
     let (upload, admitted, continuation, prefixes) = match assignment.operation {
@@ -880,12 +880,12 @@ fn run_owner(
                 };
                 if let Some(advertisement) = &peer.advertisement {
                     ready();
-                    eprintln!(
-                        "{}",
-                        json!({
+                    crate::edge::server::report_log_line(
+                        &json!({
                             "kind":"rabsd-worker-standby-ready", "worker":worker,
                             "connection_generation":advertisement.generation,
                         })
+                        .to_string(),
                     );
                 }
                 parked = Some(peer);

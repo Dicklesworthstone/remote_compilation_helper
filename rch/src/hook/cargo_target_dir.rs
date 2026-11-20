@@ -447,6 +447,7 @@ pub(super) fn managed_clean_overlay_cargo_tokens(
 enum CommandPrefixMode {
     Cargo,
     ClassifiedCargo,
+    Compiler,
     Job,
 }
 
@@ -490,6 +491,14 @@ fn literal_command_tokens(
 /// shell evaluation cannot certify a bounded set of cache output roots.
 pub(crate) fn cargo_disk_home_override(command: &str) -> anyhow::Result<Option<String>> {
     let (tokens, executable_index) = literal_command_tokens(command, CommandPrefixMode::Cargo)?;
+    disk_home_override(&tokens, executable_index)
+}
+
+/// Resolve the cache scope of a literal native compiler invocation. Compiler
+/// arguments may spell environment options or CARGO_HOME without changing the
+/// environment. Shells and other command launchers require their own contract.
+pub(crate) fn compiler_disk_home_override(command: &str) -> anyhow::Result<Option<String>> {
+    let (tokens, executable_index) = literal_command_tokens(command, CommandPrefixMode::Compiler)?;
     disk_home_override(&tokens, executable_index)
 }
 
@@ -626,7 +635,12 @@ fn command_tokens_with_wrappers(
             Some(
                 "cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe" | "cargo-xwin"
                 | "cargo-xwin.exe",
-            ) => break,
+            ) if mode != CommandPrefixMode::Compiler => break,
+            Some("rustc" | "gcc" | "g++" | "cc" | "c++" | "clang" | "clang++")
+                if mode == CommandPrefixMode::Compiler =>
+            {
+                break;
+            }
             Some("env") => {
                 index += 1;
                 while let Some(token) = tokens.get(index) {
@@ -1482,6 +1496,64 @@ mod managed_build_dir_tests {
         ] {
             assert!(
                 super::cargo_disk_home_override(command).is_err(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_disk_cache_scope_separates_arguments_from_environment() {
+        for (command, home) in [
+            ("gcc -S cargo_bridge.c", None),
+            ("/usr/bin/gcc -S cargo_bridge.c", None),
+            ("cc -S cargo_bridge.c", None),
+            ("c++ -S cargo_bridge.cpp", None),
+            ("gcc -c 'cargo bridge.c' -DCARGO_HOME=relative", None),
+            (
+                "rustc -C link-arg=CARGO_HOME=relative cargo_bridge.rs",
+                None,
+            ),
+            ("time -f CARGO_HOME=/format gcc -S cargo_bridge.c", None),
+            ("time -f '-i' gcc -S cargo_bridge.c", None),
+            (
+                "CARGO_HOME='/worker/cache with spaces' gcc -S cargo_bridge.c",
+                Some("/worker/cache with spaces"),
+            ),
+            (
+                "env -u CARGO_HOME CARGO_HOME='/worker/cache with spaces' gcc -S cargo_bridge.c",
+                Some("/worker/cache with spaces"),
+            ),
+            (
+                "env -i CARGO_HOME=/worker/cache clang -DCARGO_HOME=payload -S cargo_bridge.c",
+                Some("/worker/cache"),
+            ),
+        ] {
+            assert_eq!(
+                super::compiler_disk_home_override(command)
+                    .unwrap()
+                    .as_deref(),
+                home,
+                "{command}"
+            );
+        }
+        for command in [
+            "env -i gcc -S cargo_bridge.c",
+            "env -u CARGO_HOME gcc -S cargo_bridge.c",
+            "env --unset=CARGO_HOME clang -S cargo_bridge.c",
+            "env CARGO_HOME=/one env -i gcc cargo_bridge.c",
+            "CARGO_HOME=relative gcc -S cargo_bridge.c",
+            "CARGO_HOME=$HOME/cache rustc cargo_bridge.rs",
+            "env -S 'CARGO_HOME=/worker/cache gcc -S cargo_bridge.c'",
+            "gcc -S cargo_bridge.c; CARGO_HOME=relative cargo check",
+            "timeout 10 env CARGO_HOME=/untracked gcc -S cargo_bridge.c",
+            "sh -c 'env -u CARGO_HOME gcc -S cargo_bridge.c'",
+            "nix develop -c env CARGO_HOME=/untracked cargo check",
+            "timeout 10 gcc -S cargo_bridge.c",
+            "sh -c 'gcc -S cargo_bridge.c'",
+            "cargo check",
+        ] {
+            assert!(
+                super::compiler_disk_home_override(command).is_err(),
                 "{command}"
             );
         }

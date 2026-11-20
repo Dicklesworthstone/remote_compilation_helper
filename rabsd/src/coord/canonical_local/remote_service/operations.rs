@@ -139,7 +139,7 @@ impl<T> Reaper<T> {
 impl<T> Drop for Reaper<T> {
     fn drop(&mut self) {
         if let Err(error) = self.finish() {
-            eprintln!("remote canonical cleanup: {error}");
+            crate::edge::server::report_log_line(&format!("remote canonical cleanup: {error}"));
         }
     }
 }
@@ -1149,5 +1149,91 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 2);
         assert!(lock(&registry.entries).is_empty());
         assert!(registry.stopped.load(Ordering::Acquire));
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn stalled_reaper_failure_notice_releases_remaining_custody_and_admission() {
+        crate::controlled_output::with_stalled_stderr(
+            concat!(
+                module_path!(),
+                "::stalled_reaper_failure_notice_releases_remaining_custody_and_admission"
+            ),
+            || {
+                use crate::coord::canonical_local::service::{
+                    AdmittedOperation, OperationAdmissions,
+                };
+
+                struct MayPanic {
+                    panic: bool,
+                    drops: Arc<AtomicUsize>,
+                    _admission: AdmittedOperation,
+                }
+                impl Drop for MayPanic {
+                    fn drop(&mut self) {
+                        self.drops.fetch_add(1, Ordering::SeqCst);
+                        if self.panic {
+                            // The production reaper must handle a failed
+                            // payload destructor. Avoid a separate panic-hook
+                            // write to the deliberately blocked test sink.
+                            std::panic::resume_unwind(Box::new("injected cleanup failure"));
+                        }
+                    }
+                }
+
+                let now = Instant::now();
+                let expired = now - Duration::from_secs(61);
+                let registry = Registry::new(authority(), 2, Duration::from_secs(60)).unwrap();
+                let admissions = OperationAdmissions::new(2, 1);
+                let drops = Arc::new(AtomicUsize::new(0));
+                let mut owners = Vec::new();
+                for (at, panic) in [(expired, true), (now, false)] {
+                    let reservation = registry
+                        .reserve([1; 32], connection(), at + Duration::from_secs(5), at)
+                        .unwrap();
+                    owners.push(reservation.operation_stop());
+                    reservation
+                        .activate(
+                            MayPanic {
+                                panic,
+                                drops: Arc::clone(&drops),
+                                _admission: admissions
+                                    .enqueue()
+                                    .unwrap()
+                                    .try_start()
+                                    .unwrap()
+                                    .unwrap(),
+                            },
+                            at + Duration::from_secs(120),
+                            at,
+                        )
+                        .unwrap()
+                        .detach(at)
+                        .unwrap();
+                }
+                let mut next = admissions.enqueue().unwrap();
+                assert!(next.try_start().unwrap().is_none());
+                let reaper = Reaper::start(Arc::clone(&registry)).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while reaper.check().is_ok() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(reaper.check().is_err());
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                // Drop joins the failed reaper, drains its surviving payload,
+                // then reports the error. Logging cannot retain this owner.
+                drop(reaper);
+                assert_eq!(drops.load(Ordering::SeqCst), 2);
+                assert!(owners.iter().all(|owner| owner.load(Ordering::Acquire)));
+                assert!(lock(&registry.entries).is_empty());
+                assert!(registry.stopped.load(Ordering::Acquire));
+                drop(
+                    next.try_start()
+                        .unwrap()
+                        .expect("drained admissions released"),
+                );
+                assert!(admissions.enqueue().unwrap().try_start().unwrap().is_some());
+            },
+        );
     }
 }
