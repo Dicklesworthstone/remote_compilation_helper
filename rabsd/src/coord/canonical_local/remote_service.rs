@@ -1615,6 +1615,7 @@ mod tests {
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
 
+    #[cfg(panic = "unwind")]
     #[test]
     fn stalled_session_notices_allow_cancellation_join_and_admission_reuse() {
         crate::controlled_output::with_stalled_stderr(

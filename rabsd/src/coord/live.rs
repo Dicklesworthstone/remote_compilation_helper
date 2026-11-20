@@ -4322,14 +4322,14 @@ impl CoordLive {
             // that could cause a caller to rerun completed work. Missing
             // positive evidence cannot pass the live sampling floor; a
             // divergence was already durably blocked by process_offer.
-            eprintln!(
-                "{}",
-                serde_json::json!({
+            crate::edge::server::report_log_line(
+                &serde_json::json!({
                     "v": 1,
                     "kind": "rabsd-verification-feedback-error",
                     "action_key": digest_key(&offer.manifest.action_key),
                     "error": format!("{error:?}"),
                 })
+                .to_string(),
             );
         }
         Ok(outcome)

@@ -379,10 +379,10 @@ impl Drop for AdmittedWorkerSession {
             self.offer.incarnation,
             self.started,
         ) {
-            eprintln!(
-                "{}",
-                serde_json::json!({"kind":"worker-session-release-error",
+            crate::edge::server::report_log_line(
+                &serde_json::json!({"kind":"worker-session-release-error",
                 "worker":self.admission.worker, "detail":error, "reexecute":false})
+                .to_string(),
             );
         }
     }
@@ -712,6 +712,60 @@ mod tests {
         drop(independent);
         drop(first);
         assert!(open(root.path(), "worker", [1; 32]).is_ok());
+    }
+
+    #[cfg(all(target_os = "linux", panic = "unwind"))]
+    #[test]
+    fn stalled_session_release_error_releases_mount_and_preserves_worker_fence() {
+        crate::controlled_output::with_stalled_stderr(
+            concat!(
+                module_path!(),
+                "::stalled_session_release_error_releases_mount_and_preserves_worker_fence"
+            ),
+            || {
+                let root = crate::test_util::private_tempdir();
+                let admission = open(root.path(), "worker", [1; 32]).unwrap();
+                let session = admission.admit(&identity(), &hello(5, 1)).unwrap();
+                let peer = PeerId(hex(&[1; 32]));
+                let before = admission
+                    .cas
+                    .store()
+                    .lock()
+                    .unwrap()
+                    .worker_incarnation_fence(&peer)
+                    .unwrap()
+                    .unwrap();
+                // Poison this real store's mutex to fail the durable release;
+                // do not emit a separate panic-hook diagnostic to the pipe.
+                let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _store = admission.cas.store().lock().unwrap();
+                    std::panic::resume_unwind(Box::new("session release store unavailable"));
+                }));
+                assert!(poisoned.is_err());
+                assert!(admission.cas.store().is_poisoned());
+                let weak = Arc::downgrade(&admission);
+                drop(admission);
+                drop(session);
+                assert!(
+                    weak.upgrade().is_none(),
+                    "session no longer holds admission custody"
+                );
+
+                // Reopening proves that the process mount was released. The
+                // failed session release must not erase durable fencing.
+                let reopened = open(root.path(), "worker", [1; 32]).unwrap();
+                let after = reopened
+                    .cas
+                    .store()
+                    .lock()
+                    .unwrap()
+                    .worker_incarnation_fence(&peer)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(after, before);
+                assert!(reopened.admit(&identity(), &hello(4, 2)).is_err());
+            },
+        );
     }
 
     #[test]

@@ -1151,6 +1151,7 @@ mod tests {
         assert!(registry.stopped.load(Ordering::Acquire));
     }
 
+    #[cfg(panic = "unwind")]
     #[test]
     fn stalled_reaper_failure_notice_releases_remaining_custody_and_admission() {
         crate::controlled_output::with_stalled_stderr(

@@ -152,9 +152,9 @@ impl ArtifactCacheConfiguration {
                 // One setup diagnostic per delivery. The existing parent is
                 // never created or chmodded; unavailable optional storage
                 // cannot prevent an otherwise valid verified transfer.
-                eprintln!(
-                    "{}",
-                    json!({"kind":"artifact-byte-cache-unavailable", "disposition":"cold", "detail":error.to_string()})
+                crate::edge::server::report_log_line(
+                    &json!({"kind":"artifact-byte-cache-unavailable", "disposition":"cold", "detail":error.to_string()})
+                        .to_string(),
                 );
                 None
             }
@@ -1870,6 +1870,34 @@ mod tests {
     use super::*;
     use rabs_sandbox::dependency_context::DependencyExecutionHost;
     use std::collections::VecDeque;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_cache_notice_preserves_cold_delivery_fallback() {
+        crate::controlled_output::with_stalled_stderr(
+            concat!(
+                module_path!(),
+                "::stalled_cache_notice_preserves_cold_delivery_fallback"
+            ),
+            || {
+                let root = crate::test_util::private_tempdir();
+                let unavailable = root.path().join("missing-cache-parent");
+                let sentinel = root.path().join("unrelated-result");
+                std::fs::write(&sentinel, b"untouched").unwrap();
+                let configuration = ArtifactCacheConfiguration {
+                    parent: unavailable.clone(),
+                    bytes: DEFAULT_ARTIFACT_CACHE_BYTES,
+                    entries: DEFAULT_ARTIFACT_CACHE_ENTRIES,
+                };
+                assert!(
+                    configuration.open().is_none(),
+                    "cold delivery remains available"
+                );
+                assert!(!unavailable.exists(), "optional parent is never created");
+                assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+            },
+        );
+    }
 
     #[test]
     fn artifact_cache_configuration_is_explicit_and_uses_shared_core_limits() {

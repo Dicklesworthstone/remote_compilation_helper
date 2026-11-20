@@ -133,7 +133,9 @@ impl Drop for CapturePins {
             return;
         }
         let Ok(mut store) = self.cas.store().lock() else {
-            eprintln!("rabsd: retaining compiler capture pins after poisoned store lock");
+            crate::edge::server::report_log_line(
+                "rabsd: retaining compiler capture pins after poisoned store lock",
+            );
             return;
         };
         // Check the class as well as the owner: even contradictory metadata
@@ -144,14 +146,16 @@ impl Drop for CapturePins {
                 if row.owner == self.owner && row.class == CAPTURE_PIN_CLASS
                     && row.root_key == digest_key(root))
             {
-                eprintln!("rabsd: retaining changed compiler capture pin {id:032x}");
+                crate::edge::server::report_log_line(&format!(
+                    "rabsd: retaining changed compiler capture pin {id:032x}"
+                ));
                 continue;
             }
             match release_pin_scoped(&mut *store, *id, &releaser) {
                 Ok(ReleaseOutcome::Released | ReleaseOutcome::AlreadyReleased) => {}
-                other => eprintln!(
+                other => crate::edge::server::report_log_line(&format!(
                     "rabsd: compiler capture pin {id:032x} release unconfirmed: {other:?}"
-                ),
+                )),
             }
         }
         // Drain old-incarnation custody only AFTER this capture's ordinary
@@ -161,12 +165,14 @@ impl Drop for CapturePins {
         // Failure retains unreconciled roots and cannot change compiler status
         // or undo a publication that has already acquired independent pins.
         match recovery::reconcile_page(&mut *store, &self.authority.coordinator) {
-            Ok(page) if page.released != 0 => eprintln!(
+            Ok(page) if page.released != 0 => crate::edge::server::report_log_line(&format!(
                 "rabsd: recovered {} fenced capture pins (scanned {}, complete {})",
                 page.released, page.scanned, page.complete
-            ),
+            )),
             Ok(_) => {}
-            Err(error) => eprintln!("rabsd: capture recovery incomplete: {error}"),
+            Err(error) => crate::edge::server::report_log_line(&format!(
+                "rabsd: capture recovery incomplete: {error}"
+            )),
         }
     }
 }
@@ -458,6 +464,61 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .released
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_capture_notice_releases_store_and_only_owned_pins() {
+        crate::controlled_output::with_stalled_stderr(
+            concat!(
+                module_path!(),
+                "::stalled_capture_notice_releases_store_and_only_owned_pins"
+            ),
+            || {
+                use rabs_cas::metadata_store::SqlValue;
+
+                let dir = crate::test_util::private_tempdir();
+                let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
+                let mut pins = CapturePins::new(Arc::clone(&cas), &authority(1));
+                put_bytes(&cas, b"first captured output", &mut pins).unwrap();
+                put_bytes(&cas, b"second captured output", &mut pins).unwrap();
+                let (&changed_id, changed_root) = pins.held.first_key_value().unwrap();
+                let changed_root = changed_root.clone();
+                let (&owned_id, owned_root) = pins.held.last_key_value().unwrap();
+                let owned_root = owned_root.clone();
+                assert_ne!(changed_id, owned_id);
+                // Change the first durable row, not the destructor's in-memory
+                // ownership. It must be retained while the later owned pin is
+                // released even when the retention notice cannot be consumed.
+                assert_eq!(
+                    cas.store()
+                        .lock()
+                        .unwrap()
+                        .execute(
+                            "UPDATE pins SET owner = ?1 WHERE id_hex = ?2",
+                            &[
+                                SqlValue::Text("changed-owner".into()),
+                                SqlValue::Text(format!("{changed_id:032x}")),
+                            ],
+                        )
+                        .unwrap(),
+                    1
+                );
+                drop(pins);
+                let mut store = cas
+                    .store()
+                    .try_lock()
+                    .expect("capture released the CAS lock");
+                let changed = store.pin_row(changed_id).unwrap().unwrap();
+                assert_eq!(changed.owner, "changed-owner");
+                assert!(!changed.released);
+                assert!(store.pin_row(owned_id).unwrap().unwrap().released);
+                drop(store);
+                let candidates = collectible(&cas);
+                assert!(!candidates.contains(&digest_key(&changed_root)));
+                assert!(candidates.contains(&digest_key(&owned_root)));
+            },
         );
     }
 
