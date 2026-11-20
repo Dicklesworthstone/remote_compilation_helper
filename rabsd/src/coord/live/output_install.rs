@@ -620,14 +620,19 @@ pub(super) fn install_prepared(
     plan: &PreparedOutputs,
     prepared: PreparedActionOutputs,
 ) -> Result<Vec<PathBuf>, ServeError> {
-    install_prepared_logged(store, plan, prepared, &mut std::io::stderr().lock())
+    install_prepared_observed(store, plan, prepared, &mut |notice| {
+        // The caller retains the CAS store and destination reservation until
+        // installation returns. A stopped diagnostic consumer must not hold
+        // either owner, or prevent metadata readiness from reaching Cargo.
+        crate::edge::server::report_log_line(&notice.to_string());
+    })
 }
 
-fn install_prepared_logged(
+fn install_prepared_observed(
     store: &mut dyn RabsMetadataStore,
     plan: &PreparedOutputs,
     prepared: PreparedActionOutputs,
-    log: &mut impl Write,
+    notice: &mut impl FnMut(&serde_json::Value),
 ) -> Result<Vec<PathBuf>, ServeError> {
     let receipt = prepared.install(store).map_err(ServeError::Materialize)?;
     for output in &receipt.installed {
@@ -638,17 +643,13 @@ fn install_prepared_logged(
         // Digests distinguish canonical identity from subscriber derivation.
         // Never log raw dep-info or source/environment contents.
         // A diagnostic sink failure must not hide a completed installation.
-        let _ = writeln!(
-            log,
-            "{}",
-            serde_json::json!({
-                "kind": "rabs-dep-info-installed", "action_key": plan.action_key,
-                "contract": DEP_INFO_DERIVATION_CONTRACT,
-                "destination_bytes": destination.as_os_str().as_bytes(),
-                "canonical_sha256": derived.derivation.canonical_sha256,
-                "derived_sha256": derived.derivation.derived_sha256,
-            })
-        );
+        notice(&serde_json::json!({
+            "kind": "rabs-dep-info-installed", "action_key": plan.action_key,
+            "contract": DEP_INFO_DERIVATION_CONTRACT,
+            "destination_bytes": destination.as_os_str().as_bytes(),
+            "canonical_sha256": derived.derivation.canonical_sha256,
+            "derived_sha256": derived.derivation.derived_sha256,
+        }));
     }
     Ok(receipt
         .installed
@@ -1204,11 +1205,11 @@ mod tests {
             .split_metadata();
         let mut log = Vec::new();
         let prepared_head = stage_for_install(head.unwrap(), &plan).unwrap();
-        let files = install_prepared_logged(
+        let files = install_prepared_observed(
             &mut *cas.store().lock().unwrap(),
             &plan,
             prepared_head,
-            &mut log,
+            &mut |notice| writeln!(&mut log, "{notice}").unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1233,11 +1234,11 @@ mod tests {
         assert!(!destination.join("libunit.rlib").exists());
         let head_files = files;
         let prepared_tail = stage_for_install(tail, &plan).unwrap();
-        let files = install_prepared_logged(
+        let files = install_prepared_observed(
             &mut *cas.store().lock().unwrap(),
             &plan,
             prepared_tail,
-            &mut log,
+            &mut |notice| writeln!(&mut log, "{notice}").unwrap(),
         )
         .unwrap();
         assert_eq!(files, vec![destination.join("libunit.rlib")]);
@@ -1267,5 +1268,108 @@ mod tests {
         // A post-install replacement must be refused before forwarding events.
         std::fs::write(destination.join("unit.d"), canonical).unwrap();
         assert!(verify_installed_dep_info(&plan, &head_files).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stalled_diagnostics_do_not_hold_installed_metadata_or_the_cas_lock() {
+        crate::controlled_output::with_stalled_stderr(
+            concat!(
+                module_path!(),
+                "::stalled_diagnostics_do_not_hold_installed_metadata_or_the_cas_lock"
+            ),
+            || {
+                use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+                use rabs_cas::digest_set::{DigestRequest, digest_set};
+                use rabs_protocol::raw_bytes::RawBytes;
+                use rabs_protocol::result_identity::{LogicalOutput, ObjectId};
+
+                let directory = crate::test_util::private_tempdir();
+                let cas = crate::janitor::store::mount_and_reconcile(&directory.path().join("cas"))
+                    .unwrap();
+                let source = directory.path().join("source");
+                let destination = directory.path().join("target");
+                std::fs::create_dir(&source).unwrap();
+                std::fs::write(source.join("lib.rs"), b"pub fn unit() {}\n").unwrap();
+                let put = |bytes: &[u8]| {
+                    let object = digest_set(bytes, DigestRequest::default(), None)
+                        .unwrap()
+                        .atp_content_id;
+                    put_if_absent(
+                        cas.layout(),
+                        &mut *cas.store().lock().unwrap(),
+                        &object,
+                        &mut &bytes[..],
+                        PutLimits::default(),
+                        DurabilityPolicy::FULL,
+                    )
+                    .unwrap();
+                    ObjectId(object)
+                };
+                let canonical = b"/__rabs/out/libunit.rmeta: /__rabs/source/lib.rs\n";
+                let mut manifest = rabs_cas::test_support::sample_manifest();
+                manifest.result_kind = ResultKind::Success;
+                manifest.artifact_bundle_root = None;
+                manifest.logical_outputs = vec![
+                    LogicalOutput {
+                        role: OutputRole::ProvisionalMetadata,
+                        virtual_path: RawBytes::from("libunit.rmeta"),
+                        object: put(b"metadata"),
+                    },
+                    LogicalOutput {
+                        role: OutputRole::DepInfo,
+                        virtual_path: RawBytes::from("unit.d"),
+                        object: put(canonical),
+                    },
+                ];
+                let contract = ExpectedOutputs::WithDepInfo {
+                    paths: BTreeSet::from(["libunit.rmeta".into(), "unit.d".into()]),
+                    mappings: vec![
+                        (
+                            b"/__rabs/source".to_vec(),
+                            source.as_os_str().as_bytes().to_vec(),
+                        ),
+                        (
+                            b"/__rabs/out".to_vec(),
+                            destination.as_os_str().as_bytes().to_vec(),
+                        ),
+                    ],
+                };
+                let plan = prepare(
+                    &mut *cas.store().lock().unwrap(),
+                    &manifest,
+                    &destination,
+                    &contract,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(plan.dep_info.len(), 1, "must exercise the notice path");
+                let expected = plan.dep_info[&destination.join("unit.d")].bytes.clone();
+                let selected =
+                    select_for_install(&mut *cas.store().lock().unwrap(), &plan).unwrap();
+                let prepared = stage_for_install(selected, &plan).unwrap();
+                let installed = {
+                    let mut store = cas.store().lock().unwrap();
+                    install_prepared(&mut *store, &plan, prepared).unwrap()
+                };
+                assert!(
+                    cas.store().try_lock().is_ok(),
+                    "metadata owner must be released"
+                );
+                assert_eq!(
+                    installed,
+                    vec![
+                        destination.join("libunit.rmeta"),
+                        destination.join("unit.d")
+                    ]
+                );
+                assert_eq!(std::fs::read(&installed[0]).unwrap(), b"metadata");
+                assert_ne!(expected, canonical);
+                assert_eq!(std::fs::read(&installed[1]).unwrap(), expected);
+                verify_installed_dep_info(&plan, &installed).unwrap();
+                std::fs::write(&installed[1], canonical).unwrap();
+                assert!(verify_installed_dep_info(&plan, &installed).is_err());
+            },
+        );
     }
 }

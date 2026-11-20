@@ -23,6 +23,7 @@ use super::target_state::TargetCacheConfig;
 use super::{SharedRuntime, ordinary_directory, overlap, plain_absolute, private_directory};
 use crate::coord::{source_manifest, worker_delivery};
 use crate::edge::live_facts::read_stable;
+use crate::edge::server::report_log_line;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::net::TcpListener;
 use asupersync::runtime::RuntimeBuilder;
@@ -312,8 +313,10 @@ impl Sessions {
                 if let Some(thread) = session.thread.take() {
                     match thread.join() {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => eprintln!("remote canonical session: {error}"),
-                        Err(_) => eprintln!("remote canonical session thread panicked"),
+                        Ok(Err(error)) => {
+                            report_log_line(&format!("remote canonical session: {error}"));
+                        }
+                        Err(_) => report_log_line("remote canonical session thread panicked"),
                     }
                 }
             } else {
@@ -397,9 +400,8 @@ pub fn run_service_profile(
             return Err(error);
         }
     };
-    eprintln!(
-        "{}",
-        json!({"kind":"canonical-remote-service-listening", "version":SERVICE_VERSION,
+    report_log_line(
+        &json!({"kind":"canonical-remote-service-listening", "version":SERVICE_VERSION,
         "address":listener.local_addr()?.to_string(), "max_roots":config.max_roots,
         "max_queued_roots":config.max_queued_roots,
         "queue_timeout_seconds":config.queue_timeout_seconds,
@@ -413,6 +415,7 @@ pub fn run_service_profile(
         "jobs_per_root":config.jobs_per_root, "build_identity":build_identity,
         "required_release":release_mode == ReleaseAuthorizationMode::Required,
         "transport":"mutual-tls-atp", "cargo_location":"coordinator"})
+        .to_string(),
     );
     let result = loop {
         sessions.reap();
@@ -1611,6 +1614,81 @@ mod tests {
     use std::pin::{Pin, pin};
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn stalled_session_notices_allow_cancellation_join_and_admission_reuse() {
+        crate::controlled_output::with_stalled_stderr(
+            concat!(
+                module_path!(),
+                "::stalled_session_notices_allow_cancellation_join_and_admission_reuse"
+            ),
+            || {
+                for panicked in [false, true] {
+                    let authority = rabs_protocol::authority::CoordinatorAuthority {
+                        cluster_id: rabs_protocol::authority::ClusterId("log-drain-test".into()),
+                        credential_generation: 1,
+                        term: 1,
+                        incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(1),
+                    };
+                    let operations = Registry::new(authority, 1, Duration::from_secs(1)).unwrap();
+                    let mut sessions = Sessions::new(operations).unwrap();
+                    let failed = std::thread::spawn(move || {
+                        if panicked {
+                            // Model the already-panicked session without its
+                            // panic hook itself writing to the full test pipe.
+                            std::panic::resume_unwind(Box::new("injected session failure"));
+                        }
+                        Err(io::Error::other("injected session error"))
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !failed.is_finished() {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    sessions.connections.push(Session {
+                        stopped: Arc::new(AtomicBool::new(false)),
+                        thread: Some(failed),
+                    });
+
+                    let admissions = OperationAdmissions::new(1, 1);
+                    let admitted = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+                    let stopped = Arc::new(AtomicBool::new(false));
+                    let child_stop = Arc::clone(&stopped);
+                    let joined = Arc::new(AtomicBool::new(false));
+                    let child_joined = Arc::clone(&joined);
+                    sessions.connections.push(Session {
+                        stopped: Arc::clone(&stopped),
+                        thread: Some(std::thread::spawn(move || {
+                            while !child_stop.load(Ordering::Acquire) {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            drop(admitted);
+                            child_joined.store(true, Ordering::Release);
+                            Ok(())
+                        })),
+                    });
+                    let mut next = admissions.enqueue().unwrap();
+                    assert!(next.try_start().unwrap().is_none());
+                    assert!(!stopped.load(Ordering::Acquire));
+
+                    // The real listener reaps failed sessions before checking
+                    // shutdown. Its diagnostic must not keep the other owner
+                    // alive or consume the only admission indefinitely.
+                    sessions.reap();
+                    assert_eq!(sessions.connections.len(), 1);
+                    sessions.shutdown().unwrap();
+                    assert!(stopped.load(Ordering::Acquire));
+                    assert!(joined.load(Ordering::Acquire));
+                    drop(
+                        next.try_start()
+                            .unwrap()
+                            .expect("joined admission released"),
+                    );
+                    assert!(admissions.enqueue().unwrap().try_start().unwrap().is_some());
+                }
+            },
+        );
+    }
 
     #[test]
     fn expired_cleanup_holds_actual_admission_until_its_writer_joins() {

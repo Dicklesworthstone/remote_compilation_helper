@@ -42,13 +42,13 @@ fn checkpoint(stopped: &impl Fn() -> bool) -> io::Result<()> {
 }
 
 fn cache_warning(stage: &str, error: &io::Error) {
-    eprintln!(
-        "{}",
-        serde_json::json!({
+    crate::edge::server::report_log_line(
+        &serde_json::json!({
             "kind":"canonical-remote-toolchain-cache-warning",
             "stage":stage,
             "message":error.to_string().chars().take(1024).collect::<String>(),
         })
+        .to_string(),
     );
 }
 

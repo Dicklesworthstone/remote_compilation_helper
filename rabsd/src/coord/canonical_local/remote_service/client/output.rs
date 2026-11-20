@@ -221,6 +221,103 @@ impl Write for ControlledOutput<'_> {
     }
 }
 
+/// Exercise a production stderr writer in an isolated instance of the current
+/// test harness. The inherited blocking pipe is genuinely full (EAGAIN), while
+/// stdout retains the test verdict. A regression cannot strand the test runner
+/// or leave its child running. Pass the test's complete `module_path!()` name.
+#[cfg(test)]
+pub(crate) fn with_stalled_stderr(test_name: &str, case: impl FnOnce()) {
+    use std::fs::{self, File};
+    use std::io::{Read, Write};
+    use std::process::{Child, Command, Stdio};
+
+    const CHILD_TEST: &str = "RABS_STALLED_STDERR_TEST";
+    const CHILD_ROOT: &str = "RABS_STALLED_STDERR_TEST_ROOT";
+    const COMPLETED: &str = "RABS_STALLED_STDERR_CASE_COMPLETED";
+    let test_name = test_name.strip_prefix("rabsd::").unwrap_or(test_name);
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+        let root = std::path::PathBuf::from(std::env::var_os(CHILD_ROOT).unwrap());
+        fs::write(root.join("ready"), b"native test body ready").unwrap();
+        std::io::stdin().read_exact(&mut [0_u8]).unwrap();
+        case();
+        println!("{COMPLETED}");
+        return;
+    }
+
+    struct ChildOwner(Child);
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    let root = crate::test_util::private_tempdir();
+    let (_reader, writer) = rustix::pipe::pipe_with(
+        rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC,
+    )
+    .unwrap();
+    let bytes = [0x5a; 4096];
+    loop {
+        match rustix::io::write(&writer, &bytes) {
+            Ok(count) => assert!(count > 0),
+            Err(rustix::io::Errno::AGAIN) => break,
+            result => panic!("unexpected stderr-pipe fill: {result:?}"),
+        }
+    }
+    assert_eq!(
+        rustix::io::write(&writer, b"x"),
+        Err(rustix::io::Errno::AGAIN)
+    );
+    let flags = rustix::fs::fcntl_getfl(&writer).unwrap() & !rustix::fs::OFlags::NONBLOCK;
+    rustix::fs::fcntl_setfl(&writer, flags).unwrap();
+    let writer = File::from(writer);
+    let log_path = root.path().join("child.log");
+    let mut child = ChildOwner(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_TEST, test_name)
+            .env(CHILD_ROOT, root.path())
+            .stdin(Stdio::piped())
+            .stdout(File::create(&log_path).unwrap())
+            .stderr(writer.try_clone().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    // Loader/startup latency is separate from the bounded production operation.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !root.path().join("ready").exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "stderr regression child did not enter {test_name}: {}",
+            fs::read_to_string(&log_path).unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{test_name} retained ownership behind stalled stderr: {}",
+            fs::read_to_string(&log_path).unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(status.success(), "{test_name} child failed: {log}");
+    assert!(
+        log.contains(COMPLETED),
+        "{test_name} body did not finish: {log}"
+    );
+    assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

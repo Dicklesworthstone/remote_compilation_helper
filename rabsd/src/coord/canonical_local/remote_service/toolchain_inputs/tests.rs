@@ -452,6 +452,47 @@ fn cached_file_bytes_cannot_replace_the_final_complete_sdk_namespace_identity() 
 }
 
 #[test]
+fn stalled_cache_notice_preserves_verified_sdk_handoff_and_invalid_inventory_refusal() {
+    crate::controlled_output::with_stalled_stderr(
+        concat!(
+            module_path!(),
+            "::stalled_cache_notice_preserves_verified_sdk_handoff_and_invalid_inventory_refusal"
+        ),
+        || {
+            let (_owner, sdk) =
+                fixture(&[("bin/compiler", b"verified compiler bytes", true)], None);
+            let root = private();
+            let cache = RemoteToolchainFileCache::new(root.path(), sdk.identity().bytes).unwrap();
+            let unexpected = cache.owner.path().join("toolchain-files-v1/foreign-entry");
+            fs::write(&unexpected, b"unrecognized optional storage").unwrap();
+
+            // Real inventory refusal disables the optional writer, while the
+            // ordinary receiver still seals and verifies the complete SDK.
+            // Its warning must not hold the operation behind the log sink.
+            let (uploaded, plans) = complete(&cache, ALICE, &sdk);
+            assert_eq!(uploaded, sdk.identity().bytes);
+            assert_eq!(plans[0].missing_files, vec![0]);
+            assert!(plans[0].prefixes.is_empty());
+            assert_eq!(
+                fs::read(&unexpected).unwrap(),
+                b"unrecognized optional storage"
+            );
+            assert!(cached_objects(&cache).is_empty());
+
+            // The same cache failure grants no relaxation to the required
+            // input contract. A file count/length mismatch remains terminal.
+            let mut input = cache.for_peer(ALICE, *sdk.identity(), &|| false).unwrap();
+            let mut files = sdk.files().unwrap();
+            files[0].bytes += 1;
+            let page = ToolchainFilePage::from_native(0, &files).unwrap();
+            assert!(input.page(&page, &|| false).is_err());
+            assert!(!input.can_decline());
+            assert!(input.finish(&|| false).is_err());
+        },
+    );
+}
+
+#[test]
 fn one_global_cache_budget_bounds_peer_churn_without_reducing_sdk_validation() {
     let bytes = vec![0x48; MAX_TOOLCHAIN_CHUNK * 3 + 19];
     let (_owner, sdk) = fixture(&[("bin/compiler", &bytes, true)], None);
