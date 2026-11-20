@@ -3,13 +3,18 @@
 //! Artifact bytes and toolchain identity are fixtures, not a rustc execution
 //! proof. These tests exercise the actual admission/capture/publication seam:
 //! no pointer before publication, immutable bytes after capture, and exact
-//! attempt cleanup when the subscriber never authorizes the captured result.
+//! attempt cleanup when the subscriber never authorizes the captured result,
+//! and transcript quarantine enforcement through every replay frontier.
 #![cfg(target_os = "linux")]
 
+use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
-use rabs_cas::metadata_store::RabsMetadataStore;
+use rabs_cas::metadata_store::{
+    QuarantineScope, RabsMetadataStore, SqlEngine, SqlValue, digest_key,
+};
 use rabs_key::live_dependency::{
-    LiveRustcRequest, ToolchainFacts, live_dependency_key, plan_dependency_action,
+    LiveRustcRequest, ToolchainFacts, canonicalize_compiler_transcript, live_dependency_key,
+    plan_dependency_action,
 };
 use rabs_protocol::input_evidence::{
     ActionInputManifest, INPUT_EVIDENCE_SCHEMA_VERSION, InputFileType, PositiveInput,
@@ -18,8 +23,9 @@ use rabs_protocol::raw_bytes::RawBytes;
 use rabs_protocol::result_identity::{ObjectId, TypedDigest};
 use rabsd::coord::live::CoordLive;
 use rabsd::coord::live_dependency::{
-    CapturedLocalAttempt, CompletionOutcome, CompletionReport, LiveDecision, LiveDependencyLane,
-    LiveDependencyRequest, LocalAttempt,
+    CapturedLocalAttempt, CompletionOutcome, CompletionReport, InstallResult,
+    LIVE_TRANSCRIPT_RECEIPT, LiveDecision, LiveDependencyLane, LiveDependencyRequest, LocalAttempt,
+    MAX_TRANSCRIPT_BYTES, PendingServe,
 };
 use rabsd::edge::live_facts::{FactsMiss, LiveFacts};
 use rabsd::janitor::store::{LiveCas, mount_and_reconcile};
@@ -239,6 +245,144 @@ impl Fixture {
             .published_manifest_key(key)
             .unwrap()
     }
+
+    /// Earn the normal replay allowance through independent admitted attempts.
+    /// These are scripted identity/artifact fixtures, not real rustc or fleet
+    /// evidence; all capture, comparison and publication code is production.
+    fn replayable() -> (Self, CompletionReport, TypedDigest) {
+        let mut fixture = Self::new();
+        fixture.argv.push("--json=artifacts".into());
+        let report = CompletionReport {
+            stderr: format!(
+                "{{\"$message_type\":\"artifact\",\"artifact\":\"{}/foo-123.d\",\"emit\":\"dep-info\"}}\n\
+                 {{\"$message_type\":\"artifact\",\"artifact\":\"{}/libfoo-123.rmeta\",\"emit\":\"metadata\"}}\n\
+                 fixture diagnostic after metadata\n",
+                fixture.out.display(),
+                fixture.out.display(),
+            )
+            .into_bytes(),
+            ..success()
+        };
+        let canonical =
+            canonicalize_compiler_transcript(&report.stderr, &fixture.request().plan).unwrap();
+        let transcript = digest_set(&canonical, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        for expected in [
+            CompletionOutcome::Committed,
+            CompletionOutcome::Verified,
+            CompletionOutcome::Verified,
+        ] {
+            let attempt = fixture.begin();
+            fixture.outputs();
+            assert_eq!(attempt.capture(&report).unwrap().publish().0, expected);
+        }
+        // Every replay assertion starts from an empty destination. Retain the
+        // originally captured files so refusing a hit cannot be mistaken for
+        // successfully reinstalling files left by the fixture executions.
+        std::fs::rename(
+            &fixture.out,
+            fixture.out.with_file_name("retained-local-outputs"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&fixture.out).unwrap();
+        (fixture, report, transcript)
+    }
+
+    fn hit(&self) -> PendingServe {
+        match self.lane.decide(self.request()) {
+            LiveDecision::Hit(pending) => pending,
+            other => panic!("earned replay did not preview a hit: {other:?}"),
+        }
+    }
+
+    fn quarantine_transcript(&self, transcript: &TypedDigest) {
+        self.cas
+            .store()
+            .lock()
+            .unwrap()
+            .add_quarantine(
+                QuarantineScope::LogicalObject,
+                &digest_key(transcript),
+                "unresolved transcript fixture incident",
+            )
+            .unwrap();
+    }
+
+    fn transcript_replica(&self, transcript: &TypedDigest) -> (String, PathBuf, Vec<u8>) {
+        let primary = self
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_locations(transcript)
+            .unwrap()[0]
+            .0
+            .clone();
+        let bytes = std::fs::read(&primary).unwrap();
+        // The primary sorts before this replica, exercising refusal/failover
+        // rather than accidentally succeeding on the healthy copy first.
+        let replica = self.cas.cas_root().join("zz-transcript-replica");
+        std::fs::write(&replica, &bytes).unwrap();
+        self.cas
+            .store()
+            .lock()
+            .unwrap()
+            .add_location(
+                transcript,
+                replica.to_str().unwrap(),
+                Some(1),
+                RAW_PROFILE_V1,
+                false,
+            )
+            .unwrap();
+        assert!(primary.as_str() < replica.to_str().unwrap());
+        (primary, replica, bytes)
+    }
+
+    fn assert_no_outputs(&self) {
+        assert_eq!(std::fs::read_dir(&self.out).unwrap().count(), 0);
+    }
+}
+
+/// Isolate the process-wide policy memo without unsafe environment mutation.
+/// Fixed sampling is the production default; the fixture earns both required
+/// comparisons. The deadline also turns a callback/store-lock deadlock into a
+/// test failure rather than hanging the entire integration-test binary.
+fn run_with_fixed_sampling(test_name: &str) -> bool {
+    const CHILD: &str = "RABS_TRANSCRIPT_REPLAY_TEST_CHILD";
+    if std::env::var(CHILD).ok().as_deref() == Some(test_name) {
+        return false;
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"RABS_") {
+            command.env_remove(name);
+        }
+    }
+    let mut child = command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD, test_name)
+        .env("RABS_SPRT_SAMPLING", "0")
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "transcript fixture child failed: {status}"
+            );
+            return true;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("transcript fixture exceeded its deadline: {test_name}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn success() -> CompletionReport {
@@ -247,6 +391,346 @@ fn success() -> CompletionReport {
         signal: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
+    }
+}
+
+#[test]
+fn transcript_replay_quarantines_bad_replicas_and_replays_the_verified_copy() {
+    if run_with_fixed_sampling(
+        "transcript_replay_quarantines_bad_replicas_and_replays_the_verified_copy",
+    ) {
+        return;
+    }
+    for (replacement, quarantined) in [
+        (b"corrupt transcript fixture".to_vec(), true),
+        (vec![b'x'; MAX_TRANSCRIPT_BYTES + 1], false),
+    ] {
+        let (fixture, report, transcript) = Fixture::replayable();
+        let (primary, replica, canonical) = fixture.transcript_replica(&transcript);
+        let original_locations = fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_locations(&transcript)
+            .unwrap();
+        std::fs::write(&primary, &replacement).unwrap();
+        let pending = fixture.hit();
+        fixture.assert_no_outputs();
+        let mut replayed = Vec::new();
+        let result = pending.install_with_metadata(|prefix| {
+            // Both the lane's transcript recheck and the subscriber callback
+            // need the store. Neither may run beneath the materializer lock.
+            assert!(fixture.cas.store().try_lock().is_ok());
+            assert_eq!(
+                std::fs::read(fixture.out.join("libfoo-123.rmeta")).unwrap(),
+                b"original metadata fixture"
+            );
+            replayed.extend_from_slice(prefix);
+            Ok(())
+        });
+        let InstallResult::Served {
+            transcript: suffix,
+            installed,
+        } = result
+        else {
+            panic!("healthy transcript replica did not replay: {result:?}");
+        };
+        assert!(!replayed.is_empty(), "metadata prefix was not delivered");
+        replayed.extend_from_slice(&suffix);
+        assert_eq!(replayed, report.stderr);
+        assert_eq!(installed.len(), 1);
+        assert_eq!(std::fs::read(&primary).unwrap(), replacement);
+        assert_eq!(std::fs::read(&replica).unwrap(), canonical);
+        let mut store = fixture.cas.store().lock().unwrap();
+        assert_eq!(
+            store.object_locations(&transcript).unwrap(),
+            if quarantined {
+                vec![(
+                    replica.to_str().unwrap().to_owned(),
+                    RAW_PROFILE_V1.into(),
+                    false,
+                )]
+            } else {
+                // This reader never computed the over-limit copy's complete
+                // digest. A bound refusal must not claim corruption.
+                original_locations
+            }
+        );
+        assert_eq!(
+            store
+                .query(
+                    "SELECT quarantined FROM object_locations WHERE object_key = ?1 AND store_path = ?2",
+                    &[SqlValue::Text(digest_key(&transcript)), SqlValue::Text(primary)],
+                )
+                .unwrap(),
+            vec![vec![SqlValue::Int(i64::from(quarantined))]]
+        );
+        assert!(
+            store
+                .query(
+                    "SELECT 1 FROM quarantines WHERE scope = 'logical-object' AND subject = ?1",
+                    &[SqlValue::Text(digest_key(&transcript))],
+                )
+                .unwrap()
+                .is_empty(),
+            "one corrupt replica must not quarantine the healthy logical object"
+        );
+    }
+}
+
+#[test]
+fn logical_transcript_quarantine_blocks_preview_with_either_hex_spelling() {
+    if run_with_fixed_sampling(
+        "logical_transcript_quarantine_blocks_preview_with_either_hex_spelling",
+    ) {
+        return;
+    }
+    for uppercase in [false, true] {
+        let (fixture, _, transcript) = Fixture::replayable();
+        // Prove the unchanged publication is eligible before introducing the
+        // quarantine. Merely lacking evidence must not explain the refusal.
+        let pending = fixture.hit();
+        let key = pending.action_key().clone();
+        let manifest = pending.manifest_key().to_owned();
+        drop(pending);
+        if uppercase {
+            let canonical = digest_key(&transcript);
+            let (domain, hex) = canonical.rsplit_once(':').unwrap();
+            let alternate = format!("{domain}:{}", hex.to_ascii_uppercase());
+            assert_ne!(canonical, alternate);
+            let changed = fixture
+                .cas
+                .store()
+                .lock()
+                .unwrap()
+                .engine_mut()
+                .execute(
+                    "UPDATE decision_receipts SET decision = ?1 WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+                    &[
+                        SqlValue::Text(alternate),
+                        SqlValue::Text(LIVE_TRANSCRIPT_RECEIPT.into()),
+                        SqlValue::Text(digest_key(&key)),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(changed, 1, "fixture transcript receipt was not replaced");
+        }
+        fixture.quarantine_transcript(&transcript);
+        match fixture.lane.decide(fixture.request()) {
+            LiveDecision::Execute(attempt) => drop(attempt),
+            other => panic!("quarantined transcript must require fresh execution: {other:?}"),
+        }
+        assert_eq!(fixture.published(&key), Some(manifest));
+        fixture.assert_no_outputs();
+    }
+}
+
+#[test]
+fn logical_transcript_quarantine_revokes_an_already_previewed_hit() {
+    if run_with_fixed_sampling("logical_transcript_quarantine_revokes_an_already_previewed_hit") {
+        return;
+    }
+    for metadata in [false, true] {
+        let (fixture, _, transcript) = Fixture::replayable();
+        let pending = fixture.hit();
+        fixture.quarantine_transcript(&transcript);
+        let result = if metadata {
+            pending.install_with_metadata(|_| panic!("quarantined bytes reached the subscriber"))
+        } else {
+            pending.install()
+        };
+        assert!(
+            matches!(result, InstallResult::Declined(ref reason) if reason.contains("transcript")),
+            "revocation before installation must decline without writes: {result:?}"
+        );
+        fixture.assert_no_outputs();
+    }
+}
+
+#[test]
+fn transcript_quarantine_after_staging_prevents_metadata_and_terminal_replay() {
+    if run_with_fixed_sampling(
+        "transcript_quarantine_after_staging_prevents_metadata_and_terminal_replay",
+    ) {
+        return;
+    }
+    for metadata in [false, true] {
+        let (fixture, _, transcript) = Fixture::replayable();
+        let pending = fixture.hit();
+        // Inject a real store mutation at the post-staging install receipt,
+        // after the lane's initial check but before destination publication.
+        // This exercises the actual callback/final-delivery boundaries without
+        // relying on filesystem timing or a production-only test hook.
+        fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .engine_mut()
+            .execute(
+                &format!(
+                    "CREATE TRIGGER quarantine_transcript_on_install AFTER INSERT ON decision_receipts \
+                     WHEN NEW.kind = 'rabs-live-replay-install-v1' BEGIN \
+                     INSERT INTO quarantines (scope, subject, reason) \
+                     VALUES ('logical-object', '{}', 'fixture post-staging quarantine'); END",
+                    digest_key(&transcript),
+                ),
+                &[],
+            )
+            .unwrap();
+        let result = if metadata {
+            pending.install_with_metadata(|_| panic!("post-staging quarantine leaked a prefix"))
+        } else {
+            pending.install()
+        };
+        let refused = match &result {
+            InstallResult::ExposedFault(reason) if metadata => reason.contains("transcript"),
+            InstallResult::Fault(reason) if !metadata => reason.contains("transcript"),
+            _ => false,
+        };
+        assert!(
+            refused,
+            "quarantine did not fence transcript delivery: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.out.join("libfoo-123.rmeta")).unwrap(),
+            b"original metadata fixture",
+            "the refusal must preserve the actual installed frontier"
+        );
+        assert_eq!(
+            fixture
+                .cas
+                .store()
+                .lock()
+                .unwrap()
+                .query(
+                    "SELECT reason FROM quarantines WHERE scope = 'logical-object' AND subject = ?1",
+                    &[SqlValue::Text(digest_key(&transcript))],
+                )
+                .unwrap(),
+            vec![vec![SqlValue::Text("fixture post-staging quarantine".into())]]
+        );
+    }
+}
+
+#[test]
+fn transcript_quarantine_during_metadata_ack_prevents_terminal_success() {
+    if run_with_fixed_sampling(
+        "transcript_quarantine_during_metadata_ack_prevents_terminal_success",
+    ) {
+        return;
+    }
+    let (fixture, report, transcript) = Fixture::replayable();
+    let pending = fixture.hit();
+    let mut replayed = Vec::new();
+    let result = pending.install_with_metadata(|prefix| {
+        replayed.extend_from_slice(prefix);
+        let mut store = fixture
+            .cas
+            .store()
+            .try_lock()
+            .expect("callback retained CAS lock");
+        store
+            .add_quarantine(
+                QuarantineScope::LogicalObject,
+                &digest_key(&transcript),
+                "fixture quarantine while metadata was acknowledged",
+            )
+            .unwrap();
+        Ok(())
+    });
+    assert_eq!(
+        replayed,
+        report
+            .stderr
+            .strip_suffix(b"fixture diagnostic after metadata\n")
+            .unwrap()
+    );
+    assert!(
+        matches!(result, InstallResult::ExposedFault(ref reason) if reason.contains("transcript")),
+        "an acknowledged prefix cannot authorize success or fallback after quarantine: {result:?}"
+    );
+}
+
+#[test]
+fn transcript_quarantine_store_failure_never_falls_through_to_a_healthy_replica() {
+    if run_with_fixed_sampling(
+        "transcript_quarantine_store_failure_never_falls_through_to_a_healthy_replica",
+    ) {
+        return;
+    }
+    let (fixture, _, transcript) = Fixture::replayable();
+    let (primary, replica, canonical) = fixture.transcript_replica(&transcript);
+    std::fs::write(&primary, b"corrupt transcript fixture").unwrap();
+    fixture
+        .cas
+        .store()
+        .lock()
+        .unwrap()
+        .engine_mut()
+        .execute(
+            "CREATE TRIGGER refuse_transcript_quarantine BEFORE UPDATE OF quarantined ON object_locations \
+             WHEN NEW.quarantined = 1 BEGIN SELECT RAISE(ABORT, 'fixture quarantine unavailable'); END",
+            &[],
+        )
+        .unwrap();
+    let decision = fixture.lane.decide(fixture.request());
+    assert!(
+        !matches!(decision, LiveDecision::Hit(_)),
+        "failed quarantine persistence must not authorize another replica: {decision:?}"
+    );
+    fixture.assert_no_outputs();
+    assert_eq!(
+        std::fs::read(&primary).unwrap(),
+        b"corrupt transcript fixture"
+    );
+    assert_eq!(std::fs::read(&replica).unwrap(), canonical);
+    assert_eq!(
+        fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .object_locations(&transcript)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn transcript_store_read_failure_revokes_preview_without_destination_writes() {
+    if run_with_fixed_sampling(
+        "transcript_store_read_failure_revokes_preview_without_destination_writes",
+    ) {
+        return;
+    }
+    for table in ["decision_receipts", "quarantines"] {
+        let (fixture, _, _) = Fixture::replayable();
+        let pending = fixture.hit();
+        // Retain the fixture's metadata while making the next lookup fail.
+        // Neither an unreadable binding nor an unreadable quarantine index
+        // may be interpreted as permission to replay already retained bytes.
+        fixture
+            .cas
+            .store()
+            .lock()
+            .unwrap()
+            .engine_mut()
+            .execute(
+                &format!("ALTER TABLE {table} RENAME TO retained_{table}"),
+                &[],
+            )
+            .unwrap();
+        let result = pending.install_with_metadata(|_| {
+            panic!("failed transcript metadata lookup exposed a replay prefix")
+        });
+        assert!(
+            matches!(result, InstallResult::Declined(ref reason) if reason.contains("transcript")),
+            "failed {table} lookup must decline before installation: {result:?}"
+        );
+        fixture.assert_no_outputs();
     }
 }
 

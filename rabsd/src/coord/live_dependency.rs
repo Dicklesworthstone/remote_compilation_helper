@@ -465,6 +465,7 @@ pub struct PendingServe {
     manifest: CanonicalActionResultManifest,
     manifest_key: String,
     canonical_transcript: Vec<u8>,
+    transcript_id: TypedDigest,
     remote_validation: Option<remote::RemoteValidation>,
 }
 
@@ -559,7 +560,20 @@ impl PendingServe {
         }
         self.request.verify_toolchain()?;
         self.request.verify_package()?;
-        self.request.dependencies.verify_unchanged()
+        self.request.dependencies.verify_unchanged()?;
+        self.verify_transcript()
+    }
+
+    /// Preview retains verified bytes, but not permanent permission to replay
+    /// them. Recheck the binding and logical quarantine at each delivery
+    /// frontier, including after private output staging released the store.
+    fn verify_transcript(&self) -> Result<(), String> {
+        let cas = self.coord.live_cas().ok_or("no CAS mounted")?;
+        let mut store = cas.store().lock().map_err(|_| "store lock poisoned")?;
+        if bound_transcript_id(&mut *store, &self.manifest).as_ref() != Some(&self.transcript_id) {
+            return Err("committed compiler transcript is unavailable or quarantined".into());
+        }
+        Ok(())
     }
 
     /// Install the complete result before replaying any stderr.
@@ -620,6 +634,7 @@ impl PendingServe {
                     files,
                     self.remote_validation.as_ref(),
                 )?;
+                self.verify_transcript()?;
                 let callback = metadata_ready.as_mut().ok_or("missing metadata receiver")?;
                 callback(&transcript[..prefix_len.ok_or("missing metadata prefix")?])
             };
@@ -663,6 +678,9 @@ impl PendingServe {
                 {
                     return install_fault(reason, metadata_exposed);
                 }
+                if let Err(reason) = self.verify_transcript() {
+                    return install_fault(reason, metadata_exposed);
+                }
                 let result = finish_installation(
                     &self.request.dependencies,
                     &self.request.package,
@@ -683,6 +701,11 @@ impl PendingServe {
                     &result,
                     self.remote_validation.as_ref(),
                 ) {
+                    return install_fault(reason, metadata_exposed);
+                }
+                // Input verification and producer registration can perform
+                // more I/O. Check again at the actual transcript return edge.
+                if let Err(reason) = self.verify_transcript() {
                     return install_fault(reason, metadata_exposed);
                 }
                 match result {
@@ -981,14 +1004,13 @@ fn output_role(class: OutputClass) -> OutputRole {
     }
 }
 
-/// Load the canonical transcript bound to a committed manifest. `None`
-/// when the binding is absent, unreadable, or does not reproduce the
-/// committed observable digest — a hit then cannot be replayed exactly.
-fn load_bound_transcript(
+/// Resolve the transcript index only while it agrees with the committed
+/// observable identity and the logical object has no unresolved quarantine.
+/// Physical replica selection cannot release a logical quarantine.
+fn bound_transcript_id(
     store: &mut dyn RabsMetadataStore,
     manifest: &CanonicalActionResultManifest,
-) -> Option<Vec<u8>> {
-    use std::io::Read;
+) -> Option<TypedDigest> {
     let rows = store
         .query(
             "SELECT decision FROM decision_receipts WHERE kind = ?1 AND subject = ?2 AND seq = 0",
@@ -1022,6 +1044,29 @@ fn load_bound_transcript(
     if observable_result_digest_v1(manifest, &id) != manifest.observable_result_digest {
         return None;
     }
+    if !store
+        .query(
+            "SELECT 1 FROM quarantines WHERE scope = 'logical-object' AND subject = ?1 LIMIT 1",
+            &[SqlValue::Text(digest_key(&id))],
+        )
+        .ok()?
+        .is_empty()
+    {
+        return None;
+    }
+    Some(id)
+}
+
+/// Load only a byte-verified replica of the committed transcript. A corrupt
+/// copy is durably excluded before trying another; metadata failures refuse
+/// replay rather than forgetting quarantine or returning unverified bytes.
+fn load_bound_transcript(
+    store: &mut dyn RabsMetadataStore,
+    manifest: &CanonicalActionResultManifest,
+) -> Option<(TypedDigest, Vec<u8>)> {
+    use std::io::Read;
+
+    let id = bound_transcript_id(store, manifest)?;
     for (path, encoding, _) in store.object_locations(&id).ok()? {
         if encoding != rabs_cas::blob_store::RAW_PROFILE_V1
             || !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file())
@@ -1038,11 +1083,15 @@ fn load_bound_transcript(
             .is_err()
             || transcript.len() > MAX_TRANSCRIPT_BYTES
         {
+            // A bounded refusal is not evidence of corrupt content: placement
+            // canonicalization may expand an admitted raw transcript beyond
+            // this reader's bound. Preserve its location until fully verified.
             continue;
         }
         if object_id(&transcript).ok()? == id {
-            return Some(transcript);
+            return Some((id, transcript));
         }
+        store.set_location_quarantined(&id, &path, true).ok()?;
     }
     None
 }
@@ -1182,12 +1231,12 @@ impl LiveDependencyLane {
                 Some(manifest_key) => {
                     load_manifest(&mut *store, &manifest_key).and_then(|manifest| {
                         load_bound_transcript(&mut *store, &manifest)
-                            .map(|transcript| (manifest_key, manifest, transcript))
+                            .map(|(id, transcript)| (manifest_key, manifest, id, transcript))
                     })
                 }
             }
         };
-        let Some((manifest_key, manifest, canonical_transcript)) = loaded else {
+        let Some((manifest_key, manifest, transcript_id, canonical_transcript)) = loaded else {
             return Ok(Err(request));
         };
         let expected = request.installation_outputs()?;
@@ -1205,6 +1254,7 @@ impl LiveDependencyLane {
                 manifest,
                 manifest_key,
                 canonical_transcript,
+                transcript_id,
                 remote_validation: remote_validation.cloned(),
             })),
             Ok(_) => Ok(Err(request)),
@@ -2053,6 +2103,81 @@ mod installed_output_tests {
                 installed,
             )
         }
+    }
+
+    #[test]
+    fn valid_expanded_transcript_over_reader_bound_is_not_quarantined() {
+        let fixture = SharedDirectoryInstall::new();
+        let mut plan = fixture.plan.clone();
+        plan.out_dir = "/o".into();
+        let metadata = plan
+            .outputs
+            .declarations
+            .iter()
+            .find(|output| output.class == OutputClass::ProvisionalMetadata)
+            .unwrap();
+        let event = format!(
+            "{{\"$message_type\":\"artifact\",\"artifact\":\"/o/{}\",\"emit\":\"metadata\"}}\n",
+            metadata.virtual_path,
+        );
+        let raw = event.as_bytes().repeat(MAX_TRANSCRIPT_BYTES / event.len());
+        let canonical = canonicalize_compiler_transcript(&raw, &plan).unwrap();
+        assert!(raw.len() <= MAX_TRANSCRIPT_BYTES);
+        assert!(canonical.len() > MAX_TRANSCRIPT_BYTES);
+        let transcript = object_id(&canonical).unwrap();
+        // Direct reader fixture: the actual canonicalizer can expand accepted
+        // raw bytes. A fully verified CAS object beyond this reader's bound
+        // must remain eligible for a reader with a larger limit.
+        let key = compute(
+            rabs_key::typed_digest::DOMAIN_ACTION_KEY,
+            b"bound-transcript-reader-fixture",
+        );
+        let descriptor = compute(
+            rabs_key::typed_digest::DOMAIN_DESCRIPTOR,
+            b"bound-transcript-reader-fixture",
+        );
+        let mut manifest = CanonicalActionResultManifest {
+            action_key: key,
+            canonical_descriptor_digest: descriptor.clone(),
+            key_epoch: 1,
+            projection_epoch: 1,
+            result_kind: ResultKind::Success,
+            artifact_bundle_root: None,
+            logical_outputs: Vec::new(),
+            semantic_result_digest: descriptor.clone(),
+            observable_result_digest: descriptor,
+        };
+        manifest.semantic_result_digest =
+            rabs_cas::publication::semantic_result_digest_v1(&manifest);
+        manifest.observable_result_digest = observable_result_digest_v1(&manifest, &transcript);
+        let mut store = fixture.cas.store().lock().unwrap();
+        put_if_absent(
+            fixture.cas.layout(),
+            &mut *store,
+            &transcript,
+            &mut canonical.as_slice(),
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        store
+            .record_decision_receipt(
+                LIVE_TRANSCRIPT_RECEIPT,
+                &digest_key(&manifest.action_key),
+                0,
+                &digest_key(&transcript),
+                "bound transcript reader fixture",
+            )
+            .unwrap();
+        assert_eq!(
+            bound_transcript_id(&mut *store, &manifest),
+            Some(transcript.clone())
+        );
+        let locations = store.object_locations(&transcript).unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(std::fs::read(&locations[0].0).unwrap(), canonical);
+        assert!(load_bound_transcript(&mut *store, &manifest).is_none());
+        assert_eq!(store.object_locations(&transcript).unwrap(), locations);
     }
 
     #[test]
