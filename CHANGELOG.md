@@ -5,7 +5,7 @@ Compilation Helper): the PreToolUse hook + CLI (`rch`), the local daemon (`rchd`
 worker agent (`rch-wkr`), the RABS build sidecar (`rabs-*`, `rabsd`), and the fleet
 dashboard (`dashboard/`).
 
-Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.36` (2026-11-05).
+Scope window: project inception (`v0.1.0`, 2026-01-25) through `v2.1.37` (2026-11-20).
 
 This document was rebuilt from git history (`git log --no-merges` per tag range, `git show`
 on representative commits), version tags (`git for-each-ref`), GitHub release metadata
@@ -28,6 +28,27 @@ history. They are kept as-is because the descriptions were verified against the 
 but those particular links will 404.
 
 Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
+
+## 2.1.37 — 2026-11-20
+
+A one-fix release cut from `v2.1.36`, not from main: it is 2.1.36 plus one commit. The 270-odd commits on main since
+2.1.36 are not in it and wait for the next release from main, which will be numbered 2.1.38 or later.
+
+- **A job script that runs Cargo is admitted again** (`bd-ea631`). 2.1.36 resolved the Cargo cache scope only for a
+  literal `cargo` command, so every `rch exec --job` whose command is a script and whose arguments spell `cargo` (for
+  example `bash scripts/gate_of_record_job.sh <stage> <row> cargo -j 2 test -p <crate>`) was marked unresolved, and
+  the worker refused it before it started: `RCH-E330 remote_build_disk_budget_exceeded: monitor_unavailable`, free 0
+  bytes, "Cargo cache scope is unresolved". Job mode now resolves only the job's own top-level env prefix and keeps
+  accounting for the isolated cache the script creates. An unbounded, relative or opaque `CARGO_HOME` is still
+  refused, and the worker's disk budget and protected floor are enforced as before
+  ([`23b85fd8`](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/23b85fd88711ace3dff9a5857a5c084e0af1f679)).
+  Measured on 2026-11-20 with a probe job script on hz3 and ovh-a: 2.1.36 is refused with free 0 bytes, and this
+  change reads the worker's real free space (110 GB and 45 GB).
+
+**Compatibility:** the change is in the client (`rch`). `rchd` and `rch-wkr` are rebuilt only to carry the version;
+their code and protocol are 2.1.36's, so a 2.1.37 client works with 2.1.36 workers.
+
+Scope window: `v2.1.36..v2.1.37`.
 
 ## 2.1.36 — 2026-11-05
 
