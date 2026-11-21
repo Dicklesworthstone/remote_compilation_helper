@@ -1,4 +1,4 @@
-//! Real frontend processes with an execed Rust driver fixture.
+//! Real frontend processes with execed Rust driver and RCH fixtures.
 //! These tests exercise validation and handoff, not compilation or TLS transport.
 //! Fixtures are retained; no source, operation or test directories are removed.
 
@@ -1288,4 +1288,431 @@ fn sibling_driver_is_resolved_from_physical_frontend_not_path_or_public_symlink(
         report["profile"]["toolchain_root"],
         json!(fixture.toolchain)
     );
+}
+
+struct RchFixture {
+    root: PathBuf,
+    rch: PathBuf,
+    report: PathBuf,
+}
+
+fn rch_process_fixture(path: &Path, route: &str) {
+    let adapter = format!(
+        "#!/bin/sh\nexport RABS_RCH_TEST_ROUTE={}\nexec {} --exact native_rch_process_fixture --ignored --nocapture -- \"$@\"\n",
+        quote(OsStr::new(route)),
+        quote(std::env::current_exe().unwrap().as_os_str()),
+    );
+    new_file(path, adapter.as_bytes(), 0o700);
+}
+
+impl RchFixture {
+    fn new() -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("rabs-native-rch-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let rch = root.join("RCH 'fixture'");
+        rch_process_fixture(&rch, "explicit");
+        let report = root.join("rch-report.json");
+        Self { root, rch, report }
+    }
+
+    fn configure(&self, command: &mut Command) {
+        command
+            .current_dir(&self.root)
+            .env("CARGO_RABS_RCH", &self.rch)
+            .env("RABS_RCH_TEST_REPORT", &self.report)
+            // None of these local tools may be probed or executed by this mode.
+            .env("CARGO", "/missing/dispatcher-cargo")
+            .env("CARGO_RABS_DAEMON", "/missing/dispatcher-daemon")
+            .env("CARGO_RABS_WRAP", "/missing/dispatcher-wrapper")
+            .env("CARGO_RABS_RUSTUP", "/missing/dispatcher-rustup")
+            .env("RUSTUP_TOOLCHAIN", "selected-custom-toolchain")
+            .env("RCH_WORKER", "selected-worker")
+            .env("RCH_REQUIRE_REMOTE", "0")
+            .env("RCH_RABS_WORKER_CACHE", "0")
+            .stdin(Stdio::null());
+        for key in [
+            "CARGO_RABS_CANONICAL_ACTIVE",
+            "CARGO_RABS_REMOTE_ACTIVE",
+            "RCH_RABS_WORKER_ACTIVE",
+            "CARGO_RABS_ROOT_BUDGET_DIR",
+            "CARGO_RABS_ROOT_CAPACITY",
+            "CARGO_RABS_ROOT_CGROUP",
+            "RABS_RCH_TEST_SIGNAL",
+            "RABS_RCH_TEST_JOBSERVER",
+            "RABS_RCH_TEST_STATUS",
+        ] {
+            command.env_remove(key);
+        }
+    }
+
+    fn command_using(&self, binary: &Path) -> Command {
+        let mut command = Command::new(binary);
+        self.configure(&mut command);
+        command.arg("--rch");
+        command
+    }
+
+    fn command(&self) -> Command {
+        self.command_using(Path::new(BINARY))
+    }
+
+    fn report(&self) -> Value {
+        serde_json::from_slice(&fs::read(&self.report).unwrap()).unwrap()
+    }
+
+    fn refused(&self, output: Output) -> String {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("rabs-cargo: refused:"), "{stderr}");
+        assert!(
+            !self.report.exists(),
+            "RCH must not execute after a frontend refusal"
+        );
+        stderr
+    }
+}
+
+#[test]
+#[ignore = "Rust RCH fixture, invoked only by native handoff tests"]
+fn native_rch_process_fixture() {
+    let mut arguments = std::env::args_os();
+    let arguments: Vec<_> = arguments
+        .by_ref()
+        .skip_while(|argument| argument != "--")
+        .skip(1)
+        .map(|argument| argument.into_string().unwrap())
+        .collect();
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    let mut token = None;
+    if std::env::var_os("RABS_RCH_TEST_JOBSERVER").is_some() {
+        // The original descriptors must still exist across both execs. The
+        // FIFO-backed jobserver uses the same shared token queue when opened
+        // through procfs; no invented or duplicated token is admitted.
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .open("/proc/self/fd/3")
+            .unwrap();
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .open("/proc/self/fd/4")
+            .unwrap();
+        let mut byte = [0];
+        reader.read_exact(&mut byte).unwrap();
+        writer.write_all(&byte).unwrap();
+        token = Some(byte[0]);
+    }
+    let report = json!({
+        "argv":arguments, "cwd":std::env::current_dir().unwrap(), "stdin":input,
+        "pid":std::process::id(), "route":std::env::var("RABS_RCH_TEST_ROUTE").unwrap(),
+        "required":std::env::var("RCH_REQUIRE_REMOTE").ok(),
+        "cache":std::env::var("RCH_RABS_WORKER_CACHE").ok(),
+        "remote_active":std::env::var("CARGO_RABS_REMOTE_ACTIVE").ok(),
+        "canonical_active":std::env::var("CARGO_RABS_CANONICAL_ACTIVE").ok(),
+        "worker_active":std::env::var("RCH_RABS_WORKER_ACTIVE").ok(),
+        "cargo":std::env::var("CARGO").ok(),
+        "daemon":std::env::var("CARGO_RABS_DAEMON").ok(),
+        "wrapper":std::env::var("CARGO_RABS_WRAP").ok(),
+        "toolchain":std::env::var("RUSTUP_TOOLCHAIN").ok(),
+        "worker":std::env::var("RCH_WORKER").ok(),
+        "jobserver":std::env::var("CARGO_MAKEFLAGS").ok(), "token":token,
+    });
+    new_file(
+        Path::new(&std::env::var_os("RABS_RCH_TEST_REPORT").unwrap()),
+        &serde_json::to_vec(&report).unwrap(),
+        0o600,
+    );
+    std::io::stdout()
+        .lock()
+        .write_all(b"\0RCH stdout\xff\n")
+        .unwrap();
+    std::io::stderr()
+        .lock()
+        .write_all(b"\0RCH stderr\xfe\n")
+        .unwrap();
+    if std::env::var_os("RABS_RCH_TEST_SIGNAL").is_some() {
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+            .unwrap();
+        panic!("RCH signal termination must propagate");
+    }
+    std::process::exit(
+        std::env::var("RABS_RCH_TEST_STATUS")
+            .map(|status| status.parse().unwrap())
+            .unwrap_or(47),
+    );
+}
+
+#[test]
+fn rch_handoff_preserves_literal_arguments_input_context_and_process_identity() {
+    let fixture = RchFixture::new();
+    let cargo_arguments = [
+        "+nightly-2026-08-31",
+        "test",
+        "name with spaces",
+        "--",
+        "",
+        "a'quoted\"value",
+        "$(printf unintended)",
+        "α β",
+        "--remote",
+        "--rabs-unknown",
+    ];
+    let mut child = fixture
+        .command()
+        .arg("--")
+        .args(cargo_arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let input = b"\0opaque user input\xff\n";
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(47), "{output:?}");
+    // libtest contributes its fixture preamble; the final raw stream bytes
+    // come from the execed RCH fixture without any frontend transformation.
+    assert!(output.stdout.ends_with(b"\0RCH stdout\xff\n"), "{output:?}");
+    assert_eq!(output.stderr, b"\0RCH stderr\xfe\n");
+    let report = fixture.report();
+    let mut expected = vec!["exec", "--source-content-receipt", "--", "cargo"];
+    expected.extend(cargo_arguments);
+    assert_eq!(report["argv"], json!(expected));
+    assert_eq!(report["stdin"], json!(input));
+    assert_eq!(report["pid"], pid);
+    assert_eq!(report["cwd"], json!(fixture.root));
+    assert_eq!(report["required"], "1");
+    assert_eq!(report["cache"], "1");
+    assert_eq!(report["remote_active"], "1");
+    assert_eq!(report["canonical_active"], Value::Null);
+    assert_eq!(report["worker_active"], Value::Null);
+    assert_eq!(report["cargo"], "/missing/dispatcher-cargo");
+    assert_eq!(report["daemon"], "/missing/dispatcher-daemon");
+    assert_eq!(report["wrapper"], "/missing/dispatcher-wrapper");
+    assert_eq!(report["toolchain"], "selected-custom-toolchain");
+    assert_eq!(report["worker"], "selected-worker");
+}
+
+#[test]
+fn rch_handoff_defaults_to_build_and_preserves_failure_and_signal_status() {
+    for status in [0, 23, 101, 130, 255] {
+        let fixture = RchFixture::new();
+        let output = fixture
+            .command()
+            .env("RABS_RCH_TEST_STATUS", status.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(status), "{output:?}");
+        assert_eq!(
+            fixture.report()["argv"],
+            json!(["exec", "--source-content-receipt", "--", "cargo", "build"])
+        );
+    }
+    let fixture = RchFixture::new();
+    let output = fixture
+        .command()
+        .arg("check")
+        .env("RABS_RCH_TEST_SIGNAL", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.signal(),
+        Some(rustix::process::Signal::TERM.as_raw())
+    );
+    assert_eq!(fixture.report()["required"], "1");
+}
+
+#[test]
+fn rch_handoff_preserves_live_jobserver_descriptors_and_token_count() {
+    let fixture = RchFixture::new();
+    let fifo = fixture.root.join("jobserver");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .unwrap();
+    let mut tokens = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(&fifo)
+        .unwrap();
+    tokens.write_all(b"T").unwrap();
+    let mut command = Command::new("/bin/sh");
+    fixture.configure(&mut command);
+    let output = command
+        .args([
+            "-c",
+            "exec 3<\"$1\"; exec 4>\"$1\"; shift; exec \"$@\"",
+            "jobserver-handoff",
+        ])
+        .arg(&fifo)
+        .args([BINARY, "--rch", "check"])
+        .env("RABS_RCH_TEST_JOBSERVER", "1")
+        .env("CARGO_MAKEFLAGS", "-j --jobserver-auth=3,4")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(47), "{output:?}");
+    let report = fixture.report();
+    assert_eq!(report["jobserver"], "-j --jobserver-auth=3,4");
+    assert_eq!(report["token"], b'T');
+    let mut returned = [0_u8; 2];
+    assert_eq!(tokens.read(&mut returned).unwrap(), 1);
+    assert_eq!(returned[0], b'T');
+    assert_eq!(
+        tokens.read(&mut returned).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn rch_handoff_refuses_recursive_context_and_incompatible_local_authority() {
+    for key in [
+        "CARGO_RABS_CANONICAL_ACTIVE",
+        "CARGO_RABS_REMOTE_ACTIVE",
+        "RCH_RABS_WORKER_ACTIVE",
+        "CARGO_RABS_ROOT_BUDGET_DIR",
+        "CARGO_RABS_ROOT_CAPACITY",
+        "CARGO_RABS_ROOT_CGROUP",
+    ] {
+        let fixture = RchFixture::new();
+        fixture.refused(
+            fixture
+                .command()
+                .arg("check")
+                .env(key, "1")
+                .output()
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
+fn rch_handoff_refuses_frontend_controls_and_opaque_arguments_before_execution() {
+    use std::os::unix::ffi::OsStringExt;
+    for control in [
+        "--rch",
+        "--cache",
+        "--local=p.json",
+        "--remote",
+        "--rabsd",
+        "--stdin=closed",
+        "--stdin-file",
+        "--rabs-no-start",
+        "--rabs-unknown",
+    ] {
+        for after_command in [false, true] {
+            let fixture = RchFixture::new();
+            let mut command = fixture.command();
+            if after_command {
+                command.arg("build");
+            }
+            fixture.refused(command.arg(control).output().unwrap());
+        }
+    }
+    let fixture = RchFixture::new();
+    let error = fixture.refused(
+        fixture
+            .command()
+            .args([
+                OsString::from("build"),
+                OsString::from_vec(b"bad\xff".to_vec()),
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(error.contains("UTF-8"));
+}
+
+#[test]
+fn rch_handoff_resolves_physical_siblings_before_path_and_preserves_explicit_selection() {
+    for route in ["sibling", "path", "explicit"] {
+        let fixture = RchFixture::new();
+        let generation = fixture.root.join("generation");
+        let path_bin = fixture.root.join("path bin");
+        private_directory(&generation);
+        private_directory(&path_bin);
+        let binary = generation.join("rabs-cargo");
+        fs::copy(BINARY, &binary).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        if route != "path" {
+            rch_process_fixture(&generation.join("rch"), "sibling");
+        }
+        rch_process_fixture(&path_bin.join("rch"), "path");
+        let public = fixture.root.join("public frontend");
+        symlink(&binary, &public).unwrap();
+        let mut command = fixture.command_using(&public);
+        command.env("PATH", &path_bin);
+        if route != "explicit" {
+            command.env_remove("CARGO_RABS_RCH");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(47), "{route}: {output:?}");
+        assert_eq!(fixture.report()["route"], route);
+    }
+}
+
+#[test]
+fn rch_handoff_refuses_invalid_or_recursive_explicit_executables_without_fallback() {
+    for kind in [
+        "missing",
+        "empty",
+        "not-executable",
+        "directory",
+        "symlink",
+        "hardlink",
+    ] {
+        let fixture = RchFixture::new();
+        let selected = fixture.root.join("selected");
+        let frontend = if kind == "hardlink" {
+            // Keep both links on the same filesystem even when TMPDIR differs
+            // from Cargo's target volume.
+            let copied = fixture.root.join("frontend");
+            fs::copy(BINARY, &copied).unwrap();
+            copied
+        } else {
+            PathBuf::from(BINARY)
+        };
+        match kind {
+            "not-executable" => new_file(&selected, b"not executable", 0o600),
+            "directory" => private_directory(&selected),
+            "symlink" => symlink(BINARY, &selected).unwrap(),
+            "hardlink" => fs::hard_link(&frontend, &selected).unwrap(),
+            _ => (),
+        }
+        // A valid PATH candidate must never override an invalid explicit choice.
+        rch_process_fixture(&fixture.root.join("rch"), "path-must-not-run");
+        let value = if kind == "empty" {
+            Path::new("")
+        } else {
+            &selected
+        };
+        fixture.refused(
+            fixture
+                .command_using(&frontend)
+                .env("CARGO_RABS_RCH", value)
+                .env("PATH", &fixture.root)
+                .output()
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
+fn rch_mode_help_needs_no_profile_backend_or_toolchain() {
+    let output = Command::new(BINARY)
+        .args(["--rch", "--help"])
+        .env("CARGO_RABS_RCH", "/missing/rch")
+        .env("CARGO_RABS_DAEMON", "/missing/daemon")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8(output.stdout).unwrap().contains("--rch"));
+    assert!(output.stderr.is_empty());
 }

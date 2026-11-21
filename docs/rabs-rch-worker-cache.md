@@ -40,8 +40,30 @@ loading the Linux-only preparation path.
 
 ### Direct Cargo entry point
 
-The launcher can select this remote profile directly, without preparing RABS
-or starting a local build on the dispatcher:
+The native frontend selects this remote profile directly, without a JSON
+profile, an interpreter, local RABS preparation or a local build:
+
+```sh
+rabs-cargo --rch build --release
+rabs-cargo --rch +nightly check
+RCH_WORKER=worker-a rabs-cargo --rch test --no-run
+```
+
+`--rch` must be the first frontend option. No Cargo arguments means `build`.
+An optional `--` separates this mode from the Cargo argument list, and Cargo's
+own later `--` preserves literal program, test or lint arguments, including
+arguments named like frontend controls. Before that runtime separator,
+canonical-profile options and `--rabs-*` launcher controls refuse instead of
+being passed to Cargo. `rabs-cargo --rch --help` needs no installed backend.
+
+`CARGO_RABS_RCH` selects an explicit executable path. Without that override,
+the native frontend checks for `rch` beside its physical installed executable,
+then on PATH. An invalid explicit override refuses; it never selects another
+backend. Symlink aliases retain their invocation spelling, while aliases or
+hardlinks to the frontend itself refuse. Linux and macOS dispatchers are
+supported. Canonical profiles remain a separate, explicit execution mode.
+
+The existing script launcher also selects the remote profile:
 
 ```sh
 cargo rabs --rabs-remote build --release
@@ -49,13 +71,12 @@ cargo +nightly rabs --rabs-remote check
 RCH_WORKER=worker-a cargo rabs --rabs-remote test --no-run
 ```
 
-This requires the updated `cargo-rabs` launcher, a matching rebuilt RCH client,
-and the worker installation described above. `CARGO_RABS_RCH` selects an explicit
-RCH executable; otherwise the launcher uses its normal sibling/PATH/release
-search. Linux and macOS dispatchers are supported. It does not need a local
-RABS installation. RCH may still perform its own metadata and toolchain probes.
+Both entry points require a matching rebuilt RCH client and the worker
+installation described above. The script retains its sibling/PATH/release
+search. Neither remote entry point needs a local RABS daemon or wrapper.
+RCH may still perform its own metadata and toolchain probes.
 
-The launcher execs `rch exec --source-content-receipt -- cargo ...` with
+Each frontend execs `rch exec --source-content-receipt -- cargo ...` with
 `RCH_REQUIRE_REMOTE=1` and `RCH_RABS_WORKER_CACHE=1`. Source receipts request
 RCH's existing owned source/target path. They do not authorize caching an
 arbitrary whole-Cargo result. RCH retains source-policy enforcement, worker
@@ -83,6 +104,11 @@ first Cargo argument or an explicit `--` are never interpreted by the launcher.
 `CARGO_RABS_REMOTE_ACTIVE=1` marks the RCH process tree so re-entering remote mode
 refuses; an existing `RCH_RABS_WORKER_ACTIVE=1` similarly prevents second-hop
 dispatch. These are recursion controls, not authentication or publication rights.
+The native frontend also refuses remote entry from an active canonical build
+or while local Cargo root-admission settings are present. It preserves the
+caller's cwd, stdin, stdout/stderr and inherited jobserver descriptors across
+the exec, including downstream exit codes and signals. It performs no local
+toolchain discovery and never replaces the selected `RUSTUP_TOOLCHAIN` value.
 Normal local mode and the version-1 imported `prepare()` API are unchanged.
 
 ### Worker-side preparation
@@ -154,6 +180,15 @@ relaxed. Separate workers retain separate caches; reuse is limited by the
 existing live dependency class and its path/input contracts.
 
 ## Validation boundaries
+
+`rabs-cli/tests/cargo.rs` exercises the native `--rch` frontend with actual
+frontend processes and an execed Rust RCH fixture. Tests cover literal argument
+and raw stdin/output preservation, toolchain and routing environment, exact
+process identity, exit and signal propagation, a live FIFO-backed jobserver
+token round trip, sibling/PATH/explicit selection, recursive executable and
+context refusal, and invalid frontend/argument rejection before backend entry.
+The RCH executable in these tests is a fixture; these are native handoff tests,
+not SSH, compiler-cache, macOS or live-fleet qualification.
 
 `rch-wkr/tests/worker_cache.rs` exercises the production native worker with
 real Linux processes, Unix sockets, inherited descriptors and cancellation.
