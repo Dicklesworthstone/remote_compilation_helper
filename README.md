@@ -49,7 +49,7 @@ RCH currently recognizes and can offload:
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
 | Bun/TypeScript | `bun test`, `bun typecheck` |
 | TypeScript | `tsc --noEmit`, `npx tsc --noEmit` |
-| Go | `go build`, `go build -o <file>`, ordinary `go test`, `go test -c -o <file>`, `go vet` |
+| Go | `go build`, `go build -o <file>`, ordinary `go test`, `go test -c`, `go test -c -o <file>`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 | Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
@@ -87,16 +87,19 @@ create extra files are outside this output contract. Implicit forms such as
 prove that exactly one main package is selected and bind its executable name
 before execution.
 
-Compile-only tests also return an exact binary: for example,
-`go test -c -o bin/package.test ./package`. Both endpoints verify that the same
-single package has test sources; packages without tests and selections spanning
-multiple packages stay local. Compilation never runs the test binary. The binary
-uses the same fresh-file publication and collection-only recovery as `go build`,
-and its caches and temporary files stay outside the selected source tree.
+Compile-only tests also return an exact binary: for example, `go test -c ./package`
+or `go test -c -o bin/package.test ./package`. Without `-o`, both endpoints bind
+Go's default test-binary name to the selected package and effective module mode,
+including versioned module paths and named `.go` inputs. Both endpoints verify
+that the same single package has test sources; packages without tests and
+selections spanning multiple packages stay local. Compilation never runs the
+test binary. The binary uses the same fresh-file publication and collection-only
+recovery as `go build`, and its caches and temporary files stay outside the
+selected source tree.
 Package discovery for implicit builds and compile-only tests requires Go 1.18
-or newer with workspace mode disabled. Test profiling, fuzz corpora, implicit
-test-binary names, and output-producing test execution (`-coverprofile`,
-`-cpuprofile`, `-trace`, `-fuzz`, `-o` without `-c`, and related `-test.*` forms)
+or newer with workspace mode disabled. Test profiling, fuzz corpora, and
+output-producing test execution (`-coverprofile`, `-cpuprofile`, `-trace`, `-fuzz`,
+`-o` without `-c`, and related `-test.*` forms)
 stay local. Strict remote mode refuses unsupported forms instead of executing
 them locally.
 
@@ -1020,6 +1023,18 @@ the named payloads, not the pooled target's other cached outputs. Anything the
 narrowing cannot parse exactly (unknown flags, shell expansion, other target
 kinds, response files, custom target specs) keeps the broad per-profile filters,
 which can include other cached build outputs in the same profile.
+
+For `cmake --build DIR`, Unix Makefiles builds also return the exact executable,
+static-library and unversioned shared-library files declared by CMake's generated
+link rules, including custom build directories and outputs elsewhere inside the
+project. Discovery reads the existing generated files; it does not reconfigure
+the project or require a CMake File API query. Generated Makefiles, caches and
+the `CMakeFiles` metadata tree are excluded from artifact retrieval. This requires
+a worker with `rch-wkr cmake-outputs` support; an older worker reports a retrieval
+failure instead of silently omitting these outputs. Ninja and Ninja Multi-Config
+continue to use their own graphs. Other generators and custom-command outputs
+retain the existing artifact policy, and versioned library symlink aliases are
+not added to the regular-file publication contract.
 
 Windows workers return artifacts through tar in both quiet and interactive
 execution. The transfer honors the requested output patterns and cache exclusions,

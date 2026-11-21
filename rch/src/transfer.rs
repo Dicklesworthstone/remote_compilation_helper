@@ -3993,6 +3993,14 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
         )
         .await
         .context("build output graph query failed")?;
+        Self::build_system_output_reply(output)
+    }
+
+    /// Keep a rejected query distinct from a deliberately absent backend.
+    /// Recovery must retain unresolved output authority after any other exit.
+    pub(crate) fn build_system_output_reply(
+        output: std::process::Output,
+    ) -> Result<Option<Vec<u8>>> {
         if output.status.code() == Some(3) && output.stdout.is_empty() {
             return Ok(None);
         }

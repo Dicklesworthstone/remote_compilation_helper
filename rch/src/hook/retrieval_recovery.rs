@@ -2617,7 +2617,16 @@ impl RecoverySession {
             .clone()
             .with_remote_path_override(remote)
             .discover_build_system_outputs(worker, discovery.query())
-            .await?;
+            .await;
+        self.complete_build_system_output_query(&discovery, listing)
+    }
+
+    fn complete_build_system_output_query(
+        &mut self,
+        discovery: &BuildSystemOutputDiscovery,
+        listing: anyhow::Result<Option<Vec<u8>>>,
+    ) -> anyhow::Result<()> {
+        let listing = listing?;
         let patterns = listing
             .as_deref()
             .map(|listing| discovery.resolve(listing))
@@ -9090,25 +9099,36 @@ mod tests {
 
     #[cfg(unix)]
     fn write_go_test_output_fixture(root: &Path, external_tests: bool) {
+        write_go_test_package_fixture(
+            root,
+            "fixture.invalid/test-output",
+            "fixture",
+            external_tests,
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_go_test_package_fixture(
+        root: &Path,
+        module: &str,
+        package: &str,
+        external_tests: bool,
+    ) {
         std::fs::create_dir_all(root).unwrap();
-        std::fs::write(
-            root.join("go.mod"),
-            b"module fixture.invalid/test-output\n\ngo 1.20\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("go.mod"), format!("module {module}\n\ngo 1.20\n")).unwrap();
         std::fs::write(
             root.join("value.go"),
-            b"package fixture\nfunc Value() int { return 37 }\n",
+            format!("package {package}\nfunc Value() int {{ return 37 }}\n"),
         )
         .unwrap();
         let (package, import, value) = if external_tests {
             (
-                "fixture_test",
-                "fixture \"fixture.invalid/test-output\"",
+                format!("{package}_test"),
+                format!("fixture \"{module}\""),
                 "fixture.Value()",
             )
         } else {
-            ("fixture", "", "Value()")
+            (package.to_owned(), String::new(), "Value()")
         };
         std::fs::write(
             root.join("value_test.go"),
@@ -9140,19 +9160,96 @@ func TestValue(t *testing.T) {{
         use tokio::process::Command;
 
         let _guard = test_guard!();
-        for (relative, external_tests, inline_output) in [
-            ("fixture.test", false, false),
-            ("products/test [dev]*?", true, true),
+        struct Fixture {
+            relative: &'static str,
+            module: &'static str,
+            package: &'static str,
+            external_tests: bool,
+            legacy_gopath: bool,
+            args: &'static [&'static str],
+        }
+        for fixture in [
+            Fixture {
+                relative: "fixture.test",
+                module: "fixture.invalid/test-output",
+                package: "fixture",
+                external_tests: false,
+                legacy_gopath: false,
+                args: &["test", "-p=1", "-c", ".", "-o", "fixture.test"],
+            },
+            Fixture {
+                relative: "products/test [dev]*?",
+                module: "fixture.invalid/test-output",
+                package: "fixture",
+                external_tests: true,
+                legacy_gopath: false,
+                args: &["test", "-p=1", "-c", ".", "-o=products/test [dev]*?"],
+            },
+            Fixture {
+                relative: "test-output.test",
+                module: "fixture.invalid/test-output",
+                package: "fixture",
+                external_tests: true,
+                legacy_gopath: false,
+                args: &["test", "-p=1", "-c"],
+            },
+            Fixture {
+                relative: "versioned-output.test",
+                module: "fixture.invalid/versioned-output/v2",
+                package: "fixture",
+                external_tests: false,
+                legacy_gopath: false,
+                args: &["test", "-p=1", "-c", "-trimpath", "."],
+            },
+            Fixture {
+                relative: "command-output.test",
+                module: "fixture.invalid/command-output",
+                package: "main",
+                external_tests: false,
+                legacy_gopath: false,
+                args: &["test", "-p=1", ".", "-c=true"],
+            },
+            Fixture {
+                relative: "fixture.test",
+                module: "fixture.invalid/named-test-inputs",
+                package: "fixture",
+                external_tests: false,
+                legacy_gopath: false,
+                args: &["test", "-p=1", "-c", "value.go", "value_test.go"],
+            },
+            Fixture {
+                relative: "v2.test",
+                module: "fixture.invalid/legacy-output/v2",
+                package: "fixture",
+                external_tests: false,
+                legacy_gopath: true,
+                args: &["test", "-p=1", "-c", "."],
+            },
         ] {
+            let relative = fixture.relative;
             let identity = uuid::Uuid::new_v4().to_string();
             let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
             let base = writer.path.parent().unwrap();
-            let local = base.join("checkout");
-            let remote = base.join("worker");
+            let project = |name: &str| {
+                let root = base.join(name);
+                if fixture.legacy_gopath {
+                    root.join("src").join(fixture.module)
+                } else {
+                    root
+                }
+            };
+            let local = project("checkout");
+            let remote = project("worker");
+            let stock = project("stock");
             let missing = base.join("missing-worker");
             let unrelated_target = base.join("unrelated-cargo-target");
-            for root in [&local, &remote] {
-                write_go_test_output_fixture(root, external_tests);
+            for root in [&local, &remote, &stock] {
+                write_go_test_package_fixture(
+                    root,
+                    fixture.module,
+                    fixture.package,
+                    fixture.external_tests,
+                );
             }
             for root in [&local, &remote, &missing, &unrelated_target] {
                 std::fs::create_dir_all(root.join("products")).unwrap();
@@ -9164,18 +9261,46 @@ func TestValue(t *testing.T) {{
             let remote_marker = remote.join("tests-ran");
             let marker_assignment =
                 format!("RCH_GO_TEST_EXECUTION_MARKER={}", remote_marker.display());
-            let inline = format!("-o={relative}");
-            let mut argv = vec!["test", "-p=1", "-c", "."];
-            if inline_output {
-                argv.push(&inline);
-            } else {
-                argv.extend(["-o", relative]);
-            }
-            let command = go_fixture_command("go", &argv, &[&marker_assignment]);
+            let fixture_command = |name: &str| {
+                if fixture.legacy_gopath {
+                    let gopath = format!("GOPATH={}", base.join(name).display());
+                    go_fixture_command(
+                        "go",
+                        fixture.args,
+                        &[&marker_assignment, "GO111MODULE=off", &gopath],
+                    )
+                } else {
+                    go_fixture_command("go", fixture.args, &[&marker_assignment, "GO111MODULE=on"])
+                }
+            };
+            let command = fixture_command("checkout");
             assert_eq!(
                 rch_common::classify_command(&command).kind,
                 Some(CompilationKind::GoTest)
             );
+            let explicit = rch_common::patterns::go_test_invocation(&command)
+                .unwrap()
+                .output
+                .is_some();
+            if !explicit {
+                // Check the default name against the actual unwrapped Go
+                // compiler, including library, main, v2, and named-file
+                // selections, and GOPATH mode where /v2 remains the basename.
+                let stock_before = go_fixture_tree(&stock);
+                let mut compiler = Command::new("sh");
+                compiler
+                    .args(["-c", &fixture_command("stock")])
+                    .current_dir(&stock);
+                let output = run_go_fixture(&mut compiler).await;
+                assert!(output.status.success(), "{command}: {output:?}");
+                let mut stock_after = go_fixture_tree(&stock);
+                assert!(
+                    stock_after.remove(Path::new(relative)).is_some(),
+                    "{command}"
+                );
+                assert_eq!(stock_after, stock_before, "unexpected stock Go output");
+                assert!(!remote_marker.exists(), "stock compile-only ran tests");
+            }
             let before = go_fixture_tree(&local);
             let environment = validate_go_build_output(&command, &local, &local)
                 .await
@@ -9215,13 +9340,18 @@ func TestValue(t *testing.T) {{
                 identity,
             )
             .unwrap();
-            assert!(session.has_native_output_contract());
+            assert_eq!(session.has_native_output_contract(), explicit);
+            if !explicit {
+                assert!(session.starting_execution().is_err());
+            }
             session.require_go_outputs(contract.clone()).unwrap();
+            assert!(session.has_native_output_contract());
             assert_eq!(session.recipe.phases.len(), 1);
             assert_eq!(session.recipe.phases[0].name, "project");
             assert!(session.returned(0).is_err());
             session.starting_execution().unwrap();
-            let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+            let guarded =
+                go_build_execution_command(&fixture_command("worker"), &environment, None).unwrap();
             let mut compiler = Command::new("sh");
             compiler.args(["-c", &guarded]).current_dir(&remote);
             let output = run_go_fixture(&mut compiler).await;
@@ -9307,6 +9437,101 @@ func TestValue(t *testing.T) {{
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn go_compile_only_gopath_runtime_refuses_rebound_package_without_touching_output() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::process::Command;
+
+        let _guard = test_guard!();
+        let owner = tempfile::tempdir().unwrap();
+        let base = owner.path();
+        let caller_gopath = base.join("caller-gopath");
+        let source = caller_gopath.join("src/fixture.invalid/legacy-output/v2");
+        write_go_test_package_fixture(
+            &source,
+            "fixture.invalid/legacy-output/v2",
+            "fixture",
+            false,
+        );
+        std::fs::write(source.join("v2.test"), b"prior implicit test executable").unwrap();
+        let mut goroot = Command::new("sh");
+        goroot
+            .args(["-c", &go_fixture_command("go", &["env", "GOROOT"], &[])])
+            .current_dir(base);
+        let output = run_go_fixture(&mut goroot).await;
+        assert!(output.status.success(), "{output:?}");
+        let real_go =
+            PathBuf::from(String::from_utf8(output.stdout).unwrap().trim()).join("bin/go");
+        let real_go = shell_escape::escape(real_go.to_string_lossy());
+        let shim = base.join("toolbin/go");
+        std::fs::create_dir(shim.parent().unwrap()).unwrap();
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in env|list) exec {real_go} \"$@\";; test) printf started > workload-invoked; exec {real_go} \"$@\";; esac\nexit 114\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = go_fixture_command(
+            shim.to_str().unwrap(),
+            &["test", "-p=1", "-c", "."],
+            &[
+                "GO111MODULE=off",
+                &format!("GOPATH={}", caller_gopath.display()),
+            ],
+        );
+        let before = go_fixture_tree(&source);
+        let environment = validate_go_build_output(&command, &source, &source)
+            .await
+            .unwrap();
+        assert_eq!(
+            environment.output_contract().required_files,
+            std::collections::BTreeSet::from([PathBuf::from("v2.test")])
+        );
+
+        // Production pins GOPATH below granted runtime storage, rather than
+        // placing synchronized sources inside GOPATH/src. That changes the
+        // legacy package import identity even though its basename is still
+        // v2. The worker must refuse, not treat a helper-only naming fixture
+        // with a manually rewritten GOPATH as portable source authority.
+        let target = base.join("granted-runtime");
+        let pipeline = TransferPipeline::new(
+            source.clone(),
+            "gopath-refusal".into(),
+            "gopath-refusal-identity".into(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::GoTest))
+        .with_go_test_output(true)
+        .with_remote_path_override(source.to_str().unwrap())
+        .with_remote_cargo_target_dir_override(target.to_str().unwrap());
+        let runtime = pipeline.managed_go_runtime_environment().unwrap();
+        assert_ne!(Path::new(&runtime["GOPATH"]), caller_gopath.as_path());
+        for path in runtime.values() {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let guarded = go_build_execution_command(&command, &environment, Some(&runtime)).unwrap();
+        let mut compiler = Command::new("sh");
+        compiler.args(["-c", &guarded]).current_dir(&source);
+        let output = run_go_fixture(&mut compiler).await;
+        assert_eq!(output.status.code(), Some(113), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("worker Go test package selection differs")
+        );
+        assert!(!source.join("workload-invoked").exists());
+        assert_eq!(go_fixture_tree(&source), before);
+        assert_eq!(
+            std::fs::read(source.join("v2.test")).unwrap(),
+            b"prior implicit test executable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn go_compile_only_test_guards_reject_absent_or_changed_test_packages() {
         use super::super::artifact_patterns::direct_compiler::{
             go_build_execution_command, validate_go_build_output,
@@ -9321,6 +9546,11 @@ func TestValue(t *testing.T) {{
         let root = directory.path();
         write_go_test_output_fixture(root, false);
         std::fs::write(root.join("fixture.test"), b"prior test executable").unwrap();
+        std::fs::write(
+            root.join("test-output.test"),
+            b"prior implicit test executable",
+        )
+        .unwrap();
         for name in ["no-tests", "other"] {
             std::fs::create_dir(root.join(name)).unwrap();
             std::fs::write(
@@ -9362,6 +9592,11 @@ func TestValue(t *testing.T) {{
         let environment = validate_go_build_output(&command, root, root)
             .await
             .unwrap();
+        let implicit_command =
+            go_fixture_command(shim.to_str().unwrap(), &["test", "-p=1", "-c", "."], &[]);
+        let implicit_environment = validate_go_build_output(&implicit_command, root, root)
+            .await
+            .unwrap();
         assert_eq!(go_fixture_tree(root), before);
         for packages in [
             vec!["./no-tests"],
@@ -9369,18 +9604,26 @@ func TestValue(t *testing.T) {{
             vec!["./..."],
             vec!["./missing/..."],
         ] {
-            let mut args = vec!["test", "-p=1", "-c", "-o", "fixture.test"];
-            args.extend(packages);
-            let refused = go_fixture_command(shim.to_str().unwrap(), &args, &[]);
-            assert!(
-                validate_go_build_output(&refused, root, root)
-                    .await
-                    .is_err(),
-                "{refused}"
-            );
-            assert_eq!(go_fixture_tree(root), before, "refusal changed {refused}");
+            for explicit in [false, true] {
+                let mut args = vec!["test", "-p=1", "-c"];
+                if explicit {
+                    args.extend(["-o", "fixture.test"]);
+                }
+                args.extend(packages.iter().copied());
+                let refused = go_fixture_command(shim.to_str().unwrap(), &args, &[]);
+                assert!(
+                    validate_go_build_output(&refused, root, root)
+                        .await
+                        .is_err(),
+                    "{refused}"
+                );
+                assert_eq!(go_fixture_tree(root), before, "refusal changed {refused}");
+            }
         }
-        let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+        let guarded_commands = [
+            go_build_execution_command(&command, &environment, None).unwrap(),
+            go_build_execution_command(&implicit_command, &implicit_environment, None).unwrap(),
+        ];
         let module = std::fs::read(root.join("go.mod")).unwrap();
         std::fs::write(
             root.join("go.mod"),
@@ -9388,12 +9631,16 @@ func TestValue(t *testing.T) {{
         )
         .unwrap();
         let changed = go_fixture_tree(root);
-        let mut compiler = Command::new("sh");
-        compiler.args(["-c", &guarded]).current_dir(root);
-        let output = run_go_fixture(&mut compiler).await;
-        assert_eq!(output.status.code(), Some(113), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("test package selection differs"));
-        assert_eq!(go_fixture_tree(root), changed);
+        for guarded in &guarded_commands {
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", guarded]).current_dir(root);
+            let output = run_go_fixture(&mut compiler).await;
+            assert_eq!(output.status.code(), Some(113), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("test package selection differs")
+            );
+            assert_eq!(go_fixture_tree(root), changed);
+        }
         std::fs::write(root.join("go.mod"), module).unwrap();
 
         // A matching package identity without any selected test file must
@@ -9404,15 +9651,21 @@ func TestValue(t *testing.T) {{
         )
         .unwrap();
         let changed = go_fixture_tree(root);
-        let mut compiler = Command::new("sh");
-        compiler.args(["-c", &guarded]).current_dir(root);
-        let output = run_go_fixture(&mut compiler).await;
-        assert_eq!(output.status.code(), Some(113), "{output:?}");
-        assert_eq!(go_fixture_tree(root), changed);
+        for guarded in &guarded_commands {
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", guarded]).current_dir(root);
+            let output = run_go_fixture(&mut compiler).await;
+            assert_eq!(output.status.code(), Some(113), "{output:?}");
+            assert_eq!(go_fixture_tree(root), changed);
+        }
         assert!(!root.join("workload-invoked").exists());
         assert_eq!(
             std::fs::read(root.join("fixture.test")).unwrap(),
             b"prior test executable"
+        );
+        assert_eq!(
+            std::fs::read(root.join("test-output.test")).unwrap(),
+            b"prior implicit test executable"
         );
     }
 
@@ -9431,6 +9684,11 @@ func TestValue(t *testing.T) {{
         let root = directory.path();
         write_go_test_output_fixture(root, false);
         std::fs::write(root.join("fixture.test"), b"prior test executable").unwrap();
+        std::fs::write(
+            root.join("test-output.test"),
+            b"prior implicit test executable",
+        )
+        .unwrap();
         // go list -find loads test metadata but does not typecheck this body.
         // The real compiler must fail, leaving the prior caller output intact.
         std::fs::write(
@@ -9438,23 +9696,24 @@ func TestValue(t *testing.T) {{
             b"package fixture\nimport \"testing\"\nfunc TestBroken(t *testing.T) { UndefinedFixtureSymbol() }\n",
         )
         .unwrap();
-        let command = go_fixture_command(
-            "go",
-            &["test", "-p=1", "-c", "-o", "fixture.test", "."],
-            &[],
-        );
         let before = go_fixture_tree(root);
-        let environment = validate_go_build_output(&command, root, root)
-            .await
-            .unwrap();
-        assert_eq!(go_fixture_tree(root), before);
-        let guarded = go_build_execution_command(&command, &environment, None).unwrap();
-        let mut compiler = Command::new("sh");
-        compiler.args(["-c", &guarded]).current_dir(root);
-        let output = run_go_fixture(&mut compiler).await;
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("UndefinedFixtureSymbol"));
-        assert_eq!(go_fixture_tree(root), before);
+        for args in [
+            vec!["test", "-p=1", "-c", "-o", "fixture.test", "."],
+            vec!["test", "-p=1", "-c", "."],
+        ] {
+            let command = go_fixture_command("go", &args, &[]);
+            let environment = validate_go_build_output(&command, root, root)
+                .await
+                .unwrap();
+            assert_eq!(go_fixture_tree(root), before);
+            let guarded = go_build_execution_command(&command, &environment, None).unwrap();
+            let mut compiler = Command::new("sh");
+            compiler.args(["-c", &guarded]).current_dir(root);
+            let output = run_go_fixture(&mut compiler).await;
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("UndefinedFixtureSymbol"));
+            assert_eq!(go_fixture_tree(root), before);
+        }
     }
 
     #[cfg(unix)]
@@ -9686,6 +9945,155 @@ func TestValue(t *testing.T) {{
                 .to_string_lossy()
                 .starts_with(".rch-go-output.")
         }));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn refused_cmake_query_keeps_broad_backend_staging_unpublishable_after_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::process::Command;
+
+        let _guard = test_guard!();
+        for failure in ["old-worker", "truncated-cache", "partial-listing"] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let remote = base.join("worker");
+            for root in [&local, &remote] {
+                std::fs::create_dir_all(root.join("build")).unwrap();
+            }
+            let paths = [
+                "build/Makefile",
+                "build/CMakeCache.txt",
+                "build/cmake_install.cmake",
+                "build/app",
+                "build/source.c",
+            ];
+            for path in paths {
+                std::fs::write(local.join(path), b"caller sentinel\n").unwrap();
+            }
+            std::fs::write(
+                remote.join("build/CMakeCache.txt"),
+                if failure == "truncated-cache" {
+                    "CMAKE_GENERATOR:INTERNAL=Unix Makefiles"
+                } else {
+                    "CMAKE_GENERATOR:INTERNAL=Unix Makefiles\n"
+                },
+            )
+            .unwrap();
+            let binary = base.join("worker-capability");
+            let script = if failure == "partial-listing" {
+                format!(
+                    "#!/bin/sh\nif [ \"$2\" = probe ]; then printf '%s\\n' {}; else printf '%s\\n' {} {} {} 'build/app: cmake_link'; exit 73; fi\n",
+                    shell_words::quote(rch_common::cmake_outputs::PROBE_REPLY),
+                    shell_words::quote(rch_common::cmake_outputs::OUTPUT_HEADER),
+                    shell_words::quote(remote.to_str().unwrap()),
+                    shell_words::quote(remote.to_str().unwrap()),
+                )
+            } else {
+                "#!/bin/sh\nexit 2\n".to_owned()
+            };
+            std::fs::write(&binary, script).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let command = "cmake --build build";
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "cmake-refusal".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap());
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                None,
+                Some(CompilationKind::CmakeBuild),
+                command,
+                &[],
+                identity,
+            )
+            .unwrap();
+            session.starting_execution().unwrap();
+            session.completed(0).unwrap();
+            session.staging_pipeline("project", &pipeline).unwrap();
+            let stage = session.stage(0);
+            std::fs::create_dir_all(stage.join("build")).unwrap();
+            for path in paths {
+                std::fs::write(stage.join(path), b"worker backend or output\n").unwrap();
+            }
+            assert!(
+                session.recipe.phases[0]
+                    .patterns
+                    .contains(&"build/**".into())
+            );
+            let journal = std::fs::read(&writer.path).unwrap();
+            let discovery =
+                BuildSystemOutputDiscovery::for_command(Some(CompilationKind::CmakeBuild), command)
+                    .unwrap();
+            // Exercise the actual query and the production reply/collection
+            // boundary locally. No SSH ownership or transfer is simulated:
+            // even an already-populated broad stage must remain unpublished.
+            let output = rch_common::ssh::capture_control_output(
+                Command::new("sh")
+                    .args(["-c", discovery.query()])
+                    .env("RCH_WKR_BIN", &binary)
+                    .current_dir(&remote),
+                None,
+                1024 * 1024,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            assert_eq!(output.status.code(), Some(73), "{failure}: {output:?}");
+            assert_eq!(output.stdout.is_empty(), failure != "partial-listing");
+            let reply = TransferPipeline::build_system_output_reply(output);
+            assert!(reply.is_err());
+            assert!(
+                session
+                    .complete_build_system_output_query(&discovery, reply)
+                    .is_err()
+            );
+            for recovered in [false, true] {
+                if recovered {
+                    session = reload_publication(&session);
+                }
+                assert_eq!(session.recipe.exit_code, Some(0));
+                assert!(session.recipe.execution_started);
+                assert!(session.retain_failed_delivery_evidence());
+                assert!(
+                    !session
+                        .recipe
+                        .build_system_output_capture
+                        .as_ref()
+                        .unwrap()
+                        .resolved
+                );
+                assert!(session.publish("project").await.is_err());
+                assert!(session.returned(0).is_err());
+                assert!(session.recipe.phases[0].published.is_empty());
+                assert!(!session.recipe.phases[0].complete);
+                assert_eq!(std::fs::read(&writer.path).unwrap(), journal);
+                for path in paths {
+                    assert_eq!(
+                        std::fs::read(local.join(path)).unwrap(),
+                        b"caller sentinel\n"
+                    );
+                    assert_eq!(
+                        std::fs::read(stage.join(path)).unwrap(),
+                        b"worker backend or output\n"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

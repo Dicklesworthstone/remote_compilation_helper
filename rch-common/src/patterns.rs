@@ -2534,15 +2534,17 @@ pub struct GoBuildInvocation {
     pub packages: Vec<String>,
 }
 
-/// Literal arguments of a Go test compilation with one explicit executable.
+/// Literal arguments of a Go test compilation with one executable.
 ///
-/// This represents `go test -c -o FILE`, never an invocation that runs tests.
+/// This represents `go test -c [-o FILE]`, never an invocation that runs tests.
 /// The executor must still prove that the selected package has test sources,
 /// since Go can succeed without creating a binary for a package with no tests.
+/// Without `-o`, the selected compiler's package facts must also establish the
+/// default test executable name before execution or artifact publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoTestInvocation {
-    /// Exactly one explicit project-relative executable, not an output directory.
-    pub output: GoBuildOutput,
+    /// Explicit project-relative executable, when supplied; never a directory.
+    pub output: Option<GoBuildOutput>,
     /// Build flags accepted by both `go test` and the package-discovery query.
     /// Test compilation controls (`-c`, `-o`) are omitted; opaque values remain.
     pub build_flags: Vec<String>,
@@ -2688,12 +2690,14 @@ pub fn go_build_invocation(command: &str) -> Option<GoBuildInvocation> {
     })
 }
 
-/// Parse compile-only Go tests with an exact output file.
+/// Parse compile-only Go tests eligible for exact output discovery.
 ///
 /// Go accepts known options before and after one contiguous package list.
 /// Unknown options and trailing positional test arguments change that grammar,
 /// so they remain local. No test execution, profiles, fuzz corpus, wrapper,
 /// response file, or native-library output can acquire a one-file contract.
+/// An absent `-o` is only a discovery candidate: it does not authorize a
+/// guessed filename or a multiple-package output directory.
 #[must_use]
 pub fn go_test_invocation(command: &str) -> Option<GoTestInvocation> {
     let normalized = normalize_command(command);
@@ -2751,7 +2755,7 @@ pub fn go_test_invocation(command: &str) -> Option<GoTestInvocation> {
         }
     }
     compile_only.then_some(GoTestInvocation {
-        output: output?,
+        output,
         build_flags,
         packages,
     })
@@ -2765,7 +2769,7 @@ pub fn go_build_output(command: &str) -> Option<GoBuildOutput> {
 }
 
 /// Classify Go builds eligible for explicit or compiler-discovered output
-/// delivery, compile-only tests with an exact output, and streaming test/vet
+/// delivery, compile-only tests with exact output discovery, and streaming test/vet
 /// commands. Other file-producing test modes remain local until they have an
 /// equivalent contract; arbitrary subcommands are never offloaded here.
 fn classify_go(cmd: &str) -> Classification {
@@ -2801,7 +2805,7 @@ fn classify_go(cmd: &str) -> Classification {
                     Classification::compilation(
                         CompilationKind::GoTest,
                         0.95,
-                        "go test compilation with explicit executable output",
+                        "go test compilation with exact executable output discovery",
                     )
                 } else {
                     Classification::not_compilation(
@@ -8938,8 +8942,9 @@ mod tests_go_and_typescript {
             ("go test -c -o app.test main.go main_test.go", "app.test", 3),
         ] {
             let invocation = go_test_invocation(command).unwrap_or_else(|| panic!("{command}"));
-            assert_eq!(invocation.output.path, path, "{command}");
-            assert_eq!(invocation.output.option_index, option_index, "{command}");
+            let output = invocation.output.unwrap();
+            assert_eq!(output.path, path, "{command}");
+            assert_eq!(output.option_index, option_index, "{command}");
             assert_eq!(
                 kind_of(command),
                 cfg!(unix).then_some(CompilationKind::GoTest),
@@ -8949,13 +8954,41 @@ mod tests_go_and_typescript {
     }
 
     #[test]
+    fn go_compile_only_tests_can_discover_their_default_executable() {
+        for command in [
+            "go test -c",
+            "go test -c ./pkg",
+            "go test -c=true ./pkg",
+            "go test '-c=true' ./pkg",
+            "go test ./pkg -c -trimpath",
+            "go test -c -tags=e2e ./pkg",
+            "go test -c value.go value_test.go",
+            "env GOFLAGS= go test -c -ldflags '-s -w' ./...",
+        ] {
+            let invocation = go_test_invocation(command).unwrap_or_else(|| panic!("{command}"));
+            assert!(invocation.output.is_none(), "{command}");
+            assert_eq!(
+                kind_of(command),
+                cfg!(unix).then_some(CompilationKind::GoTest),
+                "{command}"
+            );
+        }
+        // A flag-looking build-option value is not an explicit output. The
+        // real -c still authorizes discovery, which must validate the packages.
+        let invocation = go_test_invocation("go test -tags -o -c ./pkg").unwrap();
+        assert!(invocation.output.is_none());
+        assert_eq!(invocation.build_flags, ["-tags", "-o"]);
+        assert_eq!(invocation.packages, ["./pkg"]);
+    }
+
+    #[test]
     fn go_test_discovery_preserves_build_flags_and_contiguous_packages() {
         let invocation = go_test_invocation(
             "go test -tags 'debug e2e' -c ./pkg/first ./pkg/second -trimpath -o bin/tests -p=2 -ldflags '-s -X main.version=v2'",
         )
         .unwrap();
-        assert_eq!(invocation.output.path, "bin/tests");
-        assert_eq!(invocation.output.option_index, 8);
+        assert_eq!(invocation.output.as_ref().unwrap().path, "bin/tests");
+        assert_eq!(invocation.output.as_ref().unwrap().option_index, 8);
         assert_eq!(
             invocation.build_flags,
             [
@@ -9000,7 +9033,6 @@ mod tests_go_and_typescript {
     fn go_test_flag_values_cannot_authorize_compile_only_output() {
         for command in [
             "go test -tags -c -o app.test ./pkg",
-            "go test -tags -o -c app.test ./pkg",
             "go test -ldflags '-X main.version=-c' -o app.test ./pkg",
             "go test -run -c -o app.test ./pkg",
             "go test -c -run -o app.test ./pkg",
@@ -9011,8 +9043,8 @@ mod tests_go_and_typescript {
             assert_eq!(kind_of(command), None, "{command}");
         }
         let invocation = go_test_invocation("go test -tags -o -c -o app.test ./pkg").unwrap();
-        assert_eq!(invocation.output.option_index, 5);
-        assert_eq!(invocation.output.path, "app.test");
+        assert_eq!(invocation.output.as_ref().unwrap().option_index, 5);
+        assert_eq!(invocation.output.as_ref().unwrap().path, "app.test");
         assert_eq!(invocation.build_flags, ["-tags", "-o"]);
         assert_eq!(invocation.packages, ["./pkg"]);
     }
@@ -9020,7 +9052,6 @@ mod tests_go_and_typescript {
     #[test]
     fn go_compile_only_tests_decline_other_output_or_execution_contracts() {
         for command in [
-            "go test -c",
             "go test -o app.test",
             "go test -c=false -o app.test",
             "go test -c=true -c=false -o app.test",
@@ -9050,7 +9081,6 @@ mod tests_go_and_typescript {
             "go test -c -gcflags '-cpuprofile=compiler.out' -o app.test",
             "go test -c -asmflags '-debug' -o app.test",
             "go test -c -ldflags '-tmpdir=products' -o app.test",
-            "go test -c -tags -o app.test",
             "go test -c -tags= -o app.test",
             "go test -c -o $OUTPUT ./pkg",
             "go test -c -o app* ./pkg",
@@ -9177,9 +9207,6 @@ mod tests_go_and_typescript {
     #[test]
     fn go_test_binary_profile_and_exec_outputs_stay_local() {
         for command in [
-            "go test -c ./pkg",
-            "go test -c=true ./pkg",
-            "go test '-c=true' ./pkg",
             "go test -exec sudo ./pkg",
             "go test '-exec=sudo' ./pkg",
             "go test -o test.bin ./pkg",
