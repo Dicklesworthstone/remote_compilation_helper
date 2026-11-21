@@ -15,6 +15,8 @@
 //! failure classes operators kept conflating.
 
 use crate::incident::IncidentReasonCode;
+use crate::patterns::NATIVE_BUILD_TOOLS;
+use crate::types::NativeToolCapabilities;
 use crate::worker_facts::{
     DiskRootFacts, RuntimeFacts, RustFacts, WorkerBinaryFacts, derive_target_triple,
 };
@@ -379,6 +381,15 @@ fi; "#
            nixv=$(nix --version 2>/dev/null) && printf '%snix_version=%s\\n' \"$P\" \"$nixv\"; \
          fi; ",
     );
+    // Fixed native tools have their own fact namespace. A named operator probe
+    // at a custom path cannot attest the executable a bare compiler invokes.
+    for tool in NATIVE_BUILD_TOOLS {
+        let name = shq(tool);
+        s.push_str(&format!(
+            "if {name} '--version' >/dev/null 2>&1; then printf '%snative_tool=%s\\n' \"$P\" {name}; \
+             else printf '%snative_tool_absent=%s\\n' \"$P\" {name}; fi; "
+        ));
+    }
     // Operator-declared named tools. Each is the exact argv from worker config,
     // run as this (already configured) user with output discarded — verification
     // is the EXIT STATUS, and a chatty tool must not be able to inject fact
@@ -465,6 +476,8 @@ pub struct ProbedFacts {
     pub tools_present: Vec<String>,
     /// Operator-declared tools whose probe ran and did NOT exit zero.
     pub tools_absent: Vec<String>,
+    /// Fixed native build-tool evidence, independent of operator probe names.
+    pub native_tools: NativeToolCapabilities,
     /// Raw worker_version line (kept even if protocol was missing).
     worker_version: Option<String>,
     worker_protocol: Option<u32>,
@@ -577,6 +590,18 @@ pub fn parse_capability_probe(stdout: &str) -> ProbedFacts {
                     f.tools_absent.push(value.to_string());
                 }
             }
+            "native_tool" | "native_tool_absent" | "native_tool_pending"
+                if NATIVE_BUILD_TOOLS.contains(&value) =>
+            {
+                let names = match key {
+                    "native_tool" => &mut f.native_tools.present,
+                    "native_tool_absent" => &mut f.native_tools.absent,
+                    _ => &mut f.native_tools.pending,
+                };
+                if !names.iter().any(|name| name == value) {
+                    names.push(value.to_owned());
+                }
+            }
             "bun_version" => f.runtimes.bun_version = Some(value.to_string()),
             "node_version" => f.runtimes.node_version = Some(value.to_string()),
             "npm_version" => f.runtimes.npm_version = Some(value.to_string()),
@@ -665,6 +690,9 @@ pub struct CapabilityRequirement {
     /// because the caller asked for the gate precisely because the job cannot
     /// run without the tool.
     pub needs_tools: Vec<String>,
+    /// Fixed native PATH executables inferred from directly invoked build tools.
+    /// Operator-declared probes do not satisfy these requirements.
+    pub needs_native_tools: Vec<String>,
 }
 
 impl CapabilityRequirement {
@@ -853,6 +881,14 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
             return CapabilityVerdict::Rejected {
                 reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
                 detail: format!("missing rustup component {component} for toolchain {toolchain}"),
+            };
+        }
+    }
+    for needed in &req.needs_native_tools {
+        if let Some(reason) = facts.native_tools.missing_reason(needed) {
+            return CapabilityVerdict::Rejected {
+                reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+                detail: format!("capability_missing:native_tool:{needed}:{reason}"),
             };
         }
     }
@@ -1445,8 +1481,69 @@ esac
         assert!(script.contains("if '/usr/bin/ld.lld' '--version' >/dev/null 2>&1;"));
         assert!(script.contains("tool=%s"));
         assert!(script.contains("tool_absent=%s"));
-        // No tools declared => no tool probes at all (no requirement, no gate).
-        assert!(!build_capability_probe_script(&self::spec()).contains("tool="));
+        // Fixed native probes do not invent operator-declared capabilities.
+        assert!(!build_capability_probe_script(&self::spec()).contains("printf '%stool="));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_shell_probes_verify_actual_path_tools_independently_of_named_aliases() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        for (name, script) in [
+            (
+                "gcc",
+                "#!/bin/sh\nprintf 'RCH_FACT native_tool=gcc\\n'\nexit 17\n",
+            ),
+            (
+                "cc",
+                "#!/bin/sh\n[ \"$1\" = --version ] && [ \"$RCH_CARGO_WRAPPER_ORIGIN\" = rch ]\n",
+            ),
+            (
+                "worker",
+                "#!/bin/sh\ncase \"$1\" in --version) printf 'fixture\\n';; --protocol-version) printf '1\\n';; *) exit 2;; esac\n",
+            ),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut spec = ProbeSpec::new("rch", root.path().join("worker").to_str().unwrap())
+            .with_tools([tool("gcc", &["/bin/sh", "-c", "exit 0"])]);
+        spec.rust_components = false;
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &build_capability_probe_script(&spec)])
+            .env_clear()
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let facts = parse_capability_probe(&String::from_utf8(output.stdout).unwrap());
+        assert_eq!(facts.tools_present, ["gcc"]);
+        assert_eq!(facts.native_tools.present, ["cc"]);
+        assert_eq!(facts.native_tools.missing_reason("gcc"), Some("probe_failed"));
+        assert_eq!(
+            facts.native_tools.missing_reason("clang"),
+            Some("probe_failed")
+        );
+        assert_eq!(facts.native_tools.absent.len(), NATIVE_BUILD_TOOLS.len() - 1);
+        assert!(facts.native_tools.pending.is_empty());
+
+        let mut required = CapabilityRequirement {
+            needs_native_tools: vec!["gcc".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            assess_admissibility(&facts, &required),
+            CapabilityVerdict::Rejected { detail, .. }
+                if detail == "capability_missing:native_tool:gcc:probe_failed"
+        ));
+        required.needs_native_tools = vec!["cc".into()];
+        assert_eq!(
+            assess_admissibility(&facts, &required),
+            CapabilityVerdict::Admissible
+        );
     }
 
     #[test]

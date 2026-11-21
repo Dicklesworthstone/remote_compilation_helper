@@ -1066,6 +1066,244 @@ struct DeclaredToolProbeResults {
     warnings: Vec<String>,
 }
 
+enum ToolProbeOutcome {
+    Present,
+    Absent,
+    Pending(String),
+}
+
+/// Both fixed native probes and operator declarations use the same bounded
+/// process ownership. Exit status alone decides presence; output is discarded.
+async fn probe_tool_status(
+    mut command: tokio::process::Command,
+    name: &str,
+    deadline: tokio::time::Instant,
+) -> ToolProbeOutcome {
+    use std::process::Stdio;
+    use tokio::time::{Instant, timeout, timeout_at};
+
+    if Instant::now() >= deadline {
+        return ToolProbeOutcome::Pending(format!(
+            "tool probe {name}: shared deadline reached before spawn"
+        ));
+    }
+    command
+        .envs(rch_common::MANAGED_CARGO_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Control-plane probes own their groups; they are not nested inside a
+    // workload's disk-budget process group.
+    #[cfg(unix)]
+    let child = rch_common::ssh::OwnedProcessGroup::spawn(&mut command);
+    #[cfg(not(unix))]
+    let child = command.kill_on_drop(true).spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return ToolProbeOutcome::Absent;
+        }
+        Err(error) => {
+            return ToolProbeOutcome::Pending(format!(
+                "tool probe {name} could not start: {error}"
+            ));
+        }
+    };
+    let result = timeout_at(deadline, child.wait()).await;
+    let mut warning = match result {
+        // A ready future may beat an expired timer after a scheduler stall.
+        Ok(Ok(status)) if Instant::now() < deadline => {
+            return if status.success() {
+                ToolProbeOutcome::Present
+            } else {
+                ToolProbeOutcome::Absent
+            };
+        }
+        Ok(Ok(_)) => format!("tool probe {name} completed after the shared deadline"),
+        Ok(Err(error)) => format!("tool probe {name} wait failed: {error}"),
+        Err(_) => format!("tool probe {name} timed out at the shared deadline"),
+    };
+    // Signal descendants while the unreaped leader still pins the group;
+    // cancellation must not extend this control operation without a bound.
+    let _ = child.start_kill();
+    if !matches!(
+        timeout(std::time::Duration::from_secs(1), child.wait()).await,
+        Ok(Ok(_))
+    ) {
+        warning.push_str("; owned child reap was not confirmed");
+    }
+    ToolProbeOutcome::Pending(warning)
+}
+
+/// Probe the finite native build-tool inventory independently of operator
+/// aliases. Run concurrently so one stalled compiler cannot suppress every
+/// other tool's evidence. PATH is the actual worker execution PATH; no custom
+/// compiler locations or well-known fallback installations are substituted.
+async fn probe_native_tools(
+    path_var: Option<std::ffi::OsString>,
+    deadline: tokio::time::Instant,
+) -> (rch_common::types::NativeToolCapabilities, Vec<String>) {
+    let mut facts = rch_common::types::NativeToolCapabilities {
+        pending: rch_common::patterns::NATIVE_BUILD_TOOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+        ..Default::default()
+    };
+    let mut probes = tokio::task::JoinSet::new();
+    for &name in rch_common::patterns::NATIVE_BUILD_TOOLS {
+        let mut command = tokio::process::Command::new(name);
+        command.arg("--version");
+        if let Some(path) = &path_var {
+            command.env("PATH", path);
+        } else {
+            command.env_remove("PATH");
+        }
+        probes.spawn(async move { (name, probe_tool_status(command, name, deadline).await) });
+    }
+    let mut warnings = Vec::new();
+    while let Some(result) = probes.join_next().await {
+        match result {
+            Ok((name, ToolProbeOutcome::Present)) => {
+                facts.pending.retain(|pending| pending != name);
+                facts.present.push(name.to_owned());
+            }
+            Ok((name, ToolProbeOutcome::Absent)) => {
+                facts.pending.retain(|pending| pending != name);
+                facts.absent.push(name.to_owned());
+            }
+            Ok((_, ToolProbeOutcome::Pending(warning))) => warnings.push(warning),
+            Err(error) => warnings.push(format!("native tool probe task failed: {error}")),
+        }
+    }
+    facts.present.sort();
+    facts.absent.sort();
+    facts.pending.sort();
+    (facts, warnings)
+}
+
+#[cfg(all(test, unix))]
+mod native_tool_probe_tests {
+    use super::{probe_declared_tools, probe_native_tools};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn install_tool(root: &Path, name: &str, script: &str) {
+        let path = root.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_probes_use_exact_names_exit_status_and_managed_environment() {
+        let root = tempfile::tempdir().unwrap();
+        install_tool(
+            root.path(),
+            "gcc",
+            "#!/bin/sh\nprintf 'RCH_FACT native_tool=gcc\\n'\nexit 17\n",
+        );
+        install_tool(
+            root.path(),
+            "cc",
+            "#!/bin/sh\n[ \"$1\" = --version ] && [ \"$RCH_CARGO_WRAPPER_BYPASS\" = 1 ] && [ \"$RCH_CARGO_WRAPPER_ORIGIN\" = rch ]\n",
+        );
+        install_tool(root.path(), "clang++", "#!/bin/sh\nexit 0\n");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (facts, warnings) =
+            probe_native_tools(Some(root.path().as_os_str().to_owned()), deadline).await;
+        assert_eq!(facts.present, ["cc", "clang++"]);
+        assert!(facts.pending.is_empty(), "{facts:?}: {warnings:?}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(facts.missing_reason("gcc"), Some("probe_failed"));
+        assert_eq!(facts.missing_reason("c++"), Some("probe_failed"));
+        assert_eq!(facts.missing_reason("clang"), Some("probe_failed"));
+        assert_eq!(facts.absent.len(), 8);
+
+        let aliases = probe_declared_tools(
+            Some(r#"[{"name":"gcc","command":["/bin/sh","-c","exit 0"]}]"#),
+            deadline,
+        )
+        .await;
+        assert_eq!(aliases.present, ["gcc"]);
+        assert_eq!(facts.missing_reason("gcc"), Some("probe_failed"));
+    }
+
+    #[tokio::test]
+    async fn native_probe_timeout_preserves_other_tools_and_reaps_the_process() {
+        let root = tempfile::tempdir().unwrap();
+        install_tool(
+            root.path(),
+            "gcc",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nexec /bin/sleep 20\n",
+        );
+        install_tool(root.path(), "cc", "#!/bin/sh\nexit 0\n");
+        let started = tokio::time::Instant::now();
+        let (facts, warnings) = tokio::time::timeout(
+            Duration::from_secs(5),
+            probe_native_tools(
+                Some(root.path().as_os_str().to_owned()),
+                started + Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect("native inventory and owned cleanup remain bounded");
+        assert_eq!(facts.present, ["cc"]);
+        assert_eq!(facts.pending, ["gcc"]);
+        assert_eq!(facts.missing_reason("gcc"), Some("probe_pending"));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("gcc") && warning.contains("timed out")),
+            "{warnings:?}"
+        );
+        let pid: i32 = std::fs::read_to_string(root.path().join("gcc.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(pid > 1);
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "timed-out native probe must be killed and reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_native_inventory_stays_pending_without_running_tools() {
+        let root = tempfile::tempdir().unwrap();
+        install_tool(
+            root.path(),
+            "gcc",
+            "#!/bin/sh\nprintf started > \"$0.started\"\n",
+        );
+        let (facts, warnings) = probe_native_tools(
+            Some(root.path().as_os_str().to_owned()),
+            tokio::time::Instant::now(),
+        )
+        .await;
+        assert!(facts.present.is_empty() && facts.absent.is_empty());
+        assert_eq!(
+            facts.pending.len(),
+            rch_common::patterns::NATIVE_BUILD_TOOLS.len()
+        );
+        assert_eq!(warnings.len(), facts.pending.len());
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("before spawn"))
+        );
+        assert!(!root.path().join("gcc.started").exists());
+    }
+}
+
 /// Run the operator-declared named tool probes within one shared deadline.
 ///
 /// Each probe runs the declared argv DIRECTLY — no shell, no PATH games beyond
@@ -1079,8 +1317,6 @@ async fn probe_declared_tools(
 ) -> DeclaredToolProbeResults {
     use rch_common::capability_probe::NamedToolProbe;
     use rch_common::types::WorkerToolProbe;
-    use std::process::Stdio;
-    use tokio::time::{Instant, timeout, timeout_at};
 
     let mut results = DeclaredToolProbeResults::default();
     let Some(raw) = spec_json.map(str::trim).filter(|raw| !raw.is_empty()) else {
@@ -1111,78 +1347,16 @@ async fn probe_declared_tools(
             continue;
         };
         let name = probe.name().to_string();
-        if Instant::now() >= deadline {
-            results.warnings.push(format!(
-                "tool probe {name}: shared deadline reached before spawn"
-            ));
-            results.pending.push(name);
-            continue;
-        }
         let mut command = tokio::process::Command::new(program);
-        command
-            // These fixed, operator-declared probes run on this worker just
-            // like admitted jobs. Cargo invoked by a probe or its descendants
-            // must neither recurse into offload nor inherit an unpaired bypass.
-            .envs(rch_common::MANAGED_CARGO_ENV)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // These control-plane probes own their groups; unlike installers,
-        // they are not nested inside the job's disk-budget process group.
-        #[cfg(unix)]
-        let child = rch_common::ssh::OwnedProcessGroup::spawn(&mut command);
-        #[cfg(not(unix))]
-        let child = command.kill_on_drop(true).spawn();
-        let mut child = match child {
-            Ok(child) => child,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::PermissionDenied
-                        | std::io::ErrorKind::InvalidInput
-                ) =>
-            {
-                results.absent.push(name);
-                continue;
-            }
-            Err(error) => {
-                results
-                    .warnings
-                    .push(format!("tool probe {name} could not start: {error}"));
+        command.args(args);
+        match probe_tool_status(command, &name, deadline).await {
+            ToolProbeOutcome::Present => results.present.push(name),
+            ToolProbeOutcome::Absent => results.absent.push(name),
+            ToolProbeOutcome::Pending(warning) => {
+                results.warnings.push(warning);
                 results.pending.push(name);
-                continue;
             }
-        };
-        let result = timeout_at(deadline, child.wait()).await;
-        let mut warning = match result {
-            // A ready future can win over an expired timer after a scheduler
-            // stall. Do not turn a late zero into verified capability evidence.
-            Ok(Ok(status)) if Instant::now() < deadline => {
-                if status.success() {
-                    results.present.push(name);
-                } else {
-                    results.absent.push(name);
-                }
-                continue;
-            }
-            Ok(Ok(_)) => format!("tool probe {name} completed after the shared deadline"),
-            Ok(Err(error)) => format!("tool probe {name} wait failed: {error}"),
-            Err(_) => format!("tool probe {name} timed out at the shared deadline"),
-        };
-        // Cancellation is bounded too. On Unix, signal descendants while the
-        // unreaped leader still pins the group's identity; never signal a
-        // remembered PID after reaping. Other platforms own the direct child.
-        let _ = child.start_kill();
-        if !matches!(
-            timeout(std::time::Duration::from_secs(1), child.wait()).await,
-            Ok(Ok(_))
-        ) {
-            warning.push_str("; owned child reap was not confirmed");
         }
-        results.warnings.push(warning);
-        results.pending.push(name);
     }
     results
 }
@@ -1258,15 +1432,17 @@ async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
     capabilities.rustup_components = components;
     warnings.extend(inventory_warnings);
 
-    let tool_results = probe_declared_tools(
-        tool_probe,
-        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-    .await;
+    let tool_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (tool_results, (native_tools, native_warnings)) = tokio::join!(
+        probe_declared_tools(tool_probe, tool_deadline),
+        probe_native_tools(std::env::var_os("PATH"), tool_deadline),
+    );
     capabilities.tools_present = tool_results.present;
     capabilities.tools_absent = tool_results.absent;
     capabilities.tools_pending = tool_results.pending;
+    capabilities.native_tools = native_tools;
     warnings.extend(tool_results.warnings);
+    warnings.extend(native_warnings);
 
     capabilities.probe_warnings = warnings;
 

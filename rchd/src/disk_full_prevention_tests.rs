@@ -736,6 +736,10 @@ mod tests {
                 node_version: Some("v26.7.0".into()),
                 bun_version: Some("1.3.0".into()),
                 tools_present: vec!["clang".into()],
+                native_tools: rch_common::types::NativeToolCapabilities {
+                    present: vec!["clang".into()],
+                    ..Default::default()
+                },
                 disk_free_gb: Some(100.0),
                 disk_total_gb: Some(500.0),
                 build_disk_free_gb: Some(100.0),

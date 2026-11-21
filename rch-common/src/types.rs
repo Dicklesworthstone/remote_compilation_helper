@@ -1265,6 +1265,44 @@ impl Default for WorkerConfig {
     }
 }
 
+/// Evidence from fixed native build-tool probes, separate from operator aliases.
+/// Every name is the actual PATH executable tested with `--version`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeToolCapabilities {
+    /// Executables whose fixed probe completed successfully before its deadline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present: Vec<String>,
+    /// Executables that could not run or whose probe exited unsuccessfully.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absent: Vec<String>,
+    /// Executables without a timely definitive result, including unstarted probes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<String>,
+}
+
+impl NativeToolCapabilities {
+    /// Whether this snapshot contains no native build-tool observations.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.present.is_empty() && self.absent.is_empty() && self.pending.is_empty()
+    }
+
+    /// Why a fixed native executable cannot be admitted, or `None` when verified.
+    /// Incomplete and negative observations override a contradictory positive.
+    #[must_use]
+    pub fn missing_reason(&self, tool: &str) -> Option<&'static str> {
+        if self.pending.iter().any(|name| name == tool) {
+            Some("probe_pending")
+        } else if self.absent.iter().any(|name| name == tool) {
+            Some("probe_failed")
+        } else if self.present.iter().any(|name| name == tool) {
+            None
+        } else {
+            Some("unprobed")
+        }
+    }
+}
+
 /// Runtime capabilities detected on a worker.
 ///
 /// These are probed during health checks and cached for routing decisions.
@@ -1352,6 +1390,11 @@ pub struct WorkerCapabilities {
     /// even if an inconsistent snapshot also lists it as present or absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools_pending: Vec<String>,
+
+    /// Fixed PATH-native compiler/build-tool evidence. Operator-declared named
+    /// probes cannot satisfy this gate, even when their names match a compiler.
+    #[serde(default, skip_serializing_if = "NativeToolCapabilities::is_empty")]
+    pub native_tools: NativeToolCapabilities,
 
     // Health metrics (bd-3eaa)
     /// Number of CPU cores on the worker.
@@ -5296,6 +5339,39 @@ retry_max = 2
         assert_eq!(capabilities.tools_absent, ["missing-linker"]);
         assert!(capabilities.has_node());
         assert_eq!(serde_json::to_value(&capabilities).unwrap(), partial);
+    }
+
+    #[test]
+    fn native_tool_capabilities_keep_aliases_and_unverified_facts_separate() {
+        let legacy: WorkerCapabilities = serde_json::from_value(serde_json::json!({
+            "tools_present": ["clang"],
+        }))
+        .unwrap();
+        assert_eq!(legacy.native_tools.missing_reason("clang"), Some("unprobed"));
+        let observed = serde_json::json!({
+            "tools_present": ["gcc"],
+            "native_tools": {
+                "present": ["clang", "cc", "gcc", "make"],
+                "absent": ["gcc", "make"],
+                "pending": ["make"],
+            },
+        });
+        let capabilities: WorkerCapabilities = serde_json::from_value(observed.clone()).unwrap();
+        assert_eq!(capabilities.native_tools.missing_reason("clang"), None);
+        assert_eq!(capabilities.native_tools.missing_reason("cc"), None);
+        assert_eq!(
+            capabilities.native_tools.missing_reason("c++"),
+            Some("unprobed")
+        );
+        assert_eq!(
+            capabilities.native_tools.missing_reason("gcc"),
+            Some("probe_failed")
+        );
+        assert_eq!(
+            capabilities.native_tools.missing_reason("make"),
+            Some("probe_pending")
+        );
+        assert_eq!(serde_json::to_value(capabilities).unwrap(), observed);
     }
 
     #[test]

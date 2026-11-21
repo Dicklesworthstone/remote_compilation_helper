@@ -397,6 +397,44 @@ pub fn classify_command(cmd: &str) -> Classification {
     classify_command_inner(cmd, 0)
 }
 
+/// Fixed PATH executables probed for ordinary native build admission.
+/// Compiler aliases are independent capabilities: usable `gcc` does not prove
+/// that `cc`, `g++`, or `c++` can run on the same worker.
+pub const NATIVE_BUILD_TOOLS: &[&str] = &[
+    "gcc", "g++", "cc", "c++", "clang", "clang++", "make", "cmake", "ninja", "meson",
+];
+
+/// The fixed native executable a directly classified command actually invokes.
+///
+/// Do not normalize this word: `/opt/clang`, `PATH=... clang`, `sudo clang`,
+/// compiler caches, and shell/timing wrappers are not proved by a PATH `clang`
+/// probe. Those forms retain their explicit named-tool requirements. The hook
+/// passes an extracted compilation command after rewriting a supported shell
+/// wrapper; an opaque job is never reinterpreted here. The one accepted prefix
+/// is the validated literal Cargo profile settings RCH itself forwards on all
+/// commands; those settings cannot replace PATH or the invoked program.
+#[must_use]
+pub fn native_tool_for_command(command: &str) -> Option<&'static str> {
+    let mut remaining = command.trim_start();
+    let program = loop {
+        let (word, rest) = split_wrapper_word(remaining)?;
+        if let Some((key, value)) = word.split_once('=')
+            && remaining.starts_with(word)
+            && crate::config::env::cargo_profile_env_is_safe(key, value)
+        {
+            remaining = rest;
+        } else {
+            break word;
+        }
+    };
+    let tool = NATIVE_BUILD_TOOLS
+        .iter()
+        .copied()
+        .find(|tool| *tool == program)?;
+    let classification = classify_command(command);
+    (classification.is_compilation && classification.command_prefix.is_none()).then_some(tool)
+}
+
 /// Detect a command that *would* be a compilation command if it weren't for an
 /// (unsafe / unhandled) pipe/redirect/background/subshell structure — i.e. one
 /// that the classifier declines purely because of its shell structure rather
@@ -3478,6 +3516,54 @@ pub fn split_shell_commands(cmd: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_build_admission_preserves_the_invoked_executable() {
+        for (command, expected) in [
+            ("gcc -c source.c", "gcc"),
+            ("g++ -o app source.cpp", "g++"),
+            ("cc -c source.c", "cc"),
+            ("c++ -c source.cpp", "c++"),
+            ("clang -c source.c", "clang"),
+            ("clang++ -c source.cpp", "clang++"),
+            ("make -j2", "make"),
+            ("cmake --build build", "cmake"),
+            ("ninja -C build", "ninja"),
+            ("meson compile -C build", "meson"),
+            (
+                "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 gcc -c source.c",
+                "gcc",
+            ),
+        ] {
+            assert_eq!(native_tool_for_command(command), Some(expected), "{command}");
+        }
+        for command in [
+            "/opt/toolchain/clang -c source.c",
+            "./gcc -c source.c",
+            "PATH=/opt/toolchain/bin gcc -c source.c",
+            "env PATH=/opt/toolchain/bin gcc -c source.c",
+            "env -i gcc -c source.c",
+            "CARGO_PROFILE_DEV_RUSTFLAGS=--sysroot=/opt gcc -c source.c",
+            "'CARGO_PROFILE_DEV_DEBUG=0' gcc -c source.c",
+            "sudo -u builder gcc -c source.c",
+            "nice -n 10 gcc -c source.c",
+            "timeout 10 gcc -c source.c",
+            "ccache gcc -c source.c",
+            "sccache clang -c source.c",
+            "sh -c 'gcc -c source.c'",
+            "cd /project && gcc -c source.c",
+            "gcc -c source.c && clang -c other.c",
+            "echo 'gcc -c source.c'",
+            "./run.sh gcc -c source.c",
+            "make clean",
+            "cmake --version",
+            "ninja -t clean",
+            "meson setup build",
+            "cargo build",
+        ] {
+            assert_eq!(native_tool_for_command(command), None, "{command}");
+        }
+    }
 
     #[test]
     fn cargo_xwin_compilations_use_their_cargo_contracts() {

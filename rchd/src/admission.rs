@@ -44,6 +44,7 @@ pub(crate) const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
 /// and avoids cloning each worker's capability inventory at admission.
 pub(crate) struct ExecutionRequirements<'a> {
     request: &'a SelectionRequest,
+    native_tool: Option<&'static str>,
     component: Option<&'static str>,
     component_toolchain: Option<String>,
     preflight_toolchain: Option<String>,
@@ -55,6 +56,10 @@ impl<'a> ExecutionRequirements<'a> {
         let component_toolchain = component.and_then(|_| required_component_toolchain(request));
         Self {
             request,
+            native_tool: request
+                .command
+                .as_deref()
+                .and_then(rch_common::patterns::native_tool_for_command),
             component,
             component_toolchain,
             // Match the selector's existing concrete-toolchain preflight policy.
@@ -75,7 +80,13 @@ impl<'a> ExecutionRequirements<'a> {
     }
 
     pub(crate) fn tool_mismatch(&self, capabilities: &WorkerCapabilities) -> Option<String> {
-        required_tool_capability_mismatch(self.request, capabilities)
+        required_tool_capability_mismatch(self.request, capabilities).or_else(|| {
+            let tool = self.native_tool?;
+            capabilities
+                .native_tools
+                .missing_reason(tool)
+                .map(|reason| format!("capability_missing:native_tool:{tool}:{reason}"))
+        })
     }
 
     pub(crate) fn component_mismatch(&self, capabilities: &WorkerCapabilities) -> Option<String> {
@@ -684,6 +695,146 @@ mod tests {
                 requirements.capabilities_satisfied(&capabilities),
                 expected.is_none(),
                 "present={present}, absent={absent}, pending={pending}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_build_commands_require_driver_evidence_without_explicit_tools() {
+        for command in [
+            "gcc -c source.c",
+            "g++ -c source.cpp",
+            "cc -c source.c",
+            "c++ -c source.cpp",
+            "clang -c source.c",
+            "clang++ -c source.cpp",
+            "make -j2",
+            "cmake --build build",
+            "ninja -C build",
+            "meson compile -C build",
+        ] {
+            let request: SelectionRequest = serde_json::from_value(serde_json::json!({
+                "project": "native-admission",
+                "command": command,
+                "estimated_cores": 1,
+                "required_runtime": RequiredRuntime::None,
+            }))
+            .unwrap();
+            assert!(request.required_tools.is_empty());
+            assert!(
+                !ExecutionRequirements::new(&request)
+                    .capabilities_satisfied(&WorkerCapabilities::mock_with_rust()),
+                "{command}: a Rust-only worker cannot run this native build"
+            );
+        }
+    }
+
+    #[test]
+    fn native_admission_uses_exact_driver_evidence_and_preserves_explicit_requirements() {
+        let mut request: SelectionRequest = serde_json::from_value(serde_json::json!({
+            "project": "native-admission",
+            "command": "cc -c source.c",
+            "estimated_cores": 1,
+            "required_runtime": RequiredRuntime::None,
+            "job_mode": true,
+        }))
+        .unwrap();
+        let mut capabilities = WorkerCapabilities {
+            tools_present: vec!["cc".into()],
+            native_tools: rch_common::types::NativeToolCapabilities {
+                present: vec!["gcc".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            ExecutionRequirements::new(&request)
+                .tool_mismatch(&capabilities)
+                .as_deref(),
+            Some("capability_missing:native_tool:cc:unprobed"),
+            "an operator alias or a different compiler is not evidence for cc"
+        );
+
+        capabilities.native_tools.present.push("cc".into());
+        assert!(ExecutionRequirements::new(&request).capabilities_satisfied(&capabilities));
+        capabilities.native_tools.absent.push("cc".into());
+        assert_eq!(
+            ExecutionRequirements::new(&request)
+                .tool_mismatch(&capabilities)
+                .as_deref(),
+            Some("capability_missing:native_tool:cc:probe_failed")
+        );
+        capabilities.native_tools.pending.push("cc".into());
+        assert_eq!(
+            ExecutionRequirements::new(&request)
+                .tool_mismatch(&capabilities)
+                .as_deref(),
+            Some("capability_missing:native_tool:cc:probe_pending")
+        );
+
+        capabilities.native_tools.absent.clear();
+        capabilities.native_tools.pending.clear();
+        request.required_tools.push("approved-sdk".into());
+        assert_eq!(
+            ExecutionRequirements::new(&request)
+                .tool_mismatch(&capabilities)
+                .as_deref(),
+            Some("capability_missing:tool:approved-sdk:not_declared")
+        );
+        capabilities.tools_present.push("approved-sdk".into());
+        assert!(ExecutionRequirements::new(&request).capabilities_satisfied(&capabilities));
+
+        request.command = Some("CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cc -c source.c".into());
+        capabilities.native_tools.present.clear();
+        assert_eq!(
+            ExecutionRequirements::new(&request)
+                .tool_mismatch(&capabilities)
+                .as_deref(),
+            Some("capability_missing:native_tool:cc:unprobed"),
+            "the hook's managed Cargo settings must not hide the native executable"
+        );
+    }
+
+    #[test]
+    fn native_admission_does_not_attest_custom_paths_or_opaque_wrappers() {
+        for command in [
+            "/opt/toolchain/clang -c source.c",
+            "env PATH=/opt/toolchain/bin clang -c source.c",
+            "sudo -u builder clang -c source.c",
+            "ccache clang -c source.c",
+            "sh -c 'clang -c source.c'",
+            "./run.sh",
+        ] {
+            let mut request: SelectionRequest = serde_json::from_value(serde_json::json!({
+                "project": "opaque-native-admission",
+                "command": command,
+                "estimated_cores": 1,
+                "required_runtime": RequiredRuntime::None,
+                "job_mode": true,
+                "required_tools": ["approved-toolchain"],
+            }))
+            .unwrap();
+            assert_eq!(
+                ExecutionRequirements::new(&request)
+                    .tool_mismatch(&WorkerCapabilities::default())
+                    .as_deref(),
+                Some("capability_missing:tool:approved-toolchain:not_declared"),
+                "{command}"
+            );
+            let capabilities = WorkerCapabilities {
+                tools_present: vec!["approved-toolchain".into()],
+                ..Default::default()
+            };
+            assert!(
+                ExecutionRequirements::new(&request).capabilities_satisfied(&capabilities),
+                "{command}: PATH probes do not attest an opaque executable"
+            );
+
+            request.required_tools.clear();
+            assert!(
+                ExecutionRequirements::new(&request)
+                    .capabilities_satisfied(&WorkerCapabilities::default()),
+                "{command}: the existing opaque-command contract remains unchanged"
             );
         }
     }

@@ -20,7 +20,7 @@ use crate::admission_rejection::{AdmissionRejectionSummary, RejectionClass};
 use crate::capability_probe::CapabilityRequirement;
 use crate::patterns::{
     CompilationKind, cargo_xwin_compilation_kind, classify_command, classify_command_detailed,
-    normalize_command, split_shell_commands, split_wrapper_word,
+    native_tool_for_command, normalize_command, split_shell_commands, split_wrapper_word,
 };
 
 /// The decisive recommendation `rch admit` returns.
@@ -82,6 +82,10 @@ pub struct RequiredCapabilities {
     /// the caller states, not something a classifier guesses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs_tools: Vec<String>,
+    /// Fixed native PATH executables inferred from directly invoked build tools.
+    /// Separate from caller-stated tool aliases and their operator-defined argv.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_native_tools: Vec<String>,
 }
 
 impl RequiredCapabilities {
@@ -101,6 +105,7 @@ impl RequiredCapabilities {
             needs_toolchains: self.needs_toolchains.clone(),
             needs_os: self.needs_os.clone(),
             needs_tools: self.needs_tools.clone(),
+            needs_native_tools: self.needs_native_tools.clone(),
             ..CapabilityRequirement::default()
         }
     }
@@ -536,6 +541,10 @@ fn compiler_target_options(words: &[AdmissionArgument]) -> Vec<String> {
 /// and test-program arguments are never Rust standard-library requirements.
 fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> DerivedCapabilities {
     let mut req = RequiredCapabilities::default();
+    req.needs_native_tools = native_tool_for_command(command)
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
     if let Some(kind) = kind {
         req.needs_cargo = is_rust_kind(kind);
         req.needs_bun = matches!(
@@ -738,12 +747,17 @@ pub fn preflight(command: &str, proof_policy: bool) -> AdmitPreflight {
             required.needs_node |= part_req.needs_node;
             required.needs_targets.extend(part_req.needs_targets);
             required.needs_toolchains.extend(part_req.needs_toolchains);
+            required
+                .needs_native_tools
+                .extend(part_req.needs_native_tools);
         }
     }
     required.needs_targets.sort();
     required.needs_targets.dedup();
     required.needs_toolchains.sort();
     required.needs_toolchains.dedup();
+    required.needs_native_tools.sort();
+    required.needs_native_tools.dedup();
     // Recomputed over the merged target set: a compound command whose parts
     // disagree on the required OS must not inherit one part's answer.
     required.needs_os = os_from_command_and_targets(command, &host_targets);
@@ -811,6 +825,13 @@ impl AdmitPreflight {
     #[must_use]
     pub fn as_job(mut self, required_tools: Vec<String>) -> Self {
         self.job_mode = true;
+        // A job executes the original command rather than the hook's extracted
+        // shell segments. Only a directly invoked native tool is proved by the
+        // fixed PATH inventory; scripts and context-changing prefixes stay opaque.
+        self.required.needs_native_tools = native_tool_for_command(&self.command)
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
         self.required.needs_tools = required_tools;
         self.required.needs_tools.sort();
         self.required.needs_tools.dedup();
@@ -876,6 +897,37 @@ mod tests {
     use crate::admission_rejection::{
         AdmissionRejectionCategory, CandidateRejection, aggregate_rejections,
     };
+
+    #[test]
+    fn native_build_preflight_uses_fixed_evidence_without_rewriting_job_requirements() {
+        let compile =
+            preflight("cc -c source.c", false).with_required_tools(vec!["approved-sdk".into()]);
+        assert_eq!(compile.required.needs_native_tools, ["cc"]);
+        assert_eq!(compile.required.needs_tools, ["approved-sdk"]);
+        assert_eq!(compile.required.to_requirement(1).needs_native_tools, ["cc"]);
+        let job = compile.as_job(vec!["custom-toolchain".into()]);
+        assert_eq!(job.required.needs_native_tools, ["cc"]);
+        assert_eq!(job.required.needs_tools, ["custom-toolchain"]);
+
+        let compound = preflight("gcc -c source.c && clang -c other.c", false);
+        assert_eq!(compound.required.needs_native_tools, ["clang", "gcc"]);
+        assert!(
+            compound
+                .as_job(Vec::new())
+                .required
+                .needs_native_tools
+                .is_empty()
+        );
+        for command in [
+            "/opt/bin/cc -c source.c",
+            "env PATH=/opt/bin cc -c source.c",
+            "./run.sh cc -c source.c",
+        ] {
+            let job = preflight(command, false).as_job(vec!["custom-toolchain".into()]);
+            assert!(job.required.needs_native_tools.is_empty(), "{command}");
+            assert_eq!(job.required.needs_tools, ["custom-toolchain"]);
+        }
+    }
 
     #[test]
     fn compiler_tool_requirements_preserve_rust_target_and_classification() {

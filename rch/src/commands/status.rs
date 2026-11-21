@@ -1412,6 +1412,9 @@ pub(super) fn format_admit_required_capabilities(
     for tool in &req.needs_tools {
         needs.push(format!("tool:{tool}"));
     }
+    for tool in &req.needs_native_tools {
+        needs.push(format!("native-tool:{tool}"));
+    }
     needs
 }
 
@@ -5140,7 +5143,7 @@ mod tests {
     }
 
     #[test]
-    fn admit_human_capabilities_include_nix_go_node_and_os() {
+    fn admit_human_capabilities_include_runtimes_os_and_native_tools() {
         use rch_common::admit_preflight::RequiredCapabilities;
         let req = RequiredCapabilities {
             needs_cargo: true,
@@ -5153,6 +5156,7 @@ mod tests {
             needs_targets: vec!["aarch64-apple-darwin".to_string()],
             needs_toolchains: vec!["nightly".to_string()],
             needs_tools: vec!["clang".to_string()],
+            needs_native_tools: vec!["cc".to_string()],
         };
         assert_eq!(
             format_admit_required_capabilities(&req),
@@ -5167,6 +5171,7 @@ mod tests {
                 "target:aarch64-apple-darwin",
                 "toolchain:nightly",
                 "tool:clang",
+                "native-tool:cc",
             ]
         );
     }

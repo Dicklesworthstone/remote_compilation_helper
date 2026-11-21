@@ -4755,7 +4755,7 @@ mod tests {
     async fn endpoint_bound_reservation_rechecks_every_execution_requirement() {
         let _guard = rch_common::test_guard!();
         for case in [
-            "tool", "node", "bun", "clippy", "rustfmt", "channel", "version",
+            "tool", "native", "node", "bun", "clippy", "rustfmt", "channel", "version",
         ] {
             let worker = WorkerState::new(recovered_worker_config("requirements-race", 8));
             let mut request = execution_request(RequiredRuntime::Rust);
@@ -4764,6 +4764,10 @@ mod tests {
                 node_version: Some("v26.7.0".into()),
                 bun_version: Some("1.3.0".into()),
                 tools_present: vec!["clang".into(), "node@26.7.0".into(), "bun@1.3.0".into()],
+                native_tools: rch_common::types::NativeToolCapabilities {
+                    present: vec!["clang".into()],
+                    ..Default::default()
+                },
                 rustup_toolchains: vec!["nightly-2026-08-31-x86_64-unknown-linux-gnu".into()],
                 rustup_components: vec![
                     "nightly-2026-08-31-x86_64-unknown-linux-gnu:clippy".into(),
@@ -4778,6 +4782,11 @@ mod tests {
                     request.required_tools.push("clang".into());
                     unavailable.tools_present.retain(|tool| tool != "clang");
                     unavailable.tools_absent.push("clang".into());
+                }
+                "native" => {
+                    request.required_runtime = RequiredRuntime::None;
+                    request.command = Some("clang -c source.c".into());
+                    unavailable.native_tools.pending.push("clang".into());
                 }
                 "node" => {
                     request.required_runtime = RequiredRuntime::Node;

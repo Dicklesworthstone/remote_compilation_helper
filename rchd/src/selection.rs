@@ -6750,6 +6750,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_build_selection_ignores_fast_unverified_workers_and_refreshes() {
+        let pool = WorkerPool::new();
+        let fast = make_worker("fast-rust-only", 8, 100.0);
+        fast.set_capabilities(WorkerCapabilities {
+            tools_present: vec!["gcc".into()],
+            ..WorkerCapabilities::mock_with_rust()
+        })
+        .await;
+        pool.add_worker_state(fast).await;
+
+        let native = make_worker("native-builder", 8, 50.0);
+        native
+            .set_capabilities(WorkerCapabilities {
+                native_tools: rch_common::types::NativeToolCapabilities {
+                    present: vec!["gcc".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(native).await;
+        let selector = budgeted_fixture_selector(
+            &pool,
+            WorkerSelector::with_config(
+                SelectionConfig {
+                    strategy: SelectionStrategy::Fastest,
+                    ..Default::default()
+                },
+                CircuitBreakerConfig::default(),
+            ),
+        )
+        .await;
+        let mut request = tool_gate_request();
+        request.job_mode = false;
+        request.command = Some("gcc -c source.c".into());
+        assert!(request.required_tools.is_empty());
+
+        let selected = selector.select(&pool, &request).await.worker.unwrap();
+        assert_eq!(selected.config.read().await.id.as_str(), "native-builder");
+        let diagnostics = selector
+            .build_selection_diagnostics(&pool, &request, &HashSet::new())
+            .await;
+        let unverified = diagnostics
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id.as_str() == "fast-rust-only")
+            .unwrap();
+        assert_eq!(
+            unverified.final_decision,
+            WorkerSelectionDiagnosticDecision::Deny
+        );
+        assert!(
+            unverified
+                .reason_codes
+                .iter()
+                .any(|code| code == "tool.required_missing")
+        );
+
+        let native = pool.get(&WorkerId::new("native-builder")).await.unwrap();
+        let mut pending = native.capabilities().await;
+        pending.native_tools.pending.push("gcc".into());
+        native.set_capabilities(pending.clone()).await;
+        assert!(
+            selector.select(&pool, &request).await.worker.is_none(),
+            "stale positive cannot override a pending refresh"
+        );
+        pending.native_tools.pending.clear();
+        native.set_capabilities(pending).await;
+        let refreshed = selector.select(&pool, &request).await.worker.unwrap();
+        assert_eq!(refreshed.config.read().await.id.as_str(), "native-builder");
+
+        request.command = Some("cc -c source.c".into());
+        assert!(
+            selector.select(&pool, &request).await.worker.is_none(),
+            "gcc evidence cannot qualify cc"
+        );
+        assert_eq!(
+            native.used_slots(),
+            0,
+            "selection has not spent a reservation"
+        );
+    }
+
     #[test]
     fn required_tool_gate_needs_verified_evidence_not_a_declaration() {
         let caps = WorkerCapabilities {
