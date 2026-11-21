@@ -912,7 +912,11 @@ fn shared_service_shutdown_allows_cleanup_and_rejects_escalation_or_nonzero_exit
     let pgid = uncooperative.process.as_ref().unwrap().pgid();
     let error = uncooperative.shutdown(Duration::from_secs(3)).unwrap_err();
     assert!(error.contains("kill_sent: true"), "{error}");
-    assert!(rabs_asupersync::process_groups::members_from_proc(pgid).is_empty());
+    assert!(
+        rabs_asupersync::process_groups::members_from_proc(pgid)
+            .expect("complete census")
+            .is_empty()
+    );
 
     let error = spawn("nonzero", "exit 7")
         .shutdown(Duration::from_secs(3))

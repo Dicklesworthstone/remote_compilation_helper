@@ -81,6 +81,95 @@ const RUNNING: u8 = 0;
 // it stopped. The high bit leaves every typed stop reason independently intact.
 const FINISHED: u8 = 0x80;
 
+const EXECUTION_UNTRACKED: u8 = 0;
+const EXECUTION_PREPARING: u8 = 1;
+const EXECUTION_POSSIBLY_STARTED: u8 = 2;
+const EXECUTION_PROVEN_UNSTARTED: u8 = 3;
+
+/// Local evidence that this exact admitted request never started its workload.
+/// Only a failed constructor or a joined native execution owner can issue it;
+/// a wire field, exit code or `executed: false` is not equivalent evidence.
+#[derive(Debug)]
+pub struct UnstartedExecution {
+    request_id: u64,
+}
+
+impl UnstartedExecution {
+    #[must_use]
+    pub fn matches(&self, request_id: u64) -> bool {
+        self.request_id == request_id
+    }
+}
+
+#[derive(Debug)]
+struct UnstartedLaunch {
+    request_id: u64,
+    error: io::Error,
+}
+
+impl std::fmt::Display for UnstartedLaunch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for UnstartedLaunch {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+fn unstarted_launch(request_id: u64, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), UnstartedLaunch { request_id, error })
+}
+
+/// Inspect only the constructor's private error type, never error text or an
+/// OS error code. The caller must bind the proof to its current admission.
+#[must_use]
+pub fn unstarted_launch_proof(error: &io::Error) -> Option<UnstartedExecution> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<UnstartedLaunch>())
+        .map(|failure| UnstartedExecution {
+            request_id: failure.request_id,
+        })
+}
+
+/// One exclusive native invocation. Preparation errors remain uncertain:
+/// helpers may have started processes even though the workload did not start.
+pub(crate) struct NativeExecution<'a> {
+    phase: &'a AtomicU8,
+    exclusive: bool,
+}
+
+impl NativeExecution<'_> {
+    pub(crate) fn admitted(&self) -> bool {
+        self.exclusive
+    }
+
+    /// Call only before helpers run, or at an explicit cancellation boundary
+    /// after every preparation helper has successfully settled. The joined
+    /// task additionally proves all remaining local owners have been dropped.
+    pub(crate) fn refuse_unstarted(&self) {
+        if self.exclusive {
+            let _ = self.phase.compare_exchange(
+                EXECUTION_PREPARING,
+                EXECUTION_PROVEN_UNSTARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    /// Cross the uncertain boundary BEFORE attempting process creation. Even
+    /// a failed spawn can have created a child; only its supervisor may prove
+    /// cleanup after this point.
+    pub(crate) fn spawning(&self) {
+        self.phase
+            .store(EXECUTION_POSSIBLY_STARTED, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Default)]
 struct OutputCapture {
     requested: bool,
@@ -115,6 +204,7 @@ impl ExecutionLease {
 #[derive(Debug, Clone)]
 pub struct ExecutionControl {
     state: Arc<AtomicU8>,
+    execution_phase: Arc<AtomicU8>,
     deadline: Instant,
     lease: Arc<Mutex<Option<ExecutionLease>>>,
     output: Arc<Mutex<OutputCapture>>,
@@ -169,6 +259,7 @@ impl ExecutionControl {
             .transpose()?;
         Ok(Self {
             state: Arc::new(AtomicU8::new(RUNNING)),
+            execution_phase: Arc::new(AtomicU8::new(EXECUTION_UNTRACKED)),
             deadline,
             lease: Arc::new(Mutex::new(lease)),
             output: Arc::new(Mutex::new(OutputCapture::default())),
@@ -178,6 +269,29 @@ impl ExecutionControl {
             preview: Arc::new(LiveOutputPreview::default()),
             metadata_prefetch: Arc::new(crate::metadata_prefetch::MetadataPrefetch::default()),
         })
+    }
+
+    pub(crate) fn native_execution(&self) -> NativeExecution<'_> {
+        let exclusive = self.state.load(Ordering::Acquire) & FINISHED == 0
+            && self
+                .execution_phase
+                .compare_exchange(
+                    EXECUTION_UNTRACKED,
+                    EXECUTION_PREPARING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+        if !exclusive {
+            // A reused or concurrent execution context cannot borrow evidence
+            // from the earlier invocation, including an earlier refusal.
+            self.execution_phase
+                .store(EXECUTION_POSSIBLY_STARTED, Ordering::Release);
+        }
+        NativeExecution {
+            phase: &self.execution_phase,
+            exclusive,
+        }
     }
 
     /// Request a stop. False means another stop or completion already won.
@@ -536,6 +650,7 @@ fn complete_result(
 #[derive(Default)]
 struct CompletionState {
     result: Option<Result<ExecutionCompletion, String>>,
+    unstarted: bool,
     retained_result_digest: Option<String>,
     waker: Option<Waker>,
 }
@@ -548,6 +663,7 @@ pub struct ExecutionTask {
     state: Arc<Mutex<CompletionState>>,
     thread: Option<JoinHandle<()>>,
     completed: bool,
+    unstarted: bool,
 }
 
 impl ExecutionTask {
@@ -570,7 +686,9 @@ impl ExecutionTask {
         timeout: Duration,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
-        Self::spawn_controlled(request_id, ExecutionControl::new(timeout)?, None, execute)
+        let control = ExecutionControl::new(timeout)
+            .map_err(|error| unstarted_launch(request_id, error))?;
+        Self::spawn_controlled(request_id, control, None, execute)
     }
 
     /// Fix the artifact contract BEFORE spawning, so even a very fast executor
@@ -581,8 +699,11 @@ impl ExecutionTask {
         artifacts: ArtifactPlan,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
-        let control = ExecutionControl::new(timeout)?;
-        control.request_artifacts(artifacts)?;
+        let control = ExecutionControl::new(timeout)
+            .map_err(|error| unstarted_launch(request_id, error))?;
+        control
+            .request_artifacts(artifacts)
+            .map_err(|error| unstarted_launch(request_id, error))?;
         Self::spawn_controlled(request_id, control, None, execute)
     }
 
@@ -611,25 +732,50 @@ impl ExecutionTask {
         lease: Option<(RequestExecutionLeaseIdentity, u64)>,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
-        let control = match lease {
-            Some((identity, ttl_ms)) => {
-                if identity.request_id != request_id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "execution lease request differs from task",
-                    ));
+        let prepared = (|| {
+            let control = match lease {
+                Some((identity, ttl_ms)) => {
+                    if identity.request_id != request_id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "execution lease request differs from task",
+                        ));
+                    }
+                    ExecutionControl::new_with_lease(timeout, identity, ttl_ms)?
                 }
-                ExecutionControl::new_with_lease(timeout, identity, ttl_ms)?
+                None => ExecutionControl::new(timeout)?,
+            };
+            if let Some(plan) = artifacts {
+                control.request_artifacts(plan)?;
             }
-            None => ExecutionControl::new(timeout)?,
-        };
-        if let Some(plan) = artifacts {
-            control.request_artifacts(plan)?;
-        }
-        if retention.is_some() {
-            control.request_output_capture();
-        }
+            if retention.is_some() {
+                control.request_output_capture();
+            }
+            Ok(control)
+        })();
+        let control = prepared.map_err(|error| unstarted_launch(request_id, error))?;
         Self::spawn_controlled(request_id, control, retention, execute)
+    }
+
+    /// Construct the admitted journal's retention sink before starting any
+    /// executor. A storage refusal here carries the same no-execution proof as
+    /// thread creation failure; callers cannot supply an arbitrary preparation
+    /// callback that might itself have started work.
+    pub fn spawn_for_journaled_delivery(
+        request_id: u64,
+        timeout: Duration,
+        artifacts: Option<ArtifactPlan>,
+        retention: Option<(&std::path::Path, crate::result_spool::ResultRecipient)>,
+        lease: Option<(RequestExecutionLeaseIdentity, u64)>,
+        execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
+    ) -> io::Result<Self> {
+        let retention = retention
+            .map(|(root, recipient)| RetentionTarget::from_admitted(root, request_id, recipient))
+            .transpose()
+            .map_err(|error| unstarted_launch(request_id, error))?;
+        Self::spawn_for_delivery_with_lease(
+            request_id, timeout, artifacts, retention, lease, execute,
+        )
     }
 
     fn spawn_controlled(
@@ -644,12 +790,18 @@ impl ExecutionTask {
         let thread = std::thread::Builder::new()
             .name(format!("rabs-exec-{request_id}"))
             .spawn(move || {
+                let mut returned_unstarted = false;
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let result = execute(worker_control.clone());
                     let stop_reason = worker_control.finish();
                     if result.request_id != request_id {
                         return Err("executor returned a different request identity".to_owned());
                     }
+                    returned_unstarted = !result.executed
+                        && result.exit_code != 0
+                        && result.residual_group_members == 0
+                        && worker_control.execution_phase.load(Ordering::Acquire)
+                            == EXECUTION_PROVEN_UNSTARTED;
                     let mut completion = complete_result(&worker_control, result, stop_reason)?;
                     let retained = match retention {
                         Some(target) if completion.result.executed => Some(
@@ -662,6 +814,10 @@ impl ExecutionTask {
                     Ok((completion, retained))
                 }));
                 let _ = worker_control.finish();
+                let unstarted = outcome.is_ok()
+                    && returned_unstarted
+                    && worker_control.execution_phase.load(Ordering::Acquire)
+                        == EXECUTION_PROVEN_UNSTARTED;
                 let (result, retained_result_digest) = match outcome {
                     Ok(Ok((completion, retained))) => (Ok(completion), retained),
                     Ok(Err(error)) => (Err(error), None),
@@ -670,19 +826,22 @@ impl ExecutionTask {
                 let waker = {
                     let mut state = worker_state.lock().unwrap_or_else(|e| e.into_inner());
                     state.result = Some(result);
+                    state.unstarted = unstarted;
                     state.retained_result_digest = retained_result_digest;
                     state.waker.take()
                 };
                 if let Some(waker) = waker {
                     waker.wake();
                 }
-            })?;
+            })
+            .map_err(|error| unstarted_launch(request_id, error))?;
         Ok(Self {
             request_id,
             control,
             state,
             thread: Some(thread),
             completed: false,
+            unstarted: false,
         })
     }
 
@@ -690,6 +849,20 @@ impl ExecutionTask {
     #[must_use]
     pub fn request_id(&self) -> u64 {
         self.request_id
+    }
+
+    /// Available only after the actual executor thread joined successfully.
+    /// Generic executors, panics, reused controls and all spawn attempts remain
+    /// uncertain unless their ordinary process/drain completion proves cleanup.
+    #[must_use]
+    pub fn unstarted_execution(&self) -> Option<UnstartedExecution> {
+        (self.completed
+            && self.unstarted
+            && self.control.execution_phase.load(Ordering::Acquire)
+                == EXECUTION_PROVEN_UNSTARTED)
+            .then_some(UnstartedExecution {
+                request_id: self.request_id,
+            })
     }
 
     /// Present only after complete bytes and their seal are durably stored.
@@ -723,10 +896,10 @@ impl ExecutionTask {
         if self.completed {
             return Poll::Ready(Err("execution completion already consumed".to_owned()));
         }
-        let result = {
+        let (result, unstarted) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(result) = state.result.take() {
-                result
+                (result, state.unstarted)
             } else {
                 state.waker = Some(cx.waker().clone());
                 return Poll::Pending;
@@ -738,6 +911,7 @@ impl ExecutionTask {
         {
             return Poll::Ready(Err("execution owner thread failed".to_owned()));
         }
+        self.unstarted = unstarted;
         Poll::Ready(result)
     }
 
@@ -798,6 +972,112 @@ mod tests {
             stderr_spill_bytes: 0,
             stdout_spill_path: None,
             stderr_spill_path: None,
+        }
+    }
+
+    #[test]
+    fn unstarted_launch_proof_binds_constructor_and_retention_failures() {
+        let error = ExecutionTask::spawn(301, Duration::ZERO, |_| {
+            panic!("a refused constructor must not run the executor")
+        })
+        .err()
+        .expect("zero budget refuses before thread creation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let proof = unstarted_launch_proof(&error).expect("trusted constructor proof");
+        assert!(proof.matches(301));
+        assert!(!proof.matches(302));
+        assert!(
+            unstarted_launch_proof(&io::Error::new(error.kind(), error.to_string())).is_none(),
+            "matching text and error kind are not cleanup evidence"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let error = ExecutionTask::spawn_for_journaled_delivery(
+            302,
+            Duration::from_secs(5),
+            None,
+            Some((
+                root.path(),
+                crate::result_spool::ResultRecipient::TlsSpki([7; 32]),
+            )),
+            None,
+            |_| panic!("missing admitted retention state must not run the executor"),
+        )
+        .err()
+        .expect("retention setup reads a real missing journal");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let proof = unstarted_launch_proof(&error).expect("trusted retention proof");
+        assert!(proof.matches(302));
+        assert!(!proof.matches(301));
+    }
+
+    #[test]
+    fn unstarted_task_proof_requires_explicit_native_boundary_and_join() {
+        for (index, scenario) in [
+            "safe",
+            "generic",
+            "preparation-error",
+            "spawn-attempted",
+            "reused-context",
+            "panic",
+            "wrong-result-id",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request_id = 310 + index as u64;
+            let mut task =
+                ExecutionTask::spawn(request_id, Duration::from_secs(5), move |control| {
+                    if scenario != "generic" {
+                        let execution = control.native_execution();
+                        assert!(execution.admitted());
+                        match scenario {
+                            "safe" | "wrong-result-id" => execution.refuse_unstarted(),
+                            "preparation-error" => {
+                                control
+                                    .retain_outputs(Err("helper cleanup is uncertain".to_owned()))
+                                    .unwrap();
+                            }
+                            "spawn-attempted" => {
+                                execution.spawning();
+                                execution.refuse_unstarted();
+                            }
+                            "reused-context" => {
+                                execution.refuse_unstarted();
+                                let reused = control.native_execution();
+                                assert!(!reused.admitted());
+                                reused.refuse_unstarted();
+                            }
+                            "panic" => {
+                                execution.refuse_unstarted();
+                                panic!("an unwind cannot attest completed preparation cleanup");
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    let mut failed = result(if scenario == "wrong-result-id" {
+                        request_id + 1
+                    } else {
+                        request_id
+                    });
+                    failed.executed = false;
+                    failed.exit_code = -1;
+                    failed
+                })
+                .unwrap();
+            assert!(task.unstarted_execution().is_none(), "{scenario}");
+            let completed = wait(&mut task);
+            if scenario == "safe" {
+                assert!(!completed.unwrap().result.executed);
+                let proof = task.unstarted_execution().expect("joined native refusal");
+                assert!(proof.matches(request_id));
+                assert!(!proof.matches(request_id + 1));
+            } else {
+                assert!(task.unstarted_execution().is_none(), "{scenario}");
+                if matches!(scenario, "preparation-error" | "panic" | "wrong-result-id") {
+                    assert!(completed.is_err(), "{scenario}");
+                }
+            }
         }
     }
 
@@ -1066,7 +1346,11 @@ mod tests {
         assert_eq!(outputs.stderr.read_chunk(0, 64).unwrap(), b"diagnostic");
         let pgid = pgid.load(Ordering::Acquire);
         assert_ne!(pgid, 0);
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(
+            members_from_proc(pgid)
+                .expect("verified process-group census")
+                .is_empty()
+        );
         assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists());
         assert!(!task.renew_execution_lease(1));
     }

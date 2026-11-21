@@ -38,12 +38,12 @@ fn spec(script: &str) -> ProcessGroupSpec {
 fn wait_until_empty(pgid: u32, millis: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(millis);
     while std::time::Instant::now() < deadline {
-        if members_from_proc(pgid).is_empty() {
+        if members_from_proc(pgid).expect("complete census").is_empty() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    members_from_proc(pgid).is_empty()
+    members_from_proc(pgid).expect("complete census").is_empty()
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn chaos_staggered_descendants_leave_zero_orphans_every_pass() {
         let receipt = graceful_shutdown(&mut group, &quick(400, 800));
         assert!(
             receipt.ownership_resolved,
-            "pass {teardown_after_ms}: unresolved, residuals {}",
+            "pass {teardown_after_ms}: unresolved, residuals {:?}",
             receipt.residuals_final
         );
         assert!(
@@ -66,7 +66,7 @@ fn chaos_staggered_descendants_leave_zero_orphans_every_pass() {
             "pass {teardown_after_ms}: orphans survived the group"
         );
         assert!(
-            receipt.residuals_final == 0,
+            receipt.residuals_final == Some(0),
             "receipt must agree with reality"
         );
     }
@@ -127,7 +127,7 @@ fn term_resistant_tree_escalates_with_ordered_receipt() {
     let receipt = graceful_shutdown(&mut group, &quick(250, 1_500));
     assert!(receipt.term_sent, "graceful step ran");
     assert!(receipt.kill_sent, "TERM resistance forces escalation");
-    assert_eq!(receipt.residuals_final, 0, "nothing survives KILL");
+    assert_eq!(receipt.residuals_final, Some(0), "nothing survives KILL");
     assert!(receipt.ownership_resolved);
 
     // Receipt stages are strictly time-ordered and contain the full arc.
@@ -159,7 +159,7 @@ fn consumed_handle_path_escalates_identically() {
     assert!(receipt.term_sent, "graceful step ran first");
     assert!(receipt.kill_sent, "resolver escalates like the full policy");
     assert!(receipt.ownership_resolved);
-    assert!(members_from_proc(pgid).is_empty());
+    assert!(members_from_proc(pgid).expect("complete census").is_empty());
 }
 
 #[test]

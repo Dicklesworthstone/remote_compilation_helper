@@ -37,12 +37,14 @@ use rabs_wkr::artifacts::{
 };
 use rabs_wkr::execution::{
     DEFAULT_EXECUTION_TIMEOUT, ExecutionCompletion, ExecutionTask, OUTPUT_PREVIEW_VERSION,
-    StopReason, output_preview_reply,
+    StopReason, UnstartedExecution, output_preview_reply, unstarted_launch_proof,
 };
 use rabs_wkr::host_budget::HostBudget;
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
-use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient, RetentionTarget};
+use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient};
+#[cfg(test)]
+use rabs_wkr::result_spool::RetentionTarget;
 use rabs_wkr::session::{
     CanonicalExecRequest, ExecutionResources, PressureSample, UploadedInputs,
     execute_canonical_controlled, execute_uploaded_canonical_controlled, parse_command_context,
@@ -409,7 +411,7 @@ impl InputDeadline {
         Ok(())
     }
 
-    fn launched(&mut self) {
+    fn execution_inputs_consumed(&mut self) {
         self.upload = None;
     }
 }
@@ -1399,13 +1401,18 @@ fn journal_completion(
     request_id: u64,
     result: &Result<ExecutionCompletion, String>,
     retained: Option<&str>,
+    unstarted: Option<&UnstartedExecution>,
 ) -> Result<(), String> {
     let Some(journal) = journal else {
         return Ok(());
     };
+    let proven_unstarted = unstarted.is_some_and(|proof| proof.matches(request_id));
     let (mut receipt, resolved) = match result {
         Ok(completion) => {
             let result = &completion.result;
+            if proven_unstarted && (result.executed || result.residual_group_members != 0) {
+                return Err("unstarted execution proof conflicts with its completion".to_owned());
+            }
             (
                 serde_json::json!({
                     "kind": "exec-result", "request_id": result.request_id,
@@ -1414,20 +1421,24 @@ fn journal_completion(
                     "residual_group_members": result.residual_group_members,
                     "stop_reason": completion.stop_reason.map(StopReason::label),
                 }),
-                result.executed && result.residual_group_members == 0,
+                proven_unstarted || (result.executed && result.residual_group_members == 0),
             )
         }
         Err(error) => (
             serde_json::json!({
                 "kind": "error", "request_id": request_id,
-                "reason": "execution-completion-failed", "execution_may_have_run": true,
+                "reason": "execution-completion-failed", "execution_may_have_run": !proven_unstarted,
                 "error_sha256": rabs_wkr::session::sha256_hex(error.as_bytes()),
             }),
-            false,
+            proven_unstarted,
         ),
     };
+    if proven_unstarted {
+        receipt["executed"] = serde_json::json!(false);
+        receipt["execution_may_have_run"] = serde_json::json!(false);
+    }
     if let Some(digest) = retained {
-        if !resolved {
+        if !resolved || proven_unstarted {
             return Err("unresolved execution cannot advertise a retained result".to_owned());
         }
         receipt["retained_result_sha256"] = serde_json::json!(digest);
@@ -1913,8 +1924,10 @@ where
                 }
                 SessionEvent::Completed { request_id, result } => {
                     let digest = active.as_ref().and_then(ExecutionTask::retained_result_digest);
+                    let unstarted = active.as_ref().and_then(ExecutionTask::unstarted_execution);
+                    let proven_unstarted = unstarted.as_ref().is_some_and(|proof| proof.matches(request_id));
                     drop(active.take());
-                    journal_completion(journal.as_deref_mut(), request_id, &result, digest.as_deref())?;
+                    journal_completion(journal.as_deref_mut(), request_id, &result, digest.as_deref(), unstarted.as_ref())?;
                     let reply = match *result {
                         Ok(mut completion) => {
                             let reply = completion_frame(&completion, digest.as_deref());
@@ -1925,7 +1938,7 @@ where
                         }
                         Err(reason) => serde_json::json!({
                             "kind": "error", "request_id": request_id, "reason": reason,
-                            "execution_may_have_run": true, "stage": "execution-completion",
+                            "execution_may_have_run": !proven_unstarted, "stage": "execution-completion",
                         }).to_string(),
                     };
                     write_session_frame(stream, &reply, &mut input_deadline, "result write").await?;
@@ -2174,15 +2187,23 @@ where
                                                 // Both input owners now belong to
                                                 // process/drain lifetime. Only the
                                                 // execution timeout/lease applies.
-                                                input_deadline.launched();
+                                                input_deadline.execution_inputs_consumed();
                                                 last_admitted = Some(id); active = Some(task); continue;
                                             }
                                             Err(error) => {
+                                                let proven_unstarted = unstarted_launch_proof(&error)
+                                                    .is_some_and(|proof| proof.matches(id));
                                                 if let Some(journal) = journal.as_deref_mut() {
                                                     journal.finish(id, &serde_json::json!({
                                                         "kind": "error", "request_id": id,
-                                                        "reason": "execution-start-failed", "execution_may_have_run": true,
-                                                    }), false).map_err(|error| format!("persist launch failure: {error}"))?;
+                                                        "reason": "execution-start-failed", "execution_may_have_run": !proven_unstarted,
+                                                    }), proven_unstarted).map_err(|error| format!("persist launch failure: {error}"))?;
+                                                }
+                                                if proven_unstarted {
+                                                    // The constructor consumed and dropped both
+                                                    // staged owners without starting an executor.
+                                                    // Do not keep their old upload clock armed.
+                                                    input_deadline.execution_inputs_consumed();
                                                 }
                                                 request_error(Some(id), &format!("execution start: {error}"))
                                             }
@@ -2233,6 +2254,7 @@ where
             request_id,
             &cleanup,
             task.retained_result_digest().as_deref(),
+            task.unstarted_execution().as_ref(),
         )?;
         if outcome.is_ok() {
             cleanup.map_err(|e| format!("session cleanup: {e}"))?;
@@ -2589,9 +2611,7 @@ async fn session_loop(
             let target_cache = resources.target_cache.clone();
             let runtime_pool = resources.runtime_pool.clone();
             let id = request.request_id;
-            let retention = retain_result
-                .then(|| RetentionTarget::from_admitted(&journal_root, id, recipient.clone()))
-                .transpose()?;
+            let retention = retain_result.then(|| (journal_root.as_path(), recipient.clone()));
             let execute = move |control: rabs_wkr::execution::ExecutionControl| {
                 // Ownership is inside the blocking executor, not the read future.
                 // Cancellation/disconnect cannot remove source before process drain.
@@ -2635,7 +2655,7 @@ async fn session_loop(
                     }
                 }
             };
-            ExecutionTask::spawn_for_delivery_with_lease(
+            ExecutionTask::spawn_for_journaled_delivery(
                 id, timeout, artifacts, retention, lease, execute,
             )
         },
@@ -5239,6 +5259,221 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         assert_eq!(peer.replies()[1]["reason"], "prior-execution-uncertain");
         assert_eq!(journal.status(70)["status"], "execution-uncertain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_proven_unstarted_launch_allows_new_work_without_replay() {
+        for retention_failure in [false, true] {
+            let root = private_root();
+            let missing_retention = root.path().join("missing-retention-journal");
+            let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+            let mut wire = Wire::default();
+            let peer = wire.clone();
+            wire.frame(request(370));
+            wire.frame(request(370));
+            wire.frame(serde_json::json!({"kind":"request-status","request_id":370}));
+            wire.frame(request(371));
+            let launches = AtomicUsize::new(0);
+            let bodies = Arc::new(AtomicUsize::new(0));
+            wait(drive_session(
+                &mut wire,
+                &report(),
+                true,
+                Some(&mut journal),
+                false,
+                |request, timeout, _| {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    if request.request_id == 370 {
+                        if retention_failure {
+                            return ExecutionTask::spawn_for_journaled_delivery(
+                                request.request_id,
+                                timeout,
+                                None,
+                                Some((&missing_retention, ResultRecipient::TlsSpki([7; 32]))),
+                                None,
+                                |_| panic!("retention refusal must precede executor creation"),
+                            );
+                        }
+                        return ExecutionTask::spawn(request.request_id, Duration::ZERO, |_| {
+                            panic!("constructor refusal must precede executor creation")
+                        });
+                    }
+                    let bodies = Arc::clone(&bodies);
+                    ExecutionTask::spawn(request.request_id, timeout, move |_| {
+                        bodies.fetch_add(1, Ordering::SeqCst);
+                        result(request.request_id)
+                    })
+                },
+                pressure,
+            ))
+            .unwrap();
+            let replies = peer.replies();
+            assert_eq!(launches.load(Ordering::SeqCst), 2);
+            assert_eq!(bodies.load(Ordering::SeqCst), 1);
+            assert_eq!(replies[0]["kind"], "error");
+            assert_eq!(replies[1]["reason"], "durable-request-already-admitted");
+            assert_eq!(replies[2]["status"], "terminal-observed");
+            assert_eq!(replies[2]["receipt"]["execution_may_have_run"], false);
+            assert_eq!(replies[2]["replay_authorized"], false);
+            assert_eq!(replies[3]["request_id"], 371);
+            assert_eq!(replies[3]["executed"], true);
+            assert_eq!(journal.high_water(), Some(371));
+            drop(journal);
+            let mut reopened = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+            assert_eq!(
+                reopened
+                    .admit(&request(370), DEFAULT_EXECUTION_TIMEOUT)
+                    .unwrap(),
+                Some("durable-request-retired"),
+            );
+            assert_eq!(reopened.status(371)["status"], "terminal-observed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_unstarted_launch_proof_cannot_resolve_another_request() {
+        let root = private_root();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default();
+        let peer = wire.clone();
+        wire.frame(request(380));
+        wire.frame(request(381));
+        wire.close();
+        let launches = AtomicUsize::new(0);
+        wait(drive_session(
+            &mut wire,
+            &report(),
+            false,
+            Some(&mut journal),
+            false,
+            |request, _, _| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                ExecutionTask::spawn(request.request_id + 1, Duration::ZERO, |_| {
+                    panic!("constructor must refuse")
+                })
+            },
+            pressure,
+        ))
+        .unwrap();
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(peer.replies()[1]["reason"], "prior-execution-uncertain");
+        assert_eq!(journal.status(380)["status"], "execution-uncertain");
+        assert_eq!(journal.status(380)["receipt"]["execution_may_have_run"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_native_prelaunch_cancellation_releases_admission_without_replay() {
+        let root = private_root();
+        let runtime = root.path().join("must-not-be-created");
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut wire = Wire::default();
+        let peer = wire.clone();
+        wire.frame(request(390));
+        wait(drive_session(
+            &mut wire,
+            &report(),
+            true,
+            Some(&mut journal),
+            false,
+            |request, timeout, _| {
+                let runtime = runtime.clone();
+                ExecutionTask::spawn(request.request_id, timeout, move |control| {
+                    assert!(control.cancel(StopReason::Cancelled));
+                    // The actual native executor must stop before probing the
+                    // deliberately absent toolchain/workspace/runtime paths.
+                    execute_canonical_controlled(
+                        &request,
+                        &runtime,
+                        &runtime,
+                        ExecutionResources::new(1),
+                        &runtime,
+                        &control,
+                    )
+                })
+            },
+            pressure,
+        ))
+        .unwrap();
+        let replies = peer.replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["executed"], false);
+        assert_eq!(replies[0]["exit_code"], 130);
+        assert_eq!(replies[0]["stop_reason"], "cancelled");
+        assert_eq!(journal.status(390)["status"], "terminal-observed");
+        assert_eq!(journal.status(390)["receipt"]["execution_may_have_run"], false);
+        assert!(!runtime.exists());
+        drop(journal);
+
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let mut next = Wire::default();
+        let next_peer = next.clone();
+        next.frame(request(390));
+        next.frame(request(391));
+        let launched = AtomicUsize::new(0);
+        wait(drive_session(
+            &mut next,
+            &report(),
+            true,
+            Some(&mut journal),
+            false,
+            |request, timeout, _| {
+                launched.fetch_add(1, Ordering::SeqCst);
+                ExecutionTask::spawn(request.request_id, timeout, move |_| result(request.request_id))
+            },
+            pressure,
+        ))
+        .unwrap();
+        assert_eq!(launched.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            next_peer.replies()[0]["reason"],
+            "durable-request-already-admitted"
+        );
+        assert_eq!(next_peer.replies()[1]["request_id"], 391);
+        assert_eq!(journal.status(391)["status"], "terminal-observed");
+        assert!(!runtime.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journaled_unexecuted_flag_and_completion_error_do_not_prove_cleanup() {
+        for completion_error in [false, true] {
+            let root = private_root();
+            let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+            let mut wire = Wire::default();
+            wire.frame(request(400));
+            wait(drive_session(
+                &mut wire,
+                &report(),
+                true,
+                Some(&mut journal),
+                false,
+                |request, timeout, _| {
+                    ExecutionTask::spawn(request.request_id, timeout, move |control| {
+                        if completion_error {
+                            control
+                                .retain_outputs(Err("unproven executor failure".to_owned()))
+                                .unwrap();
+                        }
+                        let mut failed = result(request.request_id);
+                        failed.executed = false;
+                        failed.exit_code = -1;
+                        failed
+                    })
+                },
+                pressure,
+            ))
+            .unwrap();
+            assert_eq!(journal.status(400)["status"], "execution-uncertain");
+            assert_eq!(
+                journal
+                    .admit(&request(401), DEFAULT_EXECUTION_TIMEOUT)
+                    .unwrap(),
+                Some("prior-execution-uncertain"),
+            );
+        }
     }
 
     #[cfg(unix)]

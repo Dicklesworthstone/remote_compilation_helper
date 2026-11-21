@@ -1126,11 +1126,16 @@ fn execute_canonical_inner(
     use rabs_sandbox::canonical_mounts::CanonicalMountPlan;
     use rabs_sandbox::canonical_namespace::{HostIsolationSupport, command_for};
     use std::process::Stdio;
+    let execution = control.native_execution();
+    if !execution.admitted() {
+        return exec_error(request.request_id);
+    }
     let (source, uploaded_toolchain) = match inputs {
         Some(inputs) => (Some(inputs.source), inputs.toolchain),
         None => (None, None),
     };
     if control.reason().is_some() {
+        execution.refuse_unstarted();
         return exec_error(request.request_id);
     }
     let grant = request
@@ -1141,6 +1146,7 @@ fn execute_canonical_inner(
     if let Some(budget) = resources.host_budget
         && grant > budget.capacity()
     {
+        execution.refuse_unstarted();
         let _ = control.retain_outputs(Err(format!(
             "fixed execution grant {grant} exceeds configured host capacity {}; set an explicit jobserver_grant within that capacity",
             budget.capacity(),
@@ -1673,6 +1679,9 @@ fn execute_canonical_inner(
     // Verification may have spent the remaining lease or execution budget.
     // Do not start a compiler after that final input-preparation boundary.
     if control.reason().is_some() {
+        // Every preparation and verification helper returned successfully.
+        // A helper error above retains uncertainty, even when cancelled.
+        execution.refuse_unstarted();
         return exec_error(request.request_id);
     }
     // Bulk source/toolchain preparation and final input verification precede
@@ -1685,11 +1694,15 @@ fn execute_canonical_inner(
     {
         Ok(lease) => lease,
         Err(error) => {
+            // Admission uses only local slot locks/records. All subprocess
+            // preparation already settled, and no workload spawn was attempted.
+            execution.refuse_unstarted();
             let _ = control.retain_outputs(Err(format!("host execution admission: {error}")));
             return exec_error(request.request_id);
         }
     };
     if control.reason().is_some() {
+        execution.refuse_unstarted();
         return exec_error(request.request_id);
     }
     if let Some(lease) = host_lease.as_mut() {
@@ -1714,8 +1727,10 @@ fn execute_canonical_inner(
         {
             let _ = control.retain_outputs(Err(format!("unstarted host lease cleanup: {error}")));
         }
+        execution.refuse_unstarted();
         return exec_error(request.request_id);
     }
+    execution.spawning();
     let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
         // The spawn adapter can fail after creating a child. Its error does not
         // carry complete cleanup evidence, so an armed host lease stays fenced.

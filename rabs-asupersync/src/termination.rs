@@ -19,8 +19,8 @@
 //! cancellation progress record for crashpacks and the coordinator.
 //!
 //! Idempotence: running the policy against an already-dead group is a
-//! successful no-op (`ESRCH` from `kill(1)` reads as "already
-//! resolved", never as an error), so callers may retry safely.
+//! successful no-op once a complete census verifies emptiness. A failed
+//! signal or unavailable census never proves resolution.
 //!
 //! Exactly-once has TWO halves: the policy guarantees
 //! `ownership_resolved` can only be true with zero live members (safe
@@ -32,7 +32,9 @@ use std::io;
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use crate::process_groups::{ManagedProcessGroup, members_from_proc};
+use crate::process_groups::{
+    GroupSignal, ManagedProcessGroup, members_from_proc, signal_process_group,
+};
 use crate::region_tree::Attribution;
 
 /// Bounded timings for one shutdown. All fields are explicit so tests
@@ -82,6 +84,10 @@ pub enum TerminationStage {
     LeaderReaped,
     /// Membership verified empty — ownership fully resolved.
     Resolved,
+    /// A native group signal failed; membership still needs verification.
+    SignalFailed,
+    /// The final census or leader reap did not prove ownership resolved.
+    Unresolved,
 }
 
 /// How the leader ended, decoded from [`ExitStatus`] (signal deaths
@@ -130,10 +136,15 @@ pub struct TerminationReceipt {
     /// How the leader ended (`None` when another owner of the child
     /// reaped it first, e.g. after consuming `wait_with_output`).
     pub leader_exit: Option<LeaderExit>,
-    /// Live members still present when the grace window closed.
-    pub residuals_after_grace: u32,
-    /// Live members after the final verification window. 0 = clean.
-    pub residuals_final: u32,
+    /// Live members when the grace window closed; `None` means unverified
+    /// or the window was unnecessary because the group was already gone.
+    pub residuals_after_grace: Option<u32>,
+    /// Live members after final verification. `Some(0)` proves emptiness;
+    /// `None` means the census was unavailable, never an empty group.
+    pub residuals_final: Option<u32>,
+    /// Last cleanup error, if any. A later complete census may still resolve
+    /// ownership; retain the error as evidence of the failed observation.
+    pub cleanup_error: Option<String>,
     /// Release gate: zero live residual members. Slot/token/lease
     /// release MUST be gated on this flag (exactly-once contract).
     pub ownership_resolved: bool,
@@ -143,70 +154,70 @@ pub struct TerminationReceipt {
     pub elapsed_ms: u64,
 }
 
-/// Outcome of trying to deliver one group signal.
-enum Signalled {
-    /// Delivered to at least one live member.
-    Delivered,
-    /// Nothing alive to signal (`ESRCH`) — that IS resolution.
-    GroupGone,
-}
-
-fn send_group_signal(pgid: u32, signal: &str) -> io::Result<()> {
-    // `--` guards the negative operand from option parsing (procps);
-    // same discipline as `ManagedProcessGroup::signal_group`.
-    let status = std::process::Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "kill -{signal} -- -{pgid} failed: {status}"
-        )))
-    }
-}
-
 fn signal_receipt(
     pgid: u32,
-    signal: &str,
+    signal: GroupSignal,
     sent_flag: impl FnOnce(&mut TerminationReceipt),
     stage: TerminationStage,
     receipt: &mut TerminationReceipt,
     start: Instant,
-) -> Signalled {
-    match send_group_signal(pgid, signal) {
+) {
+    match signal_process_group(pgid, signal) {
         Ok(()) => {
             sent_flag(receipt);
             receipt.record(stage, start);
-            Signalled::Delivered
         }
-        Err(_) => {
-            receipt.record(TerminationStage::AlreadyGone, start);
-            finish_resolution(receipt, start, 0);
-            Signalled::GroupGone
+        Err(error) => {
+            receipt.cleanup_error = Some(error.to_string());
+            receipt.record(TerminationStage::SignalFailed, start);
         }
     }
 }
 
 /// Poll membership until empty or the bounded window closes; returns
 /// the survivor count at window close.
-fn drain_until(pgid: u32, window: Duration, policy: &TerminationPolicy) -> u32 {
+fn drain_until(pgid: u32, window: Duration, policy: &TerminationPolicy) -> io::Result<u32> {
     let deadline = Instant::now() + window;
     loop {
-        let survivors = members_from_proc(pgid).len() as u32;
+        let survivors = u32::try_from(members_from_proc(pgid)?.len())
+            .map_err(|_| io::Error::other("process-group member count overflow"))?;
         if survivors == 0 || Instant::now() >= deadline {
-            return survivors;
+            return Ok(survivors);
         }
-        std::thread::sleep(policy.poll_clamped());
+        std::thread::sleep(
+            policy
+                .poll_clamped()
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
-fn finish_resolution(receipt: &mut TerminationReceipt, start: Instant, residuals_final: u32) {
-    receipt.residuals_final = residuals_final;
-    receipt.ownership_resolved = residuals_final == 0;
-    receipt.record(TerminationStage::Resolved, start);
+fn observed_count(receipt: &mut TerminationReceipt, observed: io::Result<u32>) -> Option<u32> {
+    match observed {
+        Ok(count) => Some(count),
+        Err(error) => {
+            receipt.cleanup_error = Some(error.to_string());
+            None
+        }
+    }
+}
+
+fn finish_resolution(
+    receipt: &mut TerminationReceipt,
+    start: Instant,
+    residuals_final: io::Result<u32>,
+    leader_reaped: bool,
+) {
+    receipt.residuals_final = observed_count(receipt, residuals_final);
+    receipt.ownership_resolved = receipt.residuals_final == Some(0) && leader_reaped;
+    receipt.record(
+        if receipt.ownership_resolved {
+            TerminationStage::Resolved
+        } else {
+            TerminationStage::Unresolved
+        },
+        start,
+    );
     receipt.elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 }
 
@@ -218,8 +229,9 @@ impl TerminationReceipt {
             kill_sent: false,
             leader_already_exited: false,
             leader_exit: None,
-            residuals_after_grace: 0,
-            residuals_final: 0,
+            residuals_after_grace: None,
+            residuals_final: None,
+            cleanup_error: None,
             ownership_resolved: false,
             stages: Vec::new(),
             elapsed_ms: 0,
@@ -259,34 +271,41 @@ pub fn graceful_shutdown(
     let pgid = group.pgid();
 
     // Fast path: nothing alive at all — pure bookkeeping resolution.
-    if receipt.leader_already_exited && members_from_proc(pgid).is_empty() {
+    if receipt.leader_already_exited
+        && members_from_proc(pgid).is_ok_and(|members| members.is_empty())
+    {
         receipt.record(TerminationStage::AlreadyGone, start);
-        finish_resolution(&mut receipt, start, 0);
+        finish_resolution(&mut receipt, start, Ok(0), true);
         return receipt;
     }
 
     // 1+2. Graceful request, then the bounded cooperative-drain window.
-    match signal_receipt(
+    signal_receipt(
         pgid,
-        "TERM",
+        GroupSignal::Term,
         |r| r.term_sent = true,
         TerminationStage::TermSent,
         &mut receipt,
         start,
-    ) {
-        Signalled::GroupGone => return receipt, // already finished resolved
-        Signalled::Delivered => {}
-    }
-    receipt.residuals_after_grace = drain_until(pgid, policy.grace, policy);
+    );
+    receipt.residuals_after_grace =
+        observed_count(&mut receipt, drain_until(pgid, policy.grace, policy));
 
     // 3. Escalate only if cooperation failed.
-    if receipt.residuals_after_grace > 0 {
+    if receipt.residuals_after_grace != Some(0) {
         receipt.record(TerminationStage::GraceExpired, start);
         // Vanished between scan and KILL: fine, verification below
         // confirms emptiness either way.
-        if send_group_signal(pgid, "KILL").is_ok() {
-            receipt.kill_sent = true;
-            receipt.record(TerminationStage::KillSent, start);
+        signal_receipt(
+            pgid,
+            GroupSignal::Kill,
+            |r| r.kill_sent = true,
+            TerminationStage::KillSent,
+            &mut receipt,
+            start,
+        );
+        if !receipt.kill_sent {
+            let _ = group.kill_leader();
         }
     }
 
@@ -295,13 +314,35 @@ pub fn graceful_shutdown(
     // it is harmless; for a KILLed leader this is the only capture.
     // leader_already_exited is intentionally NOT touched: it describes
     // the PRE-policy observation.
-    if let Ok(status) = group.wait_leader() {
-        receipt.leader_exit = Some(LeaderExit::capture(status));
-        receipt.record(TerminationStage::LeaderReaped, start);
-    }
+    // Failed signaling must not turn a bounded policy into an unbounded wait.
+    let deadline = Instant::now() + policy.final_wait;
+    let leader_reaped = loop {
+        match group.leader_try_wait() {
+            Ok(Some(status)) => {
+                receipt.leader_exit = Some(LeaderExit::capture(status));
+                receipt.record(TerminationStage::LeaderReaped, start);
+                break true;
+            }
+            Err(error) => {
+                receipt.cleanup_error = Some(error.to_string());
+                break false;
+            }
+            Ok(None) if Instant::now() >= deadline => break false,
+            Ok(None) => {}
+        }
+        std::thread::sleep(
+            policy
+                .poll_clamped()
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
+    };
 
-    let residuals_final = drain_until(pgid, policy.final_wait, policy);
-    finish_resolution(&mut receipt, start, residuals_final);
+    let residuals_final = drain_until(
+        pgid,
+        deadline.saturating_duration_since(Instant::now()),
+        policy,
+    );
+    finish_resolution(&mut receipt, start, residuals_final, leader_reaped);
     receipt
 }
 
@@ -317,36 +358,38 @@ pub fn resolve_residuals(
     receipt.leader_already_exited = true;
     let start = Instant::now();
 
-    if members_from_proc(pgid).is_empty() {
+    if members_from_proc(pgid).is_ok_and(|members| members.is_empty()) {
         receipt.record(TerminationStage::AlreadyGone, start);
-        finish_resolution(&mut receipt, start, 0);
+        finish_resolution(&mut receipt, start, Ok(0), true);
         return receipt;
     }
 
-    match signal_receipt(
+    signal_receipt(
         pgid,
-        "TERM",
+        GroupSignal::Term,
         |r| r.term_sent = true,
         TerminationStage::TermSent,
         &mut receipt,
         start,
-    ) {
-        Signalled::GroupGone => return receipt,
-        Signalled::Delivered => {}
-    }
-    receipt.residuals_after_grace = drain_until(pgid, policy.grace, policy);
+    );
+    receipt.residuals_after_grace =
+        observed_count(&mut receipt, drain_until(pgid, policy.grace, policy));
 
-    if receipt.residuals_after_grace > 0 {
+    if receipt.residuals_after_grace != Some(0) {
         receipt.record(TerminationStage::GraceExpired, start);
         // Vanished between scan and KILL: verification below confirms.
-        if send_group_signal(pgid, "KILL").is_ok() {
-            receipt.kill_sent = true;
-            receipt.record(TerminationStage::KillSent, start);
-        }
+        signal_receipt(
+            pgid,
+            GroupSignal::Kill,
+            |r| r.kill_sent = true,
+            TerminationStage::KillSent,
+            &mut receipt,
+            start,
+        );
     }
 
     let residuals_final = drain_until(pgid, policy.final_wait, policy);
-    finish_resolution(&mut receipt, start, residuals_final);
+    finish_resolution(&mut receipt, start, residuals_final, true);
     receipt
 }
 
@@ -369,6 +412,58 @@ mod tests {
             Duration::from_millis(1),
             "zero poll must clamp to avoid a busy-spin"
         );
+    }
+
+    #[test]
+    fn failed_signal_and_unavailable_census_never_authorize_release() {
+        let start = Instant::now();
+        let mut receipt = TerminationReceipt::fresh(Attribution::default());
+        // Native validation rejects this identifier before issuing a syscall.
+        // A signal failure alone used to fabricate an already-gone receipt.
+        signal_receipt(
+            0,
+            GroupSignal::Term,
+            |r| r.term_sent = true,
+            TerminationStage::TermSent,
+            &mut receipt,
+            start,
+        );
+        assert!(!receipt.term_sent);
+        assert!(!receipt.ownership_resolved);
+        assert_eq!(receipt.residuals_final, None);
+        assert_eq!(receipt.stages[0].0, TerminationStage::SignalFailed);
+        finish_resolution(
+            &mut receipt,
+            start,
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            true,
+        );
+        assert!(!receipt.ownership_resolved);
+        assert_eq!(receipt.residuals_final, None);
+        assert!(receipt.cleanup_error.is_some());
+        assert!(!receipt.stages.iter().any(|(stage, _)| matches!(
+            stage,
+            TerminationStage::Resolved | TerminationStage::AlreadyGone
+        )));
+    }
+
+    #[test]
+    fn resolution_requires_both_verified_emptiness_and_reaped_leader() {
+        for (members, reaped, resolved) in [(2, true, false), (0, false, false), (0, true, true)] {
+            let start = Instant::now();
+            let mut receipt = TerminationReceipt::fresh(Attribution::default());
+            finish_resolution(&mut receipt, start, Ok(members), reaped);
+            assert_eq!(receipt.residuals_final, Some(members));
+            assert_eq!(receipt.ownership_resolved, resolved);
+            assert_eq!(
+                receipt.stages.last().unwrap().0,
+                if resolved {
+                    TerminationStage::Resolved
+                } else {
+                    TerminationStage::Unresolved
+                }
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -407,6 +502,46 @@ mod tests {
         }
 
         #[test]
+        fn graceful_shutdown_uses_native_signals_with_no_path() {
+            const CHILD: &str = "RABS_TEST_TERMINATION_NO_PATH";
+            if std::env::var_os(CHILD).is_none() {
+                let module = module_path!().split_once("::").unwrap().1;
+                let test = format!("{module}::graceful_shutdown_uses_native_signals_with_no_path");
+                let output = std::process::Command::new("/proc/self/exe")
+                    .args(["--exact", &test, "--nocapture"])
+                    .env(CHILD, "1")
+                    .env("PATH", "/nonexistent/rabs-no-kill-helper")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                return;
+            }
+            let script = ProcessGroupSpec::new(
+                "/bin/sh",
+                ["-c".to_owned(), "/bin/sleep 30 & wait".to_owned()],
+            );
+            let mut group = ManagedProcessGroup::spawn(&script).expect("spawn");
+            let receipt = graceful_shutdown(&mut group, &quick(100, 400));
+            // Retain a cleanup fallback so a failed assertion does not orphan
+            // the fixture while exposing the old external-kill failure.
+            if !receipt.ownership_resolved {
+                let _ = group.signal_group(GroupSignal::Kill);
+                let _ = group.kill_leader();
+                let _ = group.wait_leader();
+            }
+            assert!(receipt.term_sent, "native TERM must actually be delivered");
+            assert!(receipt.ownership_resolved, "{receipt:?}");
+            assert_eq!(receipt.residuals_final, Some(0));
+            assert!(members_from_proc(group.pgid()).unwrap().is_empty());
+        }
+
+        #[test]
         fn natural_exit_before_shutdown_skips_signals() {
             let mut group = ManagedProcessGroup::spawn(&spec("exit 0")).expect("spawn");
             std::thread::sleep(Duration::from_millis(50)); // corpse settles
@@ -426,7 +561,7 @@ mod tests {
             let receipt = resolve_residuals(pgid, Attribution::default(), &quick(100, 100));
             assert!(receipt.leader_already_exited);
             assert!(receipt.ownership_resolved);
-            assert!(members_from_proc(pgid).is_empty());
+            assert!(members_from_proc(pgid).expect("complete census").is_empty());
         }
     }
 }

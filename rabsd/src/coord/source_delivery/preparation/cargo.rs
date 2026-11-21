@@ -1551,7 +1551,9 @@ impl OwnedGroup {
                 ))
             }
             Err(error) => {
-                if !rabs_asupersync::process_groups::members_from_proc(group).is_empty() {
+                if !rabs_asupersync::process_groups::members_from_proc(group)
+                    .is_ok_and(|members| members.is_empty())
+                {
                     self.retain_unresolved_root();
                 }
                 Err(error)
@@ -1623,14 +1625,26 @@ fn bounded_command_with_input(
         .stdout(File::create(&stdout)?)
         .stderr(File::create(&stderr)?);
     let admission = control.acquire_root(timeout)?;
+    let process = match ManagedProcessGroup::spawn_command(
+        command,
+        Attribution {
+            build_operation: Some("local-cargo-source-preparation".to_owned()),
+            ..Attribution::default()
+        },
+    ) {
+        Ok(process) => process,
+        Err(error) => {
+            // A spawn error may follow child creation and an unverified census.
+            // Retain capacity just as the managed drain does on unknown closure.
+            std::mem::forget(admission);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("Cargo planning spawn did not prove process-group closure: {error}"),
+            ));
+        }
+    };
     let mut owned = OwnedGroup {
-        process: Some(ManagedProcessGroup::spawn_command(
-            command,
-            Attribution {
-                build_operation: Some("local-cargo-source-preparation".to_owned()),
-                ..Attribution::default()
-            },
-        )?),
+        process: Some(process),
         root: Some(admission),
     };
     let deadline = Instant::now() + timeout;
@@ -2433,7 +2447,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let group: u32 = fs::read_to_string(&group_path).unwrap().parse().unwrap();
         assert!(
-            rabs_asupersync::process_groups::members_from_proc(group).is_empty(),
+            rabs_asupersync::process_groups::members_from_proc(group)
+                .expect("complete census")
+                .is_empty(),
             "timed-out Cargo probe must leave no live descendants"
         );
         let mut output = Command::new("/bin/sh");
@@ -2469,7 +2485,9 @@ mod tests {
                     .ok()
                     .and_then(|text| text.parse::<u32>().ok());
                 self.drained_at_release.set(group.is_some_and(|group| {
-                    rabs_asupersync::process_groups::members_from_proc(group).is_empty()
+                    rabs_asupersync::process_groups::members_from_proc(group)
+                        .expect("complete census")
+                        .is_empty()
                 }));
                 self.held.set(false);
             }
@@ -2603,7 +2621,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
         let group: u32 = fs::read_to_string(group_path).unwrap().parse().unwrap();
         assert!(
-            rabs_asupersync::process_groups::members_from_proc(group).is_empty(),
+            rabs_asupersync::process_groups::members_from_proc(group)
+                .expect("complete census")
+                .is_empty(),
             "standalone planning must drain its independent process group"
         );
     }
@@ -2632,7 +2652,10 @@ mod tests {
                     .and_then(|text| text.parse::<u32>().ok())
             {
                 let deadline = Instant::now() + Duration::from_secs(6);
-                while !rabs_asupersync::process_groups::members_from_proc(group).is_empty() {
+                while !rabs_asupersync::process_groups::members_from_proc(group)
+                    .expect("complete census")
+                    .is_empty()
+                {
                     assert!(
                         Instant::now() < deadline,
                         "finite planning fixture remained live"
@@ -2660,6 +2683,80 @@ mod tests {
             "coord::source_delivery::preparation::cargo::tests::standalone_planning_success_preserves_uncancelled_delivery",
             &["success"],
         );
+    }
+
+    #[test]
+    fn planning_spawn_failure_retains_root_and_blocks_replacement() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Admission {
+            held: Rc<Cell<bool>>,
+            released: Rc<Cell<usize>>,
+        }
+        impl Drop for Admission {
+            fn drop(&mut self) {
+                self.held.set(false);
+                self.released.set(self.released.get() + 1);
+            }
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let held = Rc::new(Cell::new(false));
+        let released = Rc::new(Cell::new(0));
+        let attempts = Cell::new(0);
+        let acquired = Cell::new(0);
+        let stopped = || false;
+        let acquire = |timeout| {
+            assert_eq!(timeout, Duration::from_secs(1));
+            attempts.set(attempts.get() + 1);
+            if held.get() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "prior planning root remains unresolved",
+                ));
+            }
+            held.set(true);
+            acquired.set(acquired.get() + 1);
+            Ok(PreparationRootGuard::new(Admission {
+                held: Rc::clone(&held),
+                released: Rc::clone(&released),
+            }))
+        };
+        let control = PreparationControl::new(&stopped, Some(&acquire));
+        let missing = scratch.path().join("missing-cargo-executable");
+        let result = bounded_command_controlled(
+            Command::new(&missing),
+            scratch.path(),
+            Duration::from_secs(1),
+            1024,
+            &control,
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(acquired.get(), 1);
+        assert!(held.get(), "spawn failure refunded unresolved ownership");
+        assert_eq!(released.get(), 0);
+
+        let marker = scratch.path().join("replacement-must-not-start");
+        let mut replacement = Command::new("/bin/sh");
+        replacement
+            .args(["-c", "printf started > \"$1\"", "fixture"])
+            .arg(&marker);
+        let error = bounded_command_controlled(
+            replacement,
+            scratch.path(),
+            Duration::from_secs(1),
+            1024,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(acquired.get(), 1);
+        assert!(held.get());
+        assert_eq!(released.get(), 0);
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -2727,7 +2824,9 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(5));
             let group: u32 = fs::read_to_string(group_path).unwrap().parse().unwrap();
             assert!(
-                rabs_asupersync::process_groups::members_from_proc(group).is_empty(),
+                rabs_asupersync::process_groups::members_from_proc(group)
+                    .expect("complete census")
+                    .is_empty(),
                 "missing-PATH signal fallback must also kill compiler descendants"
             );
             return;

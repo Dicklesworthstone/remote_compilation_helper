@@ -79,7 +79,7 @@ fn both_binary_streams_are_visible_while_the_real_child_waits_for_the_observer()
     assert_eq!(bytes(&output.stdout), b"out\0\xffafter");
     assert_eq!(bytes(&output.stderr), b"err\0\xfftail");
     assert_eq!(output.residual_group_members, 0);
-    assert!(members_from_proc(pgid).is_empty());
+    assert!(members_from_proc(pgid).expect("complete census").is_empty());
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn cancellation_after_preview_preserves_drained_bytes_and_resolves_descendants()
     assert!(!output.status.success());
     assert_eq!(bytes(&output.stdout), b"before-cancel");
     assert_eq!(output.residual_group_members, 0);
-    assert!(members_from_proc(pgid).is_empty());
+    assert!(members_from_proc(pgid).expect("complete census").is_empty());
 }
 
 #[test]
@@ -175,5 +175,5 @@ fn early_preview_cannot_turn_later_quota_failure_into_complete_output() {
             .to_string()
             .contains("capture exceeds 5 bytes")
     );
-    assert!(members_from_proc(pgid).is_empty());
+    assert!(members_from_proc(pgid).expect("complete census").is_empty());
 }

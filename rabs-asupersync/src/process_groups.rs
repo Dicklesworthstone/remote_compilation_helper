@@ -64,7 +64,7 @@ pub enum GroupSignal {
     Hup,
 }
 
-fn signal_process_group(pgid: u32, signal: GroupSignal) -> io::Result<()> {
+pub(crate) fn signal_process_group(pgid: u32, signal: GroupSignal) -> io::Result<()> {
     // Native kill(-1, sig) targets every permitted process, and zero targets
     // the caller's own group. Neither can identify an owned action group.
     let group = i32::try_from(pgid)
@@ -89,9 +89,9 @@ pub struct GroupMember {
     pub pid: i32,
     /// Parent pid within or outside the group.
     pub ppid: i32,
-    /// Process state letter (`R`, `S`, `D`, …). `Z` (zombie) members are
-    /// filtered out during scanning — they hold no execution resource
-    /// and are reaped by their surviving parent or pid 1.
+    /// Process state letter (`R`, `S`, `D`, …). A `Z` (zombie) leader
+    /// is excluded only after confirming a single thread. An exited main
+    /// thread may still have live peers that retain execution resources.
     pub state: char,
     /// Executable name from `/proc/<pid>/stat` (parenthesized, may contain
     /// spaces — parsed defensively).
@@ -186,7 +186,7 @@ impl ManagedProcessGroup {
             // leader outside its requested fresh group must be refused.
             #[cfg(target_os = "linux")]
             let members = {
-                let probe = members_from_proc(pgid);
+                let probe = members_from_proc(pgid)?;
                 match leader.try_wait()? {
                     Some(_) => {}
                     None => {
@@ -205,7 +205,7 @@ impl ManagedProcessGroup {
                 probe
             };
             #[cfg(not(target_os = "linux"))]
-            let members = members_from_proc(pgid);
+            let members = members_from_proc(pgid)?;
             Ok(members)
         })
     }
@@ -248,7 +248,9 @@ impl ManagedProcessGroup {
     /// refresh appear here; nothing else can add members, because group
     /// membership is inherited, not joined.
     pub fn refresh_members(&mut self) -> io::Result<usize> {
-        self.members = members_from_proc(self.pgid);
+        // An unavailable census is not an empty group. Preserve the previous
+        // observation on error; callers must retain ownership until verified.
+        self.members = members_from_proc(self.pgid)?;
         Ok(self.members.len())
     }
 
@@ -481,6 +483,7 @@ impl ManagedProcessGroup {
         let streams = lanes.join();
         let status = status?;
         let (stdout, stderr) = streams?;
+        let residual_group_members = residual_group_members?;
         Ok(crate::stream_drain::DrainedOutput {
             status,
             stdout,
@@ -494,9 +497,9 @@ impl ManagedProcessGroup {
     /// pid 1 and are reaped), escalates to a group KILL at half grace,
     /// then verifies empty. Returns the residual LIVE-member count — 0
     /// means fully resolved; anything else is an honest incident record
-    /// for the receipt/crashpack.
-    #[must_use]
-    pub fn reap_residuals(&self) -> u32 {
+    /// for the receipt/crashpack. An unavailable census returns an error,
+    /// never a fabricated zero; ownership remains unresolved.
+    pub fn reap_residuals(&self) -> io::Result<u32> {
         reap_residuals(self.pgid)
     }
 }
@@ -504,25 +507,43 @@ impl ManagedProcessGroup {
 /// Free-function closer for pgids whose handle is already consumed
 /// (`wait_with_output` takes ownership). Same contract as
 /// [`ManagedProcessGroup::reap_residuals`].
-#[must_use]
-pub fn reap_residuals(pgid: u32) -> u32 {
+pub fn reap_residuals(pgid: u32) -> io::Result<u32> {
+    reap_residuals_with(
+        || members_from_proc(pgid),
+        || signal_process_group(pgid, GroupSignal::Kill),
+    )
+}
+
+fn reap_residuals_with(
+    mut census: impl FnMut() -> io::Result<Vec<GroupMember>>,
+    mut kill: impl FnMut() -> io::Result<()>,
+) -> io::Result<u32> {
     const POLLS: usize = 20;
     const POLL_MILLIS: u64 = 10;
 
-    let mut escalated = false;
     for poll in 0..=POLLS {
-        if members_from_proc(pgid).is_empty() {
-            return 0;
+        let members = match census() {
+            Ok(members) => members,
+            Err(error) => {
+                // Output lanes may still have writers. Attempt group-wide
+                // closure before their owner joins them, but preserve unknown
+                // membership even if the signal was successfully delivered.
+                let _ = kill();
+                return Err(error);
+            }
+        };
+        if members.is_empty() || poll == POLLS {
+            return u32::try_from(members.len())
+                .map_err(|_| io::Error::other("process-group member count overflow"));
         }
-        if poll == POLLS / 2 && !escalated {
+        if poll == POLLS / 2 {
             // Half the grace spent: force. KILL needs no cooperation, so
             // one pass suffices; remaining polls VERIFY emptiness.
-            escalated = true;
-            let _ = signal_process_group(pgid, GroupSignal::Kill);
+            let _ = kill();
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MILLIS));
     }
-    members_from_proc(pgid).len() as u32
+    unreachable!("the final census returns its observed count")
 }
 
 /// Check `/proc/<pgid>/stat` directly for the group leader's `pgrp`.
@@ -546,14 +567,25 @@ fn leader_in_own_pgrp(pgid: u32) -> Option<bool> {
 /// Parses `/proc/<pid>/stat` defensively: `comm` is parenthesized and may
 /// contain spaces *and* parentheses, so fields are taken relative to the
 /// LAST `)`. Layout after it: `state ppid pgrp …`.
+///
+/// An unreadable directory, stat record, or membership field returns an error.
+/// Only a complete census may prove that an owned group has no live members.
 #[cfg(target_os = "linux")]
-#[must_use]
-pub fn members_from_proc(pgid: u32) -> Vec<GroupMember> {
+pub fn members_from_proc(pgid: u32) -> io::Result<Vec<GroupMember>> {
+    members_from_proc_at(pgid, std::path::Path::new("/proc"))
+}
+
+#[cfg(target_os = "linux")]
+fn members_from_proc_at(pgid: u32, proc_root: &std::path::Path) -> io::Result<Vec<GroupMember>> {
+    if pgid <= 1 || i32::try_from(pgid).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid owned process group for membership census",
+        ));
+    }
     let mut members = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return members;
-    };
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir(proc_root)? {
+        let entry = entry?;
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -561,23 +593,47 @@ pub fn members_from_proc(pgid: u32) -> Vec<GroupMember> {
         else {
             continue; // not a pid directory
         };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue; // raced exit or permission
+        let process_dir = entry.path();
+        let stat = match std::fs::read(process_dir.join("stat")) {
+            Ok(stat) => stat,
+            Err(error) => {
+                // Only a vanished PID directory proves the ordinary exit
+                // race. Permissions, descriptor exhaustion, and a missing
+                // stat file for a still-visible PID leave membership unknown.
+                if process_disappeared(&process_dir, &error) {
+                    continue;
+                }
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot census process {pid}: {error}"),
+                ));
+            }
         };
-        if let Some(member) = group_member_from_stat(pid, pgid, &stat) {
+        // Linux permits arbitrary bytes in comm. Its display name may be
+        // lossy; membership fields after the final ')' must still parse.
+        let stat = String::from_utf8_lossy(&stat);
+        if let Some(member) = group_member_from_stat(pid, pgid, &stat)? {
             members.push(member);
         }
     }
     members.sort_by_key(|m| m.pid);
-    members
+    Ok(members)
 }
 
-/// Non-Linux stub: no `/proc`, membership stays empty (fixture tests are
-/// Linux-only; CI workers are Linux per README Limitations).
+#[cfg(target_os = "linux")]
+fn process_disappeared(process_dir: &std::path::Path, error: &io::Error) -> bool {
+    (error.kind() == io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()))
+        && matches!(std::fs::symlink_metadata(process_dir), Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+/// Without a supported process census, descendant closure cannot be proven.
 #[cfg(not(target_os = "linux"))]
-#[must_use]
-pub fn members_from_proc(_pgid: u32) -> Vec<GroupMember> {
-    Vec::new()
+pub fn members_from_proc(_pgid: u32) -> io::Result<Vec<GroupMember>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process-group membership verification requires Linux procfs",
+    ))
 }
 
 /// Split `/proc/<pid>/stat` into `(comm, fields_after_comm)`.
@@ -594,21 +650,49 @@ fn split_stat_fields(stat: &str) -> Option<(&str, &str)> {
 /// Read only membership fields for unrelated processes. A complete census
 /// still visits every entry; only matching live members need an owned name.
 #[cfg(any(target_os = "linux", test))]
-fn group_member_from_stat(pid: i32, pgid: u32, stat: &str) -> Option<GroupMember> {
-    let (comm, rest) = split_stat_fields(stat)?;
+fn group_member_from_stat(pid: i32, pgid: u32, stat: &str) -> io::Result<Option<GroupMember>> {
+    let malformed = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot determine process-group membership from stat for pid {pid}"),
+        )
+    };
+    let (comm, rest) = split_stat_fields(stat).ok_or_else(malformed)?;
     let mut fields = rest.split_whitespace();
-    let state = fields.next()?.chars().next().unwrap_or('?');
-    let parent = fields.next()?;
-    let member_pgrp = fields.next()?.parse::<u32>().ok()?;
-    if member_pgrp != pgid || state == 'Z' {
-        return None;
+    let state = fields.next().ok_or_else(malformed)?;
+    if state.len() != 1 || !state.as_bytes()[0].is_ascii_alphabetic() {
+        return Err(malformed());
     }
-    Some(GroupMember {
+    let state = char::from(state.as_bytes()[0]);
+    let parent = fields.next().ok_or_else(malformed)?;
+    let member_pgrp = fields
+        .next()
+        .ok_or_else(malformed)?
+        .parse::<u32>()
+        .map_err(|_| malformed())?;
+    if member_pgrp != pgid {
+        return Ok(None);
+    }
+    if state == 'Z' {
+        // The exited thread-group leader can retain live peer threads.
+        // Fields 3, 4, and 5 were consumed above; num_threads is field 20.
+        let threads = fields
+            .nth(14)
+            .ok_or_else(malformed)?
+            .parse::<u32>()
+            .map_err(|_| malformed())?;
+        match threads {
+            0 => return Err(malformed()),
+            1 => return Ok(None),
+            _ => {}
+        }
+    }
+    Ok(Some(GroupMember {
         pid,
         ppid: parent.parse().unwrap_or(-1),
         state,
         comm: comm.to_owned(),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -653,7 +737,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn observe_descendant(leader: &mut Child) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while members_from_proc(leader.id()).len() < 2 {
+        while members_from_proc(leader.id())
+            .expect("complete census")
+            .len()
+            < 2
+        {
             assert!(leader.try_wait().unwrap().is_none());
             assert!(Instant::now() < deadline, "child did not fork a descendant");
             std::thread::sleep(Duration::from_millis(5));
@@ -676,7 +764,7 @@ mod tests {
                 .to_string()
                 .contains("verification failure")
         );
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(members_from_proc(pgid).expect("complete census").is_empty());
         assert!(
             !std::path::Path::new(&format!("/proc/{pgid}")).exists(),
             "leader was not reaped"
@@ -695,7 +783,7 @@ mod tests {
             })
         }));
         assert!(outcome.is_err());
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(members_from_proc(pgid).expect("complete census").is_empty());
         assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists());
     }
 
@@ -726,7 +814,7 @@ mod tests {
             )
         }));
         assert!(outcome.is_err());
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(members_from_proc(pgid).expect("complete census").is_empty());
         assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists());
     }
 
@@ -806,7 +894,7 @@ mod tests {
                 .and_then(|e| e.downcast_ref::<crate::stream_drain::DrainFailure>()),
             Some(crate::stream_drain::DrainFailure::OutputLimitExceeded { maximum: 7 })
         ));
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(members_from_proc(pgid).expect("complete census").is_empty());
         let retained: u64 = ["stdout.spill", "stderr.spill"]
             .iter()
             .map(|name| {
@@ -851,7 +939,7 @@ mod tests {
             "drain failure did not reach the process owner"
         );
         assert!(error.to_string().contains("stdout.spill"));
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(members_from_proc(pgid).expect("complete census").is_empty());
         assert_eq!(std::fs::read(blocked).unwrap(), b"preserve");
     }
 
@@ -882,7 +970,7 @@ mod tests {
             || start.elapsed() >= Duration::from_secs(3),
         );
         assert!(outcome.is_err());
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(members_from_proc(pgid).expect("complete census").is_empty());
     }
 
     fn spec(program: &str, script: &str) -> ProcessGroupSpec {
@@ -934,7 +1022,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let remaining = members_from_proc(group.pgid());
+            let remaining = members_from_proc(group.pgid()).expect("complete census");
             if remaining.is_empty() || Instant::now() > deadline {
                 assert!(remaining.is_empty(), "group survived KILL: {remaining:?}");
                 break;
@@ -967,23 +1055,163 @@ mod tests {
     #[test]
     fn group_member_parser_preserves_fields_and_refusals() {
         let line = "123 ((weird) name) S 456 123 0 0 -1 4194560 ignored tail";
-        let member = group_member_from_stat(123, 123, line).expect("member");
+        let member = group_member_from_stat(123, 123, line)
+            .expect("complete stat")
+            .expect("member");
         assert_eq!((member.pid, member.ppid, member.state), (123, 456, 'S'));
         assert_eq!(member.comm, "(weird) name");
-        assert!(group_member_from_stat(123, 999, line).is_none());
+        assert!(group_member_from_stat(123, 999, line).unwrap().is_none());
+        assert!(
+            group_member_from_stat(
+                123,
+                123,
+                "123 (rustc) Z 456 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1",
+            )
+                .unwrap()
+                .is_none()
+        );
         for invalid in [
-            "123 (rustc) Z 456 123 0",
             "123 (rustc) S 456",
             "123 (rustc) S 456 invalid 0",
             "123 (rustc S 456 123 0",
         ] {
-            assert!(group_member_from_stat(123, 123, invalid).is_none());
+            assert_eq!(
+                group_member_from_stat(123, 123, invalid).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
         }
         // Preserve existing treatment of an unparseable parent and terminal
         // states other than Z; this change does not narrow the census policy.
         let unknown_parent = group_member_from_stat(123, 123, "123 (x) X unknown 123")
+            .expect("complete stat")
             .expect("existing membership semantics");
         assert_eq!((unknown_parent.ppid, unknown_parent.state), (-1, 'X'));
+    }
+
+    #[test]
+    fn zombie_leader_with_live_threads_remains_an_owned_group_member() {
+        let live = "123 ((weird) name) Z 456 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 2";
+        let member = group_member_from_stat(123, 123, live)
+            .expect("complete thread census")
+            .expect("live peer threads retain group ownership");
+        assert_eq!((member.pid, member.ppid, member.state), (123, 456, 'Z'));
+        assert_eq!(member.comm, "(weird) name");
+        let dead = "123 ((weird) name) Z 456 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1";
+        assert!(group_member_from_stat(123, 123, dead).unwrap().is_none());
+        for unknown in [
+            "123 ((weird) name) Z 456 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+            "123 ((weird) name) Z 456 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -1",
+            "123 ((weird) name) Z 456 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 invalid",
+            "123 (compiler) Z 456 123",
+        ] {
+            assert_eq!(
+                group_member_from_stat(123, 123, unknown).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{unknown}"
+            );
+        }
+        assert!(
+            group_member_from_stat(123, 123, "123 (unrelated) Z 456 999")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            group_member_from_stat(123, 123, "123 (compiler) S 456 123")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn census_errors_cannot_be_reported_as_an_empty_group() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("unavailable-proc");
+        assert_eq!(
+            members_from_proc_at(123, &missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let pid = root.path().join("123");
+        std::fs::create_dir(&pid).unwrap();
+        // A still-visible PID with unavailable stat is not a proven exit race.
+        assert_eq!(
+            members_from_proc_at(123, root.path()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        std::fs::write(pid.join("stat"), b"123 (compiler) S 1 broken").unwrap();
+        assert_eq!(
+            members_from_proc_at(123, root.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        // Even a malformed unrelated PID may belong to our group. Its unread
+        // membership cannot be silently discarded from the closure proof.
+        std::fs::write(pid.join("stat"), b"123 (compiler) S 1 999").unwrap();
+        let other = root.path().join("456");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("stat"), b"456 (unknown) S 1").unwrap();
+        assert!(members_from_proc_at(123, root.path()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn census_preserves_non_utf8_names_and_distinguishes_confirmed_exit_races() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("123");
+        let absent = io::Error::from(io::ErrorKind::NotFound);
+        assert!(process_disappeared(&pid, &absent));
+        assert!(!process_disappeared(
+            &pid,
+            &io::Error::from(io::ErrorKind::PermissionDenied)
+        ));
+        std::fs::create_dir(&pid).unwrap();
+        assert!(!process_disappeared(&pid, &absent));
+        std::fs::write(pid.join("stat"), b"123 (cc\xff (worker)) S 1 123 0").unwrap();
+        let census = members_from_proc_at(123, root.path()).unwrap();
+        assert_eq!(census.len(), 1);
+        assert_eq!((census[0].pid, census[0].state), (123, 'S'));
+        assert_eq!(census[0].comm, "cc\u{fffd} (worker)");
+
+        std::fs::write(
+            pid.join("stat"),
+            b"123 (compiler) Z 1 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1",
+        )
+        .unwrap();
+        assert!(members_from_proc_at(123, root.path()).unwrap().is_empty());
+        std::fs::write(pid.join("stat"), b"123 (unrelated) S 1 999").unwrap();
+        assert!(members_from_proc_at(123, root.path()).unwrap().is_empty());
+        for invalid in [0, 1, u32::MAX] {
+            assert_eq!(
+                members_from_proc_at(invalid, root.path()).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn residual_cleanup_attempts_kill_without_turning_unknown_membership_into_zero() {
+        for signal_succeeds in [false, true] {
+            let mut signals = 0;
+            let error = reap_residuals_with(
+                || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                || {
+                    signals += 1;
+                    if signal_succeeds {
+                        Ok(())
+                    } else {
+                        Err(io::Error::from(io::ErrorKind::NotFound))
+                    }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(signals, 1, "unknown writers still receive cleanup");
+        }
+        let count = reap_residuals_with(
+            || Ok(Vec::new()),
+            || panic!("a verified empty group needs no signal"),
+        )
+        .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -996,7 +1224,11 @@ mod tests {
 
         // Wait for /proc to drop every trace of the group.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !members_from_proc(group.pgid()).is_empty() && Instant::now() < deadline {
+        while !members_from_proc(group.pgid())
+            .expect("complete census")
+            .is_empty()
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -1073,7 +1305,8 @@ mod tests {
                         spill_dir: dir.path().join("spill"),
                     },
                     || {
-                        observed_descendant |= members_from_proc(pgid).len() >= 2;
+                        observed_descendant |=
+                            members_from_proc(pgid).expect("complete census").len() >= 2;
                         leader_waits && observed_descendant
                     },
                 )
@@ -1084,7 +1317,7 @@ mod tests {
             assert_eq!(output.stdout.resident(), b"stdout-ready");
             assert_eq!(output.stderr.resident(), b"stderr-ready");
             assert_eq!(output.residual_group_members, 0);
-            assert!(members_from_proc(pgid).is_empty());
+            assert!(members_from_proc(pgid).expect("complete census").is_empty());
             assert!(!std::path::Path::new(&format!("/proc/{pgid}")).exists());
         }
     }
@@ -1121,7 +1354,7 @@ mod tests {
         assert_eq!(output.stdout.resident(), b"stdout-ready");
         assert_eq!(output.stderr.resident(), b"stderr-ready");
         assert_eq!(output.residual_group_members, 0);
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(members_from_proc(pgid).expect("complete census").is_empty());
     }
 
     #[test]
@@ -1292,7 +1525,7 @@ mod tests {
                 ));
             }
             assert!(started.elapsed() < Duration::from_secs(5));
-            assert!(members_from_proc(pgid).is_empty());
+            assert!(members_from_proc(pgid).expect("complete census").is_empty());
             assert!(
                 std::fs::metadata(stdout_path).unwrap().len()
                     + std::fs::metadata(stderr_path).unwrap().len()
@@ -1418,6 +1651,6 @@ mod tests {
         assert_eq!(output.residual_group_members, 0);
         assert_eq!(output.stdout.total_bytes(), 0);
         assert_eq!(output.stderr.total_bytes(), 0);
-        assert!(members_from_proc(pgid).is_empty());
+        assert!(members_from_proc(pgid).expect("complete census").is_empty());
     }
 }

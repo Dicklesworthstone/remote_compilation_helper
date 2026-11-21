@@ -1149,7 +1149,7 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(term_ok, "group TERM delivered");
-        let residual = crate::process_groups::reap_residuals(pgid);
+        let residual = crate::process_groups::reap_residuals(pgid).expect("verified residuals");
 
         let status = child.wait().expect("leader reaped after cancellation");
         let stdout = out_lane

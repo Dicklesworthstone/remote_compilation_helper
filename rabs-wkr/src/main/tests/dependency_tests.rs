@@ -2702,6 +2702,7 @@ fn assert_retained_dependency_resume(version: &str, include_execution_host: bool
             id,
             &completion,
             task.retained_result_digest().as_deref(),
+            None,
         )
         .unwrap();
         assert!(journal.has_retained_result());

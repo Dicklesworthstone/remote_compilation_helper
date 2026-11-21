@@ -2491,7 +2491,21 @@ fn execute_controlled(
             stopped.load(Ordering::Acquire) || shared.is_some_and(|runtime| !runtime.healthy())
         })?);
     }
-    let process = ManagedProcessGroup::spawn_command(command, Attribution::default())?;
+    let process = match ManagedProcessGroup::spawn_command(command, Attribution::default()) {
+        Ok(process) => process,
+        Err(error) => {
+            // Formation verification can fail after the child was created.
+            // Its best-effort guard is not a verified descendant-closure receipt.
+            if let Some(runtime) = shared {
+                runtime.stopped.store(true, Ordering::Release);
+            }
+            std::mem::forget(root);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("canonical Cargo spawn did not prove process-group closure: {error}"),
+            ));
+        }
+    };
     let group = process.pgid();
     let start = Instant::now();
     let mut cancelled = false;
@@ -2511,7 +2525,8 @@ fn execute_controlled(
     };
     let unresolved = match &drained {
         Ok(output) => output.residual_group_members != 0,
-        Err(_) => !rabs_asupersync::process_groups::members_from_proc(group).is_empty(),
+        Err(_) => !rabs_asupersync::process_groups::members_from_proc(group)
+            .is_ok_and(|members| members.is_empty()),
     };
     if unresolved {
         if let Some(runtime) = shared {
