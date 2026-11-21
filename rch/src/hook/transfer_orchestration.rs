@@ -1569,6 +1569,12 @@ async fn execute_remote_compilation_inner(
         }
     }
     verify_coalesced_source_plan(&sync_plan, &coalesced_source_roots)?;
+    if let Some(destination) = result_destination {
+        // Recheck the final source closure before any source grant or transfer.
+        // Workspace metadata can live outside the command's invocation tree.
+        destination
+            .verify_source_roots(sync_plan.iter().map(|entry| entry.local_root.as_path()))?;
+    }
     if let Some(spec) = clean_overlay {
         anyhow::ensure!(
             sync_plan.iter().filter(|entry| entry.is_primary).count() == 1,

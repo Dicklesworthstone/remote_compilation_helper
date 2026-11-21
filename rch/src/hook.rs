@@ -3361,6 +3361,26 @@ fn validate_job_result_dirs(dirs: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> 
     Ok(validated)
 }
 
+fn exit_invalid_job_results(command: &str, duration_ms: u64, error: &anyhow::Error) -> ! {
+    let reporter = HookReporter::new(OutputVisibility::Summary);
+    reporter.summary_critical(&format!("[RCH-E001] {error}"));
+    emit_exec_envelope(&ExecResultEnvelope {
+        api_version: "1.0",
+        command,
+        outcome: "collection_error",
+        location: "local",
+        fallback_reason: None,
+        worker_id: None,
+        remote_exit_code: None,
+        duration_ms: Some(duration_ms),
+        timing: None,
+        result_dirs: None,
+        error_code: Some("RCH-E001"),
+        admission: None,
+    });
+    std::process::exit(2);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CleanBaseTreeEntry {
     mode: u32,
@@ -5041,24 +5061,8 @@ pub async fn run_exec(
         Ok((dirs, destination))
     })() {
         Ok(validated) => validated,
-        Err(e) => {
-            let reporter = HookReporter::new(OutputVisibility::Summary);
-            reporter.summary_critical(&format!("[RCH-E001] {e}"));
-            emit_exec_envelope(&ExecResultEnvelope {
-                api_version: "1.0",
-                command: &command,
-                outcome: "collection_error",
-                location: "local",
-                fallback_reason: None,
-                worker_id: None,
-                remote_exit_code: None,
-                duration_ms: Some(exec_start.elapsed().as_millis() as u64),
-                timing: None,
-                result_dirs: None,
-                error_code: Some("RCH-E001"),
-                admission: None,
-            });
-            std::process::exit(2);
+        Err(error) => {
+            exit_invalid_job_results(&command, exec_start.elapsed().as_millis() as u64, &error)
         }
     };
     let classification = if job {
@@ -5268,6 +5272,30 @@ pub async fn run_exec(
             &dependency_bases,
         )
         .await?;
+    }
+    if let Some(destination) = result_destination.as_ref() {
+        // Ordinary jobs also transfer enclosing Cargo workspace metadata,
+        // including an explicit package.workspace outside the invocation tree.
+        // Validate with the transfer planner before creating a lease or asking
+        // the daemon to select a worker; cwd alone is not the source boundary.
+        let validation = (|| -> anyhow::Result<()> {
+            let normalized = normalize_project_path_with_policy(
+                project_root.as_deref().unwrap_or_else(|| Path::new(".")),
+                &topology_policy,
+            )?;
+            let primary = normalized.canonical_path().to_path_buf();
+            // This check consumes only local roots, not the remote identity.
+            let plan = dependency_closure::build_sync_closure_plan(
+                std::slice::from_ref(&primary),
+                &primary,
+                "",
+                &topology_policy,
+            );
+            destination.verify_source_roots(plan.iter().map(|entry| entry.local_root.as_path()))
+        })();
+        if let Err(error) = validation {
+            exit_invalid_job_results(&command, exec_start.elapsed().as_millis() as u64, &error);
+        }
     }
     let selection_project = if clean_overlay_spec.is_none() && clean_overlay_fmt_check {
         selection_project_for_source_content_fmt_check(&project, uuid::Uuid::new_v4())

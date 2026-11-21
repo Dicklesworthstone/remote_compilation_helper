@@ -3760,6 +3760,167 @@ fn exec_result_destination_refuses_unusable_roots_before_admission() {
 
 #[cfg(unix)]
 #[test]
+fn exec_result_destination_protects_explicit_cargo_workspace_metadata_before_admission() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let directory = tempfile::Builder::new()
+        .prefix("rch-result-source-")
+        .disable_cleanup(true)
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let config_dir = root.join("config");
+    let state_dir = root.join("state");
+    let bin = root.join("bin");
+    let projects = root.join("projects");
+    let project = projects.join("app");
+    let workspace = projects.join("owner");
+    let external = root.join("outputs");
+    for path in [
+        &home,
+        &config_dir,
+        &state_dir,
+        &bin,
+        &project.join("src"),
+        &workspace.join(".cargo"),
+        &external,
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nworkspace = \"../owner\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"../app\"]\n",
+    )
+    .unwrap();
+    // The source planner sends this sibling owner's metadata even for --job.
+    // Mapping .cargo results back into the owner would replace source inputs.
+    let protected = workspace.join(".cargo/config.toml");
+    let original = b"[build]\njobs = 2\n";
+    std::fs::write(&protected, original).unwrap();
+    let alias = root.join("workspace-alias");
+    symlink(&workspace, &alias).unwrap();
+
+    let sentinel = root.join("workload-ran");
+    for executable in ["make", "ssh"] {
+        let path = bin.join(executable);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n: > '{}'\nexit 99\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    symlink("/bin/sh", bin.join("sh")).unwrap();
+    let socket = root.join("daemon.sock");
+    let daemon =
+        FallbackDaemonServer::start(&socket, FallbackDaemonFixture::UnconfirmedSelection).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[general]\nsocket_path = \"{socket}\"\n\n\
+             [self_healing]\nhook_starts_daemon = false\n\n\
+             [compilation]\nallow_local_fallback = false\n\n\
+             [path_topology]\ncanonical_root = \"{projects}\"\nalias_root = \"{alias}\"\n",
+            socket = socket.display(),
+            projects = projects.display(),
+            alias = root.join("alias").display(),
+        ),
+    )
+    .unwrap();
+
+    let run = |destination: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_rch"))
+            .env_clear()
+            .env("PATH", &bin)
+            .env("HOME", &home)
+            .env("RCH_CONFIG_DIR", &config_dir)
+            .env("RCH_STATE_HOME", &state_dir)
+            .env("RCH_DISABLE_CONFIG_CACHE", "1")
+            .env("RCH_NO_UPDATE_CHECK", "1")
+            .env("RCH_RESTART_ADMISSION_WAIT_SECS", "0")
+            .current_dir(&project)
+            .stdin(std::process::Stdio::null())
+            .args([
+                "--json",
+                "exec",
+                "--job",
+                "--result-dir",
+                ".cargo",
+                "--result-dest",
+            ])
+            .arg(destination)
+            .args(["--", "make"])
+            .output()
+            .expect("run mapped job from explicit workspace member")
+    };
+    for destination in [&workspace, &alias] {
+        let output = run(destination);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let context = format!("{}: {stderr}; stdout={stdout}", destination.display());
+        assert_eq!(output.status.code(), Some(2), "{context}");
+        assert_contains(&stderr, "--result-dest overlaps source");
+        let envelope: serde_json::Value = serde_json::from_str(
+            stdout
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(envelope["outcome"], "collection_error", "{context}");
+        assert_eq!(envelope["error_code"], "RCH-E001", "{context}");
+        assert!(!sentinel.exists(), "{context}");
+        assert_eq!(std::fs::read(&protected).unwrap(), original, "{context}");
+        let leases = std::fs::read_dir(state_dir.join("job-leases"))
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "json")
+                    })
+                    .count()
+            })
+            .unwrap_or_else(|error| {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                0
+            });
+        assert_eq!(leases, 0, "{context}");
+    }
+    // A disjoint result root must still reach ordinary worker admission.
+    let output = run(&external);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "fixture never confirms a worker");
+    assert!(!stderr.contains("[RCH-E001]"), "{stderr}");
+    let requests = daemon.finish();
+    assert_eq!(
+        requests.len(),
+        2,
+        "invalid roots reached admission: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("GET /select-worker?")),
+        "disjoint result root did not reach worker admission: {stderr}"
+    );
+    assert!(!sentinel.exists(), "{stderr}");
+    assert_eq!(std::fs::read(&protected).unwrap(), original);
+    assert!(std::fs::read_dir(&external).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn exec_result_destination_never_falls_back_to_an_unmapped_local_job() {
     let destination = tempfile::Builder::new()
         .prefix("rch-result-dest-")

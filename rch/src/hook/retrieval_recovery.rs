@@ -277,6 +277,20 @@ impl JobResultDestination {
         );
         Ok(())
     }
+
+    /// Protect every local source authority, including workspace metadata
+    /// outside the invocation directory. Checking cwd alone would let mapped
+    /// results replace inputs transferred from a sibling workspace owner.
+    pub(crate) fn verify_source_roots<'a>(
+        &self,
+        source_roots: impl IntoIterator<Item = &'a Path>,
+    ) -> anyhow::Result<()> {
+        self.verify()?;
+        for root in source_roots {
+            self.verify_separate_from(root)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -10542,6 +10556,56 @@ func TestValue(t *testing.T) {{
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(selected.verify().is_err());
         assert!(JobResultDestination::resolve(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_result_source_closure_protects_workspace_metadata_and_aliases() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let invocation = root.join("projects/app");
+        let workspace = root.join("projects/owner");
+        let metadata = workspace.join(".cargo");
+        let output = root.join("outputs");
+        for path in [&invocation, &workspace, &metadata, &output] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let alias = root.join("workspace-alias");
+        symlink(&workspace, &alias).unwrap();
+        let sources = [invocation.as_path(), workspace.as_path()];
+
+        for path in [&workspace, &metadata, &alias] {
+            let destination = JobResultDestination::resolve(path).unwrap();
+            // All three pass the old cwd-only check, despite sharing source.
+            destination.verify_separate_from(&invocation).unwrap();
+            assert!(
+                destination.verify_source_roots(sources).is_err(),
+                "{} must remain source authority",
+                path.display()
+            );
+        }
+        let ancestor = JobResultDestination::resolve(&root).unwrap();
+        assert!(ancestor.verify_source_roots(sources).is_err());
+
+        let destination = JobResultDestination::resolve(&output).unwrap();
+        destination.verify_source_roots(sources).unwrap();
+        let missing_source = output.join("not-created/source");
+        assert!(
+            destination
+                .verify_source_roots([missing_source.as_path()])
+                .is_err()
+        );
+        let separate_missing_source = root.join("not-created/source");
+        destination
+            .verify_source_roots([separate_missing_source.as_path()])
+            .unwrap();
+        assert!(std::fs::read_dir(&output).unwrap().next().is_none());
     }
 
     #[tokio::test]
