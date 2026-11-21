@@ -1,6 +1,6 @@
 # Canonical Cargo-driver builds through the installed toolset
 
-`cargo rabs --rabs-canonical PROFILE.json -- build --workspace` connects ordinary
+`rabs-cargo --worker PROFILE.json -- build --workspace` connects ordinary
 Cargo workspace builds to RABS's existing canonical worker path. The same path
 supports `check`, `clippy`, `doc`, `test`, `run`, and `bench`, with Cargo selecting the
 requested libraries, binaries, examples and test or benchmark executables.
@@ -54,16 +54,29 @@ entrypoint remains available for explicit one-off profiles.
 ## Native canonical Cargo entry point
 
 `rabs-cargo` is the Rust command-line entry point for ordinary local Cargo,
-RCH remote execution, the local canonical driver and the shared remote
-coordinator. Its canonical modes accept the native
-`canonical-compile-local-v1` and `canonical-compile-remote-v1` profiles described
-below. It exposes `build`, `check`, `clippy`, `doc`, `test`, `run`, and `bench`,
-including executing `run`/`test`/`bench` with explicitly closed or captured file input.
+RCH remote execution, canonical worker execution, the local canonical driver
+and the shared remote coordinator.
+
+| Mode | Profile | Execution owner |
+|---|---|---|
+| `--cache` | None | Local Cargo with native cache preparation |
+| `--rch` | None | RCH with worker-local cache preparation |
+| `--worker` | `canonical-cargo-v1` | A pinned worker, or the existing daemon's worker pool |
+| `--local` | `canonical-compile-local-v1` | Local canonical driver or its selected service |
+| `--remote` | `canonical-compile-remote-v1` | Shared pinned-TLS coordinator |
+
+The canonical modes expose `build`, `check`, `clippy`, `doc`, `test`, `run`, and
+`bench`. The local and shared-coordinator modes support explicitly closed or
+captured file input for executing `run`/`test`/`bench`. Worker execution uses
+closed stdin.
 
 Build it from the same checkout as the native driver:
 
 ```sh
 cargo build --locked --profile wrapper-release -p rabs-cli --bin rabs-cargo
+
+target/wrapper-release/rabs-cargo --worker WORKER.json \
+  --rabsd /absolute/path/to/rabsd -- build --workspace
 
 target/wrapper-release/rabs-cargo --remote REMOTE.json \
   --rabsd /absolute/path/to/rabsd --stdin closed -- run --bin application
@@ -76,9 +89,10 @@ target/wrapper-release/rabs-cargo --local LOCAL.json \
   --rabsd /absolute/path/to/rabsd -- check --workspace --all-targets
 ```
 
-Use `--local PROFILE` or `--remote PROFILE` exactly once. Cargo selectors follow
-the optional `--` separator. With an explicit Cargo command, its selectors
-replace the saved command and selection; with no Cargo command, the native
+Select one canonical mode and profile. Cargo selectors follow the optional `--`
+separator. `--worker` requires an explicit Cargo command because its profile
+contains placement and input settings. For `--local` and `--remote`, an explicit
+Cargo command replaces the saved command and selection; with no command, the
 profile's command and selection remain in effect. Arguments after Cargo's own
 `--` remain program or test arguments and are validated by the shared canonical
 command contract.
@@ -91,6 +105,8 @@ service submissions require explicit closed or captured file input for `run`
 and executing `bench`; `test` defaults to EOF and also accepts captured input.
 `--stdin inherit` is available for direct local `run`, executing `test`, and
 executing `bench`, subject to the driver's noninteractive-input rules.
+`--worker` accepts an explicit `--stdin closed`; inherited input and
+`--stdin-file` are refused before creating an operation.
 
 The profile selects exactly one of an explicit physical `toolchain_root` or
 `"toolchain": "rustup"`. The Rustup option resolves the installed compiler in the
@@ -125,6 +141,46 @@ This executable can also be installed independently with
 `cargo install --locked --path rabs-cli --bin rabs-cargo`; select the matching
 driver explicitly when it is installed elsewhere. This source-build command
 does not establish that a published release bundle contains the executable.
+
+### Direct workers and durable worker-pool jobs
+
+The native `--worker` mode accepts the existing `canonical-cargo-v1` profile
+described in [Profile and prerequisites](#profile-and-prerequisites). It supports
+the same literal worker endpoint and certificate pin, source root, toolchain,
+manifest, vendored or captured dependencies, source-selection policy,
+`jobserver_grant`, explicit environment and private incremental setting. The
+existing `cargo rabs --rabs-canonical` launcher accepts this profile as well.
+
+With `daemon_socket`, the native frontend submits one durable job to the
+existing daemon. An ordered `workers` array selects the existing pool placement
+path and requires that socket. `live_stderr` is available for daemon-owned jobs.
+The frontend retains `spec.json`, `operation.json` and, for a pool, `pool.json`
+under a fresh private operation directory. Allocation intent stays
+`request_id: "allocate"` until the native execution owner assigns the request.
+Client TLS credentials remain in the process environment; they are not copied
+into the Cargo environment or retained submission records.
+
+The frontend hands off once to `rabsd --worker-build-tls --prepare-from` or
+`rabsd --job-build --prepare-from`. Source capture, worker admission, mutual TLS,
+process supervision and verified output delivery remain in those native owners.
+A failed or interrupted handoff retains its operation and never starts another
+build. The reported operation directory can be passed directly to the native
+recovery command. For a daemon-owned job:
+
+```sh
+rabs-recover /data/rabs-operations/cargo-JOB_ID
+rabs-recover --status /data/rabs-operations/cargo-JOB_ID
+rabs-recover --wait /data/rabs-operations/cargo-JOB_ID
+```
+
+Inspection and daemon job controls use the retained identity without the
+original profile, source tree or toolchain. Direct worker recovery additionally
+requires the prepared `bundle/request.json` and its original admission state;
+allocation intent alone cannot authorize result retrieval. See
+[Outputs, failure and recovery](#outputs-failure-and-recovery) for the result-only
+resume and acknowledgment rules. Native process tests exercise the producer and
+recovery records together with explicit driver fixtures; they do not establish
+live worker execution, TLS interoperability or a performance improvement.
 
 ### Ordinary local Cargo with native cache preparation
 
@@ -171,7 +227,7 @@ fixtures; compiler reuse and fleet performance require their own qualification.
 
 ## Profile and prerequisites
 
-Linux is required on the preparing host and worker. Install matching `cargo-rabs`
+Linux is required on the preparing host and worker. Install matching `rabs-cargo`
 and `rabsd` on the preparing host and `rabs-wkr` on the worker. The native toolchain
 directory must contain ordinary executable `bin/cargo` and `bin/rustc` plus the
 runtime/sysroot files required by the existing toolchain capture contract. Rustup

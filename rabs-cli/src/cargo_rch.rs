@@ -29,6 +29,7 @@ pub(crate) fn reject_frontend_controls(arguments: &[OsString]) -> io::Result<()>
                     | b"--cache"
                     | b"--local"
                     | b"--remote"
+                    | b"--worker"
                     | b"--rabsd"
                     | b"--stdin"
                     | b"--stdin-file"

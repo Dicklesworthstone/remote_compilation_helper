@@ -18,6 +18,7 @@ use std::process::ExitCode;
 const HELP: &str = "Run Cargo with native cache preparation, RCH, or a canonical profile.
 
 Usage: rabs-cargo (--local PROFILE | --remote PROFILE) [OPTIONS] [--] [+TOOLCHAIN] [COMMAND ARGS...]
+       rabs-cargo --worker PROFILE [OPTIONS] [--] [+TOOLCHAIN] COMMAND [ARGS...]
        rabs-cargo --rch [--] [CARGO ARGS...]
        rabs-cargo --cache [--] [CARGO ARGS...]
 
@@ -26,6 +27,7 @@ Options:
   --cache                Local Cargo with bounded native RABS cache preparation
   --local PROFILE        Local canonical driver, optionally using its service_socket
   --remote PROFILE       Captured inputs and verified results over pinned TLS
+  --worker PROFILE       Direct worker or daemon-owned pool through a canonical-cargo-v1 profile
   --rabsd EXECUTABLE     Explicit native driver (otherwise CARGO_RABS_DAEMON or sibling rabsd)
   --stdin closed|inherit  Supply EOF, or inherit nonterminal input for direct local run/test/bench
   --stdin-file RELATIVE  Capture one source-root-relative input file for run/test/bench execution
@@ -56,6 +58,15 @@ Literal program/test/lint arguments follow its -- separator. Manifest, jobs,
 environment and physical roots remain explicit profile settings. With no
 command, retain the profile's command and selection. An explicit command
 replaces both, including an empty selection for ordinary Cargo defaults.
+
+Worker profiles require an explicit command and retain the existing direct-worker
+contract: one pinned TLS endpoint, or an ordered worker pool with daemon_socket.
+The native driver captures inputs, allocates the request identity, executes once
+and returns verified artifacts. A private cargo-ID operation retains spec.json,
+operation.json and an optional pool.json for rabs-recover. Worker stdin is closed;
+--stdin closed is accepted, while inherited or captured-file stdin is unavailable
+on this route. Profiles may select incremental state, jobserver_grant and daemon
+live_stderr. TLS credentials remain in the local driver environment.
 
 Profiles select toolchain_root or toolchain: rustup. A leading +TOOLCHAIN requires
 the Rustup profile and a Cargo command. Discovery honors the caller's directory

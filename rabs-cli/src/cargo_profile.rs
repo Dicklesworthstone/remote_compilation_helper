@@ -1,5 +1,8 @@
 //! Bounded operator intent retained privately before one native-driver exec.
 
+#[path = "cargo_worker.rs"]
+mod worker;
+
 use crate::cargo_cli::{Input, Mode, Options};
 use rabs_sandbox::cargo_check::{CompilationCommand, CompilationSelection, CompilationStdin};
 use rabs_sandbox::process_context::CommandContext;
@@ -352,7 +355,16 @@ fn logical(
     if command == CompilationCommand::Clippy {
         environment.push(("CARGO".into(), "/__rabs/toolchain/bin/cargo".into()));
     }
-    if let Some(env) = profile.get("env") {
+    command_environment(profile.get("env"), environment, "/__rabs/workspace")?;
+    Ok(command)
+}
+
+fn command_environment(
+    values: Option<&Value>,
+    mut environment: Vec<(String, String)>,
+    cwd: &str,
+) -> io::Result<CommandContext> {
+    if let Some(env) = values {
         for (name, value) in env
             .as_object()
             .ok_or_else(|| invalid("env must be an object of literal strings"))?
@@ -378,9 +390,8 @@ fn logical(
             ));
         }
     }
-    CommandContext::new("/__rabs/workspace", environment)
-        .map_err(|_| invalid("env exceeds the native identifier or value bounds"))?;
-    Ok(command)
+    CommandContext::new(cwd, environment)
+        .map_err(|_| invalid("env exceeds the native identifier or value bounds"))
 }
 
 fn roots_disjoint(roots: &[PathBuf]) -> io::Result<()> {
@@ -855,6 +866,7 @@ fn validate_profile(
     options: &Options,
 ) -> io::Result<(PathBuf, Option<PathBuf>, CompilationCommand)> {
     let (version, physical) = match options.mode {
+        Mode::Worker => return worker::validate_profile(profile, options),
         Mode::Local => (
             "canonical-compile-local-v1",
             vec![
@@ -968,192 +980,188 @@ fn validate_profile(
             executable(&toolchain.join("bin").join(name))?;
         }
     }
-    let (operation_root, output_root) = match options.mode {
-        Mode::Local => {
-            let state = plain_absolute(string(profile, "state_root")?)?;
-            let operation = plain_absolute(string(profile, "operation_root")?)?;
-            private_directory(&state)?;
-            private_directory(&operation)?;
-            roots.extend([state, operation.clone()]);
-            let wrapper = plain_absolute(string(profile, "wrapper")?)?;
-            executable(&wrapper)?;
-            require(
-                !roots
-                    .iter()
-                    .any(|root| toolchain.as_ref() != Some(root) && wrapper.starts_with(root)),
-                "wrapper must be outside captured source and mutable operation roots",
+    let (operation_root, output_root) = if options.mode == Mode::Local {
+        let state = plain_absolute(string(profile, "state_root")?)?;
+        let operation = plain_absolute(string(profile, "operation_root")?)?;
+        private_directory(&state)?;
+        private_directory(&operation)?;
+        roots.extend([state, operation.clone()]);
+        let wrapper = plain_absolute(string(profile, "wrapper")?)?;
+        executable(&wrapper)?;
+        require(
+            !roots
+                .iter()
+                .any(|root| toolchain.as_ref() != Some(root) && wrapper.starts_with(root)),
+            "wrapper must be outside captured source and mutable operation roots",
+        )?;
+        if let Some(socket) = profile
+            .get("service_socket")
+            .filter(|value| !value.is_null())
+        {
+            let socket = plain_absolute(
+                socket
+                    .as_str()
+                    .ok_or_else(|| invalid("service_socket must be an absolute path"))?,
             )?;
-            if let Some(socket) = profile
-                .get("service_socket")
-                .filter(|value| !value.is_null())
-            {
-                let socket = plain_absolute(
-                    socket
-                        .as_str()
-                        .ok_or_else(|| invalid("service_socket must be an absolute path"))?,
-                )?;
-                require(
-                    !socket.starts_with(&source)
-                        && toolchain
-                            .as_ref()
-                            .is_none_or(|root| !socket.starts_with(root))
-                        && !socket.starts_with(&operation)
-                        && profile
-                            .get("cargo_home_source")
-                            .and_then(Value::as_str)
-                            .is_none_or(|home| !socket.starts_with(home)),
-                    "service socket must be outside captured inputs and operation root",
-                )?;
-            }
-            if let Some(cache) = profile.get("target_cache").filter(|value| !value.is_null()) {
-                let cache = cache
-                    .as_object()
-                    .ok_or_else(|| invalid("target_cache must be an object"))?;
-                require(
-                    cache.keys().all(|key| {
-                        matches!(key.as_str(), "runtime_epoch" | "max_bytes" | "max_families")
-                    }),
-                    "unknown target_cache field",
-                )?;
-                let epoch = string(cache, "runtime_epoch")?;
-                require(
-                    !epoch.is_empty()
-                        && epoch.len() <= 256
-                        && epoch.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-                        }),
-                    "target_cache requires a bounded runtime_epoch",
-                )?;
-                for (field, limit) in [
-                    ("max_bytes", 8 * 1024 * 1024 * 1024_u64),
-                    ("max_families", 32),
-                ] {
-                    if let Some(value) = cache.get(field) {
-                        require(
-                            value
-                                .as_u64()
-                                .is_some_and(|value| value > 0 && value <= limit),
-                            "target_cache bound is invalid",
-                        )?;
-                    }
-                }
-            }
-            (operation, None)
+            require(
+                !socket.starts_with(&source)
+                    && toolchain
+                        .as_ref()
+                        .is_none_or(|root| !socket.starts_with(root))
+                    && !socket.starts_with(&operation)
+                    && profile
+                        .get("cargo_home_source")
+                        .and_then(Value::as_str)
+                        .is_none_or(|home| !socket.starts_with(home)),
+                "service socket must be outside captured inputs and operation root",
+            )?;
         }
-        Mode::Remote => {
-            let staging = plain_absolute(string(profile, "staging_root")?)?;
-            private_directory(&staging)?;
-            roots.push(staging.clone());
+        if let Some(cache) = profile.get("target_cache").filter(|value| !value.is_null()) {
+            let cache = cache
+                .as_object()
+                .ok_or_else(|| invalid("target_cache must be an object"))?;
             require(
-                profile.contains_key("output_root") != profile.contains_key("output_destination"),
-                "remote profile requires exactly one output_root or output_destination",
+                cache.keys().all(|key| {
+                    matches!(key.as_str(), "runtime_epoch" | "max_bytes" | "max_families")
+                }),
+                "unknown target_cache field",
             )?;
-            let output_root = if profile.contains_key("output_root") {
-                let root = plain_absolute(string(profile, "output_root")?)?;
-                private_directory(&root)?;
-                roots.push(root.clone());
-                Some(root)
-            } else {
-                let destination = plain_absolute(string(profile, "output_destination")?)?;
-                let parent = destination
-                    .parent()
-                    .ok_or_else(|| invalid("output destination has no parent"))?;
-                private_directory(parent)?;
-                roots.push(parent.to_path_buf());
-                absent(&destination)?;
-                None
-            };
-            let pin = string(profile, "coordinator_pin")?;
+            let epoch = string(cache, "runtime_epoch")?;
             require(
-                pin.len() == 64
-                    && pin
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && pin.bytes().any(|byte| byte != b'0'),
-                "coordinator_pin must be a nonzero lowercase SHA-256 pin",
+                !epoch.is_empty()
+                    && epoch.len() <= 256
+                    && epoch.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    }),
+                "target_cache requires a bounded runtime_epoch",
             )?;
-            let coordinator = string(profile, "coordinator")?;
-            let server = string(profile, "server_name")?;
-            require(
-                !coordinator.is_empty()
-                    && coordinator.len() <= 1024
-                    && !coordinator.chars().any(char::is_control)
-                    && !server.is_empty()
-                    && server.len() <= 253
-                    && !server.chars().any(char::is_control),
-                "coordinator and TLS server name must be bounded and explicit",
-            )?;
-            let tls = profile
-                .get("tls")
-                .and_then(Value::as_object)
-                .ok_or_else(|| invalid("remote profile requires TLS credentials"))?;
-            require(
-                tls.len() == 3
-                    && ["ca", "certificate", "private_key"]
-                        .iter()
-                        .all(|name| tls.contains_key(*name)),
-                "TLS requires exactly ca, certificate and private_key",
-            )?;
-            for name in ["ca", "certificate", "private_key"] {
-                let credential = plain_absolute(string(tls, name)?)?;
-                open_regular(&credential)?;
-                if name == "private_key" {
+            for (field, limit) in [
+                ("max_bytes", 8 * 1024 * 1024 * 1024_u64),
+                ("max_families", 32),
+            ] {
+                if let Some(value) = cache.get(field) {
                     require(
-                        !roots
-                            .iter()
-                            .take(roots.len() - 2)
-                            .any(|root| credential.starts_with(root)),
-                        "authentication key must be outside captured inputs",
+                        value
+                            .as_u64()
+                            .is_some_and(|value| value > 0 && value <= limit),
+                        "target_cache bound is invalid",
                     )?;
                 }
             }
-            if let Some(presentation) = profile.get("stdout_presentation") {
-                require(
-                    matches!(
-                        presentation.as_str(),
-                        Some("raw" | "cargo-json-subscriber-v1" | "cargo-json-source-paths-v1")
-                    ),
-                    "unsupported stdout_presentation",
-                )?;
-            }
-            if let Some(reuse) = profile
-                .get("artifact_reuse_root")
-                .filter(|value| !value.is_null())
-            {
-                let reuse = plain_absolute(
-                    reuse
-                        .as_str()
-                        .ok_or_else(|| invalid("artifact reuse root must be a path"))?,
-                )?;
-                private_directory(&reuse)?;
+        }
+        (operation, None)
+    } else {
+        let staging = plain_absolute(string(profile, "staging_root")?)?;
+        private_directory(&staging)?;
+        roots.push(staging.clone());
+        require(
+            profile.contains_key("output_root") != profile.contains_key("output_destination"),
+            "remote profile requires exactly one output_root or output_destination",
+        )?;
+        let output_root = if profile.contains_key("output_root") {
+            let root = plain_absolute(string(profile, "output_root")?)?;
+            private_directory(&root)?;
+            roots.push(root.clone());
+            Some(root)
+        } else {
+            let destination = plain_absolute(string(profile, "output_destination")?)?;
+            let parent = destination
+                .parent()
+                .ok_or_else(|| invalid("output destination has no parent"))?;
+            private_directory(parent)?;
+            roots.push(parent.to_path_buf());
+            absent(&destination)?;
+            None
+        };
+        let pin = string(profile, "coordinator_pin")?;
+        require(
+            pin.len() == 64
+                && pin
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && pin.bytes().any(|byte| byte != b'0'),
+            "coordinator_pin must be a nonzero lowercase SHA-256 pin",
+        )?;
+        let coordinator = string(profile, "coordinator")?;
+        let server = string(profile, "server_name")?;
+        require(
+            !coordinator.is_empty()
+                && coordinator.len() <= 1024
+                && !coordinator.chars().any(char::is_control)
+                && !server.is_empty()
+                && server.len() <= 253
+                && !server.chars().any(char::is_control),
+            "coordinator and TLS server name must be bounded and explicit",
+        )?;
+        let tls = profile
+            .get("tls")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid("remote profile requires TLS credentials"))?;
+        require(
+            tls.len() == 3
+                && ["ca", "certificate", "private_key"]
+                    .iter()
+                    .all(|name| tls.contains_key(*name)),
+            "TLS requires exactly ca, certificate and private_key",
+        )?;
+        for name in ["ca", "certificate", "private_key"] {
+            let credential = plain_absolute(string(tls, name)?)?;
+            open_regular(&credential)?;
+            if name == "private_key" {
                 require(
                     !roots
                         .iter()
-                        .take(roots.len() - 1)
-                        .any(|root| reuse.starts_with(root) || root.starts_with(&reuse)),
-                    "artifact reuse must be outside source, compiler and staging roots",
+                        .take(roots.len() - 2)
+                        .any(|root| credential.starts_with(root)),
+                    "authentication key must be outside captured inputs",
                 )?;
-                require(
-                    !Path::new(string(tls, "private_key")?).starts_with(&reuse),
-                    "authentication key must be outside artifact reuse hints",
-                )?;
-                if let Some(output_root) = &output_root {
-                    require(
-                        !output_root.starts_with(&reuse),
-                        "artifact reuse cannot contain new output destinations",
-                    )?;
-                }
-                if let Some(destination) = profile.get("output_destination").and_then(Value::as_str)
-                {
-                    let destination = Path::new(destination);
-                    require(
-                        !reuse.starts_with(destination) && !destination.starts_with(&reuse),
-                        "artifact reuse cannot overlap new output destination",
-                    )?;
-                }
             }
-            (staging, output_root)
         }
+        if let Some(presentation) = profile.get("stdout_presentation") {
+            require(
+                matches!(
+                    presentation.as_str(),
+                    Some("raw" | "cargo-json-subscriber-v1" | "cargo-json-source-paths-v1")
+                ),
+                "unsupported stdout_presentation",
+            )?;
+        }
+        if let Some(reuse) = profile
+            .get("artifact_reuse_root")
+            .filter(|value| !value.is_null())
+        {
+            let reuse = plain_absolute(
+                reuse
+                    .as_str()
+                    .ok_or_else(|| invalid("artifact reuse root must be a path"))?,
+            )?;
+            private_directory(&reuse)?;
+            require(
+                !roots
+                    .iter()
+                    .take(roots.len() - 1)
+                    .any(|root| reuse.starts_with(root) || root.starts_with(&reuse)),
+                "artifact reuse must be outside source, compiler and staging roots",
+            )?;
+            require(
+                !Path::new(string(tls, "private_key")?).starts_with(&reuse),
+                "authentication key must be outside artifact reuse hints",
+            )?;
+            if let Some(output_root) = &output_root {
+                require(
+                    !output_root.starts_with(&reuse),
+                    "artifact reuse cannot contain new output destinations",
+                )?;
+            }
+            if let Some(destination) = profile.get("output_destination").and_then(Value::as_str) {
+                let destination = Path::new(destination);
+                require(
+                    !reuse.starts_with(destination) && !destination.starts_with(&reuse),
+                    "artifact reuse cannot overlap new output destination",
+                )?;
+            }
+        }
+        (staging, output_root)
     };
     roots_disjoint(&roots)?;
     Ok((operation_root, output_root, command))
@@ -1257,6 +1265,9 @@ pub(crate) fn run(options: &Options, current: &Path) -> io::Result<()> {
     let daemon = driver(options, current)?;
     let mut profile = read_profile(Path::new(&options.profile))?;
     let (root, outputs, command) = validate(&mut profile, options, current)?;
+    if options.mode == Mode::Worker {
+        return worker::run(options, &daemon, &profile, &root);
+    }
     let parent = private_directory(&root)?;
     let operation = tempfile::Builder::new()
         .prefix(&format!("cargo-{}-", command.as_str()))
@@ -1310,9 +1321,10 @@ pub(crate) fn run(options: &Options, current: &Path) -> io::Result<()> {
         retained.display()
     );
     let error = Command::new(daemon)
-        .arg(match options.mode {
-            Mode::Local => "--canonical-compile-local",
-            Mode::Remote => "--canonical-compile-remote",
+        .arg(if options.mode == Mode::Local {
+            "--canonical-compile-local"
+        } else {
+            "--canonical-compile-remote"
         })
         .arg(retained)
         .env("CARGO_RABS_CANONICAL_ACTIVE", "1")

@@ -1044,6 +1044,219 @@ fn native_job_daemon_fixture() {
 }
 
 #[test]
+#[ignore = "Rust submission fixture, invoked only by the native frontend/recovery regression"]
+fn native_worker_submission_fixture() {
+    let arguments: Vec<OsString> = std::env::args_os()
+        .skip_while(|argument| argument != "--")
+        .skip(1)
+        .collect();
+    assert!(matches!(
+        arguments[0].to_str(),
+        Some("--worker-build-tls" | "--job-build")
+    ));
+    let preparation = arguments
+        .iter()
+        .position(|argument| argument == "--prepare-from")
+        .expect("one native preparation handoff");
+    let specification = Path::new(&arguments[preparation + 2]);
+    let operation = specification.parent().unwrap();
+    let value: Value = serde_json::from_slice(&fs::read(specification).unwrap()).unwrap();
+    assert_eq!(value["kind"], "canonical-exec");
+    assert_eq!(value["request_id"], "allocate");
+    assert_eq!(value["artifacts"]["cargo"], "cargo-json-v1");
+    assert!(!operation.join("bundle").exists());
+    let arguments: Vec<_> = arguments
+        .iter()
+        .map(|argument| argument.to_str().unwrap())
+        .collect();
+    let report = json!({"operation":operation, "argv":arguments});
+    new_file(
+        Path::new(&std::env::var_os("RABS_SUBMISSION_RECOVERY_REPORT").unwrap()),
+        &serde_json::to_vec(&report).unwrap(),
+        0o600,
+    );
+    // This is a handoff fixture, not an execution or delivery receipt. The
+    // direct recovery case below separately supplies a prepared request.
+    std::process::exit(37);
+}
+
+#[test]
+fn native_worker_submission_records_feed_native_recovery_without_resubmission() {
+    for placement in ["direct", "daemon", "pool"] {
+        let root = tempfile::Builder::new()
+            .prefix("rwrec-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let source = root.join("source");
+        let toolchain = root.join("sdk");
+        let operations = root.join("operations");
+        let state = root.join("original state");
+        for path in [&source, &toolchain, &operations, &state] {
+            private_directory(path);
+        }
+        private_directory(&toolchain.join("bin"));
+        for name in ["cargo", "rustc"] {
+            new_file(
+                &toolchain.join("bin").join(name),
+                b"unused compiler fixture",
+                0o700,
+            );
+        }
+        new_file(
+            &source.join("Cargo.toml"),
+            b"[package]\nname='fixture'\nversion='0.1.0'\n",
+            0o600,
+        );
+        let submitter = root.join("native submission fixture");
+        new_file(
+            &submitter,
+            format!(
+                "#!/bin/sh\nexec {} --exact native_worker_submission_fixture --ignored --nocapture -- \"$@\"\n",
+                quote(std::env::current_exe().unwrap().as_os_str()),
+            )
+            .as_bytes(),
+            0o700,
+        );
+        let socket = root.join("socket");
+        let _listener = if placement != "direct" {
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            Some(listener)
+        } else {
+            None
+        };
+        let mut profile = json!({
+            "version":"canonical-cargo-v1", "source_root":source,
+            "toolchain_root":toolchain, "operation_root":operations,
+            "env":{"PROJECT_VALUE":"must-not-be-printed"},
+        });
+        if placement == "pool" {
+            profile["workers"] = json!([
+                {"listen":"127.0.0.1:7443", "worker":"worker-a", "worker_spki_sha256":PIN},
+                {"listen":"[2001:db8::2]:7444", "worker":"worker-b", "worker_spki_sha256":"ab".repeat(32)},
+            ]);
+        } else {
+            profile["listen"] = "127.0.0.1:7443".into();
+            profile["worker"] = "worker-a".into();
+            profile["worker_spki_sha256"] = PIN.into();
+        }
+        if placement != "direct" {
+            profile["daemon_socket"] = json!(socket);
+            profile["live_stderr"] = true.into();
+        }
+        let profile_path = root.join("profile.json");
+        new_file(&profile_path, &serde_json::to_vec(&profile).unwrap(), 0o600);
+        let submission_report = root.join("submission-report.json");
+        let output = Command::new(env!("CARGO_BIN_EXE_rabs-cargo"))
+            .arg("--worker")
+            .arg(&profile_path)
+            .arg("--rabsd")
+            .arg(&submitter)
+            .args(["--", "build", "--workspace"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("RABS_SUBMISSION_RECOVERY_REPORT", &submission_report)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(37), "{placement}: {output:?}");
+        let submission: Value =
+            serde_json::from_slice(&fs::read(&submission_report).unwrap()).unwrap();
+        let operation = PathBuf::from(submission["operation"].as_str().unwrap());
+        let record = operation.join("operation.json");
+        let before = fs::read(&record).unwrap();
+        let metadata: Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(metadata["automatic_retry"], false);
+        assert_eq!(metadata["publication_authorized"], false);
+
+        // Recovery must use only retained ownership. Moving the original
+        // inputs keeps them intact while proving neither frontend recaptures.
+        fs::rename(&source, root.join("retained source")).unwrap();
+        fs::rename(&toolchain, root.join("retained sdk")).unwrap();
+        fs::rename(&profile_path, root.join("retained profile.json")).unwrap();
+
+        let mut inspect = Command::new(BINARY);
+        inspect
+            .arg(&operation)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("CARGO_RABS_DAEMON", "/must/not/execute")
+            .stdin(Stdio::null());
+        if placement == "direct" {
+            // Native preparation replaces allocation intent with an exact
+            // request before execution. Model that boundary explicitly; this
+            // test does not claim to prepare a real toolchain or use TLS.
+            let request = json!({
+                "kind":"canonical-exec", "request_id":u64::MAX,
+                "program":"/__rabs/toolchain/bin/cargo", "source_manifest":{},
+                "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "cargo":"cargo-json-v1"},
+            });
+            private_directory(&operation.join("bundle"));
+            new_file(
+                &operation.join("bundle/request.json"),
+                &serde_json::to_vec(&request).unwrap(),
+                0o600,
+            );
+            inspect.arg("--canonical-state-dir").arg(&state);
+        }
+        let inspected = inspect.output().unwrap();
+        assert!(inspected.status.success(), "{placement}: {inspected:?}");
+        let result: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+        assert_eq!(result["publication_authorized"], false);
+        assert_eq!(result["reexecute"], false);
+        assert!(!String::from_utf8_lossy(&inspected.stdout).contains("must-not-be-printed"));
+        if placement == "direct" {
+            assert_eq!(result["kind"], "rabs-remote-recovery-intent");
+            assert_eq!(result["request_id"], u64::MAX);
+            assert_eq!(result["worker_id"], "worker-a");
+            assert_eq!(result["transport_state_dir"], json!(state));
+        } else {
+            assert_eq!(result["kind"], "rabs-daemon-job-intent");
+            assert_eq!(result["job_id"], metadata["job_id"]);
+            assert_eq!(result["daemon_socket"], json!(socket));
+            let control = root.join("native recovery fixture");
+            new_file(
+                &control,
+                format!(
+                    "#!/bin/sh\nexec {} --exact native_job_daemon_fixture --ignored --nocapture -- \"$@\"\n",
+                    quote(std::env::current_exe().unwrap().as_os_str()),
+                )
+                .as_bytes(),
+                0o700,
+            );
+            let report = root.join("recovery-report.json");
+            let waited = Command::new(BINARY)
+                .arg(&operation)
+                .args(["--wait", "--rabsd"])
+                .arg(&control)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("RABS_STATE_DIR", root.join("unrelated current state"))
+                .env("CARGO_RABS_CANONICAL_ACTIVE", "0")
+                .env("RABS_RECOVER_JOB_REPORT", &report)
+                .env("RABS_RECOVER_JOB_UNRELATED", "preserved verbatim")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert_eq!(waited.status.code(), Some(37), "{placement}: {waited:?}");
+            let handoff: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+            assert_eq!(
+                handoff["argv"],
+                json!(["--job-wait", "--live-stderr", metadata["job_id"]])
+            );
+            assert_eq!(handoff["socket"], json!(socket));
+            assert_eq!(handoff["tls"], json!([null, null, null]));
+            assert!(!operation.join("bundle").exists());
+        }
+        assert_eq!(fs::read(&record).unwrap(), before);
+        assert_eq!(fs::read_dir(&operations).unwrap().count(), 1);
+        assert!(!operation.join("outputs").exists());
+        assert!(!operation.join("delivery").exists());
+    }
+}
+
+#[test]
 fn daemon_job_inspection_needs_no_socket_bundle_toolchain_or_driver() {
     for pooled in [false, true] {
         for live in [None, Some(false), Some(true)] {

@@ -8,6 +8,7 @@ use std::io;
 pub(crate) enum Mode {
     Local,
     Remote,
+    Worker,
 }
 
 #[derive(Debug)]
@@ -70,7 +71,7 @@ pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
             });
         if !matches!(
             name.to_str(),
-            Some("--local" | "--remote" | "--rabsd" | "--stdin" | "--stdin-file")
+            Some("--local" | "--remote" | "--worker" | "--rabsd" | "--stdin" | "--stdin-file")
         ) {
             return Err(invalid("unknown frontend option; use --help"));
         }
@@ -88,12 +89,16 @@ pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
             return Err(invalid("frontend option requires a nonempty value"));
         }
         match name.to_str() {
-            Some("--local" | "--remote") => {
+            Some("--local" | "--remote" | "--worker") => {
                 if mode.is_some() {
-                    return Err(invalid("select exactly one local or remote profile"));
+                    return Err(invalid(
+                        "select exactly one local, remote or worker profile",
+                    ));
                 }
                 mode = Some(if name == "--local" {
                     Mode::Local
+                } else if name == "--worker" {
+                    Mode::Worker
                 } else {
                     Mode::Remote
                 });
@@ -125,7 +130,7 @@ pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
         }
         at += 1;
     }
-    let mode = mode.ok_or_else(|| invalid("select --local PROFILE or --remote PROFILE"))?;
+    let mode = mode.ok_or_else(|| invalid("select --local, --remote or --worker PROFILE"))?;
     let profile = profile.ok_or_else(|| invalid("profile path is missing"))?;
     let toolchain = if arguments
         .get(at)
@@ -150,6 +155,9 @@ pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
     } else {
         Some(selection(&arguments[at..])?)
     };
+    if mode == Mode::Worker && selected.is_none() {
+        return Err(invalid("worker profiles require an explicit Cargo command"));
+    }
     Ok(Invocation::Run(Box::new(Options {
         mode,
         profile,
