@@ -1988,6 +1988,7 @@ async fn async_main() -> Result<()> {
             cli.socket.clone(),
             admin_disable_store.clone(),
             context.pool.clone(),
+            context.history.clone(),
         );
     }
 

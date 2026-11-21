@@ -17,6 +17,7 @@
 use crate::api::is_process_alive;
 use crate::api::lease_owns_unretired_source;
 use crate::events::EventBus;
+use crate::history::BuildHistory;
 use crate::workers::{OwnedRecoveryPermit, WorkerPool};
 use rch_common::WorkerConfig;
 use rch_common::bypass_record::{AdminDisableStore, AdminNetworkPermit};
@@ -233,6 +234,38 @@ fn abandoned_without_recovery(lease: &DurableJobLease, now_unix_ms: u64) -> bool
         && now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= DAEMON_ABSENCE_MIN_AGE_MS
 }
 
+/// A daemon receipt settles execution independently of the age of a dead
+/// wrapper's journal (#146). It does not settle retained output/source work:
+/// those journals must continue through their existing recovery recipe.
+/// This is only an admission hint. The local client reloads the journal under
+/// its exclusive gate and asks this daemon for the exact receipt again.
+fn completed_without_recovery(lease: &DurableJobLease, history: &BuildHistory) -> Option<i32> {
+    if history.ownership_failed()
+        || lease.schema_version != 1
+        || lease.recovery.is_some()
+        || lease.terminal_acknowledged
+        || lease.heartbeat_unix_ms == 0
+        || !matches!(
+            lease.state,
+            rch_common::job_identity::JobLifecycleState::Running
+                | rch_common::job_identity::JobLifecycleState::Finished
+                | rch_common::job_identity::JobLifecycleState::Abandoned
+        )
+    {
+        return None;
+    }
+    let build_id = lease.identity.remote_build_id.filter(|id| *id > 0)?;
+    let worker = lease.worker_id.as_deref().filter(|id| !id.is_empty())?;
+    if history.active_build(build_id).is_some() {
+        return None;
+    }
+    let receipt = history.terminal_build(build_id, &lease.identity.local_wrapper_id)?;
+    (receipt.id == build_id
+        && receipt.worker_id.as_deref() == Some(worker)
+        && lease.exit_code.is_none_or(|code| code == receipt.exit_code))
+    .then_some(receipt.exit_code)
+}
+
 /// A successful CLI exit can mean only that a live wrapper was asked to resume.
 /// Count recovery as complete only after reading the original journal back.
 fn verify_recovery_completion(
@@ -405,6 +438,9 @@ struct RecoveryCandidate {
     build_id: u64,
     worker_id: String,
     heartbeat_unix_ms: u64,
+    /// Exact terminal history observed during selection, never mutation
+    /// authority. A fresh local daemon query must still confirm completion.
+    terminal_exit: Option<i32>,
 }
 
 /// Only dead source owners, pending daemon handoffs, or acknowledged
@@ -415,6 +451,7 @@ fn recoverable_candidates(
     lease_dir: &Path,
     now_unix_ms: u64,
     presence: impl Fn(&DurableJobLease) -> OwnerPresence,
+    history: Option<&BuildHistory>,
 ) -> Vec<RecoveryCandidate> {
     let Ok(entries) = std::fs::read_dir(lease_dir) else {
         return Vec::new();
@@ -430,26 +467,31 @@ fn recoverable_candidates(
                 .is_some_and(|extension| extension == "json")
         })
         .filter_map(|path| read_lease(lease_dir, path.file_stem()?.to_str()?).ok())
-        .filter(|lease| {
-            let unfinished = terminal_cancellation_unsettled(lease)
+        .filter_map(|lease| {
+            let terminal_exit =
+                history.and_then(|history| completed_without_recovery(&lease, history));
+            let unfinished = terminal_cancellation_unsettled(&lease)
                 || (!lease.terminal_acknowledged
-                    && (lease_owns_unretired_source(lease)
-                        || retired_delivery(lease).is_some()
-                        || abandoned_without_recovery(lease, now_unix_ms)));
+                    && (lease_owns_unretired_source(&lease)
+                        || retired_delivery(&lease).is_some()
+                        || abandoned_without_recovery(&lease, now_unix_ms)
+                        || terminal_exit.is_some()));
             // A recent heartbeat cannot keep a provably dead owner alive.
             // Reusing the restart barrier's fifteen-minute grace stranded
             // execute/finalize leases after wrapper death or a build deadline
             // (GH #134). Recovery still claims the journal's exclusive gate
             // and confirms exact worker/daemon receipts before releasing any
             // source fence; merely scheduling it changes no durable evidence.
-            unfinished && presence(lease) == OwnerPresence::Absent
+            (unfinished && presence(&lease) == OwnerPresence::Absent)
+                .then_some((lease, terminal_exit))
         })
-        .filter_map(|lease| {
+        .filter_map(|(lease, terminal_exit)| {
             Some(RecoveryCandidate {
                 wrapper_id: lease.identity.local_wrapper_id,
                 build_id: lease.identity.remote_build_id.filter(|id| *id > 0)?,
                 worker_id: lease.worker_id.filter(|id| !id.is_empty())?,
                 heartbeat_unix_ms: lease.heartbeat_unix_ms,
+                terminal_exit,
             })
         })
         .collect();
@@ -612,6 +654,7 @@ pub(crate) fn start(
     socket: PathBuf,
     admin_store: Arc<Mutex<AdminDisableStore>>,
     pool: WorkerPool,
+    history: Arc<BuildHistory>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let rch = match std::env::current_exe() {
@@ -654,10 +697,11 @@ pub(crate) fn start(
                         continue;
                     }
                     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+                    let history = history.clone();
                     match tokio::task::spawn_blocking(move || {
                         recoverable_candidates(&default_job_lease_directory(), now, |lease| {
                             owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
-                        })
+                        }, Some(&history))
                     }).await {
                         Ok(candidates) => queue.refresh(candidates),
                         Err(error) => warn!(%error, "Lease recovery scan failed; retaining in-flight tasks"),
@@ -829,7 +873,7 @@ async fn recovery_admission(
 ) -> Result<Option<RecoveryAdmission>, String> {
     let before = read_lease(lease_dir, &candidate.wrapper_id)?;
     check_candidate(&before, &candidate.wrapper_id, Some(candidate))?;
-    if local_terminal_settlement_candidate(&before) {
+    if candidate.terminal_exit.is_some() || local_terminal_settlement_candidate(&before) {
         return Ok(Some(RecoveryAdmission::Local));
     }
     let Some(admin) = admin_store
@@ -870,6 +914,13 @@ fn check_candidate(
     {
         return Err("recovery admission changed after scanning; client was not started".into());
     }
+    if let Some(exit) = candidate.and_then(|candidate| candidate.terminal_exit)
+        && (before.recovery.is_some() || before.exit_code.is_some_and(|observed| observed != exit))
+    {
+        return Err(
+            "terminal recovery obligations changed after scanning; journal retained".into(),
+        );
+    }
     Ok(())
 }
 
@@ -908,6 +959,7 @@ async fn recover_in_with_policy(
     check_candidate(&before, wrapper_id, candidate)?;
     if matches!(policy, RecoveryClientPolicy::Local)
         && !local_terminal_settlement_candidate(&before)
+        && !candidate.is_some_and(|candidate| candidate.terminal_exit.is_some())
     {
         return Err(
             "local recovery obligations changed before launch; client was not started".into(),
@@ -1117,17 +1169,22 @@ mod tests {
         now: u64,
         alive: impl Fn(u32) -> bool,
     ) -> Vec<String> {
-        recoverable_candidates(directory, now, |lease| {
-            if lease.wrapper_pid == 0 {
-                // The legacy test probe cannot establish ownership when no
-                // PID was recorded. Model the production tri-state result.
-                OwnerPresence::Unknown
-            } else if alive(lease.wrapper_pid) {
-                OwnerPresence::Live
-            } else {
-                OwnerPresence::Absent
-            }
-        })
+        recoverable_candidates(
+            directory,
+            now,
+            |lease| {
+                if lease.wrapper_pid == 0 {
+                    // The legacy test probe cannot establish ownership when no
+                    // PID was recorded. Model the production tri-state result.
+                    OwnerPresence::Unknown
+                } else if alive(lease.wrapper_pid) {
+                    OwnerPresence::Live
+                } else {
+                    OwnerPresence::Absent
+                }
+            },
+            None,
+        )
         .into_iter()
         .map(|candidate| candidate.wrapper_id)
         .collect()
@@ -1139,6 +1196,7 @@ mod tests {
             build_id: 7,
             worker_id: worker.to_owned(),
             heartbeat_unix_ms: 0,
+            terminal_exit: None,
         }
     }
 
@@ -2093,8 +2151,12 @@ mod tests {
                     )
                     .await;
             }
-            let candidates =
-                recoverable_candidates(directory.path(), 3_600_001, |_| OwnerPresence::Absent);
+            let candidates = recoverable_candidates(
+                directory.path(),
+                3_600_001,
+                |_| OwnerPresence::Absent,
+                None,
+            );
             assert_eq!(candidates.len(), 1);
             let selected = &candidates[0];
             let mut admission = recovery_admission(&store, &pool, directory.path(), selected)
@@ -2379,9 +2441,12 @@ mod tests {
             leases.push(owned);
         }
         let scan = || {
-            recoverable_candidates(directory.path(), now_ms, |lease| {
-                owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
-            })
+            recoverable_candidates(
+                directory.path(),
+                now_ms,
+                |lease| owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref()),
+                None,
+            )
         };
         let original_ids: Vec<_> = leases[..9]
             .iter()
@@ -3890,9 +3955,10 @@ mod tests {
             )
             .unwrap();
             for presence in [OwnerPresence::Live, OwnerPresence::Unknown] {
-                assert!(recoverable_candidates(dir.path(), now, |_| presence).is_empty());
+                assert!(recoverable_candidates(dir.path(), now, |_| presence, None).is_empty());
             }
-            let recovered = recoverable_candidates(dir.path(), now, |_| OwnerPresence::Absent);
+            let recovered =
+                recoverable_candidates(dir.path(), now, |_| OwnerPresence::Absent, None);
             assert_eq!(recovered.len(), 1);
             assert_eq!(recovered[0].wrapper_id, candidate.identity.local_wrapper_id);
         }
@@ -3936,9 +4002,12 @@ mod tests {
             journals.push((path, bytes));
         }
         let scan = || {
-            recoverable_candidates(directory.path(), now, |lease| {
-                owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
-            })
+            recoverable_candidates(
+                directory.path(),
+                now,
+                |lease| owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref()),
+                None,
+            )
         };
         assert!(scan().is_empty(), "the live wrapper still owns both leases");
         child.start_kill().unwrap();
@@ -4002,9 +4071,12 @@ mod tests {
                 expected = Some(lease.identity.local_wrapper_id);
             }
         }
-        let candidates = recoverable_candidates(directory.path(), now, |lease| {
-            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
-        });
+        let candidates = recoverable_candidates(
+            directory.path(),
+            now,
+            |lease| owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref()),
+            None,
+        );
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].wrapper_id, expected.unwrap());
     }
@@ -4110,7 +4182,7 @@ mod tests {
         expected.sort();
         expected.push(fresh.identity.local_wrapper_id.clone());
         for _restart in 0..2 {
-            let candidates = recoverable_candidates(dir.path(), now, presence);
+            let candidates = recoverable_candidates(dir.path(), now, presence, None);
             assert_eq!(
                 candidates
                     .iter()
@@ -4173,7 +4245,7 @@ mod tests {
         expected.sort();
         for _restart in 0..2 {
             assert_eq!(
-                recoverable_candidates(directory.path(), now, |_| OwnerPresence::Absent)
+                recoverable_candidates(directory.path(), now, |_| OwnerPresence::Absent, None)
                     .into_iter()
                     .map(|candidate| candidate.wrapper_id)
                     .collect::<Vec<_>>(),
@@ -4560,6 +4632,174 @@ mod tests {
             );
             assert_eq!(std::fs::read(&path).unwrap(), journal);
         }
+    }
+
+    #[tokio::test]
+    async fn completed_recipeless_leases_are_selected_promptly_from_exact_durable_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let history = BuildHistory::new(16).with_persistence(history_path.clone());
+        let now = 100 * 60 * 60 * 1000;
+        let mut expected = Vec::new();
+        let mut originals = Vec::new();
+        for (index, phase) in ["sync_up", "execute", "finalize"].into_iter().enumerate() {
+            let mut owned = lease(now, 11, serde_json::Value::Null);
+            owned.recovery = None;
+            let build = history.start_active_build_with_wrapper(
+                format!("completed-project-{index}"),
+                "worker1".into(),
+                "cargo test".into(),
+                owned.wrapper_pid,
+                Some(owned.identity.local_wrapper_id.clone()),
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            owned.admit(build.id, "worker1".into(), now);
+            owned.phase = phase.into();
+            let code = [0, 101, 130][index];
+            history
+                .finish_active_build(build.id, code, None, None, None)
+                .unwrap();
+            persist_recovery_fixture(directory.path(), &owned);
+            expected.push((owned.identity.local_wrapper_id.clone(), code));
+            originals.push(owned);
+        }
+        expected.sort();
+
+        for history in [
+            history,
+            BuildHistory::load_from_file(&history_path, 16).unwrap(),
+        ] {
+            for presence in [OwnerPresence::Live, OwnerPresence::Unknown] {
+                assert!(
+                    recoverable_candidates(directory.path(), now, |_| presence, Some(&history))
+                        .is_empty(),
+                    "terminal history cannot take a live or unverified owner's journal"
+                );
+            }
+            let candidates = recoverable_candidates(
+                directory.path(),
+                now,
+                |_| OwnerPresence::Absent,
+                Some(&history),
+            );
+            assert_eq!(
+                candidates
+                    .into_iter()
+                    .map(|candidate| (candidate.wrapper_id, candidate.terminal_exit.unwrap()))
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            for owned in &originals {
+                assert_eq!(
+                    read_lease(directory.path(), &owned.identity.local_wrapper_id).unwrap(),
+                    *owned,
+                    "a scan only schedules the exact local settlement; it cannot acknowledge it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_recovery_selection_preserves_active_unknown_and_contradictory_evidence() {
+        let history = BuildHistory::new(16);
+        let mut owned = lease(1, 11, serde_json::Value::Null);
+        owned.recovery = None;
+        let build = history.start_active_build_with_wrapper(
+            "completed-project".into(),
+            "worker1".into(),
+            "cargo check".into(),
+            owned.wrapper_pid,
+            Some(owned.identity.local_wrapper_id.clone()),
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+        owned.admit(build.id, "worker1".into(), 1);
+        assert_eq!(completed_without_recovery(&owned, &history), None);
+        history
+            .finish_active_build(build.id, 1, None, None, None)
+            .unwrap();
+        assert_eq!(completed_without_recovery(&owned, &history), Some(1));
+
+        for change in [
+            "build",
+            "wrapper",
+            "worker",
+            "exit",
+            "recipe",
+            "acknowledged",
+            "schema",
+            "heartbeat",
+            "queued",
+            "never_admitted",
+        ] {
+            let mut changed = owned.clone();
+            match change {
+                "build" => changed.identity.remote_build_id = Some(build.id + 1),
+                "wrapper" => {
+                    changed.identity.local_wrapper_id = JobIdentity::new_local().local_wrapper_id
+                }
+                "worker" => changed.worker_id = Some("different-worker".into()),
+                "exit" => changed.exit_code = Some(0),
+                "recipe" => changed.recovery = Some(serde_json::json!({"retired": true})),
+                "acknowledged" => changed.acknowledge_terminal(2),
+                "schema" => changed.schema_version = 2,
+                "heartbeat" => changed.heartbeat_unix_ms = 0,
+                "queued" => changed.state = rch_common::job_identity::JobLifecycleState::Queued,
+                "never_admitted" => changed.identity.remote_build_id = None,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                completed_without_recovery(&changed, &history),
+                None,
+                "{change}"
+            );
+        }
+        owned.exit_code = Some(1);
+        assert_eq!(completed_without_recovery(&owned, &history), Some(1));
+        assert_eq!(
+            completed_without_recovery(&owned, &BuildHistory::new(16)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_uses_local_admission_even_when_worker_is_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut owned = lease(1, 11, serde_json::Value::Null);
+        owned.recovery = None;
+        persist_recovery_fixture(directory.path(), &owned);
+        let mut selected = candidate(&owned.identity.local_wrapper_id, "worker1");
+        selected.terminal_exit = Some(1);
+        let store = Mutex::new(AdminDisableStore::with_path(directory.path().join("admin")));
+        let mut held_admin = store.lock().await;
+        held_admin.upsert(operator_disable("worker1")).unwrap();
+        let pool = WorkerPool::new();
+        let admission = tokio::time::timeout(
+            Duration::from_secs(1),
+            recovery_admission(&store, &pool, directory.path(), &selected),
+        )
+        .await
+        .expect("terminal accounting must not wait for a worker network permit")
+        .unwrap()
+        .unwrap();
+        assert!(matches!(admission, RecoveryAdmission::Local));
+        assert_eq!(
+            read_lease(directory.path(), &selected.wrapper_id).unwrap(),
+            owned
+        );
+
+        owned.recovery = Some(serde_json::json!({"source_roots": ["/retained/source"]}));
+        persist_recovery_fixture(directory.path(), &owned);
+        let refused = recovery_admission(&store, &pool, directory.path(), &selected).await;
+        assert!(
+            refused.is_err(),
+            "a new recipe must not inherit terminal-only admission"
+        );
+        assert_eq!(
+            read_lease(directory.path(), &selected.wrapper_id).unwrap(),
+            owned
+        );
     }
 
     #[test]

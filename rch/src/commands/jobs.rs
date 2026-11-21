@@ -42,7 +42,7 @@ pub enum JobsAction {
         /// Internal daemon admission: stdin lifetime and SSH foreground support.
         #[arg(long, hide = true, action = clap::ArgAction::Set)]
         daemon_managed: Option<bool>,
-        /// Internal settlement of retired delivery using only local daemon IPC.
+        /// Internal settlement of completed jobs using only local daemon IPC.
         #[arg(
             long,
             hide = true,
@@ -823,17 +823,23 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
     let deadline = Instant::now() + timeout;
     if local_only {
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
-        let (code, recovered_writer) = within_job_deadline(
-            deadline,
-            "local recovery settlement (retry the same journal)",
-            crate::hook::recover_job_locally(&writer),
-        )
-        .await?;
-        emit(
-            ctx,
-            &recovered_writer.terminal_job_report(&wrapper_id, "recovered", Some(code))?,
-        )?;
-        return Ok(());
+        if writer.snapshot().recovery.is_some() {
+            let (code, recovered_writer) = within_job_deadline(
+                deadline,
+                "local recovery settlement (retry the same journal)",
+                crate::hook::recover_job_locally(&writer),
+            )
+            .await?;
+            emit(
+                ctx,
+                &recovered_writer.terminal_job_report(&wrapper_id, "recovered", Some(code))?,
+            )?;
+            return Ok(());
+        }
+        // A completed no-recipe job needs only the same exact daemon receipt
+        // that attach already uses (#146). Continue through that common
+        // journal-claim path, with explicit guards against remote recovery,
+        // cancellation and age-based absence settlement below.
     }
     if cargo_json {
         anyhow::ensure!(
@@ -876,6 +882,18 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
     loop {
         let writer = DurableLeaseWriter::load(&wrapper_id)?;
         let lease = writer.snapshot();
+        if local_only {
+            anyhow::ensure!(
+                lease.recovery.is_none()
+                    && lease.identity.remote_build_id.is_some_and(|id| id > 0)
+                    && lease
+                        .worker_id
+                        .as_deref()
+                        .is_some_and(|worker| !worker.is_empty())
+                    && owner_presence(&lease) == OwnerPresence::Absent,
+                "local terminal recovery requires an admitted job with an absent wrapper and no recovery recipe; journal retained"
+            );
+        }
         if lease.terminal_acknowledged {
             if recover && lease.recovery.is_some() {
                 // A local terminal acknowledgement does not prove that the
@@ -999,6 +1017,13 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             })
         })
         .await?;
+        if local_only && status["status"] != "completed" {
+            // The scan's receipt was only a hint. It may have expired or the
+            // daemon may have restarted before this read. Keep all ownership
+            // and retry the next scan; never cancel an active job or turn
+            // missing history into a synthetic terminal result here.
+            return Err(rch_common::job_recovery::WorkerSettlementPending.into());
+        }
         if cancel {
             if status["status"] == "completed" {
                 let code = validate_completion(&lease, &status)
@@ -2894,6 +2919,260 @@ mod tests {
                 validate_admitted_cancellation(&lease, &completion(&lease, code)).unwrap(),
                 AdmittedCancellation::AlreadyCompleted(code)
             );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn automatic_terminal_recovery_only_acknowledges_exact_completed_dead_jobs() {
+        use crate::ui::context::{ColorChoice, OutputConfig, OutputMode};
+        use crate::ui::writer::OutputWriter;
+        use rch_common::process_identity::{ProcessObservation, observe_process};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        const CHILD_DIRECTORY: &str = "RCH_TEST_TERMINAL_RECOVERY";
+        const CHILD_WRAPPER: &str = "RCH_TEST_TERMINAL_WRAPPER";
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            let directory = std::path::PathBuf::from(directory);
+            let ctx = OutputContext::with_writers(
+                OutputConfig {
+                    force_mode: Some(OutputMode::Json),
+                    color: ColorChoice::Never,
+                    ..Default::default()
+                },
+                OutputWriter::new(
+                    std::fs::File::create_new(directory.join("report.json")).unwrap(),
+                    false,
+                ),
+                OutputWriter::stderr(),
+            );
+            let result = run_unix(
+                Some(JobsAction::Recover {
+                    wrapper_id: std::env::var(CHILD_WRAPPER).unwrap(),
+                    timeout_secs: 5,
+                    cargo_json: false,
+                    daemon_managed: Some(false),
+                    daemon_local_only: true,
+                }),
+                &ctx,
+            )
+            .await;
+            if let Err(error) = automatic_recovery_result(result) {
+                std::fs::write(
+                    directory.join("error.json"),
+                    serde_json::to_vec(&json!({
+                        "pending": automatic_recovery_exit_code(&error),
+                        "detail": format!("{error:#}"),
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            return;
+        }
+
+        for case in [
+            "sync_up",
+            "finalize",
+            "active",
+            "not_found",
+            "wrapper",
+            "worker",
+            "build",
+            "exit",
+            "live",
+            "unknown",
+            "busy",
+            "new_recipe",
+        ] {
+            let directory = tempfile::Builder::new()
+                .prefix("rch-terminal-recovery-")
+                .disable_cleanup(true)
+                .tempdir_in("/tmp")
+                .unwrap();
+            let state = directory.path().join("state");
+            let journals = state.join("job-leases");
+            let config = directory.path().join("config");
+            std::fs::create_dir_all(&journals).unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            let mut wrapper = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let ProcessObservation::Present(birth) = observe_process(wrapper.id()) else {
+                panic!("native wrapper birth could not be observed");
+            };
+            let mut lease = admitted_lease();
+            lease.wrapper_pid = wrapper.id();
+            lease.process_birth = Some(birth);
+            lease.phase = if case == "sync_up" {
+                "sync_up"
+            } else {
+                "finalize"
+            }
+            .into();
+            // Keep the unknown-history case older than the fallback threshold:
+            // local-only settlement still requires a terminal daemon receipt.
+            lease.heartbeat_unix_ms = if case == "not_found" {
+                1
+            } else {
+                crate::hook::unix_ms_now()
+            };
+            if case != "live" {
+                wrapper.kill().unwrap();
+                wrapper.wait().unwrap();
+            }
+            if case == "unknown" {
+                lease.wrapper_pid = 0;
+                lease.process_birth = None;
+            }
+            if case == "exit" {
+                lease.exit_code = Some(101);
+            }
+            let lease_path = journals.join(format!("{}.json", lease.identity.local_wrapper_id));
+            let original = serde_json::to_vec_pretty(&lease).unwrap();
+            write_private_job_evidence(&lease_path, &original);
+            let retained = directory.path().join("retained-output");
+            std::fs::write(&retained, b"caller output stays intact").unwrap();
+            let _held_gate = (case == "busy").then(|| {
+                rch_common::job_identity::journal::JobJournalGate::try_acquire(&lease_path)
+                    .unwrap()
+                    .unwrap()
+            });
+
+            let mut reply = completion(&lease, 1);
+            match case {
+                "active" => reply = preparation_status(&lease),
+                "not_found" => reply = json!({"status": "not_found"}),
+                "wrapper" => reply["local_wrapper_id"] = json!("another-wrapper"),
+                "worker" => reply["record"]["worker_id"] = json!("another-worker"),
+                "build" => reply["record"]["id"] = json!(43),
+                _ => {}
+            }
+            let mut updated = lease.clone();
+            updated.recovery =
+                Some(json!({"source_roots": ["/retained/source"], "retired": false}));
+            let updated_bytes = serde_json::to_vec_pretty(&updated).unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let expected_query = format!(
+                "GET /builds/42?local_wrapper_id={}\n",
+                lease.identity.local_wrapper_id
+            );
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+            let observed_path = lease_path.clone();
+            let observed_bytes = original.clone();
+            let updated_bytes_for_server = updated_bytes.clone();
+            let server = tokio::spawn(async move {
+                let mut queries = 0;
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        biased;
+                        _ = &mut stop_rx => break,
+                        connection = listener.accept() => connection.unwrap(),
+                    };
+                    let mut request = String::new();
+                    stream.read_to_string(&mut request).await.unwrap();
+                    assert_eq!(
+                        request, expected_query,
+                        "local settlement must only read daemon status"
+                    );
+                    assert_eq!(std::fs::read(&observed_path).unwrap(), observed_bytes);
+                    queries += 1;
+                    assert_eq!(queries, 1, "one terminal observation is sufficient");
+                    if case == "new_recipe" {
+                        std::fs::write(&observed_path, &updated_bytes_for_server).unwrap();
+                    }
+                    stream
+                        .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{reply}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                queries
+            });
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "commands::jobs::tests::automatic_terminal_recovery_only_acknowledges_exact_completed_dead_jobs", "--nocapture"])
+                .env_clear()
+                .env(CHILD_DIRECTORY, directory.path())
+                .env(CHILD_WRAPPER, &lease.identity.local_wrapper_id)
+                .env("RCH_STATE_HOME", &state)
+                .env("RCH_CONFIG_DIR", &config)
+                .env("RCH_SOCKET_PATH", &socket)
+                // A local completion must not need any worker-side tools.
+                .env("PATH", directory.path())
+                .current_dir(directory.path())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(10), child.output())
+                .await
+                .expect("terminal recovery exceeded its bounded operation")
+                .unwrap();
+            stop_tx.send(()).unwrap();
+            let queries = server.await.unwrap();
+            if case == "live" {
+                wrapper.kill().unwrap();
+                wrapper.wait().unwrap();
+            }
+            assert!(output.status.success(), "{case}: {output:?}");
+            assert_eq!(
+                queries,
+                usize::from(!matches!(case, "live" | "unknown")),
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read(&retained).unwrap(),
+                b"caller output stays intact"
+            );
+            assert!(!lease_path.with_extension("cancel").exists());
+            assert!(!lease_path.with_extension("recover").exists());
+            if matches!(case, "sync_up" | "finalize") {
+                assert!(!directory.path().join("error.json").exists());
+                let report: Value = serde_json::from_slice(
+                    &std::fs::read(directory.path().join("report.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(report["status"], "completed");
+                assert_eq!(report["exit_code"], 1);
+                assert_eq!(report["terminal_acknowledged"], true);
+                let settled: DurableJobLease =
+                    serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+                assert_eq!(settled.identity, lease.identity);
+                assert_eq!(settled.wrapper_pid, lease.wrapper_pid);
+                assert_eq!(settled.process_birth, lease.process_birth);
+                assert!(settled.recovery.is_none());
+                assert_eq!(settled.exit_code, Some(1));
+                assert!(settled.terminal_acknowledged);
+            } else {
+                let error: Value = serde_json::from_slice(
+                    &std::fs::read(directory.path().join("error.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    error["pending"],
+                    match case {
+                        "active" | "not_found" =>
+                            json!(rch_common::job_recovery::AUTOMATIC_RECOVERY_PENDING_EXIT_CODE),
+                        "busy" =>
+                            json!(rch_common::job_recovery::AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE),
+                        _ => Value::Null,
+                    },
+                    "{case}: {error}",
+                );
+                assert_eq!(
+                    std::fs::read(&lease_path).unwrap(),
+                    if case == "new_recipe" {
+                        updated_bytes
+                    } else {
+                        original
+                    }
+                );
+                assert!(
+                    std::fs::read(directory.path().join("report.json"))
+                        .unwrap()
+                        .is_empty()
+                );
+            }
         }
     }
 
