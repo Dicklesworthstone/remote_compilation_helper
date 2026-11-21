@@ -1804,6 +1804,13 @@ pub struct JobsConfig {
     /// every build's worker pool would be a surprising way to lose the fleet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_tools: Vec<String>,
+    /// Allow explicit argv rules to delegate non-compilation hook commands.
+    /// Unset/false preserves compilation-only interception.
+    #[serde(default)]
+    pub intercept_enabled: bool,
+    /// Ordered, operator-authorized rules. The first exact match wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::job_rules::JobRule>,
 }
 
 /// Daemon status API over TCP (`[api]`).

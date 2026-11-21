@@ -50,6 +50,7 @@ pub mod incident_ledger;
 pub mod isolated_staging;
 pub mod job_identity;
 pub mod job_recovery;
+pub mod job_rules;
 pub mod log_retention;
 pub mod logging;
 pub mod mock;

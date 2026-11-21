@@ -158,9 +158,9 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-// Version 8 adds the validated [timeouts] section. Only on-disk values are
-// cached; RCH_TIMING_SCALE is resolved independently on every load.
-const CACHE_SCHEMA_VERSION: u32 = 8;
+// Version 9 adds opt-in job interception rules. Only on-disk values are
+// cached; runtime overrides and rule validation still run on every load.
+const CACHE_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -473,6 +473,7 @@ fn load_config_uncached_from_paths(
         config = load_config_overlay(config, config_path)?;
     }
 
+    rch_common::job_rules::validate(&config.jobs).map_err(anyhow::Error::msg)?;
     Ok(config)
 }
 
@@ -494,6 +495,7 @@ pub fn load_config() -> Result<RchConfig> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
     {
+        rch_common::job_rules::validate(&config.jobs).map_err(anyhow::Error::msg)?;
         rch_common::timing::install(config.timeouts.scale);
         return Ok(config);
     }
@@ -522,6 +524,7 @@ pub fn load_config() -> Result<RchConfig> {
 
     let mut config = apply_env_overrides(config);
     apply_timing_env_overrides(&mut config, None, None)?;
+    rch_common::job_rules::validate(&config.jobs).map_err(anyhow::Error::msg)?;
 
     // br-4zf3p: CLI overrides for self-healing have highest priority
     // (CLI > env > config > defaults). Recorded by main.rs at startup.
@@ -738,6 +741,8 @@ struct PartialRchConfig {
     #[serde(default)]
     compilation: PartialCompilationConfig,
     #[serde(default)]
+    jobs: PartialJobsConfig,
+    #[serde(default)]
     selection: PartialSelectionConfig,
     #[serde(default)]
     transfer: PartialTransferConfig,
@@ -764,6 +769,13 @@ struct PartialRchConfig {
     // same trap issue #10 documented for path_topology.
     #[serde(default)]
     layer0: PartialLayer0Config,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialJobsConfig {
+    required_tools: Option<Vec<String>>,
+    intercept_enabled: Option<bool>,
+    rules: Option<Vec<rch_common::job_rules::JobRule>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1113,6 +1125,9 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
     };
 
     for error in circuit_validation_errors(&config.circuit) {
+        validation.error(error);
+    }
+    if let Err(error) = rch_common::job_rules::validate(&config.jobs) {
         validation.error(error);
     }
 
@@ -1525,6 +1540,9 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.external_timeout_enabled",
         "compilation.allow_local_fallback",
         "compilation.remote_build_jobs",
+        "jobs.required_tools",
+        "jobs.intercept_enabled",
+        "jobs.rules",
         "selection.disk_gb_per_slot",
         "selection.disk_warning_free_ratio",
         "selection.disk_warning_ratio_cap_gb",
@@ -1575,6 +1593,18 @@ fn apply_layer(
     source: &ConfigValueSource,
     _defaults: &RchConfig,
 ) {
+    if let Some(required_tools) = layer.jobs.required_tools.as_ref() {
+        config.jobs.required_tools = required_tools.clone();
+        set_source(sources, "jobs.required_tools", source.clone());
+    }
+    if let Some(enabled) = layer.jobs.intercept_enabled {
+        config.jobs.intercept_enabled = enabled;
+        set_source(sources, "jobs.intercept_enabled", source.clone());
+    }
+    if let Some(rules) = layer.jobs.rules.as_ref() {
+        config.jobs.rules = rules.clone();
+        set_source(sources, "jobs.rules", source.clone());
+    }
     if let Some(scale) = layer.timeouts.scale {
         config.timeouts.scale = scale;
         set_source(sources, "timeouts.scale", source.clone());
@@ -4254,6 +4284,121 @@ identity_file = "/tmp/id_ed25519"
                 "invalid disk requirement was ignored: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn job_interception_rules_follow_user_project_and_cache_configuration() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &user,
+            r#"
+[jobs]
+required_tools = ["cargo-mutants"]
+intercept_enabled = true
+
+[[jobs.rules]]
+name = "mutation"
+argv_prefix = ["cargo", "mutants"]
+result_dirs = ["mutants.out"]
+require_tools = ["rustc"]
+output_flag = "--output"
+"#,
+        )
+        .unwrap();
+        let no_env = HashMap::new();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user), None, Some(&no_env)).unwrap();
+        assert!(loaded.config.jobs.intercept_enabled);
+        assert_eq!(loaded.config.jobs.required_tools, ["cargo-mutants"]);
+        assert_eq!(loaded.config.jobs.rules[0].name, "mutation");
+        assert_eq!(
+            loaded.sources.get("jobs.rules"),
+            Some(&ConfigValueSource::UserConfig(user.clone()))
+        );
+        let matched = rch_common::job_rules::match_command(
+            &loaded.config.jobs,
+            "cargo mutants --output 'reports/current run'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            matched.result_dirs,
+            [PathBuf::from("reports/current run")]
+        );
+        let cached = CachedConfig {
+            schema_version: CACHE_SCHEMA_VERSION,
+            socket_path_from_default: false,
+            source_fingerprints: vec![],
+            config: loaded.config,
+        };
+        let cached: CachedConfig =
+            serde_json::from_slice(&serde_json::to_vec(&cached).unwrap()).unwrap();
+        let roundtrip = cached.into_config();
+        assert!(
+            rch_common::job_rules::match_command(&roundtrip.jobs, "cargo mutants")
+                .unwrap()
+                .is_some()
+        );
+
+        // An explicit false disables inherited rules without discarding them.
+        std::fs::write(&project, "[jobs]\nintercept_enabled = false\n").unwrap();
+        let disabled = load_config_with_sources_from_paths(
+            Some(&user),
+            Some(&project),
+            Some(&no_env),
+        )
+        .unwrap();
+        assert!(!disabled.config.jobs.intercept_enabled);
+        assert_eq!(disabled.config.jobs.rules.len(), 1);
+        assert_eq!(
+            disabled.sources.get("jobs.intercept_enabled"),
+            Some(&ConfigValueSource::ProjectConfig(project.clone()))
+        );
+        assert!(
+            rch_common::job_rules::match_command(&disabled.config.jobs, "cargo mutants")
+                .unwrap()
+                .is_none()
+        );
+
+        // Arrays replace; an empty project rule list is not an absent override.
+        std::fs::write(&project, "[jobs]\nrules = []\nrequired_tools = []\n").unwrap();
+        let cleared = load_config_uncached_from_paths(Some(&user), Some(&project)).unwrap();
+        assert!(cleared.jobs.intercept_enabled);
+        assert!(cleared.jobs.rules.is_empty());
+        assert!(cleared.jobs.required_tools.is_empty());
+    }
+
+    #[test]
+    fn invalid_job_rules_fail_both_configuration_loaders_and_file_validation() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let no_env = HashMap::new();
+        std::fs::write(
+            &path,
+            r#"
+[jobs]
+intercept_enabled = true
+
+[[jobs.rules]]
+name = "unsafe-output"
+argv_prefix = ["cargo", "mutants"]
+result_dirs = ["../outside"]
+"#,
+        )
+        .unwrap();
+        assert!(load_config_uncached_from_paths(Some(&path), None).is_err());
+        assert!(
+            load_config_with_sources_from_paths(Some(&path), None, Some(&no_env)).is_err()
+        );
+        let validation = validate_rch_config_file(&path);
+        assert!(
+            validation.errors.iter().any(|error| error.contains("jobs")),
+            "{validation:?}"
+        );
     }
 
     #[test]
