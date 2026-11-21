@@ -13,6 +13,7 @@ mod disk_supervisor;
 mod executor;
 mod file_sync;
 mod git_archive_cache;
+mod job_results;
 mod prepare;
 mod recovery_reserve;
 mod result_probe;
@@ -57,6 +58,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Retain previous declared job outputs and create fresh empty result dirs.
+    /// Reads a versioned JSON preparation request from stdin; never deletes data.
+    #[command(hide = true)]
+    PrepareJobResults,
     /// Internal bounded source-admission clock and metadata-lock handoff.
     #[command(hide = true)]
     SourceAdmission {
@@ -465,6 +470,9 @@ pub(crate) fn native_worker_executable() -> std::io::Result<std::path::PathBuf> 
 fn main() -> Result<()> {
     exit_quietly_when_stdout_reader_is_gone();
     let cli = Cli::parse();
+    if let Commands::PrepareJobResults = &cli.command {
+        std::process::exit(job_results::main());
+    }
     // This bounded control-plane probe is called by watchdogs and recovery.
     // Do not start a thread pool or initialize optional logging sinks for it:
     // neither is needed to read a kernel identity, and both can delay/refuse
@@ -634,6 +642,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
     let _logging_guards = init_logging(&log_config)?;
 
     match cli.command {
+        Commands::PrepareJobResults => {
+            anyhow::bail!("prepare-job-results requires the synchronous worker entry point")
+        }
         Commands::SourceAdmission { .. } => {
             anyhow::bail!("source-admission requires the synchronous worker entry point")
         }
