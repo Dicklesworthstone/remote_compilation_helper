@@ -831,3 +831,759 @@ fn command_help_version_and_build_identity_are_native_and_standalone() {
     let fixture = Fixture::live();
     fixture.refused(fixture.command().arg("--rabs-build-info").output().unwrap());
 }
+
+const JOB_ID: &str = "0123456789abcdef0123456789abcdef";
+
+struct JobFixture {
+    root: PathBuf,
+    operation: PathBuf,
+    record: PathBuf,
+    socket: PathBuf,
+    daemon: PathBuf,
+    report: PathBuf,
+    _listener: Option<std::os::unix::net::UnixListener>,
+}
+
+impl JobFixture {
+    fn new(pooled: bool, live_stderr: Option<bool>, online: bool) -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("rjob-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let operation = root.join(format!("cargo-{JOB_ID}"));
+        private_directory(&operation);
+        let socket = root.join("owner/socket");
+        let listener = if online {
+            private_directory(socket.parent().unwrap());
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            Some(listener)
+        } else {
+            None
+        };
+        let saved_driver = "/never-run-the-recorded-driver";
+        let submit = if pooled {
+            json!([
+                saved_driver,
+                "--job-submit-pool",
+                JOB_ID,
+                operation.join("pool.json"),
+                operation.join("bundle"),
+                operation.join("delivery"),
+                operation.join("outputs")
+            ])
+        } else {
+            json!([
+                saved_driver,
+                "--job-submit-allocated",
+                JOB_ID,
+                "[2001:db8::1]:7443",
+                "worker-a",
+                PIN,
+                operation.join("bundle"),
+                operation.join("delivery"),
+                operation.join("outputs")
+            ])
+        };
+        let wait = if live_stderr == Some(true) {
+            json!([saved_driver, "--job-wait", "--live-stderr", JOB_ID])
+        } else {
+            json!([saved_driver, "--job-wait", JOB_ID])
+        };
+        let mut value = json!({
+            "version":"canonical-cargo-v1", "request_id":"allocate",
+            "operation_directory":operation, "automatic_retry":false,
+            "publication_authorized":false, "job_id":JOB_ID, "daemon_socket":socket,
+            "job_submit_argv":submit, "job_wait_argv":wait,
+            "job_status_argv":[saved_driver, "--job-status", JOB_ID],
+            "job_cancel_argv":[saved_driver, "--job-cancel", JOB_ID],
+        });
+        if pooled {
+            value["worker_pool"] = json!([
+                {"address":"127.0.0.1:7443", "worker":"worker-a", "worker_spki_sha256":PIN},
+                {"address":"[2001:db8::2]:7444", "worker":"worker-b", "worker_spki_sha256":"ab".repeat(32)},
+            ]);
+        }
+        if let Some(live_stderr) = live_stderr {
+            value["live_stderr"] = live_stderr.into();
+        }
+        let record = operation.join("operation.json");
+        new_file(&record, &serde_json::to_vec(&value).unwrap(), 0o600);
+        let daemon = root.join("native job 'fixture'");
+        new_file(
+            &daemon,
+            format!(
+                "#!/bin/sh\nexec {} --exact native_job_daemon_fixture --ignored --nocapture -- \"$@\"\n",
+                quote(std::env::current_exe().unwrap().as_os_str()),
+            ).as_bytes(),
+            0o700,
+        );
+        let report = root.join("job-report.json");
+        Self {
+            root,
+            operation,
+            record,
+            socket,
+            daemon,
+            report,
+            _listener: listener,
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(BINARY);
+        command
+            .arg(&self.operation)
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("CARGO_RABS_DAEMON", &self.daemon)
+            .env("CARGO_RABS_CANONICAL_ACTIVE", "0")
+            .env("RABS_SOCKET_PATH", "/wrong/current/socket")
+            .env("RABS_STATE_DIR", self.root.join("unrelated current state"))
+            .env("RABS_RECOVER_JOB_REPORT", &self.report)
+            .env("RABS_RECOVER_JOB_UNRELATED", "preserved verbatim")
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn report(&self) -> Value {
+        serde_json::from_slice(&fs::read(&self.report).unwrap()).unwrap()
+    }
+
+    fn unchanged(&self, before: &[u8]) {
+        assert_eq!(fs::read(&self.record).unwrap(), before);
+        for missing in ["bundle", "outputs", "pool.json", "spec.json"] {
+            assert!(!self.operation.join(missing).exists(), "{missing}");
+        }
+    }
+
+    fn refused(&self, output: Output) {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("rabs-recover: refused:"), "{stderr}");
+        assert!(stderr.contains("no execution retry"), "{stderr}");
+        assert!(!stderr.contains("must-not-be-printed"), "{stderr}");
+        assert!(
+            !self.report.exists(),
+            "the daemon must not start on refusal"
+        );
+    }
+}
+
+#[test]
+#[ignore = "Rust daemon-job fixture, invoked only by native recovery tests"]
+fn native_job_daemon_fixture() {
+    let arguments: Vec<String> = std::env::args_os()
+        .skip_while(|argument| argument != "--")
+        .skip(1)
+        .map(|argument| argument.into_string().unwrap())
+        .collect();
+    assert!(matches!(
+        arguments[0].as_str(),
+        "--job-wait"
+            | "--job-status"
+            | "--job-cancel"
+            | "--job-resume"
+            | "--job-recover-local"
+            | "--job-acknowledge"
+    ));
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    let mut token = None;
+    if std::env::var_os("RABS_RECOVER_JOB_JOBSERVER").is_some() {
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .open("/proc/self/fd/7")
+            .unwrap();
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .open("/proc/self/fd/8")
+            .unwrap();
+        let mut byte = [0];
+        reader.read_exact(&mut byte).unwrap();
+        writer.write_all(&byte).unwrap();
+        token = Some(byte[0]);
+    }
+    let value = json!({
+        "argv":arguments, "pid":std::process::id(), "stdin":input,
+        "cwd":std::env::current_dir().unwrap(),
+        "socket":std::env::var("RABS_SOCKET_PATH").unwrap(),
+        "state":std::env::var("RABS_STATE_DIR").unwrap(),
+        "active":std::env::var("CARGO_RABS_CANONICAL_ACTIVE").unwrap(),
+        "tls":[std::env::var("RABS_COORD_TLS_CA").ok(), std::env::var("RABS_COORD_TLS_CERT").ok(),
+            std::env::var("RABS_COORD_TLS_KEY").ok()],
+        "unrelated":std::env::var("RABS_RECOVER_JOB_UNRELATED").unwrap(),
+        "jobserver":std::env::var("CARGO_MAKEFLAGS").ok(), "token":token,
+    });
+    new_file(
+        Path::new(&std::env::var_os("RABS_RECOVER_JOB_REPORT").unwrap()),
+        &serde_json::to_vec(&value).unwrap(),
+        0o600,
+    );
+    std::io::stdout()
+        .lock()
+        .write_all(b"\0job stdout\xff\n")
+        .unwrap();
+    std::io::stderr()
+        .lock()
+        .write_all(b"\0job stderr\xfe\n")
+        .unwrap();
+    if std::env::var_os("RABS_RECOVER_JOB_SIGNAL").is_some() {
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+            .unwrap();
+        panic!("daemon signal termination must propagate");
+    }
+    std::process::exit(
+        std::env::var("RABS_RECOVER_JOB_STATUS")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(37),
+    );
+}
+
+#[test]
+fn daemon_job_inspection_needs_no_socket_bundle_toolchain_or_driver() {
+    for pooled in [false, true] {
+        for live in [None, Some(false), Some(true)] {
+            let fixture = JobFixture::new(pooled, live, false);
+            let before = fs::read(&fixture.record).unwrap();
+            let output = fixture
+                .command()
+                .env("CARGO_RABS_DAEMON", "/missing/driver")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty());
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["kind"], "rabs-daemon-job-intent");
+            assert_eq!(value["job_id"], JOB_ID);
+            assert_eq!(value["request_id"], "allocate");
+            assert_eq!(value["daemon_socket"], json!(fixture.socket));
+            assert_eq!(value["live_stderr"], live.unwrap_or(false));
+            for key in [
+                "job_status_queried",
+                "outputs_verified",
+                "publication_authorized",
+                "reexecute",
+            ] {
+                assert_eq!(value[key], false, "{key}");
+            }
+            assert!(!fixture.socket.parent().unwrap().exists());
+            assert!(!fixture.report.exists());
+            fixture.unchanged(&before);
+        }
+    }
+}
+
+#[test]
+fn daemon_job_controls_use_the_same_owner_without_source_or_client_tls() {
+    for pooled in [false, true] {
+        for live in [None, Some(false), Some(true)] {
+            for (option, action) in [
+                ("--wait", "--job-wait"),
+                ("--status", "--job-status"),
+                ("--cancel", "--job-cancel"),
+            ] {
+                let fixture = JobFixture::new(pooled, live, true);
+                let before = fs::read(&fixture.record).unwrap();
+                let output = fixture.command().arg(option).output().unwrap();
+                assert_eq!(output.status.code(), Some(37), "{option}: {output:?}");
+                let report = fixture.report();
+                let expected = if option == "--wait" && live == Some(true) {
+                    json!([action, "--live-stderr", JOB_ID])
+                } else {
+                    json!([action, JOB_ID])
+                };
+                assert_eq!(report["argv"], expected);
+                assert_eq!(report["socket"], json!(fixture.socket));
+                assert_eq!(
+                    report["state"],
+                    json!(fixture.root.join("unrelated current state"))
+                );
+                assert_eq!(report["active"], "1");
+                assert_eq!(report["tls"], json!([null, null, null]));
+                assert_eq!(report["unrelated"], "preserved verbatim");
+                assert_eq!(report["cwd"], json!(fixture.root));
+                fixture.unchanged(&before);
+            }
+        }
+    }
+}
+
+#[test]
+fn daemon_job_result_controls_preserve_retained_state_and_never_submit() {
+    for pooled in [false, true] {
+        for case in ["resume", "prefix", "fresh", "delivery", "acknowledge"] {
+            let fixture = JobFixture::new(pooled, Some(true), true);
+            let before = fs::read(&fixture.record).unwrap();
+            let old = fixture.operation.join("delivery");
+            private_directory(&old);
+            new_file(&old.join("retained"), b"unverified retained bytes", 0o600);
+            let destination = fixture.root.join("new delivery 'α'");
+            let mut command = fixture.command();
+            let expected = match case {
+                "delivery" | "acknowledge" => {
+                    let (option, action) = if case == "delivery" {
+                        ("--delivery", "--job-recover-local")
+                    } else {
+                        ("--acknowledge", "--job-acknowledge")
+                    };
+                    command.arg(option).arg(&old);
+                    json!([action, JOB_ID, old])
+                }
+                _ => {
+                    command.arg("--resume-to").arg(&destination);
+                    if case == "prefix" {
+                        command.arg("--prefix-from").arg(&old);
+                        json!(["--job-resume", JOB_ID, destination, old])
+                    } else {
+                        if case == "fresh" {
+                            command.arg("--no-prefix");
+                        }
+                        json!(["--job-resume", JOB_ID, destination])
+                    }
+                }
+            };
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(37), "{case}: {output:?}");
+            assert_eq!(fixture.report()["argv"], expected);
+            assert!(
+                !destination.exists(),
+                "the frontend must not create result directories"
+            );
+            assert_eq!(
+                fs::read(old.join("retained")).unwrap(),
+                b"unverified retained bytes"
+            );
+            fixture.unchanged(&before);
+        }
+    }
+}
+
+#[test]
+fn daemon_job_handoff_preserves_process_identity_binary_streams_and_jobserver_tokens() {
+    let fixture = JobFixture::new(false, Some(true), true);
+    let fifo = fixture.root.join("jobserver");
+    rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    let mut queue = fs::File::from(
+        rustix::fs::open(
+            &fifo,
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap(),
+    );
+    queue.write_all(b"T").unwrap();
+    let configured = fixture.command();
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "exec 7<\"$1\"; exec 8>\"$1\"; shift; exec \"$@\"",
+            "job-fds",
+        ])
+        .arg(&fifo)
+        .arg(BINARY)
+        .arg(&fixture.operation)
+        .arg("--wait")
+        .env_clear()
+        .current_dir(&fixture.root);
+    for (name, value) in configured.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
+        .env("RABS_RECOVER_JOB_JOBSERVER", "1")
+        .env("CARGO_MAKEFLAGS", "-j --jobserver-auth=7,8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let input = b"original stdin\0\xff\n";
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(37), "{output:?}");
+    assert!(output.stdout.ends_with(b"\0job stdout\xff\n"), "{output:?}");
+    assert_eq!(output.stderr, b"\0job stderr\xfe\n");
+    let report = fixture.report();
+    assert_eq!(report["pid"], pid);
+    assert_eq!(report["stdin"], json!(input));
+    assert_eq!(report["jobserver"], "-j --jobserver-auth=7,8");
+    assert_eq!(report["token"], b'T');
+    let mut token = [0];
+    queue.read_exact(&mut token).unwrap();
+    assert_eq!(token, *b"T");
+    assert_eq!(
+        queue.read(&mut token).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn daemon_job_handoff_keeps_control_failures_and_signal_termination() {
+    for code in [0, 23, 101, 130, 255] {
+        let fixture = JobFixture::new(true, None, true);
+        let output = fixture
+            .command()
+            .arg("--cancel")
+            .env("RABS_RECOVER_JOB_STATUS", code.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        assert_eq!(fixture.report()["argv"], json!(["--job-cancel", JOB_ID]));
+    }
+    let fixture = JobFixture::new(false, None, true);
+    let output = fixture
+        .command()
+        .arg("--wait")
+        .env("RABS_RECOVER_JOB_SIGNAL", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.signal(), Some(15), "{output:?}");
+    assert!(fixture.report.exists());
+}
+
+#[test]
+fn daemon_job_records_cannot_change_authority_identity_or_fixed_native_commands() {
+    for case in [
+        "version",
+        "numeric-request",
+        "job-id",
+        "directory",
+        "automatic-retry",
+        "publication",
+        "mixed-direct",
+        "mixed-recovery",
+        "unknown-field",
+        "missing-job-id",
+        "status-submits",
+        "wait-id",
+        "driver-mismatch",
+        "relative-driver",
+        "wait-mode-mismatch",
+        "live-type",
+        "submit-id",
+        "submit-count",
+        "submit-outputs",
+        "submit-worker",
+        "submit-pin",
+        "submit-listen",
+        "argument-nul",
+        "socket-long",
+        "socket-relative",
+        "socket-overlap",
+        "pool-empty",
+        "pool-oversize",
+        "pool-fields",
+        "pool-identity",
+        "pool-pin",
+        "pool-mapped-address",
+        "pool-wildcard",
+        "pool-source-path",
+        "pool-address",
+        "pool-null",
+    ] {
+        let fixture = JobFixture::new(case.starts_with("pool-"), None, true);
+        rewrite_json(&fixture.record, |record| match case {
+            "version" => record["version"] = "unsupported".into(),
+            "numeric-request" => record["request_id"] = 7.into(),
+            "job-id" => record["job_id"] = JOB_ID.to_uppercase().into(),
+            "directory" => record["operation_directory"] = json!(fixture.root),
+            "automatic-retry" => record["automatic_retry"] = true.into(),
+            "publication" => record["publication_authorized"] = true.into(),
+            "mixed-direct" => record["prepared_build_argv"] = json!(["/never-run"]),
+            "mixed-recovery" => record["recovery"] = json!({"reexecute":true}),
+            "unknown-field" => record["unexpected"] = "must-not-be-printed".into(),
+            "missing-job-id" => {
+                record.as_object_mut().unwrap().remove("job_id");
+            }
+            "status-submits" => record["job_status_argv"][1] = "--job-submit-allocated".into(),
+            "wait-id" => record["job_wait_argv"][2] = "f".repeat(32).into(),
+            "driver-mismatch" => record["job_cancel_argv"][0] = "/other/driver".into(),
+            "relative-driver" => {
+                for name in [
+                    "job_submit_argv",
+                    "job_status_argv",
+                    "job_wait_argv",
+                    "job_cancel_argv",
+                ] {
+                    record[name][0] = "relative-driver".into();
+                }
+            }
+            "wait-mode-mismatch" => record["live_stderr"] = true.into(),
+            "live-type" => record["live_stderr"] = "true".into(),
+            "submit-id" => record["job_submit_argv"][2] = "f".repeat(32).into(),
+            "submit-count" => record["job_submit_argv"]
+                .as_array_mut()
+                .unwrap()
+                .push("extra".into()),
+            "submit-outputs" => {
+                record["job_submit_argv"][8] = json!(fixture.root.join("other-output"))
+            }
+            "submit-worker" => record["job_submit_argv"][4] = "worker α".into(),
+            "submit-pin" => record["job_submit_argv"][5] = "0".repeat(64).into(),
+            "submit-listen" => record["job_submit_argv"][3] = "localhost:7443".into(),
+            "argument-nul" => record["job_submit_argv"][4] = "\0must-not-be-printed".into(),
+            "socket-long" => record["daemon_socket"] = format!("/{}", "s".repeat(108)).into(),
+            "socket-relative" => record["daemon_socket"] = "relative/socket".into(),
+            "socket-overlap" => record["daemon_socket"] = json!(fixture.operation.join("socket")),
+            "pool-empty" => record["worker_pool"] = json!([]),
+            "pool-oversize" => {
+                record["worker_pool"] = json!(vec![record["worker_pool"][0].clone(); 33])
+            }
+            "pool-fields" => record["worker_pool"][0]["unexpected"] = true.into(),
+            "pool-identity" => record["worker_pool"][1]["worker"] = "worker-a".into(),
+            "pool-pin" => record["worker_pool"][1]["worker_spki_sha256"] = PIN.into(),
+            "pool-mapped-address" => {
+                record["worker_pool"][1]["address"] = "[::ffff:127.0.0.1]:7443".into()
+            }
+            "pool-wildcard" => record["worker_pool"][1]["address"] = "0.0.0.0:7443".into(),
+            "pool-source-path" => {
+                record["job_submit_argv"][3] = json!(fixture.root.join("other-pool"))
+            }
+            "pool-address" => record["worker_pool"][1]["address"] = "localhost:7444".into(),
+            "pool-null" => record["worker_pool"] = Value::Null,
+            _ => unreachable!(),
+        });
+        let before = fs::read(&fixture.record).unwrap();
+        fixture.refused(fixture.command().arg("--status").output().unwrap());
+        fixture.unchanged(&before);
+    }
+}
+
+#[test]
+fn daemon_job_records_and_active_sockets_require_private_ordinary_ownership() {
+    for case in [
+        "record-mode",
+        "root-mode",
+        "record-hardlink",
+        "record-symlink",
+        "record-fifo",
+        "record-oversize",
+        "duplicate-json",
+        "duplicate-intents",
+        "socket-missing",
+        "socket-file",
+        "socket-fifo",
+        "socket-symlink",
+        "socket-parent-alias",
+        "socket-mode",
+        "socket-parent-mode",
+    ] {
+        let initially_online = !matches!(case, "socket-missing" | "socket-file" | "socket-fifo");
+        let fixture = JobFixture::new(false, None, initially_online);
+        match case {
+            "record-mode" => {
+                fs::set_permissions(&fixture.record, fs::Permissions::from_mode(0o640)).unwrap()
+            }
+            "root-mode" => {
+                fs::set_permissions(&fixture.operation, fs::Permissions::from_mode(0o750)).unwrap()
+            }
+            "record-hardlink" => {
+                fs::hard_link(&fixture.record, fixture.root.join("record-alias")).unwrap()
+            }
+            "record-symlink" | "record-fifo" => {
+                let retained = fixture.root.join("retained-record");
+                fs::rename(&fixture.record, &retained).unwrap();
+                if case == "record-symlink" {
+                    symlink(retained, &fixture.record).unwrap();
+                } else {
+                    rustix::fs::mkfifoat(rustix::fs::CWD, &fixture.record, Mode::RUSR | Mode::WUSR)
+                        .unwrap();
+                }
+            }
+            "record-oversize" => OpenOptions::new()
+                .write(true)
+                .open(&fixture.record)
+                .unwrap()
+                .set_len(1024 * 1024)
+                .unwrap(),
+            "duplicate-json" => {
+                let record = fs::read_to_string(&fixture.record).unwrap();
+                fs::write(
+                    &fixture.record,
+                    format!("{{\"job_id\":\"{JOB_ID}\",{}", &record[1..]),
+                )
+                .unwrap();
+            }
+            "duplicate-intents" => new_file(&fixture.operation.join("recovery.json"), b"{}", 0o600),
+            "socket-file" | "socket-fifo" => {
+                private_directory(fixture.socket.parent().unwrap());
+                if case == "socket-file" {
+                    new_file(&fixture.socket, b"not a socket", 0o600);
+                } else {
+                    rustix::fs::mkfifoat(rustix::fs::CWD, &fixture.socket, Mode::RUSR | Mode::WUSR)
+                        .unwrap();
+                }
+            }
+            "socket-symlink" => {
+                let retained = fixture.root.join("retained-socket");
+                fs::rename(&fixture.socket, &retained).unwrap();
+                symlink(retained, &fixture.socket).unwrap();
+            }
+            "socket-parent-alias" => {
+                let alias = fixture.root.join("alias");
+                symlink(fixture.socket.parent().unwrap(), &alias).unwrap();
+                rewrite_json(&fixture.record, |record| {
+                    record["daemon_socket"] = json!(alias.join("socket"))
+                });
+            }
+            "socket-mode" => {
+                fs::set_permissions(&fixture.socket, fs::Permissions::from_mode(0o660)).unwrap()
+            }
+            "socket-parent-mode" => fs::set_permissions(
+                fixture.socket.parent().unwrap(),
+                fs::Permissions::from_mode(0o775),
+            )
+            .unwrap(),
+            "socket-missing" => {}
+            _ => unreachable!(),
+        }
+        fixture.refused(fixture.command().arg("--wait").output().unwrap());
+    }
+}
+
+#[test]
+fn daemon_job_result_paths_cannot_replace_inputs_outputs_or_partial_receivers() {
+    for case in [
+        "resume-existing",
+        "resume-dangling",
+        "resume-bundle",
+        "resume-output",
+        "resume-current",
+        "resume-parent-alias",
+        "delivery-bundle",
+        "delivery-output",
+        "ack-root",
+        "delivery-public",
+        "prefix-missing",
+        "prefix-public",
+        "prefix-destination",
+        "prefix-bundle",
+        "prefix-output",
+        "prefix-symlink",
+    ] {
+        let fixture = JobFixture::new(true, Some(true), true);
+        let before = fs::read(&fixture.record).unwrap();
+        let mut option = "--resume-to";
+        let mut destination = fixture.root.join("new-delivery");
+        let mut prefix = None;
+        match case {
+            "resume-existing" => private_directory(&destination),
+            "resume-dangling" => symlink(fixture.root.join("missing"), &destination).unwrap(),
+            "resume-bundle" => destination = fixture.operation.join("bundle"),
+            "resume-output" => destination = fixture.operation.join("outputs"),
+            "resume-current" => destination = fixture.operation.join("delivery"),
+            "resume-parent-alias" => {
+                let parent = fixture.root.join("actual-parent");
+                private_directory(&parent);
+                let alias = fixture.root.join("alias");
+                symlink(parent, &alias).unwrap();
+                destination = alias.join("new-delivery");
+            }
+            "delivery-bundle" | "delivery-output" | "delivery-public" => {
+                option = "--delivery";
+                if case != "delivery-public" {
+                    destination = fixture.operation.join(if case == "delivery-bundle" {
+                        "bundle"
+                    } else {
+                        "outputs"
+                    });
+                }
+                private_directory(&destination);
+                if case == "delivery-public" {
+                    fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+            "ack-root" => {
+                option = "--acknowledge";
+                destination = fixture.operation.clone();
+            }
+            "prefix-missing" => prefix = Some(fixture.root.join("missing-prefix")),
+            _ => {
+                let selected = match case {
+                    "prefix-bundle" => fixture.operation.join("bundle"),
+                    "prefix-output" => fixture.operation.join("outputs"),
+                    _ => fixture.root.join("partial"),
+                };
+                private_directory(&selected);
+                if case == "prefix-public" {
+                    fs::set_permissions(&selected, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                if case == "prefix-destination" {
+                    destination = selected.join("new-delivery");
+                }
+                prefix = if case == "prefix-symlink" {
+                    let alias = fixture.root.join("prefix-alias");
+                    symlink(selected, &alias).unwrap();
+                    Some(alias)
+                } else {
+                    Some(selected)
+                };
+            }
+        }
+        let mut command = fixture.command();
+        command.arg(option).arg(destination);
+        if let Some(prefix) = prefix {
+            command.arg("--prefix-from").arg(prefix);
+        }
+        fixture.refused(command.output().unwrap());
+        assert_eq!(fs::read(&fixture.record).unwrap(), before);
+    }
+}
+
+#[test]
+fn daemon_job_controls_cannot_bypass_a_direct_owner_or_replace_daemon_admission_state() {
+    for fixture in [Fixture::live(), Fixture::canonical(false)] {
+        for option in ["--wait", "--status", "--cancel", "--delivery"] {
+            let mut command = fixture.command();
+            command.arg(option).arg("--rabsd").arg(&fixture.daemon);
+            if option == "--delivery" {
+                command = fixture.operation(option, &fixture.root.join("delivery"));
+            }
+            fixture.refused(command.output().unwrap());
+        }
+    }
+    let fixture = JobFixture::new(false, None, true);
+    fixture.refused(
+        fixture
+            .command()
+            .arg("--status")
+            .arg("--canonical-state-dir")
+            .arg(&fixture.root)
+            .output()
+            .unwrap(),
+    );
+    fixture.refused(
+        fixture
+            .command()
+            .arg("--status")
+            .arg("--resume-to")
+            .arg(fixture.root.join("another-result"))
+            .output()
+            .unwrap(),
+    );
+    fixture.refused(
+        fixture
+            .command()
+            .arg("--status")
+            .env("CARGO_RABS_DAEMON", BINARY)
+            .output()
+            .unwrap(),
+    );
+    let output = fixture
+        .command()
+        .arg("--status")
+        .env("CARGO_RABS_DAEMON", "/missing/ignored-override")
+        .arg("--rabsd")
+        .arg(&fixture.daemon)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(37), "{output:?}");
+    assert_eq!(fixture.report()["argv"], json!(["--job-status", JOB_ID]));
+}

@@ -393,6 +393,51 @@ recovery, and release commands. They preserve its selected worker and request
 identity. Wait on the original job afterward to replay a verified compiler
 result.
 
+The installed native `rabs-recover` command also accepts these daemon-owned
+operation directories. Its default is offline inspection of retained intent;
+select `--wait` explicitly to contact the owner and replay a verified result:
+
+```sh
+rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID
+rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID --status
+rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID --wait
+rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID --cancel
+```
+
+Native inspection reports that outputs have not been verified and does not
+require a running daemon. Active controls use the job ID and private socket
+retained in `operation.json`, including the saved live-stderr preference for
+`--wait`. They reconstruct one invocation of the selected or installed sibling
+`rabsd`; saved command strings are validated as intent and never executed. The
+original source tree, profile, toolchain and bundle can be unavailable. Client
+TLS credentials are unnecessary because the existing daemon owns the worker
+connection and numeric request identity.
+
+The native result controls are:
+
+```sh
+rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID \
+    --resume-to /home/builder/recovered-delivery
+rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID \
+    --resume-to /home/builder/resumed-delivery --prefix-from /home/builder/partial-delivery
+rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID \
+    --delivery /home/builder/complete-delivery
+rabs-recover /home/builder/.cache/rch/operations/cargo-JOB_ID \
+    --acknowledge /home/builder/complete-delivery
+```
+
+Choose one control or result destination per invocation. A daemon-job resume
+uses a fresh destination and forwards partial bytes only when `--prefix-from`
+is explicit; `--no-prefix` also selects a fresh download. The daemon remains
+responsible for verifying every result and deciding whether a retained delivery
+can be reconciled or acknowledged. Status, cancellation and result controls
+return the native control status; use `--wait` afterward for the verified
+compiler exit code and diagnostics. Cancellation admission does not prove that
+worker teardown has finished. None of these commands submits a new job, reads
+the allocation template as a numeric request, or retries execution after a lost
+reply. Direct-worker recovery keeps its existing TLS, original admission-state
+and partial-delivery requirements.
+
 Each later explicit recovery or `rabsd --job-wait --live-stderr JOB_ID` starts a
 new presentation cursor and may replay the whole retained diagnostic transcript.
 There is no durable console-position checkpoint across client processes.

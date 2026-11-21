@@ -1,17 +1,18 @@
-//! Retained-intent validation and one-way handoff to the existing TLS operator.
+//! Retained-intent validation and one-way handoff to the existing execution owner.
 
-use crate::cli::Options;
+use crate::cli::{JobControl, Options};
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, MemfdFlags, Mode, OFlags, SealFlags, Stat};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -421,6 +422,277 @@ impl Intent {
     }
 }
 
+/// A daemon job retains allocation intent, not a worker request. Its durable
+/// owner alone knows which request/worker/result currently belongs to the job.
+/// Recovery must not reopen a source bundle or bypass that owner through TLS.
+#[derive(Debug)]
+struct JobIntent {
+    root: PathBuf,
+    id: String,
+    socket: PathBuf,
+    live_stderr: bool,
+    root_identity: Identity,
+    record_fingerprint: Fingerprint,
+}
+
+impl JobIntent {
+    fn verify_unchanged(&self) -> Result<()> {
+        let root = open_directory(&self.root)?;
+        require(
+            Identity::of(&rustix::fs::fstat(&root)?) == self.root_identity,
+            "daemon job directory changed",
+        )?;
+        require(
+            Fingerprint::of(&rustix::fs::statat(
+                &root,
+                "operation.json",
+                AtFlags::SYMLINK_NOFOLLOW,
+            )?) == self.record_fingerprint,
+            "daemon job identity changed before handoff",
+        )
+    }
+
+    fn inspection(&self) -> Value {
+        json!({
+            "kind":"rabs-daemon-job-intent", "directory":self.root,
+            "origin":"canonical-cargo-daemon", "job_id":self.id,
+            "request_id":"allocate", "daemon_socket":self.socket,
+            "live_stderr":self.live_stderr, "job_status_queried":false,
+            "outputs_verified":false, "publication_authorized":false, "reexecute":false,
+        })
+    }
+}
+
+enum RetainedIntent {
+    Direct(Box<Intent>),
+    Job(Box<JobIntent>),
+}
+
+fn saved_job_argv<'a>(record: &'a Value, field: &str, length: usize) -> Result<Vec<&'a str>> {
+    let arguments = record[field].as_array().ok_or(Refused(
+        "daemon job changed its fixed native command contract",
+    ))?;
+    require(
+        arguments.len() == length,
+        "daemon job changed its fixed native command contract",
+    )?;
+    arguments
+        .iter()
+        .map(|value| {
+            let argument = string(value, "invalid saved daemon job argument")?;
+            require(
+                !argument.is_empty()
+                    && argument.chars().count() <= 4096
+                    && !argument.contains('\0'),
+                "invalid saved daemon job argument",
+            )?;
+            Ok(argument)
+        })
+        .collect()
+}
+
+fn job_worker(address: &str, worker: &str, pin: &str) -> Result<(IpAddr, u16)> {
+    require(
+        address.len() <= 128
+            && !worker.is_empty()
+            && worker.len() <= 128
+            && worker.as_bytes()[0].is_ascii_alphanumeric()
+            && worker
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "invalid recorded daemon worker endpoint",
+    )?;
+    worker_identity(worker, pin)?;
+    let endpoint: SocketAddr = listener(address)?
+        .parse()
+        .map_err(|_| Refused("invalid recorded daemon worker endpoint"))?;
+    let ip = match endpoint.ip() {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        ip => ip,
+    };
+    Ok((ip, endpoint.port()))
+}
+
+fn validate_job_pool(value: &Value) -> Result<()> {
+    let pool = value
+        .as_array()
+        .filter(|pool| (1..=32).contains(&pool.len()))
+        .ok_or(Refused("daemon job requires a bounded worker pool"))?;
+    let mut endpoints = Vec::<(IpAddr, u16)>::new();
+    let mut workers = BTreeSet::new();
+    let mut pins = BTreeSet::new();
+    for entry in pool {
+        let fields = entry
+            .as_object()
+            .ok_or(Refused("invalid recorded daemon worker pool"))?;
+        require(
+            fields.len() == 3
+                && ["address", "worker", "worker_spki_sha256"]
+                    .iter()
+                    .all(|key| fields.contains_key(*key)),
+            "invalid recorded daemon worker pool",
+        )?;
+        let address = string(&entry["address"], "invalid recorded daemon worker endpoint")?;
+        let worker = string(&entry["worker"], "invalid recorded daemon worker identity")?;
+        let pin = string(
+            &entry["worker_spki_sha256"],
+            "invalid recorded daemon worker pin",
+        )?;
+        let (ip, port) = job_worker(address, worker, pin)?;
+        require(
+            workers.insert(worker)
+                && pins.insert(pin)
+                && !endpoints.iter().any(|(other_ip, other_port)| {
+                    port == *other_port
+                        && (ip == *other_ip || ip.is_unspecified() || other_ip.is_unspecified())
+                }),
+            "daemon worker pool repeats a listener, worker identity or pin",
+        )?;
+        endpoints.push((ip, port));
+    }
+    Ok(())
+}
+
+fn load_job_intent(
+    root: PathBuf,
+    record: &Value,
+    root_identity: Identity,
+    record_fingerprint: Fingerprint,
+) -> Result<JobIntent> {
+    const REQUIRED: &[&str] = &[
+        "version",
+        "request_id",
+        "operation_directory",
+        "automatic_retry",
+        "publication_authorized",
+        "job_id",
+        "daemon_socket",
+        "job_submit_argv",
+        "job_status_argv",
+        "job_wait_argv",
+        "job_cancel_argv",
+    ];
+    let fields = record
+        .as_object()
+        .ok_or(Refused("invalid daemon job record"))?;
+    require(
+        REQUIRED.iter().all(|key| fields.contains_key(*key))
+            && fields.keys().all(|key| {
+                REQUIRED.contains(&key.as_str())
+                    || matches!(key.as_str(), "worker_pool" | "live_stderr")
+            }),
+        "daemon job record has missing, mixed or unsupported fields",
+    )?;
+    let id = string(&record["job_id"], "invalid daemon job identity")?;
+    let name = format!("cargo-{id}");
+    require(
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            && root.file_name() == Some(OsStr::new(&name))
+            && record["request_id"] == "allocate",
+        "invalid daemon job identity or allocation intent",
+    )?;
+    let live_stderr = match record.get("live_stderr") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or(Refused("invalid daemon job live output policy"))?,
+    };
+    let pooled = record.get("worker_pool").is_some();
+    let submit = saved_job_argv(record, "job_submit_argv", if pooled { 7 } else { 9 })?;
+    absolute(submit[0])?;
+    require(
+        submit[1]
+            == if pooled {
+                "--job-submit-pool"
+            } else {
+                "--job-submit-allocated"
+            }
+            && submit[2] == id,
+        "daemon job changed its fixed submission intent",
+    )?;
+    for (field, action) in [
+        ("job_status_argv", "--job-status"),
+        ("job_cancel_argv", "--job-cancel"),
+        ("job_wait_argv", "--job-wait"),
+    ] {
+        let live = field == "job_wait_argv" && live_stderr;
+        let saved = saved_job_argv(record, field, if live { 4 } else { 3 })?;
+        let expected = if live {
+            vec![action, "--live-stderr", id]
+        } else {
+            vec![action, id]
+        };
+        require(
+            saved[0] == submit[0] && saved[1..] == expected,
+            "daemon job changed its fixed control intent",
+        )?;
+    }
+    for (saved, name) in submit[submit.len() - 3..]
+        .iter()
+        .zip(["bundle", "delivery", "outputs"])
+    {
+        require(
+            same_path(Path::new(saved), &root.join(name)),
+            "daemon job changed its retained bundle or result paths",
+        )?;
+    }
+    if pooled {
+        require(
+            same_path(Path::new(submit[3]), &root.join("pool.json")),
+            "daemon job changed its fixed worker pool path",
+        )?;
+        validate_job_pool(&record["worker_pool"])?;
+    } else {
+        job_worker(submit[3], submit[4], submit[5])?;
+    }
+    let socket = absolute_value(&record["daemon_socket"])?;
+    require(
+        socket.as_os_str().as_encoded_bytes().len() < 108 && !paths_overlap(&root, &socket),
+        "invalid recorded daemon socket path",
+    )?;
+    let intent = JobIntent {
+        root,
+        id: id.into(),
+        socket,
+        live_stderr,
+        root_identity,
+        record_fingerprint,
+    };
+    intent.verify_unchanged()?;
+    Ok(intent)
+}
+
+fn job_endpoint(socket: &Path) -> Result<(Identity, Identity)> {
+    let parent = open_directory(
+        socket
+            .parent()
+            .ok_or(Refused("daemon socket has no parent"))?,
+    )?;
+    let parent_metadata = rustix::fs::fstat(&parent)?;
+    require(
+        parent_metadata.st_uid == rustix::process::geteuid().as_raw()
+            && parent_metadata.st_mode & 0o022 == 0,
+        "daemon socket parent must belong to this user and not be writable by others",
+    )?;
+    let metadata = rustix::fs::statat(
+        &parent,
+        socket
+            .file_name()
+            .ok_or(Refused("daemon socket has no name"))?,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?;
+    require(
+        FileType::from_raw_mode(metadata.st_mode) == FileType::Socket
+            && metadata.st_uid == rustix::process::geteuid().as_raw()
+            && metadata.st_mode & 0o077 == 0,
+        "daemon job requires its existing private Unix socket",
+    )?;
+    Ok((Identity::of(&parent_metadata), Identity::of(&metadata)))
+}
+
 fn load_live_intent(root: PathBuf) -> Result<Intent> {
     let state = root
         .parent()
@@ -579,7 +851,7 @@ fn canonical_state(
     Ok(state)
 }
 
-fn load_canonical_intent(root: PathBuf, override_state: Option<&OsStr>) -> Result<Intent> {
+fn load_canonical_intent(root: PathBuf, override_state: Option<&OsStr>) -> Result<RetainedIntent> {
     let root_fd = open_directory(&root)?;
     let root_metadata = rustix::fs::fstat(&root_fd)?;
     require(
@@ -596,6 +868,31 @@ fn load_canonical_intent(root: PathBuf, override_state: Option<&OsStr>) -> Resul
             && record["publication_authorized"] == false,
         "unsupported canonical operation or recovery authority",
     )?;
+    if [
+        "job_id",
+        "daemon_socket",
+        "job_submit_argv",
+        "job_status_argv",
+        "job_wait_argv",
+        "job_cancel_argv",
+        "worker_pool",
+        "live_stderr",
+    ]
+    .iter()
+    .any(|key| record.get(*key).is_some())
+    {
+        require(
+            override_state.is_none(),
+            "daemon jobs retain their own admission state; no state override is allowed",
+        )?;
+        return load_job_intent(
+            root,
+            &record,
+            Identity::of(&root_metadata),
+            record_fingerprint,
+        )
+        .map(|intent| RetainedIntent::Job(Box::new(intent)));
+    }
     let argv = record["prepared_build_argv"].as_array().ok_or(Refused(
         "canonical operation changed its fixed prepared-build contract",
     ))?;
@@ -707,10 +1004,10 @@ fn load_canonical_intent(root: PathBuf, override_state: Option<&OsStr>) -> Resul
         origin: "canonical-cargo",
     };
     intent.verify_unchanged()?;
-    Ok(intent)
+    Ok(RetainedIntent::Direct(Box::new(intent)))
 }
 
-fn load_intent(directory: &OsStr, override_state: Option<&OsStr>) -> Result<Intent> {
+fn load_intent(directory: &OsStr, override_state: Option<&OsStr>) -> Result<RetainedIntent> {
     let root = absolute_os(directory)?;
     let descriptor = open_directory(&root)?;
     let mut found = Vec::new();
@@ -730,7 +1027,7 @@ fn load_intent(directory: &OsStr, override_state: Option<&OsStr>) -> Result<Inte
             override_state.is_none(),
             "canonical state override cannot change dependency admission",
         )?;
-        load_live_intent(root)
+        load_live_intent(root).map(|intent| RetainedIntent::Direct(Box::new(intent)))
     } else {
         load_canonical_intent(root, override_state)
     }
@@ -877,8 +1174,115 @@ fn sealed_request(data: &[u8]) -> Result<File> {
     Ok(file)
 }
 
+fn job_operation(intent: &JobIntent, options: &Options) -> Result<Vec<OsString>> {
+    if let Some(control) = options.job_control {
+        let action = match control {
+            JobControl::Wait => "--job-wait",
+            JobControl::Status => "--job-status",
+            JobControl::Cancel => "--job-cancel",
+        };
+        let mut arguments = vec![action.into()];
+        if control == JobControl::Wait && intent.live_stderr {
+            arguments.push("--live-stderr".into());
+        }
+        arguments.push(intent.id.clone().into());
+        return Ok(arguments);
+    }
+    let (action, value, new) = if let Some(value) = &options.resume_to {
+        ("--job-resume", value, true)
+    } else if let Some(value) = &options.delivery {
+        ("--job-recover-local", value, false)
+    } else if let Some(value) = &options.acknowledge {
+        ("--job-acknowledge", value, false)
+    } else {
+        return Err(Refused("select a daemon job operation"));
+    };
+    let destination = absolute_os(value)?;
+    if new {
+        open_directory(
+            destination
+                .parent()
+                .ok_or(Refused("resume parent is unavailable"))?,
+        )?;
+        require(
+            !lexists(&destination)?,
+            "resume destination must not already exist",
+        )?;
+    } else {
+        private_directory(&destination)?;
+    }
+    let bundle = intent.root.join("bundle");
+    let output = intent.root.join("outputs");
+    require(
+        !paths_overlap(&destination, &bundle)
+            && !paths_overlap(&destination, &output)
+            && (!new || !paths_overlap(&destination, &intent.root.join("delivery"))),
+        "daemon job delivery overlaps its retained bundle or outputs",
+    )?;
+    let mut arguments = vec![
+        action.into(),
+        intent.id.clone().into(),
+        destination.clone().into(),
+    ];
+    if let Some(value) = &options.prefix_from {
+        require(
+            new && !options.no_prefix,
+            "prefix selection requires a fresh resume destination",
+        )?;
+        let prefix = absolute_os(value)?;
+        private_directory(&prefix)?;
+        require(
+            !paths_overlap(&prefix, &bundle)
+                && !paths_overlap(&prefix, &output)
+                && !paths_overlap(&prefix, &destination),
+            "daemon job prefix overlaps retained inputs or its new destination",
+        )?;
+        arguments.push(prefix.into());
+    }
+    // The daemon owns receipt verification and all previous result attempts.
+    // Only an explicitly selected prefix is forwarded; an old delivery path
+    // is never guessed from allocation intent or treated as result evidence.
+    Ok(arguments)
+}
+
+fn run_job(intent: &JobIntent, options: &Options, current_executable: &Path) -> Result<()> {
+    if options.job_control.is_none()
+        && options.resume_to.is_none()
+        && options.delivery.is_none()
+        && options.acknowledge.is_none()
+    {
+        intent.verify_unchanged()?;
+        writeln!(io::stdout().lock(), "{}", intent.inspection())?;
+        return Ok(());
+    }
+    let arguments = job_operation(intent, options)?;
+    let daemon = daemon_path(options.daemon.as_deref(), current_executable)?;
+    let endpoint = job_endpoint(&intent.socket)?;
+    intent.verify_unchanged()?;
+    require(
+        job_endpoint(&intent.socket)? == endpoint,
+        "daemon socket changed before handoff",
+    )?;
+    // The same durable owner retains the numeric worker request, authentication
+    // and execution frontier. No client TLS credentials, input recapture or
+    // submission path belongs in this handoff, including after a lost reply.
+    let error = Command::new(daemon)
+        .args(arguments)
+        .env("RABS_SOCKET_PATH", &intent.socket)
+        .env("CARGO_RABS_CANONICAL_ACTIVE", "1")
+        .exec();
+    Err(error.into())
+}
+
 pub(crate) fn run(options: &Options, current_executable: &Path) -> Result<()> {
-    let intent = load_intent(&options.directory, options.canonical_state.as_deref())?;
+    let intent = match load_intent(&options.directory, options.canonical_state.as_deref())? {
+        RetainedIntent::Direct(intent) => intent,
+        RetainedIntent::Job(intent) => return run_job(&intent, options, current_executable),
+    };
+    require(
+        options.job_control.is_none() && options.delivery.is_none(),
+        "wait, status, cancellation and local delivery recovery require a daemon-owned job",
+    )?;
     if options.resume_to.is_none() && options.acknowledge.is_none() {
         writeln!(io::stdout().lock(), "{}", intent.inspection())?;
         return Ok(());
@@ -919,6 +1323,83 @@ pub(crate) fn run(options: &Options, current_executable: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn retained_job_intent() -> JobIntent {
+        let parent = tempfile::Builder::new()
+            .prefix("rjob-intent-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let id = "0123456789abcdef0123456789abcdef";
+        let root = parent.join(format!("cargo-{id}"));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let record = json!({
+            "version":"canonical-cargo-v1", "request_id":"allocate", "operation_directory":root,
+            "automatic_retry":false, "publication_authorized":false, "job_id":id,
+            "daemon_socket":parent.join("offline.socket"),
+            "job_submit_argv":["/saved/rabsd", "--job-submit-allocated", id,
+                "127.0.0.1:7443", "worker", "12".repeat(32), root.join("bundle"),
+                root.join("delivery"), root.join("outputs")],
+            "job_status_argv":["/saved/rabsd", "--job-status", id],
+            "job_wait_argv":["/saved/rabsd", "--job-wait", id],
+            "job_cancel_argv":["/saved/rabsd", "--job-cancel", id],
+        });
+        let path = root.join("operation.json");
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        let RetainedIntent::Job(intent) = load_intent(root.as_os_str(), None).unwrap() else {
+            panic!("expected daemon-owned intent");
+        };
+        *intent
+    }
+
+    #[test]
+    fn daemon_job_handoff_revalidation_rejects_replaced_directory_and_record() {
+        for changed in ["directory", "record", "record-mode", "record-content"] {
+            let intent = retained_job_intent();
+            let record = intent.root.join("operation.json");
+            match changed {
+                "directory" => {
+                    fs::rename(
+                        &intent.root,
+                        intent.root.with_file_name("retained-operation"),
+                    )
+                    .unwrap();
+                    fs::create_dir(&intent.root).unwrap();
+                    fs::set_permissions(&intent.root, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                "record" => {
+                    let retained = intent.root.join("retained-record");
+                    fs::rename(&record, &retained).unwrap();
+                    fs::copy(retained, record).unwrap();
+                }
+                "record-mode" => {
+                    fs::set_permissions(record, fs::Permissions::from_mode(0o640)).unwrap()
+                }
+                "record-content" => fs::write(record, b"changed job identity").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(intent.verify_unchanged().is_err(), "{changed}");
+        }
+    }
+
+    #[test]
+    fn daemon_endpoint_identity_distinguishes_replacement_from_the_checked_owner() {
+        let root = tempfile::Builder::new()
+            .prefix("rjob-sock-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        let socket = root.join("socket");
+        let _first = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let original = job_endpoint(&socket).unwrap();
+        fs::rename(&socket, root.join("retained-socket")).unwrap();
+        let _second = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(job_endpoint(&socket).unwrap(), original);
+    }
 
     fn retained_live_intent() -> Intent {
         let parent = tempfile::Builder::new()
