@@ -200,6 +200,8 @@ enum SeedRole {
 enum TerminalCompletionPolicy {
     Leaf,
     Committed,
+    GeneratedLeaf,
+    GeneratedCommitted,
 }
 
 impl TerminalCompletionPolicy {
@@ -207,6 +209,12 @@ impl TerminalCompletionPolicy {
         match policy {
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => Ok(Self::Leaf),
             CommittedDependencyPolicy::WorkspaceTerminalMetadata => Ok(Self::Committed),
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata => {
+                Ok(Self::GeneratedLeaf)
+            }
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
+                Ok(Self::GeneratedCommitted)
+            }
             _ => Err("terminal completion has a nonterminal policy".into()),
         }
     }
@@ -215,6 +223,12 @@ impl TerminalCompletionPolicy {
         match self {
             Self::Leaf => CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
             Self::Committed => CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+            Self::GeneratedLeaf => {
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
+            }
+            Self::GeneratedCommitted => {
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+            }
         }
     }
 }
@@ -1552,7 +1566,7 @@ mod tests {
         policy: TerminalCompletionPolicy,
         bytes: &[u8],
     ) -> OfferPreparedActionResult {
-        let parents = if policy == TerminalCompletionPolicy::Committed {
+        let parents = if !policy.policy().is_terminal_leaf() {
             let upstream = fixture.commit_metadata_leaf(
                 tag - 1,
                 &[(
@@ -1611,6 +1625,8 @@ mod tests {
         for policy in [
             TerminalCompletionPolicy::Leaf,
             TerminalCompletionPolicy::Committed,
+            TerminalCompletionPolicy::GeneratedLeaf,
+            TerminalCompletionPolicy::GeneratedCommitted,
         ] {
             for bytes in [b"".as_slice(), b"nonempty terminal metadata".as_slice()] {
                 let fixture = WorkspaceLineageFixture::new();
@@ -1696,11 +1712,13 @@ mod tests {
         for policy in [
             TerminalCompletionPolicy::Leaf,
             TerminalCompletionPolicy::Committed,
+            TerminalCompletionPolicy::GeneratedLeaf,
+            TerminalCompletionPolicy::GeneratedCommitted,
         ] {
             for scope in [
                 "action", "class", "metadata", "dep-info", "manifest", "ancestor",
             ] {
-                if scope == "ancestor" && policy == TerminalCompletionPolicy::Leaf {
+                if scope == "ancestor" && policy.policy().is_terminal_leaf() {
                     continue;
                 }
                 let fixture = WorkspaceLineageFixture::new();

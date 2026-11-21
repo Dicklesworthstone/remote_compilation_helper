@@ -502,6 +502,10 @@ const LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
 const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
     "rustc-workspace-terminal-leaf-metadata-v2";
 const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
+const LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
+    "rustc-workspace-generated-terminal-leaf-metadata-v1";
+const LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS: &str =
+    "rustc-workspace-generated-terminal-metadata-v1";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -563,6 +567,12 @@ fn record_descriptor_class(
             }
             CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS
+            }
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata => {
+                LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+            }
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
+                LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS
             }
         }
     } else if let Some(class) = closed_workspace_library_descriptor_class(descriptor) {
@@ -677,6 +687,16 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceTerminalMetadata)
+            }
+            [SqlValue::Text(class)]
+                if class == LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS =>
+            {
+                Ok(ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata)
+            }
+            [SqlValue::Text(class)]
+                if class == LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS =>
+            {
+                Ok(ActionClassRisk::GeneratedWorkspaceTerminalMetadata)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
             _ => Err(StoreError::Backend(
@@ -5643,7 +5663,8 @@ mod tests {
         use rabs_key::live_dependency::workspace_dependency_cache::{
             CommittedDependencyPolicy, CommittedWorkspaceDependency,
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
-            plan_generated_workspace_dag_library, plan_mixed_workspace_library,
+            plan_generated_terminal_workspace_metadata, plan_generated_workspace_dag_library,
+            plan_mixed_workspace_library,
             plan_terminal_workspace_metadata, remote_committed_dependency_key,
             remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
         };
@@ -5671,6 +5692,8 @@ mod tests {
                                 | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
+                                | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
+                                | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
                         )
                     )
             );
@@ -5679,10 +5702,11 @@ mod tests {
                 Some(
                     CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
                         | CommittedDependencyPolicy::WorkspaceTerminalMetadata
+                        | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
+                        | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
                 )
             );
-            let has_dependencies = policy.is_some()
-                && policy != Some(CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata);
+            let has_dependencies = policy.is_some_and(|policy| !policy.is_terminal_leaf());
             let immutable = matches!(
                 policy,
                 Some(
@@ -5772,6 +5796,10 @@ mod tests {
                     CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
                     | CommittedDependencyPolicy::WorkspaceTerminalMetadata,
                 ) => plan_terminal_workspace_metadata(&execution),
+                Some(
+                    CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
+                    | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
+                ) => plan_generated_terminal_workspace_metadata(&execution),
                 Some(
                     CommittedDependencyPolicy::MixedWorkspaceRlib
                     | CommittedDependencyPolicy::MixedWorkspaceMetadata
@@ -6073,10 +6101,30 @@ mod tests {
                 ),
                 ActionClassRisk::WorkspaceTerminalMetadata,
             ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata),
+                    true,
+                    false,
+                ),
+                ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata),
+                    true,
+                    false,
+                ),
+                ActionClassRisk::GeneratedWorkspaceTerminalMetadata,
+            ),
         ];
-        for ((descriptor, _), expected_epoch) in descriptors.iter().zip([
-            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 30, 31, 24, 25,
-        ]) {
+        let expected_epochs = [
+            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 30, 32, 31, 33, 24, 25, 34, 35,
+        ];
+        assert_eq!(descriptors.len(), expected_epochs.len());
+        for ((descriptor, _), expected_epoch) in descriptors.iter().zip(expected_epochs) {
             assert_eq!(descriptor.key_epoch, expected_epoch);
         }
         for (index, (descriptor, _)) in descriptors.iter().enumerate() {

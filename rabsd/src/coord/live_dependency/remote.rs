@@ -41,7 +41,8 @@ use rabs_key::live_dependency::workspace_dependency_cache::{
     CommittedDependencyPolicy, committed_dependency_descriptor_policy,
     remote_committed_dependency_isolation_policy, remote_committed_dependency_key,
     remote_committed_dependency_shape, uses_committed_dependency_namespace,
-    validate_committed_workspace_metadata_plan, validate_mixed_workspace_library_plan,
+    validate_committed_workspace_metadata_plan,
+    validate_generated_terminal_workspace_metadata_plan, validate_mixed_workspace_library_plan,
     validate_terminal_workspace_metadata_plan,
 };
 #[cfg(test)]
@@ -1046,7 +1047,7 @@ impl RemoteValidation {
         };
         inputs.verify(request)?;
         let ancestors = inputs.ancestors();
-        if inputs.policy() == CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata {
+        if inputs.policy().is_terminal_leaf() {
             if !ancestors.is_empty() || !inputs.dependencies().is_empty() {
                 return Err("terminal leaf acquired unexpected producer ancestry".into());
             }
@@ -1078,7 +1079,12 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
         });
     }
     if plan.source_kind == DependencySourceKind::WorkspaceTerminalMetadata {
-        validate_terminal_workspace_metadata_plan(plan).map_err(|error| error.to_string())?;
+        if plan.generated_root.is_some() {
+            validate_generated_terminal_workspace_metadata_plan(plan)
+        } else {
+            validate_terminal_workspace_metadata_plan(plan)
+        }
+        .map_err(|error| error.to_string())?;
         return Ok(DependencyExecutionMode::ClosedMetadata);
     }
     if matches!(
@@ -5399,7 +5405,8 @@ mod execution_resource_tests {
         use rabs_key::live_dependency::plan_canonical_workspace_execution;
         use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
         use rabs_key::live_dependency::workspace_dependency_cache::{
-            CommittedWorkspaceDependency, plan_generated_workspace_dag_library,
+            CommittedWorkspaceDependency, plan_generated_terminal_workspace_metadata,
+            plan_generated_workspace_dag_library,
         };
         use rabs_protocol::input_evidence::{DirectoryEnumeration, InputFileType, PositiveInput};
         use rabs_protocol::raw_bytes::RawBytes;
@@ -5408,18 +5415,21 @@ mod execution_resource_tests {
         // This boundary exercises actual request/key/policy assemblers. Real
         // retained trees and record generations are tested in canonical.rs;
         // these inventory facts do not assert compiler or TLS execution.
-        for (archive, dag, native) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (true, false, true),
-            (true, true, true),
-            (false, false, true),
-            (false, true, true),
+        for (archive, dag, native, terminal) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, true, true, false),
+            (false, false, true, false),
+            (false, true, true, false),
+            (false, false, false, true),
+            (false, true, false, true),
         ] {
             let root = "/__rabs/out/cargo/debug/build/workspace_app-123/out";
-            let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
+            let mut fixture =
+                Fixture::workspace_metadata(Some(if terminal { "bin" } else { "lib" }), false);
             let dependency_path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
             if dag {
                 fixture
@@ -5453,14 +5463,24 @@ mod execution_resource_tests {
                 &fixture.plan.host_triple,
             )
             .unwrap();
-            fixture.plan = if dag {
+            fixture.plan = if terminal {
+                plan_generated_terminal_workspace_metadata(&fresh)
+            } else if dag {
                 plan_generated_workspace_dag_library(&fresh)
             } else {
                 plan_closed_workspace_library(&fresh)
             }
             .unwrap();
-            let policy = CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind);
-            assert_eq!(policy.is_some(), dag);
+            let policy = if terminal {
+                Some(if dag {
+                    CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+                } else {
+                    CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
+                })
+            } else {
+                CommittedDependencyPolicy::from_source_kind(fixture.plan.source_kind)
+            };
+            assert_eq!(policy.is_some(), dag || terminal);
             let mode = if archive {
                 DependencyExecutionMode::Rlib
             } else {
@@ -5665,23 +5685,26 @@ mod execution_resource_tests {
             .unwrap();
             assert_eq!(
                 key.descriptor.key_epoch,
-                match (archive, dag, native) {
-                    (true, false, true) => 30,
-                    (true, true, true) => 31,
-                    (false, false, true) => 32,
-                    (false, true, true) => 33,
-                    (true, false, false) => 26,
-                    (false, false, false) => 27,
-                    (true, true, false) => 28,
-                    (false, true, false) => 29,
+                match (archive, dag, native, terminal) {
+                    (true, false, true, false) => 30,
+                    (true, true, true, false) => 31,
+                    (false, false, true, false) => 32,
+                    (false, true, true, false) => 33,
+                    (true, false, false, false) => 26,
+                    (false, false, false, false) => 27,
+                    (true, true, false, false) => 28,
+                    (false, true, false, false) => 29,
+                    (false, false, false, true) => 34,
+                    (false, true, false, true) => 35,
+                    _ => unreachable!("unsupported generated-terminal fixture"),
                 }
             );
             verify_execution_policy(plan, &key, mode, policy).unwrap();
             assert!(verify_execution_policy(&fresh, &key, mode, policy).is_err());
-            if dag {
+            if dag || terminal {
                 assert!(
                     verify_execution_policy(plan, &key, mode, None).is_err(),
-                    "a generated DAG descriptor replaced its installed-input capability"
+                    "a generated descriptor replaced its retained input capability"
                 );
                 for other in [
                     CommittedDependencyPolicy::WorkspaceDagRlib,
@@ -5690,6 +5713,10 @@ mod execution_resource_tests {
                     CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
                     CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
                     CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
+                    CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+                    CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+                    CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata,
+                    CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
                 ] {
                     if Some(other) != policy {
                         assert!(verify_execution_policy(plan, &key, mode, Some(other)).is_err());

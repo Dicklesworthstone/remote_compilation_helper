@@ -701,6 +701,8 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
             CommittedDependencyPolicy::WorkspaceDagMetadata,
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
             CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata,
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
             CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
             CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
             CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
@@ -722,6 +724,10 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
                 CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
                 | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
                     workspace_dependency_cache::plan_terminal_workspace_metadata(&plan)
+                }
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
+                | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
+                    workspace_dependency_cache::plan_generated_terminal_workspace_metadata(&plan)
                 }
                 _ => workspace_dependency_cache::plan_mixed_workspace_library(&plan),
             };

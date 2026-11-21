@@ -2049,6 +2049,94 @@ mod tests {
     }
 
     #[test]
+    fn generated_terminal_metadata_requires_its_selected_root_and_separate_policy() {
+        use rabs_key::live_dependency::workspace_dependency_cache::{
+            plan_generated_terminal_workspace_metadata, plan_terminal_workspace_metadata,
+        };
+
+        for (kind, crate_type, test_harness, test_cfg) in [
+            ("bin", Some("bin"), false, false),
+            ("example", Some("bin"), false, false),
+            ("test", None, true, false),
+            ("bench", None, false, true),
+        ] {
+            let paths = workspace_target_paths(kind, "bin", true, true, None)
+                .require_closed_dependency_execution()
+                .unwrap();
+            let mut execution =
+                workspace_metadata_plan_with_test_cfg(crate_type, test_harness, test_cfg);
+            let generated = "/__rabs/out/cargo/debug/build/project-abc/out";
+            let physical = paths.physical(Path::new(generated)).unwrap();
+            std::fs::create_dir_all(physical.join("empty")).unwrap();
+            std::fs::write(physical.join("config.rs"), b"pub const VALUE: u32 = 42;\n").unwrap();
+            execution.generated_root = Some(generated.into());
+            execution
+                .execution_env
+                .push(("OUT_DIR".into(), generated.into()));
+            execution.execution_env.sort();
+            execution.keyed_env = execution.execution_env.clone();
+            paths.require_workspace_execution(&execution).unwrap();
+            assert!(plan_terminal_workspace_metadata(&execution).is_err());
+            let terminal = plan_generated_terminal_workspace_metadata(&execution).unwrap();
+            assert!(paths.require_local_capture().is_err());
+            assert!(paths.require_workspace_closed_library(&terminal).is_err());
+            for policy in [
+                CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+                CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+            ] {
+                assert!(
+                    paths
+                        .require_committed_dependency_library(&terminal, policy)
+                        .is_err(),
+                    "generated terminal acquired pure terminal authority: {kind}, {policy:?}"
+                );
+            }
+            for policy in [
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata,
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
+            ] {
+                paths
+                    .require_committed_dependency_library(&terminal, policy)
+                    .unwrap();
+                let prerequisite = workspace_target_paths(kind, "bin", true, false, None)
+                    .require_closed_dependency_execution()
+                    .unwrap();
+                assert!(
+                    prerequisite
+                        .require_committed_dependency_library(&terminal, policy)
+                        .is_err(),
+                    "{kind}, {policy:?}: generated prerequisite acquired terminal authority"
+                );
+                for mutation in 0..7 {
+                    let mut other = terminal.clone();
+                    match mutation {
+                        0 => other.invocation.features.clear(),
+                        1 => other.invocation.emit.push("link".into()),
+                        2 => other.invocation.crate_name = Some("unselected".into()),
+                        3 => {
+                            other.invocation.source = Some(
+                                rabs_key::invocation::SourceInput::Path("app/src/main.rs".into()),
+                            );
+                        }
+                        4 => other.generated_root = None,
+                        5 => other
+                            .invocation
+                            .lib_search
+                            .push(format!("native={generated}")),
+                        _ => other.invocation.native_libs.push("static=generated".into()),
+                    }
+                    assert!(
+                        paths
+                            .require_committed_dependency_library(&other, policy)
+                            .is_err(),
+                        "{kind}, {policy:?}, mutation {mutation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn executor_graphs_qualify_native_generated_leaves_but_keep_search_only_inputs_fresh() {
         use rabs_key::live_dependency::workspace_cache::plan_closed_workspace_library;
         use rabs_key::live_dependency::workspace_dependency_cache::plan_mixed_workspace_library;

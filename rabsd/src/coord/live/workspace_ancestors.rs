@@ -65,7 +65,9 @@ impl ProducerPolicy {
                 (true, ProducerDomain::WorkspaceDag)
             }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
-            | CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
+            | CommittedDependencyPolicy::WorkspaceTerminalMetadata
+            | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
+            | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
                 (true, ProducerDomain::WorkspaceDag)
             }
         };
@@ -107,6 +109,9 @@ impl ProducerPolicy {
             }
             ActionClassRisk::WorkspaceTerminalMetadata => {
                 CommittedDependencyPolicy::WorkspaceTerminalMetadata
+            }
+            ActionClassRisk::GeneratedWorkspaceTerminalMetadata => {
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
             }
             _ => return None,
         };
@@ -153,7 +158,9 @@ impl ProducerPolicy {
             // A successful terminal check never supplies a Rust dependency,
             // even if a compiler emitted a nonempty metadata file for it.
             ActionClassRisk::WorkspaceTerminalLeafMetadata
-            | ActionClassRisk::WorkspaceTerminalMetadata => false,
+            | ActionClassRisk::WorkspaceTerminalMetadata
+            | ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata
+            | ActionClassRisk::GeneratedWorkspaceTerminalMetadata => false,
             _ => false,
         }
     }
@@ -274,6 +281,12 @@ impl CoordLive {
             CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
                 (ActionClassRisk::WorkspaceTerminalMetadata, 25)
             }
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata => {
+                (ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata, 34)
+            }
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
+                (ActionClassRisk::GeneratedWorkspaceTerminalMetadata, 35)
+            }
             _ => return Err("terminal completion has a nonterminal policy".into()),
         };
         let held = self
@@ -370,8 +383,7 @@ impl CoordLive {
         consumer_policy: CommittedDependencyPolicy,
     ) -> Result<(), String> {
         let policy = ProducerPolicy::for_consumer(consumer_policy);
-        let terminal_leaf =
-            consumer_policy == CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata;
+        let terminal_leaf = consumer_policy.is_terminal_leaf();
         if (terminal_leaf && !dependencies.is_empty())
             || (!terminal_leaf && dependencies.is_empty())
             || dependencies.len() > MAX_LINEAGE_EDGES
@@ -514,7 +526,11 @@ pub(super) fn check_offer(
             Err("generated workspace leaf offer contains unexpected producer ancestry".into())
         };
     }
-    if risk == ActionClassRisk::WorkspaceTerminalLeafMetadata {
+    if matches!(
+        risk,
+        ActionClassRisk::WorkspaceTerminalLeafMetadata
+            | ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata
+    ) {
         return if offer.provisional_ancestors.is_empty() {
             Ok(())
         } else {
@@ -570,7 +586,11 @@ pub(super) fn check_serving(
             Err("generated workspace leaf publication contains unexpected producer ancestry".into())
         };
     }
-    if risk == ActionClassRisk::WorkspaceTerminalLeafMetadata {
+    if matches!(
+        risk,
+        ActionClassRisk::WorkspaceTerminalLeafMetadata
+            | ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata
+    ) {
         return if store
             .list_provisional_ancestors(&digest_key(action))
             .map_err(store_error)?
@@ -1140,6 +1160,12 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::WorkspaceTerminalMetadata => {
                     LIVE_WORKSPACE_TERMINAL_METADATA_CLASS
                 }
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata => {
+                    LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+                }
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
+                    LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS
+                }
                 _ => panic!("terminal fixture requires an independently keyed terminal policy"),
             };
             self.prepare_class(tag, parents, outputs, class)
@@ -1205,6 +1231,8 @@ pub(crate) mod tests {
                 LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => 33,
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 24,
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
+                LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 34,
+                LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS => 35,
                 _ => manifest.key_epoch,
             });
             manifest.logical_outputs = logical_outputs;
@@ -2056,9 +2084,11 @@ pub(crate) mod tests {
         for policy in [
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
             CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata,
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
         ] {
             let fixture = WorkspaceLineageFixture::new();
-            let parents = if policy == CommittedDependencyPolicy::WorkspaceTerminalMetadata {
+            let parents = if !policy.is_terminal_leaf() {
                 let upstream = fixture.commit_metadata_leaf(
                     90,
                     &[(
@@ -2165,9 +2195,19 @@ pub(crate) mod tests {
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS,
                 15,
             ),
+            (
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata,
+                LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+                24,
+            ),
+            (
+                CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
+                LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS,
+                25,
+            ),
         ] {
             let fixture = WorkspaceLineageFixture::new();
-            let parents = if policy == CommittedDependencyPolicy::WorkspaceTerminalMetadata {
+            let parents = if !policy.is_terminal_leaf() {
                 let upstream = fixture.commit_metadata_leaf(
                     90,
                     &[(

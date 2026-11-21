@@ -127,6 +127,13 @@ pub enum ActionClassRisk {
     /// Exact selected terminal checks with complete committed producer ancestry.
     /// Independent samples cannot be borrowed from leaf or library classes.
     WorkspaceTerminalMetadata,
+    /// Selected terminal checks with complete own generated inputs and an empty
+    /// candidate inventory. Pure terminal and generated library evidence cannot
+    /// enroll this separate class, whose outputs never authorize consumers.
+    GeneratedWorkspaceTerminalLeafMetadata,
+    /// Selected terminal checks with complete own generated inputs and exact
+    /// committed ancestry, independently sampled from every other terminal class.
+    GeneratedWorkspaceTerminalMetadata,
     /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,

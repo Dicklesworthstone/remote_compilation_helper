@@ -497,7 +497,8 @@ pub enum DependencySourceKind {
     WorkspaceMixedMetadata,
     /// A selected binary/example or test/bench metadata check. Independent leaf
     /// and committed-input policies share this complete workspace source scope;
-    /// terminal outputs never establish dependency-producer authority.
+    /// generated inputs require their separate retained policies and evidence.
+    /// Terminal outputs never establish dependency-producer authority.
     WorkspaceTerminalMetadata,
 }
 

@@ -10415,6 +10415,416 @@ fn canonical_terminal_metadata_leaves_earn_hits_without_running_programs_or_harn
     }
 }
 
+fn generated_terminal_metadata_source(
+    root: &Path,
+    kind: &str,
+    harness: Option<bool>,
+    committed: bool,
+) {
+    let harness = harness
+        .map(|value| format!("harness={value}\n"))
+        .unwrap_or_default();
+    let library = if committed {
+        "[lib]\npath='lib.rs'\ntest=false\ndoctest=false\n"
+    } else {
+        ""
+    };
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers=['app']\nresolver='2'\n",
+    );
+    write(
+        root,
+        "Cargo.lock",
+        "version=4\n\n[[package]]\nname='canonical_terminal'\nversion='0.1.0'\n",
+    );
+    write(
+        root,
+        "app/Cargo.toml",
+        format!(
+            "[package]\nname='canonical_terminal'\nversion='0.1.0'\nedition='2021'\nautobins=false\nautoexamples=false\nautotests=false\nautobenches=false\n{library}[[{kind}]]\nname='{WORKSPACE_METADATA_DAG_CONSUMER}'\npath='main.rs'\n{harness}"
+        ),
+    );
+    write(
+        root,
+        "app/build.rs",
+        r#"fn main() {
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("value.rs"), std::fs::read("generated.rs.in").unwrap()).unwrap();
+    std::fs::write(out.join("source.txt"), std::fs::read("value.txt").unwrap()).unwrap();
+    std::fs::create_dir_all(out.join("empty/nested")).unwrap();
+    let label = std::env::var("TERMINAL_METADATA_INPUT").unwrap();
+    println!("cargo::rustc-env=GENERATED_TERMINAL_LABEL={label}");
+    println!("cargo::rerun-if-changed=generated.rs.in");
+    println!("cargo::rerun-if-changed=value.txt");
+    println!("cargo::rerun-if-env-changed=TERMINAL_METADATA_INPUT");
+    println!("cargo::warning=RABS_GENERATED_TERMINAL_SCRIPT_RAN");
+}
+"#,
+    );
+    write(
+        root,
+        "app/generated.rs.in",
+        "pub const ANSWER: usize = 42;\n",
+    );
+    write(root, "app/value.txt", "generated terminal source\n");
+    let declarations = r#"include!(concat!(env!("OUT_DIR"), "/value.rs"));
+pub const SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/source.txt"));
+pub const ENVIRONMENT: &str = env!("TERMINAL_METADATA_INPUT");
+pub const FROM_RECORD: &str = env!("GENERATED_TERMINAL_LABEL");
+const _: [(); ENVIRONMENT.len()] = [(); FROM_RECORD.len()];
+fn retained_dag_warning() {}
+"#;
+    let ancestry = if committed {
+        write(root, "app/lib.rs", declarations);
+        "const _: [(); ANSWER] = [(); canonical_terminal::ANSWER];\nconst _: [(); SOURCE.len()] = [(); canonical_terminal::SOURCE.len()];\n"
+    } else {
+        ""
+    };
+    write(
+        root,
+        "app/main.rs",
+        format!(
+            "const _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\n{declarations}{ancestry}fn main() {{ panic!(\"RABS_CHECK_TARGET_EXECUTED\"); }}\n#[test]\nfn test_body_must_not_run() {{ panic!(\"RABS_CHECK_TARGET_EXECUTED\"); }}\n"
+        ),
+    );
+}
+
+fn generated_terminal_metadata_observations(
+    events: &[Value],
+    output: &str,
+    names: &[&str],
+    label: &Value,
+) -> Vec<String> {
+    let started = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-compilation-started")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1, "{output}");
+    assert_eq!(started[0]["command"], "check", "{output}");
+    assert_eq!(started[0]["private_target_state"], "cold", "{output}");
+    assert!(!output.contains("RABS_CHECK_TARGET_EXECUTED"), "{output}");
+    assert!(
+        output.contains("RABS_GENERATED_TERMINAL_SCRIPT_RAN"),
+        "{output}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event["kind"].as_str(),
+            Some(
+                "rabsd-remote-dependency-failed"
+                    | "rabsd-remote-dependency-install-failed"
+                    | "canonical-build-completed"
+            )
+        )),
+        "generated terminal check failed, fell back, or delivered a program: {output}"
+    );
+    let cargo = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let artifacts = cargo
+        .iter()
+        .filter(|event| event["reason"] == "compiler-artifact")
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), names.len() + 1, "{output}");
+    let scripts = artifacts
+        .iter()
+        .filter(|event| event["target"]["kind"] == json!(["custom-build"]))
+        .collect::<Vec<_>>();
+    assert_eq!(scripts.len(), 1, "{output}");
+    assert_eq!(
+        scripts[0]["manifest_path"],
+        "/__rabs/workspace/app/Cargo.toml"
+    );
+    assert_eq!(
+        scripts[0]["fresh"], false,
+        "the current script did not compile: {output}"
+    );
+    for name in names {
+        let matching = artifacts
+            .iter()
+            .filter(|event| event["target"]["name"] == *name)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{name}: {output}");
+        assert_eq!(
+            matching[0]["fresh"], false,
+            "Cargo Fresh hid {name}: {output}"
+        );
+        assert!(matching[0]["executable"].is_null(), "{name}: {output}");
+    }
+    let records = cargo
+        .iter()
+        .filter(|event| event["reason"] == "build-script-executed")
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{output}");
+    assert!(
+        records[0]["out_dir"]
+            .as_str()
+            .unwrap()
+            .starts_with("/__rabs/out/cargo/")
+    );
+    assert!(
+        records[0]["env"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(["GENERATED_TERMINAL_LABEL", label])),
+        "the completed Cargo record lost its exact rustc-env output: {output}"
+    );
+    workspace_dag_diagnostics(output, names)
+}
+
+/// The full worker fixture is intentionally separate from pure descriptor and
+/// seed tests. It must earn each class's ordinary samples through actual rustc;
+/// no store rows, positive evidence or generated outputs are injected.
+fn generated_terminal_metadata_replay(committed: bool) {
+    for (kind, harness) in [
+        ("bin", None),
+        ("example", None),
+        ("test", Some(true)),
+        ("test", Some(false)),
+        ("bench", Some(true)),
+        ("bench", Some(false)),
+    ] {
+        let (owner, mut profile) = native_fixture();
+        let root = owner.path();
+        let first = root.join("generated-terminal-a");
+        let second = root.join("generated-terminal-b");
+        generated_terminal_metadata_source(&first, kind, harness, committed);
+        generated_terminal_metadata_source(&second, kind, harness, committed);
+        let libraries: &[&str] = if committed {
+            &["canonical_terminal"]
+        } else {
+            &[]
+        };
+        let names = libraries
+            .iter()
+            .copied()
+            .chain([WORKSPACE_METADATA_DAG_CONSUMER])
+            .collect::<Vec<_>>();
+        profile["source_root"] = json!(first);
+        profile["vendor"] = Value::Null;
+        profile["command"] = json!("check");
+        profile["selection"] = json!({});
+        profile["selection"][kind] = json!([WORKSPACE_METADATA_DAG_CONSUMER]);
+        if committed {
+            profile["selection"]["lib"] = json!(true);
+        }
+        profile["env"] =
+            json!({"TERMINAL_METADATA_INPUT":"original generated terminal environment"});
+        profile["jobs"] = json!(1);
+        profile["target_cache"] = json!({
+            "runtime_epoch":"generated-terminal-stock-v1", "max_bytes":268435456,
+        });
+        let (code, events, output) = run(root, 1500, &profile);
+        assert_eq!(code, 0, "{committed}/{kind}/{harness:?}: {output}");
+        for decision in ["remote-offer", "execute", "hit"] {
+            assert!(decisions(&events, decision).is_empty(), "{output}");
+        }
+        let baseline = generated_terminal_metadata_observations(
+            &events,
+            &output,
+            &names,
+            &profile["env"]["TERMINAL_METADATA_INPUT"],
+        );
+        let stock_target = sole_retained_target(root);
+        let stock_files = workspace_dag_metadata_files(&stock_target, &output, libraries);
+        let mut families =
+            BTreeSet::from([stock_target.parent().unwrap().parent().unwrap().to_owned()]);
+        let (mut worker, environment) = NativeWorker::start(root);
+        let mut previous: Option<BTreeMap<String, String>> = None;
+        let mut executions = 0;
+        for number in 1..=7 {
+            match number {
+                1..=4 => {}
+                5 => profile["source_root"] = json!(second),
+                6 => write(
+                    &second,
+                    "app/generated.rs.in",
+                    "pub const ANSWER: usize = 43;\n",
+                ),
+                7 => {
+                    profile["env"]["TERMINAL_METADATA_INPUT"] =
+                        json!("changed generated terminal environment")
+                }
+                _ => unreachable!(),
+            }
+            profile["target_cache"] = json!({
+                "runtime_epoch":format!("generated-terminal-{number}-v1"), "max_bytes":268435456,
+            });
+            let hit = matches!(number, 4 | 5);
+            let journal = hit.then(|| read_bounded(&worker.state.join("requests.json")));
+            let (code, events, output) =
+                run_with_environment(root, 1500 + number, &profile, &environment);
+            assert_eq!(code, 0, "{committed}/{kind}/{harness:?}: {output}");
+            let diagnostics = generated_terminal_metadata_observations(
+                &events,
+                &output,
+                &names,
+                &profile["env"]["TERMINAL_METADATA_INPUT"],
+            );
+            assert!(decisions(&events, "execute").is_empty(), "{output}");
+            let offered = decisions(&events, "remote-offer");
+            let hits = decisions(&events, "hit");
+            let keys = if hit {
+                assert!(
+                    offered.is_empty(),
+                    "a trained generated terminal dispatched rustc: {output}"
+                );
+                assert_eq!(Some(&hits), previous.as_ref(), "{output}");
+                hits
+            } else {
+                assert!(
+                    hits.is_empty(),
+                    "unearned or invalidated generated hit: {output}"
+                );
+                assert_eq!(
+                    offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                    names.iter().copied().collect()
+                );
+                if let Some(previous) = &previous {
+                    for name in &names {
+                        if number <= 3 {
+                            assert_eq!(offered[*name], previous[*name], "cold target split {name}");
+                        } else {
+                            assert_ne!(
+                                offered[*name], previous[*name],
+                                "changed generated inputs reused {name}"
+                            );
+                        }
+                    }
+                }
+                offered.clone()
+            };
+            let expected = offered.values().cloned().collect::<BTreeSet<_>>();
+            for event_kind in [
+                "rabsd-remote-dependency-admitted",
+                "rabsd-remote-dependency-executed",
+            ] {
+                let actual = events
+                    .iter()
+                    .filter(|event| event["kind"] == event_kind)
+                    .map(|event| event["key"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual.len(), expected.len(), "{event_kind}: {output}");
+                assert_eq!(actual.into_iter().collect::<BTreeSet<_>>(), expected);
+            }
+            for name in &names {
+                let key = &keys[*name];
+                if hit {
+                    assert!(
+                        events
+                            .iter()
+                            .any(|event| event["decision"] == "served" && event["key"] == *key),
+                        "{output}"
+                    );
+                }
+                assert_closed_workspace_leaf_evidence(
+                    root,
+                    key,
+                    if number <= 3 {
+                        number as usize
+                    } else if hit {
+                        3
+                    } else {
+                        1
+                    },
+                    if *name != WORKSPACE_METADATA_DAG_CONSUMER {
+                        "rustc-workspace-generated-metadata-v1"
+                    } else if committed {
+                        "rustc-workspace-generated-terminal-metadata-v1"
+                    } else {
+                        "rustc-workspace-generated-terminal-leaf-metadata-v1"
+                    },
+                );
+                assert_no_immutable_leaf_qualification(root, key);
+            }
+            let new_families =
+                fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|family| !families.contains(family))
+                    .collect::<Vec<_>>();
+            assert_eq!(
+                new_families.len(),
+                1,
+                "each check requires its own cold target"
+            );
+            let files = workspace_dag_metadata_files(
+                &new_families[0].join("seed/target"),
+                &output,
+                libraries,
+            );
+            assert!(families.insert(new_families[0].clone()));
+            assert_workspace_dag_ancestry(root, &keys, &files, &names);
+            if number <= 5 {
+                assert_eq!(
+                    files, stock_files,
+                    "stock/cold/hit generated metadata or dep-info differs"
+                );
+                assert_eq!(
+                    diagnostics, baseline,
+                    "stock/cold/hit generated diagnostics differ"
+                );
+            }
+            executions += offered.len();
+            assert_eq!(
+                worker
+                    .events()
+                    .iter()
+                    .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                    .count(),
+                executions
+            );
+            if let Some(journal) = journal {
+                assert_eq!(read_bounded(&worker.state.join("requests.json")), journal);
+            }
+            previous = Some(keys);
+        }
+        let body = fs::read_to_string(second.join("app/main.rs")).unwrap();
+        write(
+            &second,
+            "app/main.rs",
+            format!("{body}\nconst _: [(); 1] = [(); 2];\n"),
+        );
+        profile["target_cache"] = json!({
+            "runtime_epoch":"generated-terminal-invalid-v1", "max_bytes":268435456,
+        });
+        let (code, events, output) = run_with_environment(root, 1508, &profile, &environment);
+        assert_ne!(
+            code, 0,
+            "invalid generated terminal replayed successful metadata: {output}"
+        );
+        assert!(decisions(&events, "hit").is_empty(), "{output}");
+        assert!(output.contains("mismatched types"), "{output}");
+        assert!(!output.contains("RABS_CHECK_TARGET_EXECUTED"), "{output}");
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions + names.len()
+        );
+        assert!(fs::read_dir(root.join("ops")).unwrap().next().is_none());
+        worker.finish();
+        let _retained = owner.keep();
+    }
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated terminal leaf samples, empty metadata, diagnostics, generated bytes and environment invalidation"]
+fn canonical_generated_terminal_metadata_leaves_earn_hits_without_running_targets() {
+    generated_terminal_metadata_replay(false);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; generated terminal consumers require exact committed ancestry, independent samples, stock bytes and current build scripts"]
+fn canonical_generated_terminal_metadata_consumers_earn_hits_from_committed_ancestry() {
+    generated_terminal_metadata_replay(true);
+}
+
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; terminal action quarantine must revoke the same retained Cargo Fresh target"]
 fn canonical_warm_terminal_metadata_rejects_own_action_quarantine_before_cargo_fresh() {
