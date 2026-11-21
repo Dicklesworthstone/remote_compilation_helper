@@ -647,6 +647,91 @@ fn recovery_scan_interval() -> tokio::time::Interval {
     ticker
 }
 
+/// A blocking filesystem scan cannot be cancelled once it starts. Retain its
+/// task across timer ticks and cancelled event polls instead of detaching it
+/// on a timeout and accumulating more scanners against the same stalled disk.
+#[derive(Default)]
+struct RecoveryScan {
+    task: JoinSet<Vec<RecoveryCandidate>>,
+    completed: HashSet<String>,
+}
+
+impl RecoveryScan {
+    fn start(&mut self, scan: impl FnOnce() -> Vec<RecoveryCandidate> + Send + 'static) -> bool {
+        if !self.task.is_empty() {
+            return false;
+        }
+        self.completed.clear();
+        self.task.spawn_blocking(scan);
+        true
+    }
+
+    fn reconcile(&mut self, queue: &mut RecoveryQueue, candidates: Vec<RecoveryCandidate>) {
+        // A scan can read a journal before its client completes and return it
+        // afterward. Keep its failure backoff, but never re-admit that older
+        // snapshot after completion already removed it from the pending queue.
+        // Retryable outcomes become eligible again in the next fresh scan.
+        let completed_backoff: Vec<_> = self
+            .completed
+            .iter()
+            .filter_map(|id| {
+                queue
+                    .backoff
+                    .failures
+                    .get(id)
+                    .map(|state| (id.clone(), *state))
+            })
+            .collect();
+        let completed_starts: Vec<_> = self
+            .completed
+            .iter()
+            .filter_map(|id| {
+                queue
+                    .last_started
+                    .get(id)
+                    .map(|started| (id.clone(), *started))
+            })
+            .collect();
+        queue.refresh(candidates);
+        // Absence in this older scan cannot discard backoff or fairness state
+        // recorded by a completion after the scan started.
+        queue.backoff.failures.extend(completed_backoff);
+        queue.last_started.extend(completed_starts);
+        queue
+            .pending
+            .retain(|candidate| !self.completed.contains(&candidate.wrapper_id));
+        self.completed.clear();
+    }
+}
+
+enum RecoveryEvent {
+    Completed(RecoveryCandidate, Result<RecoveryOutcome, String>),
+    Scanned(Result<Vec<RecoveryCandidate>, tokio::task::JoinError>),
+    ScanDue,
+}
+
+/// Inventory is not a completion barrier. In particular, a stalled journal
+/// read must not prevent the queue from accounting for finished clients and
+/// admitting already-known work on independent workers.
+async fn next_recovery_event(
+    queue: &mut RecoveryQueue,
+    scan: &mut RecoveryScan,
+    ticker: &mut tokio::time::Interval,
+) -> RecoveryEvent {
+    tokio::select! {
+        Some((candidate, outcome)) = queue.next_completed(), if !queue.running.is_empty() => {
+            if !scan.task.is_empty() {
+                scan.completed.insert(candidate.wrapper_id.clone());
+            }
+            RecoveryEvent::Completed(candidate, outcome)
+        }
+        Some(result) = scan.task.join_next(), if !scan.task.is_empty() => {
+            RecoveryEvent::Scanned(result)
+        }
+        _ = ticker.tick() => RecoveryEvent::ScanDue,
+    }
+}
+
 /// Start the recovery loop. `socket` is this daemon's socket; the child
 /// `rch` is pointed at it so it never reconciles against another daemon.
 pub(crate) fn start(
@@ -665,47 +750,60 @@ pub(crate) fn start(
             }
         };
         let mut queue = RecoveryQueue::default();
+        let mut scan = RecoveryScan::default();
         let mut ticker = recovery_scan_interval();
         loop {
-            tokio::select! {
-                completed = queue.next_completed(), if !queue.running.is_empty() => {
-                    if let Some((candidate, outcome)) = completed {
-                        let id = candidate.wrapper_id;
-                        match outcome {
-                            Ok(RecoveryOutcome::Recovered) => {
-                                info!(wrapper_id = %id, "Recovered dead client lease");
-                                events.emit("lease_auto_recovered", &serde_json::json!({
+            match next_recovery_event(&mut queue, &mut scan, &mut ticker).await {
+                RecoveryEvent::Completed(candidate, outcome) => {
+                    let id = candidate.wrapper_id;
+                    match outcome {
+                        Ok(RecoveryOutcome::Recovered) => {
+                            info!(wrapper_id = %id, "Recovered dead client lease");
+                            events.emit(
+                                "lease_auto_recovered",
+                                &serde_json::json!({
                                     "wrapper_id": id,
-                                }));
-                            }
-                            Ok(RecoveryOutcome::SettlementPending) => {
-                                debug!(wrapper_id = %id, "Worker settlement pending; retaining lease ownership until the next scan");
-                            }
-                            Ok(RecoveryOutcome::Deferred) => {}
-                            Err(error) => {
-                                let failures = queue.backoff.failures[&id].0;
-                                warn!(wrapper_id = %id, failures, "Dead client lease recovery failed: {error}");
-                                events.emit("lease_auto_recovery_failed", &serde_json::json!({
+                                }),
+                            );
+                        }
+                        Ok(RecoveryOutcome::SettlementPending) => {
+                            debug!(wrapper_id = %id, "Worker settlement pending; retaining lease ownership until the next scan");
+                        }
+                        Ok(RecoveryOutcome::Deferred) => {}
+                        Err(error) => {
+                            let failures = queue.backoff.failures[&id].0;
+                            warn!(wrapper_id = %id, failures, "Dead client lease recovery failed: {error}");
+                            events.emit(
+                                "lease_auto_recovery_failed",
+                                &serde_json::json!({
                                     "wrapper_id": id, "failures": failures, "error": error,
-                                }));
-                            }
+                                }),
+                            );
                         }
                     }
                 }
-                _ = ticker.tick() => {
+                RecoveryEvent::Scanned(result) => match result {
+                    Ok(candidates) => scan.reconcile(&mut queue, candidates),
+                    Err(error) => {
+                        warn!(%error, "Lease recovery scan failed; retaining in-flight tasks")
+                    }
+                },
+                RecoveryEvent::ScanDue => {
                     if !rch.exists() {
                         continue;
                     }
                     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
                     let history = history.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        recoverable_candidates(&default_job_lease_directory(), now, |lease| {
-                            owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
-                        }, Some(&history))
-                    }).await {
-                        Ok(candidates) => queue.refresh(candidates),
-                        Err(error) => warn!(%error, "Lease recovery scan failed; retaining in-flight tasks"),
-                    }
+                    scan.start(move || {
+                        recoverable_candidates(
+                            &default_job_lease_directory(),
+                            now,
+                            |lease| {
+                                owner_presence(lease.wrapper_pid, lease.owner_identity().as_ref())
+                            },
+                            Some(&history),
+                        )
+                    });
                 }
             }
             // Dormant workers consume neither the per-scan budget nor a lane.
@@ -1135,6 +1233,205 @@ mod tests {
         tokio::time::advance(Duration::from_secs(95)).await;
         assert_eq!(ticker.tick().await, started + Duration::from_secs(60));
         assert_eq!(ticker.tick().await, started + Duration::from_secs(150));
+    }
+
+    #[tokio::test]
+    async fn stalled_inventory_scan_keeps_recovery_completions_and_ready_workers_live() {
+        let mut queue = RecoveryQueue::default();
+        let mut scan = RecoveryScan::default();
+        let mut ticker = recovery_scan_interval();
+        assert!(matches!(
+            next_recovery_event(&mut queue, &mut scan, &mut ticker).await,
+            RecoveryEvent::ScanDue
+        ));
+
+        let active = candidate("active", "worker-a");
+        let follower = candidate("follower", "worker-a");
+        let independent = candidate("independent", "worker-b");
+        queue.refresh(vec![active.clone(), follower.clone(), independent.clone()]);
+        let (finish_client, client_finished) = tokio::sync::oneshot::channel();
+        let mut client_finished = Some(client_finished);
+        queue.start_ready_if(
+            Instant::now(),
+            |job| job.wrapper_id == active.wrapper_id,
+            |_| {
+                let finished = client_finished.take().unwrap();
+                async move {
+                    finished.await.unwrap();
+                    Ok(RecoveryOutcome::Recovered)
+                }
+            },
+        );
+        assert_eq!(queue.running.len(), 1);
+        assert_eq!(queue.pending.len(), 2);
+        let remaining = queue.starts_remaining;
+
+        let (entered, observing) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (returned, has_returned) = tokio::sync::oneshot::channel();
+        let outdated = vec![active.clone(), follower.clone()];
+        assert!(scan.start(move || {
+            let _ = entered.send(());
+            // Unwinding drops the sender too, so the simulated stalled read
+            // never leaves a blocking worker behind after a failed assertion.
+            let _ = blocked.recv();
+            let _ = returned.send(());
+            outdated
+        }));
+        tokio::time::timeout(Duration::from_secs(5), observing)
+            .await
+            .expect("blocking inventory scan started")
+            .unwrap();
+
+        // Cancelling an event poll must retain both the scan and the client.
+        let mut next = Box::pin(next_recovery_event(&mut queue, &mut scan, &mut ticker));
+        std::future::poll_fn(|cx| {
+            assert!(next.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(next);
+        for _ in 0..3 {
+            assert!(!scan.start(|| panic!("a delayed scan must not overlap another scan")));
+        }
+        assert_eq!(queue.running.len(), 1);
+        assert_eq!(queue.pending.len(), 2);
+        assert_eq!(queue.starts_remaining, remaining);
+
+        finish_client.send(()).unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            next_recovery_event(&mut queue, &mut scan, &mut ticker),
+        )
+        .await
+        .expect("finished client must not wait for inventory");
+        let RecoveryEvent::Completed(completed, outcome) = event else {
+            panic!("inventory is still blocked; the client must complete first");
+        };
+        assert_eq!(completed.wrapper_id, active.wrapper_id);
+        assert_eq!(outcome, Ok(RecoveryOutcome::Recovered));
+        assert!(queue.running.is_empty());
+        assert_eq!(scan.task.len(), 1);
+
+        // Releasing worker-a's queue lane admits its waiting client while an
+        // independent worker starts too, without renewing the per-scan budget.
+        queue.start_ready_if(
+            Instant::now(),
+            |_| true,
+            |job| async move {
+                if job.worker_id == "worker-b" {
+                    Err("worker settlement still needs retry".into())
+                } else {
+                    Ok(RecoveryOutcome::Recovered)
+                }
+            },
+        );
+        assert_eq!(queue.running.len(), 2);
+        assert_eq!(queue.starts_remaining, remaining - 2);
+        assert_eq!(
+            queue
+                .running
+                .values()
+                .map(|job| job.worker_id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["worker-a", "worker-b"])
+        );
+        let mut finished = HashSet::new();
+        for _ in 0..2 {
+            let event = tokio::time::timeout(
+                Duration::from_secs(5),
+                next_recovery_event(&mut queue, &mut scan, &mut ticker),
+            )
+            .await
+            .expect("ready worker completion must not wait for inventory");
+            let RecoveryEvent::Completed(job, outcome) = event else {
+                panic!("inventory has not been released");
+            };
+            assert_eq!(outcome.is_err(), job.wrapper_id == independent.wrapper_id);
+            finished.insert(job.wrapper_id);
+        }
+        assert_eq!(
+            finished,
+            HashSet::from([follower.wrapper_id, independent.wrapper_id.clone()])
+        );
+        assert_eq!(queue.backoff.failures[&independent.wrapper_id].0, 1);
+        assert!(queue.running.is_empty());
+
+        release.send(()).unwrap();
+        has_returned.await.unwrap();
+        assert!(!scan.start(|| panic!("finished inventory must be observed before replacement")));
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            next_recovery_event(&mut queue, &mut scan, &mut ticker),
+        )
+        .await
+        .expect("released inventory must complete");
+        let RecoveryEvent::Scanned(Ok(candidates)) = event else {
+            panic!("the retained scan must return its inventory");
+        };
+        scan.reconcile(&mut queue, candidates);
+        assert!(
+            queue.pending.is_empty(),
+            "late inventory cannot resurrect completed clients"
+        );
+        assert_eq!(queue.backoff.failures[&independent.wrapper_id].0, 1);
+        assert!(queue.last_started.contains_key(&independent.wrapper_id));
+        assert_eq!(queue.starts_remaining, MAX_RECOVERIES_PER_CYCLE);
+        assert!(scan.task.is_empty());
+
+        // A fresh scan may retry the still-owned failed job, preserving the
+        // backoff that was absent from the previous, older inventory snapshot.
+        let retry = independent.clone();
+        assert!(scan.start(move || vec![retry]));
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            next_recovery_event(&mut queue, &mut scan, &mut ticker),
+        )
+        .await
+        .expect("fresh inventory must complete");
+        let RecoveryEvent::Scanned(Ok(candidates)) = event else {
+            panic!("the next scan must return its own inventory");
+        };
+        scan.reconcile(&mut queue, candidates);
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(queue.pending[0].wrapper_id, independent.wrapper_id);
+        assert_eq!(queue.backoff.failures[&independent.wrapper_id].0, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_inventory_scan_preserves_queue_and_allows_a_new_scan() {
+        let mut queue = RecoveryQueue::default();
+        let mut scan = RecoveryScan::default();
+        let mut ticker = recovery_scan_interval();
+        ticker.tick().await;
+        let retained = candidate("retained", "worker-a");
+        queue.refresh(vec![retained.clone()]);
+        queue
+            .backoff
+            .record_failure(&retained.wrapper_id, Instant::now());
+        let original_backoff = queue.backoff.failures[&retained.wrapper_id];
+        assert!(scan.start(|| panic!("injected inventory failure")));
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            next_recovery_event(&mut queue, &mut scan, &mut ticker),
+        )
+        .await
+        .expect("panicked inventory must return an error");
+        assert!(matches!(event, RecoveryEvent::Scanned(Err(error)) if error.is_panic()));
+        assert_eq!(queue.pending[0].wrapper_id, retained.wrapper_id);
+        assert_eq!(
+            queue.backoff.failures[&retained.wrapper_id],
+            original_backoff
+        );
+        assert_eq!(queue.starts_remaining, MAX_RECOVERIES_PER_CYCLE);
+        assert!(scan.start(Vec::new));
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            next_recovery_event(&mut queue, &mut scan, &mut ticker),
+        )
+        .await
+        .expect("inventory retries after the failed scan is observed");
+        assert!(matches!(event, RecoveryEvent::Scanned(Ok(candidates)) if candidates.is_empty()));
     }
 
     /// A fake `rch` for recovery: a hard link to one shim written once per
