@@ -2328,9 +2328,13 @@ impl DurableLeaseWriter {
         Ok(lease)
     }
 
+    /// Claim only the journal for terminal reconciliation. Artifact overrides
+    /// apply to output recovery, never to a daemon receipt or an absence proof.
+    /// A recipe discovered by the reload must remain untouched until the caller
+    /// validates whether this terminal path still applies.
     #[cfg(unix)]
-    pub(crate) async fn claim_recovery(&self) -> anyhow::Result<Self> {
-        transfer_orchestration::recovery::recovery_owner::claim(self).await
+    pub(crate) async fn claim_terminal_recovery(&self) -> anyhow::Result<Self> {
+        transfer_orchestration::recovery::recovery_owner::claim_journal(self).await
     }
 
     pub(crate) fn snapshot(&self) -> DurableJobLease {

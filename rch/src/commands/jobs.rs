@@ -944,7 +944,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             let latest_writer = within_job_deadline(
                 deadline,
                 "terminal journal ownership",
-                writer.claim_recovery(),
+                writer.claim_terminal_recovery(),
             )
             .await?;
             if !settle_absent_pre_admission(&lease, &latest_writer, crate::hook::unix_ms_now())? {
@@ -1152,7 +1152,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             let latest_writer = within_job_deadline(
                 deadline,
                 "terminal journal ownership",
-                writer.claim_recovery(),
+                writer.claim_terminal_recovery(),
             )
             .await?;
             let latest = latest_writer.snapshot();
@@ -1197,7 +1197,7 @@ async fn run_unix(action: Option<JobsAction>, ctx: &OutputContext) -> Result<()>
             let latest_writer = within_job_deadline(
                 deadline,
                 "terminal journal ownership",
-                writer.claim_recovery(),
+                writer.claim_terminal_recovery(),
             )
             .await?;
             let Some(code) = settle_absent_not_found_without_recovery(
@@ -2933,6 +2933,7 @@ mod tests {
 
         const CHILD_DIRECTORY: &str = "RCH_TEST_TERMINAL_RECOVERY";
         const CHILD_WRAPPER: &str = "RCH_TEST_TERMINAL_WRAPPER";
+        const CHILD_ATTACH: &str = "RCH_TEST_TERMINAL_ATTACH";
         if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
             let directory = std::path::PathBuf::from(directory);
             let ctx = OutputContext::with_writers(
@@ -2947,17 +2948,22 @@ mod tests {
                 ),
                 OutputWriter::stderr(),
             );
-            let result = run_unix(
-                Some(JobsAction::Recover {
-                    wrapper_id: std::env::var(CHILD_WRAPPER).unwrap(),
+            let wrapper_id = std::env::var(CHILD_WRAPPER).unwrap();
+            let action = if std::env::var_os(CHILD_ATTACH).is_some() {
+                JobsAction::Attach {
+                    wrapper_id,
+                    timeout_secs: 5,
+                }
+            } else {
+                JobsAction::Recover {
+                    wrapper_id,
                     timeout_secs: 5,
                     cargo_json: false,
                     daemon_managed: Some(false),
                     daemon_local_only: true,
-                }),
-                &ctx,
-            )
-            .await;
+                }
+            };
+            let result = run_unix(Some(action), &ctx).await;
             if let Err(error) = automatic_recovery_result(result) {
                 std::fs::write(
                     directory.join("error.json"),
@@ -2975,6 +2981,12 @@ mod tests {
         for case in [
             "sync_up",
             "finalize",
+            "exclusions",
+            "malformed_exclusions",
+            "relocation",
+            "malformed_relocation",
+            "conflicting_policies",
+            "attach_with_exclusions",
             "active",
             "not_found",
             "wrapper",
@@ -3104,6 +3116,36 @@ mod tests {
                 .env("PATH", directory.path())
                 .current_dir(directory.path())
                 .kill_on_drop(true);
+            // These requests belong to artifact recovery. Receipt-only
+            // settlement must neither parse them nor try to load a recipe.
+            if matches!(
+                case,
+                "exclusions" | "attach_with_exclusions" | "conflicting_policies"
+            ) {
+                child.env(
+                    "RCH_RECOVERY_ARTIFACT_EXCLUSIONS",
+                    json!({
+                        "wrapper_id": lease.identity.local_wrapper_id,
+                        "directories": ["build/synthetic"],
+                    })
+                    .to_string(),
+                );
+            }
+            if case == "malformed_exclusions" {
+                child.env("RCH_RECOVERY_ARTIFACT_EXCLUSIONS", "{");
+            }
+            if matches!(case, "relocation" | "conflicting_policies") {
+                child.env(
+                    "RCH_RECOVERY_RELOCATE_STAGING",
+                    &lease.identity.local_wrapper_id,
+                );
+            }
+            if case == "malformed_relocation" {
+                child.env("RCH_RECOVERY_RELOCATE_STAGING", "not/a/wrapper");
+            }
+            if case == "attach_with_exclusions" {
+                child.env(CHILD_ATTACH, "1");
+            }
             let output = tokio::time::timeout(Duration::from_secs(10), child.output())
                 .await
                 .expect("terminal recovery exceeded its bounded operation")
@@ -3126,7 +3168,17 @@ mod tests {
             );
             assert!(!lease_path.with_extension("cancel").exists());
             assert!(!lease_path.with_extension("recover").exists());
-            if matches!(case, "sync_up" | "finalize") {
+            if matches!(
+                case,
+                "sync_up"
+                    | "finalize"
+                    | "exclusions"
+                    | "malformed_exclusions"
+                    | "relocation"
+                    | "malformed_relocation"
+                    | "conflicting_policies"
+                    | "attach_with_exclusions"
+            ) {
                 assert!(!directory.path().join("error.json").exists());
                 let report: Value = serde_json::from_slice(
                     &std::fs::read(directory.path().join("report.json")).unwrap(),
