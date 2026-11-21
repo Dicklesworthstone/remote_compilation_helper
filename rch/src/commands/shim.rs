@@ -83,7 +83,11 @@ use crate::ui::theme::StatusIndicator;
 /// `9` refuses a bare caller-set `RCH_CARGO_WRAPPER_BYPASS=1` when
 /// `RCH_REQUIRE_REMOTE` is enabled unless accompanied by `RCH_CARGO_WRAPPER_ORIGIN=rch`
 /// (bd-h6y17), preventing agents from bypassing RCH on dispatchers via env var.
-const SHIM_VERSION: &str = "9";
+///
+/// `10` keeps Cargo single-file Rust packages out of remote manifest planning.
+/// These use capped local execution unless the caller explicitly requires
+/// remote execution, in which case they fail before contacting the daemon.
+const SHIM_VERSION: &str = "10";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -130,6 +134,57 @@ export RCH_QUEUE_WHEN_BUSY
     format!("{policy}exec rch exec -- {command} \"$@\"")
 }
 
+/// Shared argv prefilter for both Cargo entrypoints. It mirrors the shared
+/// classifier's single-file exclusion without starting RCH for every Cargo
+/// call. Option values and test/program arguments are not routing flags.
+/// -Zscript only enables the feature; a .rs manifest/command selects a script.
+fn cargo_script_routing(command_prefix: &str) -> String {
+    format!(
+        r#"# RFC 3424 single-file packages have no remotely plannable Cargo.toml.
+cargo_single_file_package() {{
+  rch_script_subcommand=0
+  case "${{1:-}}" in +?*) shift ;; esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --)
+        [ "$rch_script_subcommand" = 0 ] || return 1
+        shift ;;
+      --manifest-path)
+        [ "$#" -ge 2 ] || return 1
+        case "$2" in *.rs) return 0 ;; esac
+        shift 2 ;;
+      --manifest-path=*.rs) return 0 ;;
+      --color|--config|-Z|-C|-p|--package|--exclude|-F|--features|-j|--jobs|\
+      --target|--target-dir|--build-dir|--lockfile-path|--message-format|\
+      --bin|--example|--test|--bench|--profile|--out-dir|--artifact-dir|\
+      --index|--registry|--token)
+        [ "$#" -ge 2 ] || return 1
+        shift 2 ;;
+      -*|+*) shift ;;
+      *)
+        if [ "$rch_script_subcommand" = 0 ]; then
+          case "$1" in *.rs) return 0 ;; esac
+          rch_script_subcommand=1
+        fi
+        shift ;;
+    esac
+  done
+  return 1
+}}
+if cargo_single_file_package {command_prefix}"$@"; then
+  # The installation's default remote policy applies only to supported builds.
+  # A caller's explicit remote-only request still forbids local compilation.
+  case "${{RCH_REQUIRE_REMOTE:-}}" in
+    ""|0|false|FALSE|no|NO|off|OFF) exec_local "$@" ;;
+    *)
+      echo "rch shim: Cargo single-file Rust packages are not supported remotely; refusing local execution while RCH_REQUIRE_REMOTE is enabled" >&2
+      exit 1 ;;
+  esac
+fi
+"#
+    )
+}
+
 /// Render the `cargo-clippy` shim.
 ///
 /// The `cargo` shim alone does not catch `cargo clippy`: build scripts, CI and
@@ -145,6 +200,7 @@ export RCH_QUEUE_WHEN_BUSY
 ///     it is normalized to `cargo clippy ...` and offloaded.
 fn cargo_clippy_shim_body(require_remote: bool) -> String {
     let offload = shim_offload(require_remote, "cargo clippy");
+    let script_routing = cargo_script_routing("clippy ");
     let default_require_remote = if require_remote { "1" } else { "0" };
     format!(
         r##"#!/bin/sh
@@ -189,6 +245,7 @@ fi
 if [ "${{1:-}}" = "clippy" ]; then
   exec_local "$@"
 fi
+{script_routing}
 # Direct invocation — normalize to `cargo clippy` and offload.
 {offload}
 "##,
@@ -207,6 +264,7 @@ fi
 /// A dispatcher box wants fail-closed; that is the default on install.
 fn cargo_shim_body(require_remote: bool) -> String {
     let offload = shim_offload(require_remote, "cargo");
+    let script_routing = cargo_script_routing("");
     let default_require_remote = if require_remote { "1" } else { "0" };
     format!(
         r##"#!/bin/sh
@@ -333,6 +391,7 @@ fi
 if [ -n "${{RUSTC_WORKSPACE_WRAPPER:-}}" ]; then
   exec_local "$@"
 fi
+{script_routing}
 # rust-analyzer must stay local (streaming JSON + local state). It is identified
 # by its distinctive rendered-ansi/short diagnostic formats. A PLAIN
 # `--message-format=json` is what scripts, CI and build tooling pass, and those
@@ -2365,6 +2424,183 @@ exit "${STUB_RCH_EXIT:-0}"
                 &fields[7..],
                 args.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_single_file_packages_use_local_argv_and_toolchain_without_remote_attempts() {
+        let cases: &[&[&str]] = &[
+            &["-Zscript", "check", "--manifest-path", "scripts/example.rs"],
+            &[
+                "+nightly",
+                "-Z",
+                "script",
+                "test",
+                "--manifest-path",
+                "script.rs",
+            ],
+            &["build", "-Zscript", "--manifest-path=script.rs"],
+            &["clippy", "-Z", "script", "--manifest-path", "script.rs"],
+            &["-Z=script", "build", "--manifest-path", "script.rs"],
+            &["-Zscript=yes", "check", "--manifest-path", "script.rs"],
+            &[
+                "check",
+                "--manifest-path",
+                "scripts/a file with ' quotes.rs",
+            ],
+            &["check", "--manifest-path=scripts/a file with ' quotes.rs"],
+            &["--", "check", "--manifest-path", "script.rs"],
+            &["+nightly", "scripts/example.rs", "--", "payload"],
+        ];
+        for strict in [false, true] {
+            for args in cases {
+                let command =
+                    shell_words::join(std::iter::once("cargo").chain(args.iter().copied()));
+                assert!(
+                    !rch_common::classify_command(&command).is_compilation,
+                    "{command}"
+                );
+                let output = record_shim(&cargo_shim_body(strict), &argv_bytes(args), &[]);
+                assert!(output.status.success(), "{args:?}: {output:?}");
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let fields = recorded_fields(&output);
+                assert_eq!(&fields[..2], &[b"LOCAL".as_slice(), b"8"], "{args:?}");
+                let expected = if args.first().is_some_and(|arg| arg.starts_with('+')) {
+                    &args[1..]
+                } else {
+                    args
+                };
+                assert_eq!(
+                    &fields[2..],
+                    expected
+                        .iter()
+                        .map(|arg| arg.as_bytes())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let output = packaging_invocation(
+            true,
+            &[
+                "+nightly",
+                "-Zscript",
+                "check",
+                "--manifest-path",
+                "script.rs",
+            ],
+            &[("RCH_SHIM_TEST_STATUS", "101"), ("CARGO_BUILD_JOBS", "2")],
+            true,
+        );
+        assert_eq!(output.status.code(), Some(101));
+        let fields = packaging_fields(&output);
+        assert_eq!(&fields[..3], &["rustup", "2", "unset"]);
+        assert_eq!(&fields[6..9], &["run", "nightly", "cargo"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_single_file_packages_honor_explicit_remote_only_policy() {
+        for strict in [false, true] {
+            for (body, args) in [
+                (
+                    cargo_shim_body(strict),
+                    vec!["-Zscript", "check", "--manifest-path", "script.rs"],
+                ),
+                (
+                    cargo_shim_body(strict),
+                    vec!["+nightly", "test", "--manifest-path=script.rs"],
+                ),
+                (
+                    cargo_clippy_shim_body(strict),
+                    vec!["-Z", "script", "--manifest-path", "script.rs"],
+                ),
+            ] {
+                for remote in ["1", "true", "TRUE", "yes", "on"] {
+                    let output =
+                        record_shim(&body, &argv_bytes(&args), &[("RCH_REQUIRE_REMOTE", remote)]);
+                    assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+                    assert!(
+                        output.stdout.is_empty(),
+                        "neither local Cargo nor RCH may execute"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr)
+                            .contains("single-file Rust packages")
+                    );
+                }
+                for remote in ["", "0", "false", "FALSE", "no", "off"] {
+                    let output =
+                        record_shim(&body, &argv_bytes(&args), &[("RCH_REQUIRE_REMOTE", remote)]);
+                    assert!(output.status.success(), "{args:?}: {output:?}");
+                    assert_eq!(recorded_fields(&output)[0], b"LOCAL");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_script_option_values_and_payload_arguments_still_offload() {
+        for args in [
+            vec!["-Zscript", "check"],
+            vec!["-Z", "script", "build"],
+            vec!["+nightly", "-Z=script", "test"],
+            vec!["check", "-Z", "script"],
+            vec!["-Zscript", "build", "--manifest-path", "Cargo.toml"],
+            vec![
+                "-Zscript",
+                "check",
+                "--manifest-path",
+                "scripts.rs/Cargo.toml",
+            ],
+            vec!["--config", "-Zscript", "check"],
+            vec!["--config=-Zscript", "check"],
+            vec!["--config", "alias.script=\"-Zscript\"", "check"],
+            vec![
+                "-Z",
+                "unstable-options",
+                "check",
+                "--manifest-path",
+                "scripts.rs/Cargo.toml",
+            ],
+            vec!["check", "--manifest-path=ordinary/Cargo.toml"],
+            vec!["check", "--manifest-path", "example.rs.toml"],
+            vec!["test", "--test", "script.rs"],
+            vec!["test", "--", "-Zscript"],
+            vec!["test", "--", "-Z", "script"],
+            vec!["run", "--", "--manifest-path", "script.rs"],
+            vec!["run", "--", "--manifest-path=script.rs"],
+            vec!["check", "--target-dir", "scripts.rs"],
+        ] {
+            let command = shell_words::join(std::iter::once("cargo").chain(args.iter().copied()));
+            assert!(
+                rch_common::classify_command(&command).is_compilation,
+                "{command}"
+            );
+            let output = record_shim(&cargo_shim_body(true), &argv_bytes(&args), &[]);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert_eq!(recorded_fields(&output)[0], b"RCH", "{args:?}");
+        }
+        for args in [
+            vec!["-Zscript", "--manifest-path", "script.rs"],
+            vec!["--manifest-path", "script.rs"],
+            vec!["--manifest-path=script.rs"],
+        ] {
+            let output = record_shim(&cargo_clippy_shim_body(true), &argv_bytes(&args), &[]);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert_eq!(recorded_fields(&output)[0], b"LOCAL");
+            let payload = [&["--"][..], args.as_slice()].concat();
+            let output = record_shim(&cargo_clippy_shim_body(true), &argv_bytes(&payload), &[]);
+            assert_eq!(recorded_fields(&output)[0], b"RCH");
+        }
+        for args in [
+            vec!["-Zscript"],
+            vec!["-Z", "script", "--manifest-path", "Cargo.toml"],
+        ] {
+            let output = record_shim(&cargo_clippy_shim_body(true), &argv_bytes(&args), &[]);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert_eq!(recorded_fields(&output)[0], b"RCH");
         }
     }
 

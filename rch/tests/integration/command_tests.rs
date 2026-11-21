@@ -3646,6 +3646,74 @@ fn exec_require_remote_flag_refuses_a_non_compilation_command() {
 
 #[cfg(unix)]
 #[test]
+fn exec_cargo_single_file_packages_never_reserve_a_worker() {
+    for cargo_args in [
+        vec!["cargo", "-Zscript", "check", "--manifest-path", "script.rs"],
+        vec![
+            "cargo",
+            "+nightly",
+            "test",
+            "-Z",
+            "script",
+            "--manifest-path",
+            "script.rs",
+        ],
+        vec!["cargo", "check", "--manifest-path=scripts/a file.rs"],
+    ] {
+        for (environment_remote, flag_remote) in [(false, false), (true, false), (false, true)] {
+            let mut args = Vec::new();
+            if flag_remote {
+                args.push("--require-remote");
+            }
+            args.push("--");
+            args.extend_from_slice(&cargo_args);
+            // The listening daemon records any request, and Cargo/SSH are
+            // explicit boundary sentinels. Script eligibility must be decided
+            // before admission, source planning, or a durable build lease.
+            let run = run_isolated_exec_with_socket(
+                "",
+                true,
+                true,
+                environment_remote,
+                &args,
+                FallbackDaemonFixture::UnconfirmedSelection,
+            );
+            let context = format!("{args:?}, remote_env={environment_remote}: {}", run.stderr);
+            let remote_required = environment_remote || flag_remote;
+            assert_eq!(
+                run.status.code(),
+                Some(i32::from(remote_required)),
+                "{context}"
+            );
+            assert_eq!(run.local_cargo_ran, !remote_required, "{context}");
+            assert!(
+                run.daemon_requests.is_empty(),
+                "{context}: {:?}",
+                run.daemon_requests
+            );
+            assert!(run.job_leases.is_empty(), "{context}");
+            assert!(!run.ssh_ran, "{context}");
+            assert!(run.incident("RCH-I011").is_none(), "{context}");
+            let envelope = run.envelope();
+            assert_eq!(
+                envelope["outcome"],
+                if remote_required {
+                    "refused"
+                } else {
+                    "completed"
+                },
+                "{context}"
+            );
+            if remote_required {
+                assert_contains(&run.stderr, "[RCH-E301]");
+                assert!(!run.stderr.contains("retryable"), "{context}");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn exec_require_remote_flag_outranks_force_local_config() {
     init_test_logging();
     // #123: RCH_REQUIRE_REMOTE=1 yields to an explicit `force_local = true`

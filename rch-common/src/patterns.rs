@@ -3039,11 +3039,62 @@ pub(crate) fn unquote_literal_option_word(token: &str) -> &str {
     }
 }
 
+/// Single-file Cargo packages do not have the Cargo.toml dependency closure
+/// required by remote source planning. Keep them local before reserving a
+/// worker. Parse argv only on the uncommon script-shaped path, so ordinary
+/// Cargo classification retains its allocation-free scan.
+/// The -Zscript feature flag alone does not select a single-file package.
+fn cargo_single_file_package(cmd: &str) -> bool {
+    if !cmd.contains(".rs") {
+        return false;
+    }
+    let Ok(words) = shell_words::split(cmd) else {
+        return false;
+    };
+    let mut args = words.iter().skip(1).map(String::as_str);
+    let mut subcommand_seen = false;
+    while let Some(arg) = args.next() {
+        match arg {
+            "--" if subcommand_seen => break,
+            "--" => {}
+            "--manifest-path" => {
+                if args.next().is_some_and(|path| path.ends_with(".rs")) {
+                    return true;
+                }
+            }
+            "--color" | "--config" | "-Z" | "-C" | "-p" | "--package" | "--exclude" | "-F"
+            | "--features" | "-j" | "--jobs" | "--target" | "--target-dir" | "--build-dir"
+            | "--lockfile-path" | "--message-format" | "--bin" | "--example" | "--test"
+            | "--bench" | "--profile" | "--out-dir" | "--artifact-dir" | "--index"
+            | "--registry" | "--token" => {
+                let _ = args.next();
+            }
+            _ if arg.starts_with("--manifest-path=") && arg.ends_with(".rs") => {
+                return true;
+            }
+            _ if arg.starts_with('-') || arg.starts_with('+') => {}
+            _ if !subcommand_seen => {
+                if arg.ends_with(".rs") {
+                    return true;
+                }
+                subcommand_seen = true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Classify cargo subcommands.
 ///
 /// Performance: uses iterator `.nth()` to avoid Vec allocation on the hot path.
 /// We only need tokens 0-3 (cargo, [+toolchain], subcommand, [nextest-subcommand]).
 fn classify_cargo(cmd: &str) -> Classification {
+    if cargo_single_file_package(cmd) {
+        return Classification::not_compilation(
+            "Cargo single-file Rust packages require local execution (remote manifest planning unsupported)",
+        );
+    }
     let mut tokens = cmd.split_whitespace();
 
     // Token 0: "cargo" (already validated by caller)
@@ -3522,6 +3573,71 @@ mod tests {
         }
     }
     use crate::test_guard;
+
+    #[test]
+    fn cargo_single_file_packages_never_reach_remote_manifest_planning() {
+        for command in [
+            "cargo -Zscript check --manifest-path scripts/example.rs",
+            "cargo +nightly -Z script test --manifest-path scripts/example.rs",
+            "cargo build -Zscript --manifest-path scripts/example.rs",
+            "cargo clippy -Z script --manifest-path scripts/example.rs",
+            "cargo -Z=script build --manifest-path scripts/example.rs",
+            "cargo -Zscript=yes check --manifest-path scripts/example.rs",
+            "cargo check --manifest-path scripts/example.rs",
+            "cargo check --manifest-path=scripts/example.rs",
+            "cargo check '--manifest-path=scripts/a file.rs'",
+            "cargo check --manifest-path 'scripts/a file.rs'",
+            "cargo check --manifest-path scripts/a\\ file.rs",
+            "cargo +nightly --color never -Zscript check --manifest-path scripts/example.rs",
+            "cargo -- check --manifest-path scripts/example.rs",
+            "cargo scripts/example.rs",
+            "RUST_LOG=debug cargo -Zscript check --manifest-path scripts/example.rs",
+            "env RUST_LOG=debug cargo check --manifest-path scripts/example.rs",
+            "cd /repo && cargo -Zscript check --manifest-path scripts/example.rs",
+            "bash -c 'cargo -Zscript test --manifest-path scripts/example.rs'",
+            "cargo -Zscript check --manifest-path scripts/example.rs > log.txt",
+        ] {
+            assert!(
+                !classify_command(command).is_compilation,
+                "single-file package must stay local: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_script_mentions_do_not_disable_ordinary_builds() {
+        for command in [
+            "cargo -Zscript check",
+            "cargo -Z script build",
+            "cargo +nightly -Z=script test",
+            "cargo check -Z script",
+            "cargo -Zscript build --manifest-path Cargo.toml",
+            "cargo -Zscript check --manifest-path scripts.rs/Cargo.toml",
+            "cargo --config=-Zscript check",
+            "cargo --config '-Zscript' check",
+            "cargo --config 'alias.script=\"-Zscript\"' check",
+            "cargo --config script.rs check",
+            "cargo -Zunstable-options check --manifest-path Cargo.toml",
+            "cargo -Z unstable-options check --manifest-path scripts.rs/Cargo.toml",
+            "cargo check --manifest-path scripts/example.rs.toml",
+            "cargo check --manifest-path=ordinary/Cargo.toml",
+            "cargo test --test script.rs",
+            "cargo test script.rs",
+            "cargo test -- -Zscript",
+            "cargo test -- -Z script",
+            "cargo run -- --manifest-path scripts/example.rs",
+            "cargo run -- --manifest-path=scripts/example.rs",
+            "cargo test --config '--manifest-path=scripts/example.rs'",
+            "cargo -Zallow-features=script check",
+            "cargo check --target-dir scripts.rs",
+            "cargo -- build --manifest-path Cargo.toml",
+        ] {
+            assert!(
+                classify_command(command).is_compilation,
+                "ordinary Cargo build must still offload: {command}"
+            );
+        }
+    }
 
     #[test]
     fn test_cargo_build_with_toolchain() {
@@ -6357,7 +6473,10 @@ mod tests_normalize_whitespace {
             ),
             ("env cargo test -- -Csub", "cargo test -- -Csub"),
             ("env cargo test -- '$OPTIONS*'", "cargo test -- '$OPTIONS*'"),
-            ("env rustc -C opt-level=2 lib.rs", "rustc -C opt-level=2 lib.rs"),
+            (
+                "env rustc -C opt-level=2 lib.rs",
+                "rustc -C opt-level=2 lib.rs",
+            ),
             ("env make -C sub", "make -C sub"),
         ] {
             assert_eq!(normalize_command(cmd), normalized, "{cmd}");
@@ -6375,7 +6494,11 @@ mod tests_normalize_whitespace {
         ] {
             let basic = classify_command(cmd);
             assert!(!basic.is_compilation, "{cmd}");
-            assert_eq!(classify_command_detailed(cmd).classification, basic, "{cmd}");
+            assert_eq!(
+                classify_command_detailed(cmd).classification,
+                basic,
+                "{cmd}"
+            );
         }
         let safe = classify_command("cd /repo/sub && cargo test");
         assert!(safe.is_compilation);
