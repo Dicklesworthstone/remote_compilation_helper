@@ -782,32 +782,105 @@ pub(super) struct RepoUpdaterSyncRoots {
     pub(super) specs: Vec<String>,
 }
 
+const MAX_CONCURRENT_ORIGIN_PROBES: usize = 8;
+const MAX_ORIGIN_RESPONSE_BYTES: usize = 16 * 1024;
+const ORIGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Origin discovery is optional preparation, not an unbounded prerequisite to
+/// direct synchronization. Keep the directly owned Git process and its output
+/// inside one deadline, including a Git process that closes stdout but stalls
+/// before exiting. Cancellation drops and kills that process as well.
+async fn probe_repo_origin(
+    mut command: Command,
+    allowance: Duration,
+) -> anyhow::Result<Option<String>> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("cannot start repository origin probe")?;
+    let stdout = child.stdout.take().context("missing origin probe stdout")?;
+    let observed = async {
+        let mut bytes = Vec::new();
+        stdout
+            .take((MAX_ORIGIN_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_ORIGIN_RESPONSE_BYTES,
+            "repository origin response exceeded its bound"
+        );
+        let status = child.wait().await?;
+        if !status.success() {
+            return Ok(None);
+        }
+        let origin = String::from_utf8_lossy(&bytes).trim().to_string();
+        Ok::<_, anyhow::Error>((!origin.is_empty()).then_some(origin))
+    };
+    let result = tokio::time::timeout(allowance, observed)
+        .await
+        .context("repository origin probe timed out")
+        .and_then(std::convert::identity);
+    if result.is_err() {
+        // Do not leave a timed-out or overproducing Git process running while
+        // direct source sync proceeds. The kill-on-drop owner remains active
+        // if cancellation interrupts this bounded reap.
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    }
+    result
+}
+
 pub(super) async fn collect_repo_updater_roots_and_specs(
     sync_roots: &[PathBuf],
 ) -> RepoUpdaterSyncRoots {
-    let mut specs = std::collections::BTreeSet::new();
-    let mut roots = Vec::new();
-
-    for root in sync_roots {
-        let output = Command::new("git")
+    collect_repo_updater_roots_with(sync_roots, |root| async move {
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(root)
             .arg("remote")
             .arg("get-url")
-            .arg("origin")
-            .output()
-            .await;
+            .arg("origin");
+        probe_repo_origin(command, ORIGIN_PROBE_TIMEOUT)
+            .await
+            .ok()
+            .flatten()
+    })
+    .await
+}
 
-        let Ok(output) = output else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !remote.is_empty() {
+async fn collect_repo_updater_roots_with<F, Fut>(
+    sync_roots: &[PathBuf],
+    mut probe: F,
+) -> RepoUpdaterSyncRoots
+where
+    F: FnMut(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    use futures::StreamExt;
+
+    // Futures remain in this task: dropping preparation drops every active
+    // process owner. Unordered polling lets later roots progress when an early
+    // Git probe stalls, without spawning one process per closure entry at once.
+    let mut completed =
+        futures::stream::iter(sync_roots.iter().enumerate().map(|(index, root)| {
+            let origin = probe(root.clone());
+            async move { (index, root, origin.await) }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_ORIGIN_PROBES)
+        .collect::<Vec<_>>()
+        .await;
+    completed.sort_by_key(|(index, _, _)| *index);
+
+    let mut specs = std::collections::BTreeSet::new();
+    let mut roots = Vec::new();
+    for (_, root, origin) in completed {
+        if let Some(origin) = origin {
             roots.push(root.clone());
-            specs.insert(remote);
+            specs.insert(origin);
         }
     }
 
@@ -865,4 +938,294 @@ async fn detect_remote_unsuitable_sync_roots(
     }
 
     Ok(unsuitable)
+}
+
+#[cfg(test)]
+mod origin_probe_tests {
+    use super::*;
+
+    fn git_command(root: &Path, home: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(root)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        command
+    }
+
+    async fn git_ok(root: &Path, home: &Path, args: &[&str]) {
+        let output = git_command(root, home).args(args).output().await.unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+
+    async fn wait_for_probe_pids(paths: &[PathBuf]) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while paths.iter().any(|path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .is_none()
+            }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("origin probe processes did not reach their fixture barrier");
+    }
+
+    async fn assert_processes_reaped(paths: &[PathBuf]) {
+        let pids: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let pid = std::fs::read_to_string(path)
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap();
+                rustix::process::Pid::from_raw(pid).unwrap()
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pids
+                .iter()
+                .any(|pid| rustix::process::test_kill_process(*pid) != Err(rustix::io::Errno::SRCH))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an owned origin probe survived cancellation or its deadline");
+    }
+
+    #[tokio::test]
+    async fn origin_discovery_preserves_git_rewrites_and_distinct_worktree_origins() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let home = retained.join("home");
+        let root = retained.join("repo-'\n");
+        let linked = retained.join("linked");
+        let no_origin = retained.join("no-origin");
+        for directory in [&home, &root, &no_origin] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        git_ok(&root, &home, &["init", "-q", "--initial-branch=main"]).await;
+        git_ok(
+            &root,
+            &home,
+            &[
+                "config",
+                "url.https://example.invalid/.insteadOf",
+                "fixture:",
+            ],
+        )
+        .await;
+        git_ok(
+            &root,
+            &home,
+            &["config", "extensions.worktreeConfig", "true"],
+        )
+        .await;
+        git_ok(
+            &root,
+            &home,
+            &[
+                "config",
+                "--worktree",
+                "remote.origin.url",
+                "fixture:source.git",
+            ],
+        )
+        .await;
+        git_ok(
+            &root,
+            &home,
+            &[
+                "-c",
+                "user.name=Origin Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "initial",
+            ],
+        )
+        .await;
+        git_ok(
+            &root,
+            &home,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .await;
+        git_ok(
+            &linked,
+            &home,
+            &[
+                "config",
+                "--worktree",
+                "remote.origin.url",
+                "fixture:linked.git",
+            ],
+        )
+        .await;
+        git_ok(&no_origin, &home, &["init", "-q"]).await;
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let roots = [
+            linked.clone(),
+            root.clone(),
+            retained.join("missing"),
+            no_origin,
+            nested.clone(),
+        ];
+        let collected = collect_repo_updater_roots_with(&roots, |root| {
+            let mut command = git_command(&root, &home);
+            command.args(["remote", "get-url", "origin"]);
+            async move {
+                probe_repo_origin(command, ORIGIN_PROBE_TIMEOUT)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        })
+        .await;
+        assert_eq!(collected.roots, [linked, root, nested]);
+        assert_eq!(
+            collected.specs,
+            [
+                "https://example.invalid/linked.git",
+                "https://example.invalid/source.git",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_probe_bounds_bytes_and_waits_for_successful_process_exit() {
+        for (script, accepted) in [
+            ("printf 'https://example.invalid/repo.git\\n'", true),
+            (
+                "read unused || printf 'https://example.invalid/repo.git\\n'",
+                true,
+            ),
+            (
+                "printf 'https://example.invalid/repo.git\\n'; exit 1",
+                false,
+            ),
+            ("exit 0", false),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            let origin = probe_repo_origin(command, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(origin.is_some(), accepted, "{script}");
+        }
+        let mut overflow = Command::new("sh");
+        overflow.args(["-c", "printf '%16385s' ''"]);
+        let error = probe_repo_origin(overflow, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeded its bound"),
+            "{error:#}"
+        );
+
+        let retained = tempfile::tempdir().unwrap().keep();
+        for (case, script) in [
+            "printf '%s\\n' \"$$\" > \"$1\"; exec sleep 30",
+            "printf '%s\\n' \"$$\" > \"$1\"; exec 1>&-; exec sleep 30",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pid = retained.join(format!("{case}.pid"));
+            let mut command = Command::new("sh");
+            command.args(["-c", script, "origin-fixture"]).arg(&pid);
+            let error = probe_repo_origin(command, Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("timed out"), "{error:#}");
+            assert_processes_reaped(&[pid]).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_discovery_admits_later_roots_without_waiting_for_the_first() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let roots: Vec<_> = (0..MAX_CONCURRENT_ORIGIN_PROBES + 3)
+            .map(|index| retained.join(index.to_string()))
+            .collect();
+        let last_started = roots.last().unwrap().with_extension("started");
+        let collected = collect_repo_updater_roots_with(&roots, |root| {
+            let mut command = Command::new("sh");
+            // The first process cannot finish until a root beyond the initial
+            // window has run. Sequential execution or ordered head blocking
+            // would time it out and lose an otherwise valid repository.
+            command
+                .args([
+                    "-c",
+                    "printf started > \"$1.started\"; if [ \"${1##*/}\" = 0 ]; then while [ ! -f \"$2\" ]; do sleep 0.01; done; fi; printf 'https://example.invalid/%s.git\\n' \"${1##*/}\"",
+                    "origin-fixture",
+                ])
+                .arg(&root)
+                .arg(&last_started);
+            async move {
+                probe_repo_origin(command, Duration::from_secs(5))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        })
+        .await;
+        assert_eq!(collected.roots, roots);
+        assert_eq!(collected.specs.len(), roots.len());
+    }
+
+    #[tokio::test]
+    async fn cancelling_origin_discovery_drops_every_bounded_process_owner() {
+        let retained = tempfile::tempdir().unwrap().keep();
+        let roots: Vec<_> = (0..MAX_CONCURRENT_ORIGIN_PROBES + 3)
+            .map(|index| retained.join(format!("{index}.pid")))
+            .collect();
+        let mut discovery = Box::pin(collect_repo_updater_roots_with(&roots, |root| {
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "printf '%s\\n' \"$$\" > \"$1\"; exec sleep 30",
+                    "origin-fixture",
+                ])
+                .arg(root);
+            async move {
+                probe_repo_origin(command, Duration::from_secs(20))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        }));
+        tokio::select! {
+            _ = &mut discovery => panic!("stalled origin discovery completed unexpectedly"),
+            () = wait_for_probe_pids(&roots[..MAX_CONCURRENT_ORIGIN_PROBES]) => {},
+        }
+        drop(discovery);
+        assert!(
+            roots[MAX_CONCURRENT_ORIGIN_PROBES..]
+                .iter()
+                .all(|root| !root.exists())
+        );
+        assert_processes_reaped(&roots[..MAX_CONCURRENT_ORIGIN_PROBES]).await;
+    }
 }
