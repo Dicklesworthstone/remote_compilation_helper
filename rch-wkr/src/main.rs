@@ -111,6 +111,12 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
+    /// Internal exact CMake final-output query for generated Unix Makefiles.
+    #[command(hide = true)]
+    CmakeOutputs {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
     /// Start a new session, then exec the command (Darwin has setsid(2) but
     /// no setsid(1)). Internal: used by the remote build launcher.
     #[cfg(unix)]
@@ -495,6 +501,9 @@ fn main() -> Result<()> {
     if let Commands::ArtifactHeaders { arguments } = &cli.command {
         std::process::exit(artifact_headers::main(arguments));
     }
+    if let Commands::CmakeOutputs { arguments } = &cli.command {
+        std::process::exit(rch_common::cmake_outputs::main(arguments));
+    }
     if let Commands::FileSync { arguments } = &cli.command {
         std::process::exit(file_sync::main(arguments));
     }
@@ -651,6 +660,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::ArtifactHeaders { .. } => {
             anyhow::bail!("artifact-headers requires the synchronous worker entry point")
+        }
+        Commands::CmakeOutputs { .. } => {
+            anyhow::bail!("cmake-outputs requires the synchronous worker entry point")
         }
         Commands::ProcessIdentity { pid } => print_process_identity(pid),
         Commands::RecoveryReserve { .. } => {

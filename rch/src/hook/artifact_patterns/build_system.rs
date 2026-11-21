@@ -1,4 +1,4 @@
-//! Exact Ninja graph outputs for direct Ninja and Ninja-backed CMake/Meson.
+//! Exact graph outputs for Ninja, CMake Unix Makefiles and Ninja-backed Meson.
 //!
 //! A build directory can contain source files, and its graph may write outputs
 //! in a sibling directory. Neither -C nor --build authorizes recursive copies.
@@ -66,19 +66,23 @@ impl BuildSystemOutputDiscovery {
         if executable != "ninja" {
             words[executable_index] = "ninja".into();
         }
-        let fallback = manifest_query(&directory, &manifest, &words)?;
-        let query = if let Some(configuration) = configuration {
-            // Ninja Multi-Config executes build-<config>.ninja. Ordinary
-            // single-config CMake ignores --config and still uses build.ninja.
-            // An existing non-regular candidate must fail its guards rather
-            // than silently choose a different configuration's graph.
-            let manifest = format!("build-{configuration}.ninja");
-            let selected = manifest_query(&directory, &manifest, &words)?;
-            let path = relative_output(&directory, &manifest)?;
-            let path = shell_words::quote(path.to_str()?);
-            format!("if test -e {path} || test -L {path}; then {selected}; else {fallback}; fi")
+        let ninja = manifest_query(&directory, &manifest, &words)?;
+        let query = if executable == "cmake" {
+            let (multi, legacy) = if let Some(configuration) = configuration {
+                let manifest = format!("build-{configuration}.ninja");
+                let selected = manifest_query(&directory, &manifest, &words)?;
+                let path = relative_output(&directory, &manifest)?;
+                let path = shell_words::quote(path.to_str()?);
+                let legacy = format!(
+                    "if test -e {path} || test -L {path}; then {selected}; else {ninja}; fi"
+                );
+                (selected, legacy)
+            } else {
+                (ninja.clone(), ninja.clone())
+            };
+            cmake_backend_query(&directory, &words, &ninja, &multi, &legacy)?
         } else {
-            fallback
+            ninja
         };
         Some(Self { directory, query })
     }
@@ -99,9 +103,11 @@ impl BuildSystemOutputDiscovery {
         );
         let text = std::str::from_utf8(stdout).context("non-UTF-8 Ninja output listing")?;
         let mut lines = text.split_terminator('\n');
+        let header = lines.next();
         anyhow::ensure!(
-            lines.next() == Some(OUTPUT_HEADER),
-            "missing Ninja output-root header"
+            header == Some(OUTPUT_HEADER)
+                || header == Some(rch_common::cmake_outputs::OUTPUT_HEADER),
+            "missing build output-root header"
         );
         let logical_root = lines
             .next()
@@ -171,6 +177,65 @@ impl BuildSystemOutputDiscovery {
         }
         Ok(patterns)
     }
+}
+
+fn cmake_backend_query(
+    directory: &Path,
+    executable: &[String],
+    ninja: &str,
+    multi: &str,
+    legacy: &str,
+) -> Option<String> {
+    // Backend files can survive reconfiguration. A present, complete cache
+    // chooses the graph; unknown or damaged metadata must never select stale
+    // Ninja files. Keep existing Ninja installations compatible with older
+    // workers by validating this small cache field without a new worker RPC.
+    let cache = directory.join("CMakeCache.txt");
+    let cache = shell_words::quote(cache.to_str()?);
+    let makefiles = cmake_makefiles_query(directory, executable)?;
+    Some(format!(
+        "if test -e {cache} || test -L {cache}; then \
+         if ! (test -f {cache} && test ! -L {cache} && \
+           test \"$(wc -c < {cache})\" -le 4194304 && \
+           test -z \"$(tail -c 1 {cache})\" && \
+           test \"$(LC_ALL=C grep -c '^CMAKE_GENERATOR:INTERNAL=' {cache})\" = 1); then \
+           printf '%s\\n' 'RCH_CMAKE_OUTPUTS_REFUSED: invalid CMake generator cache' >&2; exit 73; fi; \
+         case \"$(LC_ALL=C grep '^CMAKE_GENERATOR:INTERNAL=' {cache})\" in \
+           'CMAKE_GENERATOR:INTERNAL=Unix Makefiles') {makefiles};; \
+           'CMAKE_GENERATOR:INTERNAL=Ninja') ({ninja}) || exit 73;; \
+           'CMAKE_GENERATOR:INTERNAL=Ninja Multi-Config') ({multi}) || exit 73;; \
+           'CMAKE_GENERATOR:INTERNAL=') exit 73;; \
+           *) exit 3;; \
+         esac; else {legacy}; fi"
+    ))
+}
+
+fn cmake_makefiles_query(directory: &Path, executable: &[String]) -> Option<String> {
+    let directory = directory.to_str()?.to_owned();
+    let directory = if directory.is_empty() {
+        "."
+    } else {
+        &directory
+    };
+    let cache = Path::new(directory).join("CMakeCache.txt");
+    let cache = shell_words::quote(cache.to_str()?);
+    let selected = shell_words::quote(directory);
+    let probe = shell_words::quote(rch_common::cmake_outputs::PROBE_REPLY);
+    let script = format!(
+        "if test -e {cache} || test -L {cache}; then \
+         {locate}\
+         if ! rch_wkr_locate; then \
+           printf '%s\\n' 'RCH_CMAKE_OUTPUTS_REFUSED: rch-wkr is not installed' >&2; exit 73; fi; \
+         if [ \"$(\"$RCH_WKR\" cmake-outputs probe 2>/dev/null)\" != {probe} ]; then \
+           printf '%s\\n' 'RCH_CMAKE_OUTPUTS_REFUSED: deploy rch-wkr with cmake-outputs support' >&2; exit 73; fi; \
+         exec \"$RCH_WKR\" cmake-outputs list {selected}; else exit 3; fi",
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+    );
+    // Preserve the literal environment/wrapper prefix from the CMake command,
+    // but do not run CMake a second time or evaluate generated Make recipes.
+    let mut words = executable[..executable.len().checked_sub(1)?].to_vec();
+    words.extend(["sh".into(), "-c".into(), script]);
+    Some(super::super::join_exec_command(&words))
 }
 
 fn manifest_query(directory: &Path, manifest: &str, executable: &[String]) -> Option<String> {
@@ -939,6 +1004,283 @@ mod tests {
                 .unwrap();
             assert_eq!(output.status.code(), Some(3), "{command}: {output:?}");
             assert!(output.stdout.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmake_makefiles_query_refuses_an_old_worker_before_returning_a_partial_graph() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("obj")).unwrap();
+        std::fs::write(
+            root.path().join("obj/CMakeCache.txt"),
+            b"CMAKE_GENERATOR:INTERNAL=Unix Makefiles\n",
+        )
+        .unwrap();
+        let old_worker = root.path().join("old-worker");
+        std::fs::write(&old_worker, b"#!/bin/sh\nexit 2\n").unwrap();
+        std::fs::set_permissions(&old_worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let discovery = BuildSystemOutputDiscovery::for_command(
+            Some(CompilationKind::CmakeBuild),
+            "cmake --build obj",
+        )
+        .unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", discovery.query()])
+            .env("RCH_WKR_BIN", &old_worker)
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cmake-outputs support"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmake_cache_selects_its_generator_despite_stale_ninja_manifests() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let build = root.path().join("obj");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&build).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        for name in ["build.ninja", "build-Release.ninja"] {
+            std::fs::write(build.join(name), b"stale or current graph\n").unwrap();
+        }
+        let ninja = bin.join("ninja");
+        std::fs::write(&ninja, b"#!/bin/sh\nprintf 'selected-%s: link\\n' \"$4\"\n").unwrap();
+        std::fs::set_permissions(&ninja, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let discovery = BuildSystemOutputDiscovery::for_command(
+            Some(CompilationKind::CmakeBuild),
+            "cmake --build obj --config Release",
+        )
+        .unwrap();
+        for (cache, status, selected) in [
+            (
+                "CMAKE_GENERATOR:INTERNAL=Ninja\n",
+                0,
+                Some("selected-build.ninja"),
+            ),
+            (
+                "CMAKE_GENERATOR:INTERNAL=Ninja Multi-Config\n",
+                0,
+                Some("selected-build-Release.ninja"),
+            ),
+            ("CMAKE_GENERATOR:INTERNAL=Xcode\n", 3, None),
+            ("CMAKE_GENERATOR:INTERNAL=Ninja", 73, None),
+            ("CMAKE_GENERATOR:INTERNAL=\n", 73, None),
+            ("CMAKE_CACHEFILE_DIR:INTERNAL=/tmp/obj\n", 73, None),
+            (
+                "CMAKE_GENERATOR:INTERNAL=Ninja\nCMAKE_GENERATOR:INTERNAL=Ninja Multi-Config\n",
+                73,
+                None,
+            ),
+        ] {
+            std::fs::write(build.join("CMakeCache.txt"), cache).unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", discovery.query()])
+                .env("PATH", &path)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(status), "{cache}: {output:?}");
+            if let Some(selected) = selected {
+                let expected = format!("obj/{selected}");
+                assert!(
+                    discovery
+                        .resolve(&output.stdout)
+                        .unwrap()
+                        .contains(&expected)
+                );
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+            }
+        }
+        std::fs::write(
+            build.join("CMakeCache.txt"),
+            b"CMAKE_GENERATOR:INTERNAL=Ninja Multi-Config\n",
+        )
+        .unwrap();
+        std::fs::rename(
+            build.join("build-Release.ninja"),
+            build.join("retained.ninja"),
+        )
+        .unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", discovery.query()])
+            .env("PATH", &path)
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(output.stdout.is_empty());
+        std::fs::rename(build.join("CMakeCache.txt"), build.join("retained-cache")).unwrap();
+        std::os::unix::fs::symlink("retained-cache", build.join("CMakeCache.txt")).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", discovery.query()])
+            .env("PATH", &path)
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires CMake, make, a C compiler, rsync and RCH_WKR_BIN built from this tree"]
+    async fn real_cmake_makefiles_outputs_use_guarded_retrieval_without_backend_files() {
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        async fn run(command: &mut Command) -> std::process::Output {
+            let output = rch_common::ssh::capture_control_output(
+                command,
+                None,
+                1024 * 1024,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
+            .await
+            .expect("CMake/retrieval fixture failed or exceeded its deadline");
+            assert!(output.status.success(), "{command:?}: {output:?}");
+            output
+        }
+
+        let binary = PathBuf::from(
+            std::env::var_os("RCH_WKR_BIN").expect("set RCH_WKR_BIN to the matching built worker"),
+        );
+        assert!(binary.is_file());
+        for build_dir in ["cmake-build-debug", "build"] {
+            let owner = tempfile::tempdir().unwrap();
+            let worker = owner.path().join("worker");
+            let local = owner.path().join("caller");
+            let stage = owner.path().join("stage");
+            for root in [&worker, &local, &stage] {
+                std::fs::create_dir_all(root.join(build_dir)).unwrap();
+            }
+            std::fs::write(
+                worker.join("CMakeLists.txt"),
+                concat!(
+                    "cmake_minimum_required(VERSION 3.20)\nproject(rch_make_output C)\n",
+                    "set(CMAKE_RUNTIME_OUTPUT_DIRECTORY \"${CMAKE_BINARY_DIR}/nested products\")\n",
+                    "add_library(sample STATIC value.c)\nadd_executable(app main.c)\n",
+                    "target_link_libraries(app PRIVATE sample)\n",
+                ),
+            )
+            .unwrap();
+            std::fs::write(worker.join("value.c"), b"int value(void) { return 37; }\n").unwrap();
+            std::fs::write(worker.join("main.c"),
+                b"#include <stdio.h>\nint value(void); int main(void) { puts(\"cmake-makefiles-delivered\"); return value() == 37 ? 0 : 1; }\n").unwrap();
+            for name in ["CMakeLists.txt", "value.c", "main.c"] {
+                std::fs::write(local.join(name), b"caller source sentinel\n").unwrap();
+            }
+            for name in [
+                "CMakeCache.txt",
+                "Makefile",
+                "cmake_install.cmake",
+                "build.ninja",
+            ] {
+                std::fs::write(
+                    local.join(build_dir).join(name),
+                    b"caller backend sentinel\n",
+                )
+                .unwrap();
+            }
+            run(Command::new("cmake")
+                .args(["-S", ".", "-B", build_dir, "-G", "Unix Makefiles"])
+                .current_dir(&worker))
+            .await;
+            run(Command::new("cmake")
+                .args(["--build", build_dir, "--parallel", "1"])
+                .current_dir(&worker))
+            .await;
+            assert!(!worker.join(build_dir).join(".cmake/api/v1/reply").exists());
+            // A backend left behind by a previous configuration is not the
+            // completed build's graph. No Ninja installation is needed here.
+            std::fs::write(
+                worker.join(build_dir).join("build.ninja"),
+                b"build stale-output: phony\n",
+            )
+            .unwrap();
+            let text = format!(
+                "cmake --build {} --config Release",
+                shell_words::quote(build_dir)
+            );
+            let discovery =
+                BuildSystemOutputDiscovery::for_command(Some(CompilationKind::CmakeBuild), &text)
+                    .unwrap();
+            let output = run(Command::new("sh")
+                .args(["-c", discovery.query()])
+                .env("RCH_WKR_BIN", &binary)
+                .current_dir(&worker))
+            .await;
+            assert!(
+                output.stdout.starts_with(
+                    format!("{}\n", rch_common::cmake_outputs::OUTPUT_HEADER).as_bytes()
+                )
+            );
+            let selected = discovery.resolve(&output.stdout).unwrap();
+            let executable = format!("{build_dir}/nested products/app");
+            let archive = format!("{build_dir}/libsample.a");
+            assert!(selected.contains(&executable));
+            assert!(selected.contains(&archive));
+            let selected = merge_patterns(&default_c_cpp_artifact_patterns(), &selected);
+            let configuration = rch_common::WorkerConfig::default();
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "makefiles".into(),
+                "makefiles-identity".into(),
+                TransferConfig::default(),
+            )
+            .with_local_root(stage.clone());
+            let mut retrieval =
+                pipeline.local_artifact_retrieval_for_test(&configuration, &worker, &selected);
+            run(&mut retrieval).await;
+            for path in [&executable, &archive] {
+                assert_eq!(
+                    std::fs::read(stage.join(path)).unwrap(),
+                    std::fs::read(worker.join(path)).unwrap()
+                );
+            }
+            for name in [
+                "CMakeCache.txt",
+                "Makefile",
+                "cmake_install.cmake",
+                "CMakeFiles",
+                "build.ninja",
+            ] {
+                assert!(
+                    !stage.join(build_dir).join(name).exists(),
+                    "published backend {name}"
+                );
+            }
+            for name in ["CMakeLists.txt", "main.c", "value.c"] {
+                assert!(!stage.join(name).exists(), "published source {name}");
+                assert_eq!(
+                    std::fs::read(local.join(name)).unwrap(),
+                    b"caller source sentinel\n"
+                );
+            }
+            for name in [
+                "CMakeCache.txt",
+                "Makefile",
+                "cmake_install.cmake",
+                "build.ninja",
+            ] {
+                assert_eq!(
+                    std::fs::read(local.join(build_dir).join(name)).unwrap(),
+                    b"caller backend sentinel\n"
+                );
+            }
+            let output = run(&mut Command::new(stage.join(&executable))).await;
+            assert_eq!(output.stdout, b"cmake-makefiles-delivered\n");
         }
     }
 
