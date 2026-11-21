@@ -53,8 +53,9 @@ entrypoint remains available for explicit one-off profiles.
 
 ## Native canonical Cargo entry point
 
-`rabs-cargo` is the Rust command-line entry point for the local canonical driver
-and the shared remote coordinator. It accepts the native
+`rabs-cargo` is the Rust command-line entry point for ordinary local Cargo,
+RCH remote execution, the local canonical driver and the shared remote
+coordinator. Its canonical modes accept the native
 `canonical-compile-local-v1` and `canonical-compile-remote-v1` profiles described
 below. It exposes `build`, `check`, `clippy`, `doc`, `test`, `run`, and `bench`,
 including executing `run`/`test`/`bench` with explicitly closed or captured file input.
@@ -124,6 +125,49 @@ This executable can also be installed independently with
 `cargo install --locked --path rabs-cli --bin rabs-cargo`; select the matching
 driver explicitly when it is installed elsewhere. This source-build command
 does not establish that a published release bundle contains the executable.
+
+### Ordinary local Cargo with native cache preparation
+
+The profile-free `--cache` mode uses the same bounded native preparation owner
+as the RCH worker adapter:
+
+```sh
+rabs-cargo --cache -- check --workspace
+rabs-cargo --cache -- +nightly test -- --nocapture
+CARGO_RABS_WORKER=/absolute/rch-wkr rabs-cargo --cache -- build --release
+```
+
+This Linux mode requires matching `rch-wkr`, `rabs-wrap` and `rabsd` executables.
+The frontend selects `rch-wkr` from `CARGO_RABS_WORKER`, its own physical sibling
+directory, or PATH, in that order. It selects Cargo from the literal `CARGO`
+override or PATH and preserves its final symlink spelling for Rustup proxies.
+With no Cargo arguments it selects `build`. It creates no canonical profile,
+changes no working directory, and preserves opaque Unix arguments, stdin,
+environment, exit status, signals and inherited jobserver descriptors.
+
+There is one handoff to `rch-wkr worker-cache --protocol v1 -- CARGO ...`.
+That existing native owner prepares or attaches to the local daemon, verifies
+its readiness and execs Cargo once. It honors `CARGO_RABS_WRAP`,
+`CARGO_RABS_DAEMON`, state/socket/startup settings and explicit wrapper opt-outs.
+A confirmed setup failure can run stock Cargo; an uncertain setup cleanup
+cannot. Missing or incompatible `rch-wkr` refuses before Cargo starts. The
+frontend never retries a compiler or silently selects a different helper after
+an explicit executable override fails.
+
+If `CARGO_RABS_ROOT_BUDGET_DIR`, `CARGO_RABS_ROOT_CAPACITY` and
+`CARGO_RABS_ROOT_CGROUP` request local root admission, all three must be present
+and no root may already be active. The execution chain includes the existing
+`rabs-cargo-root` owner, selected by `CARGO_RABS_ROOT_HELPER` or sibling/PATH.
+That owner validates the capacity, delegated cgroup and durable budget before
+starting Cargo. Cache setup failure never bypasses requested admission.
+
+Readiness does not authorize a cache hit: the existing wrapper, coordinator,
+input closure, publication, sampling and serving rules still decide each
+compiler action. This mode performs local builds and retains ordinary Cargo
+paths. For RCH remote execution with worker-local preparation, use the separate
+[`rabs-cargo --rch` mode](rabs-rch-worker-cache.md#direct-cargo-entry-point).
+Native frontend tests exercise real process handoff with explicit helper
+fixtures; compiler reuse and fleet performance require their own qualification.
 
 ## Profile and prerequisites
 
@@ -308,6 +352,17 @@ preview stops early presentation; the verified result supplies the unseen
 suffix. **Stdout remains behind verified completion and artifact installation**,
 because Cargo's stdout can announce artifact readiness. Early diagnostics do not
 establish build success or authorize another execution.
+
+On Linux, waiting, following and replaying clients use bounded writes to pipes,
+sockets and terminals without changing the caller's descriptor flags. Their
+requested wait deadline also bounds live output. Once a terminal job is observed,
+verification and final replay share at most five further minutes inside that
+original deadline. A stalled consumer or partial write exits with an error and
+never restarts the build; the durable job remains available under the same ID.
+Failure reporting has its own short bound so a full stderr pipe cannot trap the
+client a second time. Regular-file writes retain their original offset and
+append semantics; kernel-blocked filesystem operations are not a hard real-time
+deadline guarantee.
 
 `live_stderr` accepts only `true` or `false` and requires an explicit, valid
 `daemon_socket`, even when set to `false`. Direct worker profiles and local

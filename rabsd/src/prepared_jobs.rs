@@ -13,6 +13,8 @@ use rabs_asupersync::daemon_runtime::SubsystemWork;
 use rabsd::coord::live::CoordLive;
 use rabsd::coord::prepared_operation::PreparedOperationStore;
 use serde_json::{Value, json};
+use std::cell::Cell;
+use std::fmt::Display;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
 use std::pin::pin;
@@ -23,6 +25,156 @@ use std::time::{Duration, Instant};
 
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 const CLIENT_BUDGET: Duration = Duration::from_secs(20);
+const COMPLETION_BUDGET: Duration = Duration::from_secs(300);
+#[cfg(target_os = "linux")]
+const ERROR_REPORT_BUDGET: Duration = Duration::from_millis(100);
+
+/// A waiting client's own deadline, separate from the durable job's lifetime.
+/// Completion shortens both subsequent verification and already-open writers;
+/// neither a slow console nor a final replay starts a fresh wait budget.
+struct ClientDeadline {
+    until: Cell<Instant>,
+    #[cfg(target_os = "linux")]
+    output: rabsd::OutputDeadline,
+}
+
+impl ClientDeadline {
+    fn new(until: Instant) -> Self {
+        Self {
+            until: Cell::new(until),
+            #[cfg(target_os = "linux")]
+            output: rabsd::OutputDeadline::new(until),
+        }
+    }
+
+    fn get(&self) -> Instant {
+        self.until.get()
+    }
+
+    fn limit(&self, until: Instant) {
+        let until = self.get().min(until);
+        self.until.set(until);
+        #[cfg(target_os = "linux")]
+        self.output.limit(until);
+    }
+
+    fn complete(&self) -> Instant {
+        self.limit(Instant::now() + COMPLETION_BUDGET);
+        self.get()
+    }
+}
+
+/// Own only this reader's console descriptions. The ordinary process signal
+/// dispositions remain intact; no job cancellation, result recovery or retry
+/// is attached to either writer's lifetime.
+fn with_client_console<T>(
+    deadline: &ClientDeadline,
+    work: impl FnOnce(&mut dyn Write, &mut dyn Write) -> io::Result<T>,
+) -> io::Result<T> {
+    #[cfg(target_os = "linux")]
+    {
+        client_console_to(&io::stdout(), &io::stderr(), deadline, work)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        remaining(deadline.get())?;
+        work(&mut io::stdout().lock(), &mut io::stderr().lock())
+    }
+}
+
+/// NDJSON follow has only a stdout sink. Its error reporter owns stderr
+/// separately, so an unused closed or read-only stderr cannot reject a reader.
+fn with_client_stdout<T>(
+    deadline: &ClientDeadline,
+    work: impl FnOnce(&mut dyn Write) -> io::Result<T>,
+) -> io::Result<T> {
+    #[cfg(target_os = "linux")]
+    {
+        let stopped = AtomicBool::new(false);
+        let mut stdout = rabsd::ControlledOutput::with_deadline(
+            &io::stdout(),
+            &stopped,
+            deadline.output.clone(),
+        )?;
+        work(&mut stdout)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        remaining(deadline.get())?;
+        work(&mut io::stdout().lock())
+    }
+}
+
+fn write_client_status(message: impl Display) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        write_client_record_to(&io::stderr(), message, CLIENT_BUDGET)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "{message}")?;
+        stderr.flush()
+    }
+}
+
+fn write_client_reply(message: impl Display) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        write_client_record_to(&io::stdout(), message, CLIENT_BUDGET)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{message}")?;
+        stdout.flush()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_client_record_to(
+    output: &impl std::os::fd::AsFd,
+    message: impl Display,
+    budget: Duration,
+) -> io::Result<()> {
+    let stopped = AtomicBool::new(false);
+    let mut output = rabsd::ControlledOutput::new(output, &stopped, Instant::now() + budget)?;
+    writeln!(output, "{message}")?;
+    output.flush()
+}
+
+#[cfg(target_os = "linux")]
+fn client_console_to<T>(
+    stdout: &impl std::os::fd::AsFd,
+    stderr: &impl std::os::fd::AsFd,
+    deadline: &ClientDeadline,
+    work: impl FnOnce(&mut dyn Write, &mut dyn Write) -> io::Result<T>,
+) -> io::Result<T> {
+    let stopped = AtomicBool::new(false);
+    let mut stdout =
+        rabsd::ControlledOutput::with_deadline(stdout, &stopped, deadline.output.clone())?;
+    let mut stderr =
+        rabsd::ControlledOutput::with_deadline(stderr, &stopped, deadline.output.clone())?;
+    work(&mut stdout, &mut stderr)
+}
+
+/// Failure reporting gets a small, independent bound. Reusing the failed sink
+/// or an unbounded eprintln! here could strand a client after its real timeout.
+pub(crate) fn report_client_error(message: impl Display) {
+    #[cfg(target_os = "linux")]
+    {
+        report_client_error_to(&io::stderr(), message);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = writeln!(io::stderr().lock(), "{message}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn report_client_error_to(output: &impl std::os::fd::AsFd, message: impl Display) {
+    let _ = write_client_record_to(output, message, ERROR_REPORT_BUDGET);
+}
 
 struct Drivers {
     store: Arc<PreparedOperationStore>,
@@ -387,7 +539,7 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
     let request = match parsed {
         Ok(request) => request,
         Err(detail) => {
-            eprintln!(
+            report_client_error(format_args!(
                 "rabsd: {detail}\n\
                 --job-submit <id32hex> <listen-IP:port> <worker> <pin> <bundle> <delivery> <output>\n\
                 --job-submit-allocated <id32hex> <listen-IP:port> <worker> <pin> <template-bundle> <delivery> <output>\n\
@@ -400,31 +552,28 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
                 --job-acknowledge <id32hex> <owned-delivery>\n\
                 --job-recover-local <id32hex> <owned-delivery>\n\
                 Paths must be absolute; reuse the same job ID to inspect an uncertain response."
-            );
+            ));
             return 2;
         }
     };
     match exchange(socket, &request) {
         Ok(reply) => {
             let code = i32::from(reply["kind"] == "prepared-operation-error");
-            let result = writeln!(io::stdout().lock(), "{reply}");
+            let result = write_client_reply(reply);
             if let Err(error) = result {
-                eprintln!(
+                report_client_error(format_args!(
                     "rabsd: job reply could not be written: {error}; inspect job {}",
                     args[1]
-                );
+                ));
                 return 1;
             }
             code
         }
         Err(error) => {
-            eprintln!(
-                "{}",
-                json!({
-                    "kind":"prepared-client-error", "operation_id":args[1],
-                    "detail":error.to_string(), "outcome_unconfirmed":true, "reexecute":false,
-                })
-            );
+            report_client_error(json!({
+                "kind":"prepared-client-error", "operation_id":args[1],
+                "detail":error.to_string(), "outcome_unconfirmed":true, "reexecute":false,
+            }));
             1
         }
     }
@@ -433,6 +582,87 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reader stays open without consuming a byte. A regressed blocking
+    /// writer is released only after the watchdog has recorded failure, so the
+    /// test never leaves a stranded native thread behind.
+    #[cfg(target_os = "linux")]
+    pub(super) fn with_full_pipe<T: Send + 'static>(
+        case: impl FnOnce(std::fs::File) -> T + Send + 'static,
+    ) -> T {
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+        use rustix::io::Errno;
+        use rustix::pipe::{PipeFlags, pipe_with};
+        use std::sync::mpsc;
+
+        let (reader, writer) = pipe_with(PipeFlags::NONBLOCK | PipeFlags::CLOEXEC).unwrap();
+        loop {
+            match rustix::io::write(&writer, &[0x5a; 4096]) {
+                Ok(count) => assert!(count > 0),
+                Err(Errno::AGAIN) => break,
+                result => panic!("unexpected output-pipe fill: {result:?}"),
+            }
+        }
+        assert_eq!(rustix::io::write(&writer, b"x"), Err(Errno::AGAIN));
+        let flags = fcntl_getfl(&writer).unwrap() & !OFlags::NONBLOCK;
+        fcntl_setfl(&writer, flags).unwrap();
+        let writer = std::fs::File::from(writer);
+        let observed = writer.try_clone().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let _ = sender.send(case(writer));
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        drop(reader);
+        thread.join().unwrap();
+        assert_eq!(fcntl_getfl(&observed).unwrap(), flags);
+        result.expect("prepared client stayed blocked after its output deadline")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn both_console_streams_observe_the_shortened_completion_bound() {
+        for stdout_stalls in [false, true] {
+            with_full_pipe(move |pipe| {
+                let ordinary = tempfile::tempfile().unwrap();
+                let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(30));
+                let (stdout, stderr) = if stdout_stalls {
+                    (&pipe, &ordinary)
+                } else {
+                    (&ordinary, &pipe)
+                };
+                let error = client_console_to(stdout, stderr, &deadline, |stdout, stderr| {
+                    deadline.limit(Instant::now() + Duration::from_millis(50));
+                    let retained = deadline.get();
+                    deadline.complete();
+                    assert_eq!(
+                        deadline.get(),
+                        retained,
+                        "completion must never renew a bound"
+                    );
+                    if stdout_stalls {
+                        stdout.write_all(b"verified final stdout")
+                    } else {
+                        stderr.write_all(b"live stderr")
+                    }
+                })
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert_eq!(ordinary.metadata().unwrap().len(), 0);
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_client_can_report_to_the_same_full_stderr_without_hanging_again() {
+        with_full_pipe(|pipe| {
+            report_client_error_to(
+                &pipe,
+                json!({"kind":"prepared-client-error", "reexecute":false}),
+            );
+        });
+    }
 
     #[test]
     fn allocated_submit_reuses_the_exact_job_and_paths_under_a_distinct_intent_api() {

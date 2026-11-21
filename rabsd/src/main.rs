@@ -711,7 +711,9 @@ fn main() {
             let config = match load_config() {
                 Ok(config) => config,
                 Err(error) => {
-                    eprintln!("rabsd: config error: {error}");
+                    prepared_jobs::report_client_error(format_args!(
+                        "rabsd: config error: {error}"
+                    ));
                     std::process::exit(1);
                 }
             };

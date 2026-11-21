@@ -19,6 +19,12 @@
 #[cfg(target_os = "linux")]
 #[path = "coord/canonical_local/remote_service/client/output.rs"]
 pub(crate) mod controlled_output;
+// The binary's prepared-job readers use the same output deadline and retained
+// descriptors as the library clients. This is a presentation-only interface;
+// leaving a reader never cancels or reexecutes its daemon-owned operation.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use controlled_output::{ControlledOutput, OutputDeadline};
 pub mod coord;
 pub mod doctor;
 pub mod edge;

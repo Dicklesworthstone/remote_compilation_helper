@@ -2,11 +2,11 @@
 //! completion. The client owns no worker reservation and never retries submit or
 //! dispatch after a lost response. Leaving this client does not cancel the job.
 
-use super::{exchange, invalid, wait};
+use super::{exchange, invalid, report_client_error, wait, write_client_status};
 use rabsd::coord::prepared_operation::{PreparedOperationSpec, PreparedPoolOperationSpec};
 use serde_json::{Value, json};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Component, Path};
 
 const USAGE: &str = "usage: rabsd --job-build [--live-stderr] --prepare-from <source-root> <spec.json> <id32hex> (<listen-IP:port> <worker> <pin> | --worker-pool <pool.json>) <bundle> <delivery> <outputs>";
@@ -222,7 +222,7 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
     let (source, specification, submission, live_stderr) = match arguments(args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprintln!("rabsd: {error}");
+            report_client_error(format_args!("rabsd: {error}"));
             return 2;
         }
     };
@@ -250,31 +250,23 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
         }
         // Output the inspectable identity BEFORE admission. A closed console
         // cannot leave the caller unaware of the ID of work it just submitted.
-        writeln!(
-            io::stderr().lock(),
-            "{}",
-            json!({
-                "kind":"prepared-build-ready", "operation_id":spec.id, "bundle":spec.bundle,
-                "request_id":null, "execution_may_have_run":false,
-                "publication_authorized":false, "reexecute":false,
-            })
-        )?;
+        write_client_status(json!({
+            "kind":"prepared-build-ready", "operation_id":spec.id, "bundle":spec.bundle,
+            "request_id":null, "execution_may_have_run":false,
+            "publication_authorized":false, "reexecute":false,
+        }))?;
         submitted = true; // From this point a lost reply is an unknown admission.
         let reply = exchange(socket, &submission.request())?;
         admission_reply(&reply, &submission)?;
-        writeln!(io::stderr().lock(), "{reply}")?;
+        write_client_status(reply)?;
         Ok(())
     })();
     if let Err(error) = result {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "{}",
-            json!({
-                "kind":"prepared-client-error", "operation_id":spec.id,
-                "detail":error.to_string(), "outcome_unconfirmed":submitted,
-                "diagnostics_may_have_been_exposed":false, "reexecute":false,
-            })
-        );
+        report_client_error(json!({
+            "kind":"prepared-client-error", "operation_id":spec.id,
+            "detail":error.to_string(), "outcome_unconfirmed":submitted,
+            "diagnostics_may_have_been_exposed":false, "reexecute":false,
+        }));
         return 1;
     }
     // The optional presentation mode follows the same admitted job. Neither

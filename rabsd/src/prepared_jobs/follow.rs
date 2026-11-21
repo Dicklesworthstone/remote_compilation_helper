@@ -2,7 +2,10 @@
 //! Preview bytes stay inside NDJSON records. A verified terminal result is a
 //! separate event; it never silently replays or completes the preview transcript.
 
-use super::{CLIENT_BUDGET, exchange_until, invalid, remaining, wait};
+use super::{
+    CLIENT_BUDGET, COMPLETION_BUDGET, ClientDeadline, exchange_until, invalid, remaining,
+    report_client_error, wait, with_client_stdout,
+};
 use asupersync::net::unix::UnixStream;
 use rabsd::coord::prepared_operation::PreparedCompletion;
 use serde_json::{Value, json};
@@ -10,7 +13,6 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-const COMPLETION_BUDGET: Duration = Duration::from_secs(300);
 const MAX_PREVIEW_BYTES: usize = 8 * 1024;
 
 fn arguments(args: &[String]) -> Result<(&str, Duration), &'static str> {
@@ -347,28 +349,47 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
     let (id, budget) = match arguments(args) {
         Ok(parsed) => parsed,
         Err(detail) => {
-            eprintln!("rabsd: {detail}");
+            report_client_error(format_args!("rabsd: {detail}"));
             return 2;
         }
     };
-    let until = Instant::now() + budget;
+    let deadline = ClientDeadline::new(Instant::now() + budget);
     let mut exposed = false;
-    let result = (|| -> io::Result<i32> {
+    let result = with_client_stdout(&deadline, |mut output| {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .map_err(|error| io::Error::other(format!("job follow runtime: {error:?}")))?;
-        let mut exchange = |request: &Value, deadline| {
-            rabs_asupersync::daemon_runtime::block_on_top_level(
+        let mut exchange = |request: &Value, request_deadline: Instant| {
+            let reply = rabs_asupersync::daemon_runtime::block_on_top_level(
                 &runtime,
-                exchange_until(UnixStream::connect(socket), request, deadline),
-            )
+                exchange_until(
+                    UnixStream::connect(socket),
+                    request,
+                    request_deadline.min(deadline.get()),
+                ),
+            )?;
+            if request["kind"] == "prepared-status"
+                && matches!(
+                    reply["operation"]["state"].as_str(),
+                    Some("completed" | "cancelled")
+                )
+            {
+                deadline.complete();
+            }
+            Ok(reply)
         };
-        let mut output = io::stdout().lock();
-        let completion = follow(id, until, &mut exchange, std::thread::sleep, |event| {
-            // Even a failed write can expose part of a record. Do not retry it.
-            exposed = true;
-            write_event(&mut output, event)
-        })?;
+        let completion = follow(
+            id,
+            deadline.get(),
+            &mut exchange,
+            std::thread::sleep,
+            |event| {
+                // Even a failed write can expose part of a record. Do not retry it.
+                exposed = true;
+                write_event(&mut output, event)
+            },
+        )?;
+        let until = deadline.complete();
         let (status, proof, exit_code) = match completion {
             Completion::CancelledBeforeStart { status } => (status, None, 130),
             Completion::Ready { status, proof } => {
@@ -399,19 +420,15 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
             }),
         )?;
         Ok(exit_code)
-    })();
+    });
     match result {
         Ok(code) => code,
         Err(error) => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "{}",
-                json!({
-                    "kind":"prepared-client-error", "operation_id":id,
-                    "detail":error.to_string(), "outcome_unconfirmed":true,
-                    "preview_may_have_been_exposed":exposed, "reexecute":false,
-                })
-            );
+            report_client_error(json!({
+                "kind":"prepared-client-error", "operation_id":id,
+                "detail":error.to_string(), "outcome_unconfirmed":true,
+                "preview_may_have_been_exposed":exposed, "reexecute":false,
+            }));
             1
         }
     }
@@ -441,6 +458,48 @@ mod tests {
     fn segment(stream: &str, offset: u64, data: &str, skipped: u64, observed: u64) -> Value {
         json!({"stream":stream, "offset":offset, "next_offset":offset + (data.len() / 2) as u64,
             "data_hex":data, "skipped_bytes":skipped, "observed_bytes":observed})
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_follow_stdout_pipe_stops_only_the_reader_without_retrying_an_event() {
+        super::super::tests::with_full_pipe(|pipe| {
+            let stderr = tempfile::tempfile().unwrap();
+            let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(30));
+            let mut queries = Vec::new();
+            let mut emitted = 0;
+            let result = super::super::client_console_to(
+                &pipe,
+                &stderr,
+                &deadline,
+                |mut output, _stderr| {
+                    follow(
+                        ID,
+                        deadline.get(),
+                        |query, _| {
+                            queries.push(query["kind"].as_str().unwrap().to_owned());
+                            match query["kind"].as_str() {
+                                Some("prepared-status") => Ok(status("running", 1)),
+                                Some("prepared-preview") => {
+                                    Ok(preview(json!([segment("stderr", 0, "6162", 0, 2)])))
+                                }
+                                other => panic!("reader tried to mutate the job: {other:?}"),
+                            }
+                        },
+                        |_| panic!("a blocked console cannot continue polling"),
+                        |event| {
+                            emitted += 1;
+                            deadline.limit(Instant::now() + Duration::from_millis(50));
+                            write_event(&mut output, event)
+                        },
+                    )
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains("deadline"));
+            assert_eq!(emitted, 1);
+            assert_eq!(queries, ["prepared-status", "prepared-preview"]);
+            assert_eq!(stderr.metadata().unwrap().len(), 0);
+        });
     }
 
     #[test]

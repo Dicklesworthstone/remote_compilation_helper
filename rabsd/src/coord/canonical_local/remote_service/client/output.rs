@@ -23,24 +23,24 @@ const WRITE_BYTES: usize = 64 * 1024;
 /// A completed build's delivery budget must replace its longer execution budget
 /// even when a write is already waiting for a pipe or socket to become writable.
 #[derive(Clone)]
-pub(super) struct OutputDeadline(Arc<Mutex<Instant>>);
+pub struct OutputDeadline(Arc<Mutex<Instant>>);
 
 impl OutputDeadline {
-    pub(super) fn new(deadline: Instant) -> Self {
+    pub fn new(deadline: Instant) -> Self {
         Self(Arc::new(Mutex::new(deadline)))
     }
 
-    pub(super) fn get(&self) -> Instant {
+    pub fn get(&self) -> Instant {
         *self.0.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    pub(super) fn limit(&self, deadline: Instant) {
+    pub fn limit(&self, deadline: Instant) {
         let mut current = self.0.lock().unwrap_or_else(|error| error.into_inner());
         *current = (*current).min(deadline);
     }
 }
 
-pub(super) struct ControlledOutput<'a> {
+pub struct ControlledOutput<'a> {
     descriptor: OwnedFd,
     socket: bool,
     stopped: &'a AtomicBool,
@@ -48,15 +48,11 @@ pub(super) struct ControlledOutput<'a> {
 }
 
 impl<'a> ControlledOutput<'a> {
-    pub(super) fn new(
-        output: &impl AsFd,
-        stopped: &'a AtomicBool,
-        deadline: Instant,
-    ) -> io::Result<Self> {
+    pub fn new(output: &impl AsFd, stopped: &'a AtomicBool, deadline: Instant) -> io::Result<Self> {
         Self::with_deadline(output, stopped, OutputDeadline::new(deadline))
     }
 
-    pub(super) fn with_deadline(
+    pub fn with_deadline(
         output: &impl AsFd,
         stopped: &'a AtomicBool,
         deadline: OutputDeadline,

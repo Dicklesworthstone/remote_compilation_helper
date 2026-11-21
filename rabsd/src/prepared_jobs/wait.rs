@@ -2,17 +2,19 @@
 //! Exiting this client does NOT cancel the job, resume an uncertain execution,
 //! acknowledge worker results, or submit another command.
 
-use super::{CLIENT_BUDGET, exchange_until, invalid, remaining};
+use super::{
+    CLIENT_BUDGET, COMPLETION_BUDGET, ClientDeadline, exchange_until, invalid, remaining,
+    report_client_error, with_client_console,
+};
 use asupersync::net::unix::UnixStream;
 use rabsd::coord::prepared_operation::PreparedCompletion;
 use serde_json::{Value, json};
-use std::io::{self, Write};
+use std::io;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const DEFAULT_WAIT_SECONDS: u64 = 3600;
 const MAX_WAIT_SECONDS: u64 = 86400;
-const COMPLETION_BUDGET: Duration = Duration::from_secs(300);
 
 fn arguments(args: &[String]) -> Result<(&str, Duration, bool), &'static str> {
     const USAGE: &str = "usage: rabsd --job-wait [--live-stderr] <id32hex> [timeout-seconds]";
@@ -197,27 +199,40 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
     let (id, budget, live_stderr) = match arguments(args) {
         Ok(parsed) => parsed,
         Err(detail) => {
-            eprintln!("rabsd: {detail}");
+            report_client_error(format_args!("rabsd: {detail}"));
             return 2;
         }
     };
     if live_stderr {
         return super::live::run(id, budget, socket);
     }
-    let until = Instant::now() + budget;
+    let deadline = ClientDeadline::new(Instant::now() + budget);
     let mut exposed = false;
-    let result = (|| -> io::Result<i32> {
+    let result = with_client_console(&deadline, |mut stdout, mut stderr| {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .map_err(|error| io::Error::other(format!("job wait runtime: {error:?}")))?;
         let completion = follow(
             id,
-            until,
-            |request, deadline| {
-                rabs_asupersync::daemon_runtime::block_on_top_level(
+            deadline.get(),
+            |request, request_deadline| {
+                let reply = rabs_asupersync::daemon_runtime::block_on_top_level(
                     &runtime,
-                    exchange_until(UnixStream::connect(socket), request, deadline),
-                )
+                    exchange_until(
+                        UnixStream::connect(socket),
+                        request,
+                        request_deadline.min(deadline.get()),
+                    ),
+                )?;
+                if request["kind"] == "prepared-status"
+                    && matches!(
+                        reply["operation"]["state"].as_str(),
+                        Some("completed" | "cancelled")
+                    )
+                {
+                    deadline.complete();
+                }
+                Ok(reply)
             },
             std::thread::sleep,
         )?;
@@ -225,26 +240,23 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
             Completion::CancelledBeforeStart => return Ok(130),
             Completion::Ready(proof) => *proof,
         };
+        let until = deadline.complete();
         let snapshot = proof.snapshot(until)?;
         remaining(until)?;
         // A failed or partial console write may already be visible. Once this
         // frontier is crossed, never repeat diagnostics or perform fallback.
         exposed = true;
-        snapshot.emit(&mut io::stdout().lock(), &mut io::stderr().lock(), until)?;
+        snapshot.emit(&mut stdout, &mut stderr, until)?;
         Ok(i32::from(proof.exit_code))
-    })();
+    });
     match result {
         Ok(code) => code,
         Err(error) => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "{}",
-                json!({
-                    "kind":"prepared-client-error", "operation_id":id, "detail":error.to_string(),
-                    "outcome_unconfirmed":true, "diagnostics_may_have_been_exposed":exposed,
-                    "reexecute":false,
-                })
-            );
+            report_client_error(json!({
+                "kind":"prepared-client-error", "operation_id":id, "detail":error.to_string(),
+                "outcome_unconfirmed":true, "diagnostics_may_have_been_exposed":exposed,
+                "reexecute":false,
+            }));
             1
         }
     }

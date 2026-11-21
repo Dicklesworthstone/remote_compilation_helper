@@ -5,7 +5,10 @@
 //! stderr prefix is shown early. Its digest is checked against both fully
 //! verified final streams before any stdout or remaining stderr is emitted.
 
-use super::{CLIENT_BUDGET, exchange_until, follow, invalid, remaining};
+use super::{
+    CLIENT_BUDGET, ClientDeadline, exchange_until, follow, invalid, remaining, report_client_error,
+    with_client_console,
+};
 use asupersync::net::unix::UnixStream;
 use rabs_asupersync::stream_drain::preview::MAX_PREVIEW_BYTES;
 use rabsd::coord::prepared_operation::{CARGO_STDERR_PREVIEW_VERSION, DiagnosticStream};
@@ -133,17 +136,24 @@ fn cargo_status(reply: &Value) -> io::Result<()> {
 
 fn deliver(
     id: &str,
-    until: Instant,
+    deadline: &ClientDeadline,
     mut exchange: impl FnMut(&Value, Instant) -> io::Result<Value>,
     sleep: impl FnMut(Duration),
     prefix: &mut StderrPrefix,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> io::Result<i32> {
-    let mut exchange = |request: &Value, deadline| {
-        let reply = exchange(request, deadline)?;
+    let until = deadline.get();
+    let mut exchange = |request: &Value, request_deadline: Instant| {
+        let reply = exchange(request, request_deadline.min(deadline.get()))?;
         if request["kind"] == "prepared-status" {
             cargo_status(&reply)?;
+            if matches!(
+                reply["operation"]["state"].as_str(),
+                Some("completed" | "cancelled")
+            ) {
+                deadline.complete();
+            }
         }
         Ok(reply)
     };
@@ -161,6 +171,7 @@ fn deliver(
         }
         follow::Completion::Ready { status, proof } => (status, Some(*proof)),
     };
+    let until = deadline.complete();
     let snapshot = proof
         .as_ref()
         .map(|proof| {
@@ -191,9 +202,9 @@ fn deliver(
 }
 
 pub(super) fn run(id: &str, budget: Duration, socket: &str) -> i32 {
-    let until = Instant::now() + budget;
+    let deadline = ClientDeadline::new(Instant::now() + budget);
     let mut prefix = StderrPrefix::default();
-    let result = (|| -> io::Result<i32> {
+    let result = with_client_console(&deadline, |mut stdout, mut stderr| {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .map_err(|error| io::Error::other(format!("live stderr runtime: {error:?}")))?;
@@ -202,7 +213,7 @@ pub(super) fn run(id: &str, budget: Duration, socket: &str) -> i32 {
         // worker pipe drains, lease renewals or cancellation handling.
         deliver(
             id,
-            until,
+            &deadline,
             |request, deadline| {
                 rabs_asupersync::daemon_runtime::block_on_top_level(
                     &runtime,
@@ -211,23 +222,19 @@ pub(super) fn run(id: &str, budget: Duration, socket: &str) -> i32 {
             },
             std::thread::sleep,
             &mut prefix,
-            &mut io::stdout().lock(),
-            &mut io::stderr().lock(),
+            &mut stdout,
+            &mut stderr,
         )
-    })();
+    });
     match result {
         Ok(code) => code,
         Err(error) => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "{}",
-                json!({
-                    "kind":"prepared-client-error", "operation_id":id,
-                    "detail":error.to_string(), "outcome_unconfirmed":true,
-                    "diagnostics_may_have_been_exposed":prefix.exposed,
-                    "reexecute":false,
-                })
-            );
+            report_client_error(json!({
+                "kind":"prepared-client-error", "operation_id":id,
+                "detail":error.to_string(), "outcome_unconfirmed":true,
+                "diagnostics_may_have_been_exposed":prefix.exposed,
+                "reexecute":false,
+            }));
             1
         }
     }
@@ -240,8 +247,8 @@ mod tests {
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
-    fn deadline() -> Instant {
-        Instant::now() + Duration::from_secs(2)
+    fn deadline() -> ClientDeadline {
+        ClientDeadline::new(Instant::now() + Duration::from_secs(2))
     }
 
     fn status(state: &str) -> Value {
@@ -285,7 +292,7 @@ mod tests {
         let mut queries = Vec::new();
         let result = deliver(
             ID,
-            deadline(),
+            &deadline(),
             |query, _| {
                 queries.push(query.clone());
                 Ok(replies.pop_front().unwrap())
@@ -317,7 +324,7 @@ mod tests {
             let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
             let result = deliver(
                 ID,
-                deadline(),
+                &deadline(),
                 |query, _| {
                     assert_eq!(query["kind"], "prepared-status");
                     calls += 1;
@@ -363,7 +370,7 @@ mod tests {
         assert!(
             deliver(
                 ID,
-                deadline(),
+                &deadline(),
                 |_, _| Ok(replies.pop_front().unwrap()),
                 |_| panic!("invalid preview cannot advance"),
                 &mut prefix,
@@ -449,7 +456,7 @@ mod tests {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let result = deliver(
             ID,
-            deadline(),
+            &deadline(),
             |query, _| {
                 queries.push(query.clone());
                 Ok(replies.pop_front().unwrap())
@@ -473,6 +480,51 @@ mod tests {
             query["kind"].as_str(),
             Some("prepared-status" | "prepared-preview")
         )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_live_stderr_pipe_exits_without_exposing_stdout_or_changing_the_job() {
+        super::super::tests::with_full_pipe(|pipe| {
+            let stdout = tempfile::tempfile().unwrap();
+            let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(30));
+            let mut prefix = StderrPrefix::default();
+            let mut queries = Vec::new();
+            let result = super::super::client_console_to(
+                &stdout,
+                &pipe,
+                &deadline,
+                |mut stdout, mut stderr| {
+                    deliver(
+                        ID,
+                        &deadline,
+                        |query, _| {
+                            queries.push(query["kind"].as_str().unwrap().to_owned());
+                            match query["kind"].as_str() {
+                                Some("prepared-status") => Ok(status("running")),
+                                Some("prepared-preview") => {
+                                    deadline.limit(Instant::now() + Duration::from_millis(50));
+                                    Ok(preview(vec![
+                                        segment("stdout", 0, b"artifact readiness", 0),
+                                        segment("stderr", 0, b"Compiling dependency\n", 0),
+                                    ]))
+                                }
+                                other => panic!("reader tried to mutate the job: {other:?}"),
+                            }
+                        },
+                        |_| panic!("a blocked console cannot continue polling"),
+                        &mut prefix,
+                        &mut stdout,
+                        &mut stderr,
+                    )
+                },
+            );
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert_eq!(queries, ["prepared-status", "prepared-preview"]);
+            assert!(prefix.exposed && prefix.poisoned);
+            assert!(prefix.descriptor().is_err());
+            assert_eq!(stdout.metadata().unwrap().len(), 0);
+        });
     }
 
     #[cfg(unix)]
@@ -591,7 +643,7 @@ mod tests {
             let mut count = 0;
             let code = deliver(
                 ID,
-                deadline(),
+                &deadline(),
                 |query, _| {
                     count += 1;
                     if count >= 3 {
@@ -616,6 +668,51 @@ mod tests {
             assert_eq!(*err_observer.0.lock().unwrap(), STDERR);
         }
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_full_final_stdout_pipe_stops_verified_replay_without_repeating_live_stderr() {
+            super::super::super::tests::with_full_pipe(|pipe| {
+                let (_owner, proof) = fixture();
+                let mut rows = replies(&proof, &STDERR[..10]);
+                let mut stderr = tempfile::tempfile().unwrap();
+                let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(30));
+                let mut prefix = StderrPrefix::default();
+                let mut count = 0;
+                let result = super::super::super::client_console_to(
+                    &pipe,
+                    &stderr,
+                    &deadline,
+                    |mut stdout, mut stderr| {
+                        deliver(
+                            ID,
+                            &deadline,
+                            |query, _| {
+                                count += 1;
+                                if count == 5 {
+                                    assert_eq!(query["kind"], "prepared-status");
+                                    deadline.limit(Instant::now() + Duration::from_millis(50));
+                                }
+                                Ok(rows.pop_front().unwrap())
+                            },
+                            |_| {},
+                            &mut prefix,
+                            &mut stdout,
+                            &mut stderr,
+                        )
+                    },
+                );
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+                assert_eq!(count, 5);
+                assert!(rows.is_empty());
+                assert!(prefix.exposed);
+                use std::io::{Read, Seek};
+                stderr.rewind().unwrap();
+                let mut printed = Vec::new();
+                stderr.read_to_end(&mut printed).unwrap();
+                assert_eq!(printed, &STDERR[..10]);
+            });
+        }
+
         #[test]
         fn a_false_prefix_refuses_before_final_stdout_without_retrying_or_replaying() {
             let (_owner, proof) = fixture();
@@ -624,7 +721,7 @@ mod tests {
             let mut prefix = StderrPrefix::default();
             let error = deliver(
                 ID,
-                deadline(),
+                &deadline(),
                 |_, _| Ok(rows.pop_front().unwrap()),
                 |_| {},
                 &mut prefix,
@@ -653,7 +750,7 @@ mod tests {
             let mut count = 0;
             let code = deliver(
                 ID,
-                deadline(),
+                &deadline(),
                 |_, _| {
                     count += 1;
                     if count >= 3 {
@@ -706,7 +803,7 @@ mod tests {
                 assert!(
                     deliver(
                         ID,
-                        deadline(),
+                        &deadline(),
                         |_, _| Ok(rows.pop_front().unwrap()),
                         |_| {},
                         &mut prefix,

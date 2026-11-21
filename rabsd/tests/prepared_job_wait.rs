@@ -382,6 +382,78 @@ fn actual_daemon_wait_replays_complete_binary_streams_and_original_exit_without_
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_job_status_does_not_require_its_unused_stderr_to_be_writable() {
+    let fixture = Fixture::new(Some(0), false);
+    let mut daemon = fixture.daemon();
+    let stdout = fixture.root.join("status.stdout");
+    let stderr = fixture.root.join("status.stderr");
+    fs::write(&stderr, b"").unwrap();
+    let child = fixture
+        .command()
+        .args(["--job-status", ID])
+        .stdin(Stdio::null())
+        .stdout(File::create(&stdout).unwrap())
+        .stderr(File::open(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut client = Process {
+        child,
+        stdout,
+        stderr,
+    };
+    assert!(client.wait().success());
+    let reply: Value = serde_json::from_slice(&read_log(&client.stdout)).unwrap();
+    assert_eq!(reply["kind"], "prepared-operation");
+    assert_eq!(reply["operation"]["id"], ID);
+    assert_eq!(reply["operation"]["state"], "completed");
+    assert!(read_log(&client.stderr).is_empty());
+    fixture.assert_unchanged();
+    daemon.shutdown();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_job_follow_does_not_require_its_unused_stderr_to_be_writable() {
+    let fixture = Fixture::new(Some(0), false);
+    let mut daemon = fixture.daemon();
+    let stdout = fixture.root.join("follow.stdout");
+    let stderr = fixture.root.join("follow.stderr");
+    fs::write(&stderr, b"").unwrap();
+    let child = fixture
+        .command()
+        .args(["--job-follow", ID, "10"])
+        .stdin(Stdio::null())
+        .stdout(File::create(&stdout).unwrap())
+        .stderr(File::open(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut client = Process {
+        child,
+        stdout,
+        stderr,
+    };
+    assert!(client.wait().success());
+    let output = read_log(&client.stdout);
+    let events: Vec<Value> = output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let completion = events.last().expect("missing verified completion event");
+    assert_eq!(completion["kind"], "prepared-follow-completion");
+    assert_eq!(completion["operation_id"], ID);
+    assert_eq!(completion["state"], "completed");
+    assert_eq!(completion["exit_code"], 0);
+    assert_eq!(completion["completion_verified"], true);
+    assert_eq!(completion["publication_authorized"], false);
+    assert_eq!(completion["reexecute"], false);
+    assert!(read_log(&client.stderr).is_empty());
+    fixture.assert_unchanged();
+    daemon.shutdown();
+}
+
 #[test]
 fn actual_daemon_wait_refuses_damaged_results_without_printing_even_the_valid_first_stream() {
     for corrupt in ["artifacts/app", "diagnostics/stderr"] {
