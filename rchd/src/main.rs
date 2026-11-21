@@ -2178,14 +2178,21 @@ async fn async_main() -> Result<()> {
         handle.abort();
     }
 
-    // Close the shared SSH connection pool so warm ControlMasters are torn down
-    // cleanly on shutdown rather than lingering until their idle timeout.
-    if let Some(pool) = &ssh_pool {
-        info!("Closing SSH connection pool...");
-        if let Err(e) = pool.close_all().await {
-            warn!("Error closing SSH connection pool: {}", e);
+    // Fence both pools permanently before teardown. Background tasks and
+    // previously borrowed clients must not reconnect while the daemon drains,
+    // and the independent health pool owns ControlMasters of its own.
+    let shutdown_pool = |pool: Option<Arc<rch_common::SshPool>>, name: &'static str| async move {
+        if let Some(pool) = pool {
+            info!(pool = name, "Shutting down SSH connection pool...");
+            if let Err(error) = pool.shutdown().await {
+                warn!(pool = name, %error, "Error shutting down SSH connection pool");
+            }
         }
-    }
+    };
+    tokio::join!(
+        shutdown_pool(ssh_pool.clone(), "build/telemetry"),
+        shutdown_pool(health_ssh_pool.clone(), "health"),
+    );
 
     // Clean up socket
     if std::path::Path::new(&context.socket_path).exists() {

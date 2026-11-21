@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::{Mutex, RwLock, watch};
 use tokio::time::Instant;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 mod master_guardian;
 mod orphan_recovery;
@@ -60,19 +60,21 @@ struct PoolWorkerPolicy {
 
 struct PoolWorkerControl {
     policy: watch::Sender<PoolWorkerPolicy>,
+    shutdown: watch::Receiver<bool>,
     // Serialize disable/enable while removing the old entry, without holding
     // the pool-wide map lock across a per-worker transition.
     transition: Mutex<()>,
 }
 
 impl PoolWorkerControl {
-    fn new() -> Self {
+    fn new(shutdown: watch::Receiver<bool>) -> Self {
         let (policy, _) = watch::channel(PoolWorkerPolicy {
             enabled: true,
             generation: 0,
         });
         Self {
             policy,
+            shutdown,
             transition: Mutex::new(()),
         }
     }
@@ -80,7 +82,19 @@ impl PoolWorkerControl {
     fn admission(&self) -> PoolWorkerAdmission {
         let policy = self.policy.subscribe();
         let generation = policy.borrow().generation;
-        PoolWorkerAdmission { policy, generation }
+        PoolWorkerAdmission {
+            policy,
+            generation,
+            shutdown: self.shutdown.clone(),
+        }
+    }
+
+    fn revoke_borrows(&self) {
+        // Closing a transport does not change the administrative enablement
+        // policy. Old handles must nevertheless stay revoked when the pool is
+        // reused, including handles detached by an endpoint replacement.
+        self.policy
+            .send_modify(|policy| policy.generation = policy.generation.wrapping_add(1));
     }
 }
 
@@ -90,18 +104,23 @@ impl PoolWorkerControl {
 struct PoolWorkerAdmission {
     policy: watch::Receiver<PoolWorkerPolicy>,
     generation: u64,
+    shutdown: watch::Receiver<bool>,
 }
 
 impl PoolWorkerAdmission {
     fn is_current(&self) -> bool {
         let current = self.policy.borrow();
-        current.enabled && current.generation == self.generation
+        !*self.shutdown.borrow() && current.enabled && current.generation == self.generation
     }
 
     async fn revoked(mut self) {
         loop {
-            if !self.is_current() || self.policy.changed().await.is_err() {
+            if !self.is_current() {
                 return;
+            }
+            tokio::select! {
+                result = self.policy.changed() => if result.is_err() { return; },
+                result = self.shutdown.changed() => if result.is_err() { return; },
             }
         }
     }
@@ -2487,6 +2506,8 @@ pub struct SshPool {
     /// Administrative tombstones outlive cached connections, close(), and
     /// endpoint replacement. Removing a connection must not re-enable it.
     controls: RwLock<HashMap<WorkerId, Arc<PoolWorkerControl>>>,
+    /// Terminal admission fence shared by every current and future borrower.
+    shutdown: watch::Sender<bool>,
     /// Default SSH options.
     options: SshOptions,
 }
@@ -2504,9 +2525,11 @@ impl std::fmt::Debug for SshPool {
 impl SshPool {
     /// Create a new connection pool.
     pub fn new(options: SshOptions) -> Self {
+        let (shutdown, _) = watch::channel(false);
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             controls: RwLock::new(HashMap::new()),
+            shutdown,
             options,
         }
     }
@@ -2519,7 +2542,7 @@ impl SshPool {
             .write()
             .await
             .entry(worker_id.clone())
-            .or_insert_with(|| Arc::new(PoolWorkerControl::new()))
+            .or_insert_with(|| Arc::new(PoolWorkerControl::new(self.shutdown.subscribe())))
             .clone()
     }
 
@@ -2593,7 +2616,7 @@ impl SshPool {
         ensure_ssh_deadline(deadline)?;
         Ok(controls
             .entry(worker_id.clone())
-            .or_insert_with(|| Arc::new(PoolWorkerControl::new()))
+            .or_insert_with(|| Arc::new(PoolWorkerControl::new(self.shutdown.subscribe())))
             .clone())
     }
 
@@ -2789,36 +2812,73 @@ impl SshPool {
         }
     }
 
-    /// Close a specific connection.
+    /// Revoke existing borrows and close a specific connection. Fresh borrows
+    /// remain permitted if the worker is enabled and the pool is not shut down.
     pub async fn close(&self, worker_id: &WorkerId) -> Result<()> {
+        let control = self.worker_control(worker_id).await;
         let client = {
+            let _transition = control.transition.lock().await;
             let mut connections = self.connections.write().await;
+            control.revoke_borrows();
             connections.remove(worker_id).map(|entry| entry.client)
         };
 
         if let Some(client) = client {
-            let mut client = client.write().await;
-            client.disconnect().await?;
+            Self::disconnect_clients(vec![client]).await?;
         }
 
         Ok(())
     }
 
-    /// Close all connections.
+    /// Revoke all existing borrows and close their connections within one
+    /// cleanup allowance, including time spent waiting for client locks.
+    /// The pool remains reusable; use [`Self::shutdown`] to stop admission.
     pub async fn close_all(&self) -> Result<()> {
         let clients: Vec<_> = {
+            // Keep control creation and entry insertion outside this cutoff.
+            // Revoke before awaiting any client lock: authentication and
+            // commands observe the fence and their supervisors reap children
+            // even if a caller retains its Arc or the close future is dropped.
+            let controls = self.controls.write().await;
             let mut connections = self.connections.write().await;
+            for control in controls.values() {
+                control.revoke_borrows();
+            }
             connections.drain().map(|(_, entry)| entry.client).collect()
         };
 
+        Self::disconnect_clients(clients).await
+    }
+
+    /// Permanently stop pool admission, cancel in-flight and queued work, and
+    /// close existing connections. Administrative re-enable cannot reopen a
+    /// shut-down pool; a new daemon incarnation must construct a new pool.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown.send_replace(true);
+        self.close_all().await
+    }
+
+    async fn disconnect_clients(clients: Vec<Arc<RwLock<SshClient>>>) -> Result<()> {
+        let deadline = Instant::now() + SSH_CLEANUP_TIMEOUT;
+        let mut closing = tokio::task::JoinSet::new();
         for client in clients {
-            let mut client = client.write().await;
-            if let Err(e) = client.disconnect().await {
-                error!("Error closing connection: {}", e);
+            closing.spawn(async move {
+                tokio::time::timeout_at(deadline, async { client.write().await.disconnect().await })
+                    .await
+                    .context("Timed out closing revoked SSH client")?
+            });
+        }
+        let mut failure = None;
+        while let Some(result) = closing.join_next().await {
+            let result = result
+                .context("SSH pool cleanup task failed")
+                .and_then(|result| result);
+            if let Err(error) = result {
+                warn!(%error, "Error closing revoked SSH connection");
+                failure.get_or_insert(error);
             }
         }
-
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     /// Get the number of active connections.
@@ -4087,6 +4147,33 @@ exit 37
             0,
             "close_all must drop all pooled connections"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_close_all_uses_one_deadline_for_borrowed_clients() {
+        let pool = SshPool::default();
+        let mut borrowed = Vec::new();
+        for index in 0..4 {
+            let config = worker_config(
+                &format!("worker-{index}"),
+                "unreachable.invalid",
+                "builder",
+                "",
+            );
+            let entry = pool.get_or_create_client_entry(&config).await;
+            borrowed.push(entry.read_owned().await);
+        }
+        let started = Instant::now();
+        assert!(pool.close_all().await.is_err());
+        assert_eq!(
+            started.elapsed(),
+            SSH_CLEANUP_TIMEOUT,
+            "retained locks must share one cleanup budget, not one per worker"
+        );
+        assert_eq!(pool.active_connections().await, 0);
+        for client in borrowed {
+            assert!(!client.pool_admission.as_ref().unwrap().is_current());
+        }
     }
 
     #[test]
@@ -5615,7 +5702,8 @@ exec sleep 30
     async fn external_transport_rejects_windows_and_revoked_pool_generation() {
         let fake = FakeSsh::new("ready");
         let mut client = fake.client(Duration::from_secs(3), true);
-        let control = PoolWorkerControl::new();
+        let (_shutdown, shutdown) = watch::channel(false);
+        let control = PoolWorkerControl::new(shutdown);
         client.pool_admission = Some(control.admission());
         fake.connect(&mut client).await.unwrap();
         client.config.tags = vec![crate::types::os_tag("windows")];
@@ -6496,6 +6584,168 @@ exit 37
         assert_eq!(ready.pids("master-pids").len(), 1);
         pool.close(&config.id).await.unwrap();
         ready.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn pool_close_cancels_authentication_and_revokes_old_handles() {
+        for all in [false, true] {
+            let fake = FakeSsh::new("auth-stall");
+            let config = fake.client(Duration::from_secs(30), true).config;
+            let pool = Arc::new(SshPool::new(SshOptions {
+                connect_timeout: Duration::from_secs(30),
+                control_master: true,
+                ..SshOptions::default()
+            }));
+            let entry = pool.get_or_create_client_entry(&config).await;
+            let connecting_entry = entry.clone();
+            let program = fake.program.clone();
+            let directory = fake.directory.path().to_owned();
+            let connecting = tokio::spawn(async move {
+                connecting_entry
+                    .write()
+                    .await
+                    .connect_using(&program, Some(&directory))
+                    .await
+            });
+            fake.wait_for_pid("master-pids").await;
+
+            let queued = pool.get_or_connect(&config);
+            tokio::pin!(queued);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(queued.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                if all {
+                    pool.close_all().await
+                } else {
+                    pool.close(&config.id).await
+                }
+            })
+            .await
+            .expect("close must revoke authentication before waiting for its lock")
+            .unwrap();
+            assert!(connecting.await.unwrap().is_err());
+            assert!(queued.await.is_err());
+            fake.assert_reaped().await;
+
+            let ready = FakeSsh::new("ready");
+            assert!(ready.connect(&mut *entry.write().await).await.is_err());
+            assert!(ready.pids("master-pids").is_empty());
+            let fresh = pool.get_or_create_client_entry(&config).await;
+            assert!(!Arc::ptr_eq(&entry, &fresh));
+            ready.connect(&mut *fresh.write().await).await.unwrap();
+            assert!(fresh.read().await.is_connected());
+            pool.close(&config.id).await.unwrap();
+            ready.assert_reaped().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_close_reaps_masters_while_clients_remain_borrowed() {
+        for all in [false, true] {
+            let fake = FakeSsh::new("ready");
+            let config = fake.client(Duration::from_secs(3), true).config;
+            let pool = SshPool::new(SshOptions {
+                control_master: true,
+                ..SshOptions::default()
+            });
+            let entry = pool.get_or_create_client_entry(&config).await;
+            fake.connect(&mut *entry.write().await).await.unwrap();
+            let borrowed = entry.read().await;
+            let transport = borrowed.external_transport().unwrap();
+
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                if all {
+                    pool.close_all().await
+                } else {
+                    pool.close(&config.id).await
+                }
+            })
+            .await
+            .expect("a retained client lock must not block pool closure indefinitely");
+            assert!(
+                result.is_err(),
+                "the retained lock prevents confirmed disconnect"
+            );
+            assert!(!borrowed.is_connected());
+            assert!(transport.arguments().is_err());
+            let status = borrowed
+                .session
+                .as_ref()
+                .unwrap()
+                .process
+                .wait_until(Instant::now() + Duration::from_secs(3))
+                .await
+                .unwrap();
+            assert!(!status.success());
+            fake.assert_reaped().await;
+            drop(transport);
+            drop(borrowed);
+            assert!(fake.connect(&mut *entry.write().await).await.is_err());
+            assert_eq!(fake.pids("master-pids").len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_shutdown_is_terminal_for_existing_and_new_workers() {
+        let fake = FakeSsh::new("ready");
+        let config = fake.client(Duration::from_secs(3), true).config;
+        let pool = SshPool::default();
+        let entry = pool.get_or_create_client_entry(&config).await;
+        fake.connect(&mut *entry.write().await).await.unwrap();
+        pool.shutdown().await.unwrap();
+        fake.assert_reaped().await;
+
+        // Administrative reload and new worker discovery cannot undo daemon
+        // shutdown or resurrect a previously returned client.
+        pool.set_worker_enabled(&config.id, false).await;
+        pool.set_worker_enabled(&config.id, true).await;
+        for id in [config.id.clone(), WorkerId::new("after-shutdown")] {
+            let mut worker = config.clone();
+            worker.id = id;
+            assert!(pool.get_or_connect(&worker).await.is_err());
+            assert!(
+                pool.run_with_timeout(&worker, "echo must-not-run", Duration::from_secs(30))
+                    .await
+                    .is_err()
+            );
+            let late = pool.get_or_create_client_entry(&worker).await;
+            assert!(fake.connect(&mut *late.write().await).await.is_err());
+        }
+        assert!(fake.connect(&mut *entry.write().await).await.is_err());
+        assert_eq!(pool.active_connections().await, 0);
+        assert_eq!(fake.pids("master-pids").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pool_close_revokes_detached_endpoint_clients_too() {
+        for all in [false, true] {
+            let original = FakeSsh::new("ready");
+            let replacement = FakeSsh::new("ready");
+            let mut config = original.client(Duration::from_secs(3), true).config;
+            let pool = SshPool::default();
+            let old = pool.get_or_create_client_entry(&config).await;
+            original.connect(&mut *old.write().await).await.unwrap();
+            config.host.push_str("-replacement");
+            let new = pool.get_or_create_client_entry(&config).await;
+            assert!(!Arc::ptr_eq(&old, &new));
+            replacement.connect(&mut *new.write().await).await.unwrap();
+
+            if all {
+                pool.close_all().await.unwrap();
+            } else {
+                pool.close(&config.id).await.unwrap();
+            }
+            tokio::join!(original.assert_reaped(), replacement.assert_reaped());
+            assert!(!old.read().await.is_connected());
+            assert!(!new.read().await.is_connected());
+            assert!(original.connect(&mut *old.write().await).await.is_err());
+            assert!(replacement.connect(&mut *new.write().await).await.is_err());
+            assert_eq!(original.pids("master-pids").len(), 1);
+            assert_eq!(replacement.pids("master-pids").len(), 1);
+        }
     }
 
     #[tokio::test]
