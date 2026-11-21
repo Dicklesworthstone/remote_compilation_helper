@@ -6616,18 +6616,26 @@ exit 37
                 std::task::Poll::Ready(())
             })
             .await;
-            tokio::time::timeout(Duration::from_secs(3), async {
-                if all {
-                    pool.close_all().await
-                } else {
-                    pool.close(&config.id).await
-                }
+            let (closed, rejected) = tokio::time::timeout(Duration::from_secs(3), async {
+                // Drive the queued caller while closing. A fair RwLock can
+                // reserve its reader permit before it observes revocation;
+                // leaving that future unpolled would retain the permit.
+                tokio::join!(
+                    async {
+                        if all {
+                            pool.close_all().await
+                        } else {
+                            pool.close(&config.id).await
+                        }
+                    },
+                    &mut queued,
+                )
             })
             .await
-            .expect("close must revoke authentication before waiting for its lock")
-            .unwrap();
+            .expect("close must revoke authentication before waiting for its lock");
+            closed.unwrap();
             assert!(connecting.await.unwrap().is_err());
-            assert!(queued.await.is_err());
+            assert!(rejected.is_err());
             fake.assert_reaped().await;
 
             let ready = FakeSsh::new("ready");
@@ -6639,6 +6647,68 @@ exit 37
             assert!(fresh.read().await.is_connected());
             pool.close(&config.id).await.unwrap();
             ready.assert_reaped().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_close_deadline_includes_unpolled_queued_borrows() {
+        for all in [false, true] {
+            let fake = FakeSsh::new("auth-stall");
+            let config = fake.client(Duration::from_secs(30), true).config;
+            let pool = Arc::new(SshPool::new(SshOptions {
+                connect_timeout: Duration::from_secs(30),
+                control_master: true,
+                ..SshOptions::default()
+            }));
+            let entry = pool.get_or_create_client_entry(&config).await;
+            let connecting_entry = entry.clone();
+            let program = fake.program.clone();
+            let directory = fake.directory.path().to_owned();
+            let connecting = tokio::spawn(async move {
+                connecting_entry
+                    .write()
+                    .await
+                    .connect_using(&program, Some(&directory))
+                    .await
+            });
+            fake.wait_for_pid("master-pids").await;
+
+            let queued = pool.get_or_connect(&config);
+            tokio::pin!(queued);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(queued.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // Deliberately stop polling this queued reader. Once authentication
+            // releases its writer, the reserved reader permit can block cleanup
+            // just like a held client guard. Revocation must still reap children
+            // and reject the queued caller when it eventually resumes.
+            let closed = tokio::time::timeout(Duration::from_secs(3), async {
+                if all {
+                    pool.close_all().await
+                } else {
+                    pool.close(&config.id).await
+                }
+            })
+            .await
+            .expect("an unpolled queued borrow must not block closure indefinitely");
+            assert!(
+                closed.is_err(),
+                "the reserved permit prevents confirmed cleanup"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), connecting)
+                    .await
+                    .expect("authentication must cancel despite an unpolled borrower")
+                    .unwrap()
+                    .is_err()
+            );
+            fake.assert_reaped().await;
+            assert_eq!(pool.active_connections().await, 0);
+            assert!(queued.await.is_err());
+            assert!(fake.connect(&mut *entry.write().await).await.is_err());
+            assert_eq!(fake.pids("master-pids").len(), 1);
         }
     }
 
