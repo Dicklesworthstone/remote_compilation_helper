@@ -6137,15 +6137,12 @@ pub async fn run_exec(
                         )?,
                     });
                     std::process::exit(0);
-                // bd-bu3fb: a job's completed remote command is terminal truth.
-                // The toolchain and worker-system-dependency heuristics
-                // reinterpret the command's own stderr as a WORKER fault and
-                // re-execute the workload (remotely, then possibly locally via
-                // GatedLocalFallback). A non-compilation job must surface its
-                // remote exit status verbatim instead — so both heuristics are
-                // skipped for jobs and control falls through to the signal /
-                // genuine-failure arms below (which never rerun the command
-                // locally).
+                // A completed job's exit status is terminal truth. Build-specific
+                // toolchain, dependency and signal heuristics must neither rerun
+                // an arbitrary workload nor quarantine its worker from that
+                // workload's diagnostic text. Jobs retain the deadline outcome
+                // before ordinary failure reporting and otherwise finish below
+                // with their exact exit status and already-collected outputs.
                 } else if result.deadline_triggered {
                     reporter.summary(&format!(
                         "[RCH] remote {} exceeded its configured deadline (exit {}); not retrying",
@@ -6221,7 +6218,8 @@ pub async fn run_exec(
                             ),
                         },
                     }
-                } else if let Some(signal) = is_signal_killed(result.exit_code)
+                } else if !job
+                    && let Some(signal) = is_signal_killed(result.exit_code)
                     && is_cpu_capability_signal(signal)
                 {
                     // SIGILL = worker CPU-capability fault (bd-68hon), NOT
@@ -6259,8 +6257,9 @@ pub async fn run_exec(
                             ),
                         },
                     }
-                } else if let Some(signal) =
-                    wrapped_cpu_capability_signal(result.exit_code, &result.stderr)
+                } else if !job
+                    && let Some(signal) =
+                        wrapped_cpu_capability_signal(result.exit_code, &result.stderr)
                 {
                     // bd-68hon (wrapped shape): a build-script/proc-macro
                     // SIGILL is reported by cargo as exit 101 with the signal
@@ -6299,7 +6298,7 @@ pub async fn run_exec(
                             ),
                         },
                     }
-                } else if let Some(signal) = is_signal_killed(result.exit_code) {
+                } else if !job && let Some(signal) = is_signal_killed(result.exit_code) {
                     // The exit code cannot distinguish OOM from an external
                     // kill or SSH/session cleanup. Preserve the retry policy.
                     warn!(

@@ -2936,6 +2936,10 @@ enum FallbackDaemonFixture {
     RestartDisappears,
     UnconfirmedSelection,
     TransferSkipped { completion_exit: Option<i32> },
+    MockCompletedJob {
+        exit_code: i32,
+        stderr: &'static str,
+    },
 }
 
 #[cfg(unix)]
@@ -3030,10 +3034,41 @@ impl FallbackDaemonServer {
                                 "reason": "success",
                                 "build_id": 42,
                             }),
+                            FallbackDaemonFixture::MockCompletedJob { .. } => json!({
+                                "worker": {
+                                    "id": "mock-job-worker",
+                                    "host": "mock://job-worker",
+                                    "user": "fixture",
+                                    "identity_file": "/unused/identity",
+                                    "slots_available": 4,
+                                    "speed_score": 90.0,
+                                },
+                                "reason": "success",
+                                "build_id": 42,
+                            }),
                             _ => panic!("unexpected live fixture {fixture:?}"),
                         }
                     } else if route.starts_with("POST /release-worker?") {
                         json!({"status": "ok"})
+                    } else if matches!(fixture, FallbackDaemonFixture::MockCompletedJob { .. })
+                        && route == "POST /build-heartbeat"
+                    {
+                        let mut heartbeat = String::new();
+                        reader.read_line(&mut heartbeat).unwrap();
+                        let heartbeat: serde_json::Value =
+                            serde_json::from_str(&heartbeat).unwrap();
+                        json!({
+                            "status": "ok",
+                            "build_id": heartbeat["build_id"],
+                            "worker_id": heartbeat["worker_id"],
+                            "phase": heartbeat["phase"],
+                        })
+                    } else if matches!(fixture, FallbackDaemonFixture::MockCompletedJob { .. })
+                        && (route == "GET /status" || route.starts_with("POST /workers/"))
+                    {
+                        // Let old retry/quarantine code finish so the regression
+                        // reports the unwanted requests instead of hanging.
+                        json!({})
                     } else if let Some(query) = route.strip_prefix("GET /builds/42?") {
                         let wrapper = query.strip_prefix("local_wrapper_id=").unwrap();
                         let wrapper = urlencoding::decode(wrapper).unwrap();
@@ -3271,6 +3306,14 @@ fn run_isolated_exec_with_socket(
     }
     if require_remote {
         command.env("RCH_REQUIRE_REMOTE", "1");
+    }
+    if let FallbackDaemonFixture::MockCompletedJob { exit_code, stderr } = daemon_fixture {
+        command
+            .env("RCH_MOCK_SSH", "1")
+            .env("RCH_MOCK_SSH_EXIT_CODE", exit_code.to_string())
+            .env("RCH_MOCK_SSH_STDERR", stderr)
+            .env("RCH_MOCK_RSYNC_FILES", "3")
+            .env("RCH_MOCK_RSYNC_BYTES", "128");
     }
     let output = command.output().expect("run rch exec");
     let daemon_requests = daemon.map(FallbackDaemonServer::finish).unwrap_or_default();
@@ -3992,4 +4035,83 @@ fn exec_require_remote_flag_outranks_force_local_config() {
         "remote required; refusing local fallback (force_local)",
     );
     assert_eq!(run.envelope()["outcome"], "refused", "{context}");
+}
+
+#[cfg(unix)]
+#[test]
+fn completed_jobs_preserve_signal_exits_and_result_collection_without_replay() {
+    init_test_logging();
+    // Drive the real CLI, run_exec, pipeline and durable lease through an
+    // isolated socket peer and the existing mock SSH/rsync transports. The
+    // result statistics below prove collection wiring and terminal reporting;
+    // mock rsync does not copy files or prove live worker result durability.
+    let wrapped_sigill = concat!(
+        "process didn't exit successfully: build-script ",
+        "(signal: 4, SIGILL: illegal instruction)"
+    );
+    for (exit_code, stderr) in [
+        (132, "fixture job exit 132"),
+        (137, "fixture job exit 137"),
+        (143, "fixture job exit 143"),
+        (101, wrapped_sigill),
+    ] {
+        let run = run_isolated_exec_with_socket(
+            "",
+            false,
+            false,
+            true,
+            &["--job", "--result-dir=reports", "--", "gate-fixture", "--mutation"],
+            FallbackDaemonFixture::MockCompletedJob { exit_code, stderr },
+        );
+        let context = format!("job exit {exit_code}: stderr={}", run.stderr);
+        assert_eq!(run.status.code(), Some(exit_code), "{context}");
+        assert!(!run.local_cargo_ran && !run.ssh_ran, "{context}");
+        let envelope = run.envelope();
+        assert_eq!(envelope["outcome"], "completed", "{context}");
+        assert_eq!(envelope["location"], "remote", "{context}");
+        assert_eq!(envelope["remote_exit_code"], exit_code, "{context}");
+        assert_eq!(envelope["worker_id"], "mock-job-worker", "{context}");
+        assert_eq!(
+            envelope["result_dirs"].as_array().unwrap().len(),
+            1,
+            "{context}"
+        );
+        let result = &envelope["result_dirs"][0];
+        assert_eq!(result["path"], "reports", "{context}");
+        assert_eq!(result["status"], "ok", "{context}");
+        assert_eq!(result["files"], 3, "{context}");
+        assert_eq!(result["bytes"], 128, "{context}");
+        assert_eq!(
+            run.daemon_requests
+                .iter()
+                .filter(|request| request.starts_with("GET /select-worker?"))
+                .count(),
+            1,
+            "a completed arbitrary job must not be admitted again: {context}"
+        );
+        assert_eq!(
+            run.daemon_requests
+                .iter()
+                .filter(|request| request.starts_with("POST /release-worker?"))
+                .count(),
+            1,
+            "{context}"
+        );
+        assert!(
+            !run.daemon_requests.iter().any(|request| {
+                request == "GET /status" || request.starts_with("POST /workers/")
+            }),
+            "job completion must not seek a retry or quarantine its worker: {:?}; {context}",
+            run.daemon_requests
+        );
+        assert_eq!(run.job_leases.len(), 1, "{context}");
+        let lease = &run.job_leases[0];
+        assert!(lease.terminal_acknowledged, "{lease:?}; {context}");
+        assert_eq!(lease.phase, "finished", "{lease:?}; {context}");
+        assert_eq!(
+            envelope["admission"]["terminal_acknowledged"],
+            true,
+            "{context}"
+        );
+    }
 }
