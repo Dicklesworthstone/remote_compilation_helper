@@ -473,10 +473,21 @@ pub struct ConfigDiffResponse {
 // Diagnose Response Types
 // =============================================================================
 
+/// The resolved contract of one explicitly configured automatic job rule.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ConfiguredJobRule {
+    pub name: String,
+    pub result_dirs: Vec<std::path::PathBuf>,
+    /// Effective named-tool requirements, including project-wide job policy.
+    pub required_tools: Vec<String>,
+}
+
 /// Diagnose command response for JSON output.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseResponse {
     pub classification: Classification,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_rule: Option<ConfiguredJobRule>,
     pub tiers: Vec<ClassificationTier>,
     pub command: String,
     pub normalized_command: String,

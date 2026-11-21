@@ -894,6 +894,7 @@ mod tests {
             Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo build");
         let response = DiagnoseResponse {
             classification,
+            job_rule: None,
             tiers: Vec::new(),
             command: "cargo build".to_string(),
             normalized_command: "cargo build".to_string(),
@@ -1383,6 +1384,7 @@ mod tests {
                 0.95,
                 "cargo test",
             ),
+            job_rule: None,
             tiers: Vec::new(),
             command: "cargo test -p frankenterm-core --lib agent_mail -- --nocapture".to_string(),
             normalized_command: "cargo test -p frankenterm-core --lib agent_mail -- --nocapture"

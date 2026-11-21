@@ -34,9 +34,9 @@ use self::load::run_load_storm;
 use super::config::collect_value_sources;
 use super::helpers::{humanize_duration, runtime_label, urlencoding_encode};
 use super::types::{
-    DiagnoseDaemonStatus, DiagnoseDecision, DiagnoseResponse, DiagnoseThreshold,
-    DiagnoseWorkerInventoryEntry, DiagnoseWorkerOutcome, DiagnoseWorkerSelection,
-    DryRunPipelineStep, DryRunSummary,
+    ConfiguredJobRule, DiagnoseDaemonStatus, DiagnoseDecision, DiagnoseResponse,
+    DiagnoseThreshold, DiagnoseWorkerInventoryEntry, DiagnoseWorkerOutcome,
+    DiagnoseWorkerSelection, DryRunPipelineStep, DryRunSummary,
 };
 use super::workers::{
     collect_local_capability_warnings, has_any_capabilities, probe_local_capabilities,
@@ -171,6 +171,8 @@ pub(super) fn build_diagnose_decision(
             "Confidence {:.2} below threshold {:.2}",
             classification.confidence, threshold
         )
+    } else if classification.kind == Some(rch_common::CompilationKind::Job) {
+        classification.reason.to_string()
     } else {
         format!(
             "Compilation command with confidence {:.2} >= threshold {:.2}",
@@ -210,6 +212,137 @@ pub(super) fn build_diagnose_decision_with_config(
         config.compilation.confidence_threshold
     };
     build_diagnose_decision(classification, threshold)
+}
+
+/// Rules supplement the compilation classifier; they cannot replace an
+/// existing compilation route or turn a shell expression into a simple job.
+fn configured_job_rule(
+    command: &str,
+    classification: &rch_common::Classification,
+    config: &rch_common::RchConfig,
+) -> Result<Option<ConfiguredJobRule>> {
+    if classification.is_compilation {
+        return Ok(None);
+    }
+    let Some(matched) =
+        rch_common::job_rules::match_command(&config.jobs, command).map_err(anyhow::Error::msg)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ConfiguredJobRule {
+        name: matched.rule.name.clone(),
+        result_dirs: matched.result_dirs,
+        required_tools: merge_job_required_tools(
+            matched.rule.require_tools.clone(),
+            &config.jobs.required_tools,
+            true,
+        ),
+    }))
+}
+
+fn classify_diagnostic_command(
+    command: &str,
+    config: &rch_common::RchConfig,
+) -> Result<(rch_common::ClassificationDetails, Option<ConfiguredJobRule>)> {
+    let mut details = rch_common::classify_command_detailed(command);
+    let rule = configured_job_rule(command, &details.classification, config)?;
+    if let Some(rule) = rule.as_ref() {
+        let reason = format!("Configured job rule '{}'", rule.name);
+        details.classification = rch_common::Classification::compilation(
+            rch_common::CompilationKind::Job,
+            1.0,
+            reason.clone(),
+        );
+        details.tiers.push(rch_common::ClassificationTier {
+            tier: 5,
+            name: "Configured jobs".into(),
+            decision: rch_common::TierDecision::Pass,
+            reason: reason.into(),
+        });
+    }
+    Ok((details, rule))
+}
+
+/// Match the strictness of the job rail before source-topology admission.
+/// FORCE_REMOTE requests offload but permits fallback; its presence (even
+/// falsy) also overrides the dispatcher's default. Named tool requirements
+/// independently forbid local fallback.
+fn configured_job_requires_remote(
+    rule: &ConfiguredJobRule,
+    role: rch_common::BoxRole,
+    environment: impl Fn(&str) -> Option<String>,
+) -> bool {
+    !rule.required_tools.is_empty()
+        || rch_common::placement::resolve_placement_with_role(environment, role)
+            .strict_remote_policy
+            .fail_closed()
+}
+
+fn configured_job_topology_decision(
+    rule: &ConfiguredJobRule,
+    role: rch_common::BoxRole,
+    reason: &str,
+    environment: impl Fn(&str) -> Option<String>,
+) -> (rch_common::admit_preflight::AdmitRecommendation, String) {
+    use rch_common::admit_preflight::AdmitRecommendation;
+
+    if configured_job_requires_remote(rule, role, environment) {
+        (
+            AdmitRecommendation::Defer,
+            format!(
+                "Would refuse configured job rule '{}' before worker admission: {reason}; \
+                 local fallback is forbidden by job tool requirements or strict-remote policy",
+                rule.name
+            ),
+        )
+    } else {
+        (
+            AdmitRecommendation::Local,
+            format!("Would run configured job rule '{}' locally: {reason}", rule.name),
+        )
+    }
+}
+
+fn configured_job_refusal_summary(reason: &str) -> DryRunSummary {
+    DryRunSummary {
+        would_offload: false,
+        reason: reason.to_string(),
+        pipeline_steps: vec![DryRunPipelineStep {
+            step: 1,
+            name: "Refused before execution".to_string(),
+            description: reason.to_string(),
+            skipped: true,
+            skip_reason: Some("Local fallback is forbidden".to_string()),
+            estimated_duration_ms: None,
+        }],
+        transfer_estimate: None,
+        total_estimated_ms: None,
+    }
+}
+
+fn print_configured_job_rule(style: &Theme, rule: &ConfiguredJobRule) {
+    println!("  {} {}", style.key("Job rule:"), style.value(&rule.name));
+    let directories = rule
+        .result_dirs
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "  {} {}",
+        style.key("Result directories:"),
+        style.value(if directories.is_empty() {
+            "none"
+        } else {
+            &directories
+        })
+    );
+    let tools = rule.required_tools.join(", ");
+    println!(
+        "  {} {}",
+        style.key("Required tools:"),
+        style.value(if tools.is_empty() { "none" } else { &tools })
+    );
 }
 
 pub(super) fn build_diagnose_slot_estimate(
@@ -560,8 +693,6 @@ fn print_worker_inventory(style: &Theme, selection: &DiagnoseWorkerSelection) {
 }
 
 pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
-    use rch_common::classify_command_detailed;
-
     let style = ctx.theme();
     let loaded = crate::config::load_config_with_sources()?;
     let config = loaded.config;
@@ -570,7 +701,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
     // the compiled-in `/data/projects` + `/dp` defaults. See GitHub #9.
     let topology_policy = config.path_topology.to_policy();
 
-    let details = classify_command_detailed(command);
+    let (details, job_rule) = classify_diagnostic_command(command, &config)?;
     let threshold = config.compilation.confidence_threshold;
 
     let value_sources = collect_value_sources(&config, &loaded.sources);
@@ -581,15 +712,29 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         .unwrap_or_else(|| "default".to_string());
 
     let mut decision = build_diagnose_decision_with_config(&details.classification, &config);
-    // bd-raobv: the execution path runs an off-root project locally before any
-    // worker is selected; report the same verdict here.
+    let mut configured_job_refused = false;
+    // Source topology is checked before any worker selection. Configured jobs
+    // take the exec job rail, which refuses local execution under strict policy.
     if decision.would_intercept
         && let Ok(cwd) = std::env::current_dir()
         && let Some(reason) = crate::hook::project_topology_local_reason(&topology_policy, &cwd)
     {
+        let reason = if let Some(rule) = job_rule.as_ref() {
+            let (recommendation, detail) = configured_job_topology_decision(
+                rule,
+                config.general.role,
+                &reason,
+                |key| std::env::var(key).ok(),
+            );
+            configured_job_refused =
+                recommendation == rch_common::admit_preflight::AdmitRecommendation::Defer;
+            detail
+        } else {
+            format!("Would run locally: {reason}")
+        };
         decision = DiagnoseDecision {
             would_intercept: false,
-            reason: format!("Would run locally: {reason}"),
+            reason,
         };
     }
     let would_intercept = decision.would_intercept;
@@ -613,7 +758,11 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         );
     }
 
-    let required_runtime = required_runtime_for_kind(details.classification.kind);
+    let required_runtime = if job_rule.is_some() {
+        required_runtime_for_job(command)
+    } else {
+        required_runtime_for_kind(details.classification.kind)
+    };
     let socket_path = config.general.socket_path.clone();
     let socket_exists = Path::new(&socket_path).exists();
 
@@ -687,26 +836,44 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         // A dry run: a real selection opens a durable build, and releasing it
         // without its build_id is refused, so every diagnose leaked a ghost
         // build holding slots until the daemon restarted.
-        match query_daemon_dry_run(
-            &socket_path,
-            &project,
-            estimated_cores,
-            config.compilation.disk_headroom_gib,
-            command,
-            toolchain.as_ref(),
-            required_runtime,
-            &preferred_workers,
-            Some(
-                &rch_common::SourceTopology::for_worker_namespace(
-                    &topology_policy,
-                    false,
-                    &config.transfer.remote_base,
-                )
-                .map_err(anyhow::Error::msg)?,
-            ),
+        let source_topology = rch_common::SourceTopology::for_worker_namespace(
+            &topology_policy,
+            false,
+            &config.transfer.remote_base,
         )
-        .await
-        {
+        .map_err(anyhow::Error::msg)?;
+        let selection = if let Some(rule) = job_rule.as_ref() {
+            let request = rch_common::admission_preview::PreviewRequest {
+                protocol_version: rch_common::admission_preview::PROTOCOL_VERSION,
+                project,
+                command: command.to_string(),
+                estimated_cores,
+                disk_headroom_gib: config.compilation.disk_headroom_gib,
+                preferred_workers,
+                toolchain,
+                required_runtime,
+                job_mode: true,
+                required_tools: rule.required_tools.clone(),
+                source_topology: Some(source_topology),
+            };
+            query_admission_preview(&socket_path, &request)
+                .await
+                .map(|preview| preview.selection)
+        } else {
+            query_daemon_dry_run(
+                &socket_path,
+                &project,
+                estimated_cores,
+                config.compilation.disk_headroom_gib,
+                command,
+                toolchain.as_ref(),
+                required_runtime,
+                &preferred_workers,
+                Some(&source_topology),
+            )
+            .await
+        };
+        match selection {
             Ok(response) => {
                 worker_selection = Some(DiagnoseWorkerSelection {
                     estimated_cores,
@@ -791,19 +958,53 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 
     // Build dry-run summary if requested
     let dry_run_summary = if dry_run {
-        Some(build_dry_run_summary(
-            would_intercept,
-            &decision.reason,
-            &worker_selection,
-            daemon_status.reachable,
-        ))
+        let mut summary = if configured_job_refused {
+            configured_job_refusal_summary(&decision.reason)
+        } else {
+            build_dry_run_summary(
+                would_intercept,
+                &decision.reason,
+                &worker_selection,
+                daemon_status.reachable,
+            )
+        };
+        if let Some(rule) = job_rule.as_ref().filter(|_| would_intercept) {
+            summary.reason = if summary.would_offload {
+                format!("configured job rule '{}', worker available", rule.name)
+            } else if !daemon_status.reachable {
+                format!("configured job rule '{}', but daemon is not reachable", rule.name)
+            } else {
+                format!(
+                    "configured job rule '{}', but no worker selected: {}",
+                    rule.name,
+                    worker_selection
+                        .as_ref()
+                        .map(|selection| selection.reason.to_string())
+                        .unwrap_or_else(|| "No worker available".to_string())
+                )
+            };
+            for step in &mut summary.pipeline_steps {
+                match step.step {
+                    1 => step.description = format!("Matched configured job rule '{}'", rule.name),
+                    5 => {
+                        step.description = "Execute the original job command on worker".to_string();
+                    }
+                    6 => {
+                        step.description =
+                            "Return declared results on every completed exit".to_string();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(summary)
     } else {
         None
     };
 
     // bd-2spi4: what the speed gate would decide for this project and kind,
     // before its local-slot and free-memory checks.
-    let speed_gate = would_intercept.then(|| {
+    let speed_gate = (would_intercept && job_rule.is_none()).then(|| {
         crate::hook::diagnose_speed_gate(
             &config,
             &extract_project_name_with_policy(&topology_policy),
@@ -814,6 +1015,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
     if ctx.is_json() {
         let response = DiagnoseResponse {
             classification: details.classification.clone(),
+            job_rule: job_rule.clone(),
             tiers: details.tiers.clone(),
             command: details.original.clone(),
             normalized_command: details.normalized.clone(),
@@ -842,6 +1044,10 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
     if dry_run {
         println!("{}", style.format_header("RCH Dry Run"));
         println!();
+        if let Some(rule) = job_rule.as_ref() {
+            print_configured_job_rule(style, rule);
+            println!();
+        }
         if let Some(ref summary) = dry_run_summary {
             let offload_label = if summary.would_offload {
                 style.format_success("YES")
@@ -909,7 +1115,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         }
         println!();
         println!(
-            "  {} This is a dry run. No network calls were made.",
+            "  {} This is a read-only preview. No job was reserved or executed.",
             style.muted("ℹ")
         );
         return Ok(());
@@ -941,6 +1147,9 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         .map(|k| format!("{:?}", k))
         .unwrap_or_else(|| "none".to_string());
     println!("  {} {}", style.key("Kind:"), style.value(&kind_label));
+    if let Some(rule) = job_rule.as_ref() {
+        print_configured_job_rule(style, rule);
+    }
     println!(
         "  {} {} {}",
         style.key("Confidence:"),
@@ -1376,6 +1585,8 @@ struct AdmitOutput<'a> {
     selection: Option<&'a rch_common::SelectionResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     observation_error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_rule: Option<&'a ConfiguredJobRule>,
 }
 
 pub(super) fn format_admit_required_capabilities(
@@ -1418,46 +1629,104 @@ pub(super) fn format_admit_required_capabilities(
     needs
 }
 
+fn prepare_admit_preflight(
+    command: &str,
+    explicit_job: bool,
+    mut require_tool: Vec<String>,
+    config: Option<&rch_common::RchConfig>,
+    proof_policy: bool,
+) -> Result<(
+    rch_common::admit_preflight::AdmitPreflight,
+    Option<ConfiguredJobRule>,
+)> {
+    let classification = rch_common::classify_command_detailed(command).classification;
+    let mut job_rule = match config {
+        Some(config) if !explicit_job => configured_job_rule(command, &classification, config)?,
+        _ => None,
+    };
+    let job = explicit_job || job_rule.is_some();
+    if job
+        && let Some(config) = config
+    {
+        require_tool = merge_job_required_tools(require_tool, &config.jobs.required_tools, true);
+    }
+    if let Some(rule) = job_rule.as_ref() {
+        require_tool = merge_job_required_tools(require_tool, &rule.required_tools, true);
+    }
+
+    // An explicit job or configured rule uses the existing job admission rail.
+    // Preserve the original classification facts alongside the effective mode.
+    let preflight =
+        rch_common::admit_preflight::preflight(command, proof_policy || !require_tool.is_empty());
+    let mut preflight = if job {
+        preflight.as_job(require_tool)
+    } else {
+        preflight.with_required_tools(require_tool)
+    };
+    if let Some(rule) = job_rule.as_mut() {
+        rule.required_tools = preflight.required.needs_tools.clone();
+        preflight.detail = format!("configured job rule '{}': {}", rule.name, preflight.detail);
+        if let Some(config) = config
+            && let Some(policy) =
+                crate::hook::config_local_policy(config, Some(rch_common::CompilationKind::Job))
+        {
+            preflight.base_recommendation = rch_common::admit_preflight::AdmitRecommendation::Local;
+            preflight.detail = format!(
+                "configured job rule '{}' would run locally: {}",
+                rule.name,
+                policy.reason()
+            );
+        }
+    }
+    Ok((preflight, job_rule))
+}
+
 pub async fn admit(
     command: &str,
     job: bool,
     require_tool: Vec<String>,
     ctx: &OutputContext,
 ) -> Result<()> {
-    use rch_common::admit_preflight::preflight;
-
     let config = crate::config::load_config().ok();
-    let require_tool = if job {
-        config.as_ref().map_or(require_tool.clone(), |config| {
-            merge_job_required_tools(require_tool.clone(), &config.jobs.required_tools, true)
-        })
-    } else {
-        require_tool
-    };
 
     // Proof/strict-remote policy mirrors the ControlState surface
-    // (RCH_REQUIRE_REMOTE / RCH_FORCE_REMOTE).
-    let proof_policy = !require_tool.is_empty()
-        || ["RCH_REQUIRE_REMOTE", "RCH_FORCE_REMOTE"]
-            .iter()
-            .any(|key| {
-                std::env::var(key).is_ok_and(|v| {
-                    matches!(
-                        v.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                })
-            });
-
-    // Job mode bypasses the classifier rather than consulting it, so the
-    // preflight must say so too: a fuzz script is not a compilation and would
-    // otherwise be reported `local` — the opposite of what `exec --job` does.
-    let pf = preflight(command, proof_policy);
-    let pf = if job {
-        pf.as_job(require_tool)
-    } else {
-        pf.with_required_tools(require_tool)
-    };
+    // (RCH_REQUIRE_REMOTE / RCH_FORCE_REMOTE); tool requirements add strictness.
+    let proof_policy = ["RCH_REQUIRE_REMOTE", "RCH_FORCE_REMOTE"]
+        .iter()
+        .any(|key| {
+            std::env::var(key).is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        });
+    let (mut pf, job_rule) =
+        prepare_admit_preflight(command, job, require_tool, config.as_ref(), proof_policy)?;
+    let job = pf.job_mode;
+    if let Some(rule) = job_rule.as_ref()
+        && let Some(config) = config.as_ref()
+    {
+        pf.proof_policy = configured_job_requires_remote(rule, config.general.role, |key| {
+            std::env::var(key).ok()
+        });
+        // A config-local rule is never delegated by the hook, so its existing
+        // local decision takes precedence over the exec topology check.
+        if pf.base_recommendation == rch_common::admit_preflight::AdmitRecommendation::Offload
+            && let Ok(cwd) = std::env::current_dir()
+            && let Some(reason) =
+                crate::hook::project_topology_local_reason(&config.path_topology.to_policy(), &cwd)
+        {
+            let (recommendation, detail) = configured_job_topology_decision(
+                rule,
+                config.general.role,
+                &reason,
+                |key| std::env::var(key).ok(),
+            );
+            pf.base_recommendation = recommendation;
+            pf.detail = detail;
+        }
+    }
 
     let mut live_selection = None;
     let mut observation_error = None;
@@ -1467,7 +1736,11 @@ pub async fn admit(
         observation = "unknown";
         if let Some(config) = config.as_ref() {
             let details = rch_common::classify_command_detailed(command);
-            let kind = details.classification.kind;
+            let kind = if job {
+                Some(rch_common::CompilationKind::Job)
+            } else {
+                details.classification.kind
+            };
             let topology_policy = config.path_topology.to_policy();
             let project = extract_project_name_with_policy(&topology_policy);
             let estimated_cores = estimate_cores_for_command(kind, command, &config.compilation);
@@ -1539,6 +1812,7 @@ pub async fn admit(
         observation,
         selection: live_selection.as_ref(),
         observation_error: observation_error.as_deref(),
+        job_rule: job_rule.as_ref(),
     };
     if ctx.is_json() {
         ctx.json(&ApiResponse::ok("admit", &report))?;
@@ -1571,6 +1845,9 @@ pub async fn admit(
             style.key("Mode:"),
             style.value("job (classifier bypassed)")
         );
+    }
+    if let Some(rule) = job_rule.as_ref() {
+        print_configured_job_rule(style, rule);
     }
     println!("{} {}", style.key("Compilation:"), pf.is_compilation);
     if let Some(family) = &pf.family {
@@ -5005,6 +5282,338 @@ mod tests {
             "last_error": null,
         }))
         .expect("worker status")
+    }
+
+
+    fn configured_job_fixture() -> rch_common::RchConfig {
+        let mut config = rch_common::RchConfig::default();
+        config.jobs = toml::from_str(
+            r#"
+intercept_enabled = true
+required_tools = ["cargo-mutants", "llvm-cov"]
+
+[[rules]]
+name = "mutants"
+argv_prefix = ["cargo", "mutants"]
+required_flags = ["--workspace"]
+result_dirs = ["mutants.out"]
+require_tools = ["cargo-mutants"]
+output_flag = "--output"
+"#,
+        )
+        .unwrap();
+        config
+    }
+
+    #[test]
+    fn configured_jobs_resolve_the_same_contract_for_diagnose_and_admit() {
+        let config = configured_job_fixture();
+        let command = "cargo mutants --workspace --output 'reports/current run'";
+        let (details, rule) = classify_diagnostic_command(command, &config).unwrap();
+        let rule = rule.expect("configured mutation command");
+        assert_eq!(
+            details.classification.kind,
+            Some(rch_common::CompilationKind::Job)
+        );
+        assert_eq!(details.original, command);
+        assert_eq!(rule.name, "mutants");
+        assert_eq!(
+            rule.result_dirs,
+            vec![std::path::PathBuf::from("reports/current run")]
+        );
+        assert_eq!(rule.required_tools, vec!["cargo-mutants", "llvm-cov"]);
+        let decision = build_diagnose_decision_with_config(&details.classification, &config);
+        assert!(decision.would_intercept);
+        assert!(decision.reason.contains("mutants"));
+        assert!(details.tiers.iter().any(|tier| {
+            tier.name == "Configured jobs" && tier.decision == rch_common::TierDecision::Pass
+        }));
+
+        let (preflight, admitted) = prepare_admit_preflight(
+            command,
+            false,
+            vec!["llvm-cov".into(), "clang".into()],
+            Some(&config),
+            false,
+        )
+        .unwrap();
+        let admitted = admitted.unwrap();
+        assert!(preflight.job_mode);
+        assert!(
+            !preflight.is_compilation,
+            "retain the original classification fact"
+        );
+        assert!(preflight.proof_policy);
+        assert_eq!(
+            preflight.base_recommendation,
+            rch_common::admit_preflight::AdmitRecommendation::Offload
+        );
+        assert_eq!(admitted.result_dirs, rule.result_dirs);
+        assert_eq!(
+            admitted.required_tools,
+            vec!["cargo-mutants", "clang", "llvm-cov"]
+        );
+        assert_eq!(preflight.required.needs_tools, admitted.required_tools);
+        assert!(preflight.detail.contains("mutants"));
+
+        let report = AdmitOutput {
+            preflight: &preflight,
+            recommendation: None,
+            observation: "unknown",
+            selection: None,
+            observation_error: Some("fixture has no daemon observation"),
+            job_rule: Some(&admitted),
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["job_rule"]["name"], "mutants");
+        assert_eq!(json["job_rule"]["result_dirs"][0], "reports/current run");
+        assert_eq!(
+            json["job_rule"]["required_tools"],
+            serde_json::json!(["cargo-mutants", "clang", "llvm-cov"])
+        );
+        assert!(
+            json["recommendation"].is_null(),
+            "a match is not live admission"
+        );
+        assert!(json.get("selection").is_none());
+    }
+
+    #[test]
+    fn configured_job_diagnostics_preserve_disabled_unmatched_and_compilation_paths() {
+        let mut config = configured_job_fixture();
+        config.jobs.intercept_enabled = false;
+        let command = "cargo mutants --workspace";
+        let (details, rule) = classify_diagnostic_command(command, &config).unwrap();
+        assert!(rule.is_none());
+        assert!(!details.classification.is_compilation);
+        let (preflight, rule) =
+            prepare_admit_preflight(command, false, Vec::new(), Some(&config), false).unwrap();
+        assert!(!preflight.job_mode);
+        assert!(rule.is_none());
+        assert_eq!(
+            preflight.base_recommendation,
+            rch_common::admit_preflight::AdmitRecommendation::Local
+        );
+        assert!(preflight.required.needs_tools.is_empty());
+
+        config.jobs.intercept_enabled = true;
+        for command in [
+            "cargo mutants",
+            "cargo mutants -- --workspace",
+            "cargo mutants --workspace | cat",
+            "cargo mutants --workspace && echo finished",
+            "echo cargo mutants --workspace",
+        ] {
+            let (details, rule) = classify_diagnostic_command(command, &config).unwrap();
+            assert!(rule.is_none(), "{command}");
+            assert_ne!(
+                details.classification.kind,
+                Some(rch_common::CompilationKind::Job)
+            );
+            let (preflight, rule) =
+                prepare_admit_preflight(command, false, Vec::new(), Some(&config), false).unwrap();
+            assert!(!preflight.job_mode, "{command}");
+            assert!(rule.is_none(), "{command}");
+        }
+
+        // Even an explicitly broad prefix cannot hijack supported compilations.
+        config.jobs.rules[0].argv_prefix = vec!["cargo".into()];
+        config.jobs.rules[0].required_flags.clear();
+        let (details, rule) = classify_diagnostic_command("cargo check", &config).unwrap();
+        assert_eq!(
+            details.classification.kind,
+            Some(rch_common::CompilationKind::CargoCheck)
+        );
+        assert!(rule.is_none());
+        let (preflight, rule) = prepare_admit_preflight(
+            "cargo check",
+            false,
+            Vec::new(),
+            Some(&config),
+            false,
+        )
+        .unwrap();
+        assert!(!preflight.job_mode);
+        assert!(preflight.required.needs_tools.is_empty());
+        assert!(rule.is_none());
+    }
+
+    #[test]
+    fn configured_job_admission_honors_local_policy_and_rejects_invalid_output_mapping() {
+        for disabled in [true, false] {
+            let mut config = configured_job_fixture();
+            config.general.enabled = !disabled;
+            config.general.force_local = !disabled;
+            let command = "cargo mutants --workspace";
+            let (details, rule) = classify_diagnostic_command(command, &config).unwrap();
+            assert!(rule.is_some());
+            let decision = build_diagnose_decision_with_config(&details.classification, &config);
+            assert!(!decision.would_intercept);
+            let (preflight, rule) =
+                prepare_admit_preflight(command, false, Vec::new(), Some(&config), true).unwrap();
+            assert!(rule.is_some());
+            assert_eq!(
+                preflight.base_recommendation,
+                rch_common::admit_preflight::AdmitRecommendation::Local
+            );
+            assert!(preflight.detail.contains("locally"));
+        }
+
+        let config = configured_job_fixture();
+        for command in [
+            "cargo mutants --workspace --output ../escape",
+            "cargo mutants --workspace --output",
+            "cargo mutants --workspace --output first --output second",
+        ] {
+            assert!(
+                classify_diagnostic_command(command, &config).is_err(),
+                "{command}"
+            );
+            assert!(
+                prepare_admit_preflight(command, false, Vec::new(), Some(&config), false).is_err(),
+                "{command}"
+            );
+        }
+    }
+
+
+    #[test]
+    fn configured_job_topology_matches_exec_strictness_and_dispatcher_overrides() {
+        use rch_common::BoxRole;
+        use rch_common::admit_preflight::AdmitRecommendation::{Defer, Local};
+
+        let config = configured_job_fixture();
+        let (_, rule) =
+            classify_diagnostic_command("cargo mutants --workspace", &config).unwrap();
+        let original = rule.unwrap();
+        let reason = "project /outside/repo is outside canonical root /projects";
+        for (label, tools, role, require, force, expected) in [
+            ("hybrid", false, BoxRole::Hybrid, None, None, Local),
+            ("worker", false, BoxRole::Worker, None, None, Local),
+            ("dispatcher", false, BoxRole::Dispatcher, None, None, Defer),
+            (
+                "dispatcher explicit local",
+                false,
+                BoxRole::Dispatcher,
+                Some("0"),
+                None,
+                Local,
+            ),
+            (
+                "dispatcher falsy force",
+                false,
+                BoxRole::Dispatcher,
+                None,
+                Some("false"),
+                Local,
+            ),
+            (
+                "dispatcher force is fail-open",
+                false,
+                BoxRole::Dispatcher,
+                None,
+                Some("1"),
+                Local,
+            ),
+            (
+                "hybrid force is fail-open",
+                false,
+                BoxRole::Hybrid,
+                None,
+                Some("true"),
+                Local,
+            ),
+            (
+                "explicit require",
+                false,
+                BoxRole::Hybrid,
+                Some(" TrUe "),
+                None,
+                Defer,
+            ),
+            (
+                "require wins over force",
+                false,
+                BoxRole::Hybrid,
+                Some("1"),
+                Some("1"),
+                Defer,
+            ),
+            (
+                "named tools require remote",
+                true,
+                BoxRole::Hybrid,
+                None,
+                None,
+                Defer,
+            ),
+            (
+                "named tools survive falsy overrides",
+                true,
+                BoxRole::Dispatcher,
+                Some("0"),
+                Some("0"),
+                Defer,
+            ),
+        ] {
+            let mut rule = original.clone();
+            if !tools {
+                rule.required_tools.clear();
+            }
+            let environment = |key: &str| match key {
+                "RCH_REQUIRE_REMOTE" => require.map(str::to_string),
+                "RCH_FORCE_REMOTE" => force.map(str::to_string),
+                _ => None,
+            };
+            let (recommendation, detail) =
+                configured_job_topology_decision(&rule, role, reason, environment);
+            assert_eq!(recommendation, expected, "{label}: {detail}");
+            assert!(detail.contains("mutants"), "{label}: {detail}");
+            assert!(detail.contains(reason), "{label}: {detail}");
+            assert_eq!(
+                configured_job_requires_remote(&rule, role, environment),
+                expected == Defer,
+                "{label}"
+            );
+            if expected == Defer {
+                assert!(detail.contains("Would refuse"), "{label}: {detail}");
+                let summary = configured_job_refusal_summary(&detail);
+                assert!(!summary.would_offload);
+                assert_eq!(summary.reason, detail);
+                assert!(summary.pipeline_steps.iter().all(|step| step.skipped));
+                assert!(
+                    summary
+                        .pipeline_steps
+                        .iter()
+                        .all(|step| !step.name.contains("Local execution"))
+                );
+                assert!(summary.transfer_estimate.is_none());
+            } else {
+                assert!(detail.contains("locally"), "{label}: {detail}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_jobs_keep_explicit_results_and_global_tool_policy() {
+        let config = configured_job_fixture();
+        let (preflight, rule) = prepare_admit_preflight(
+            "cargo mutants --workspace --output arbitrary",
+            true,
+            vec!["clang".into()],
+            Some(&config),
+            false,
+        )
+        .unwrap();
+        assert!(preflight.job_mode);
+        assert!(
+            rule.is_none(),
+            "explicit --job does not inherit rule result directories"
+        );
+        assert_eq!(
+            preflight.required.needs_tools,
+            vec!["cargo-mutants", "clang", "llvm-cov"]
+        );
     }
 
     #[test]

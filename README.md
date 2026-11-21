@@ -496,8 +496,8 @@ and same-invocation live-incumbent/A/A performance acceptance remain open.
 
 `rch exec --job` admits an arbitrary NON-compilation workload (sharded tests,
 fuzzing, benchmarks, mutation testing) onto the same remote rails. It bypasses
-ONLY the compilation classifier — the PreToolUse hook never sets it, so
-auto-delegation of ordinary commands is impossible.
+ONLY the compilation classifier. Ordinary commands stay local unless the
+operator explicitly enables a matching job interception rule below.
 
 ```bash
 rch exec --job -- ./run_shards.sh
@@ -508,8 +508,8 @@ mkdir -m 700 /var/tmp/verification-output
 rch exec --job --result-dir reports --result-dest /var/tmp/verification-output -- ./verify.sh
 ```
 
-Semantics: the remote exit status surfaces verbatim; no toolchain/worker-env
-rerun heuristics apply. A declared `--result-dir` that is missing or only
+Semantics: the remote exit status surfaces verbatim; no compiler-failure or
+signal-based rerun heuristics apply. A declared `--result-dir` that is missing or only
 partially transferable fails loudly (`RCH-E309`, exit 102) regardless of the
 job's own exit status. Paths must be repository-relative; conflicts with
 `--clean-overlay` / `--source-content-receipt` are refused.
@@ -606,12 +606,11 @@ worker on which `rustup run <toolchain> rustc --version` and
 
 `rch admit [--job] [--require-tool NAME]... -- <command>` preflights the same
 decision read-only — it syncs nothing and reserves nothing. Without `--job` the
-preflight consults the compilation classifier, so a fuzz script answers
-`local`; with it the classifier is bypassed exactly as `exec --job` does, and
-the answer is `offload`. The classification facts are still reported, so a
-compilation accidentally passed to `--job` still shows its family.
-This static preflight reports requirements and classification; it does not
-verify current worker readiness or establish native release qualification.
+preflight consults the compilation classifier and enabled job rules; an unmatched
+fuzz script answers `local`. Explicit `--job` bypasses the classifier exactly as
+`exec --job` does. The original classification facts remain visible. Admission
+reports the daemon's current preview when available; an unavailable observation
+stays unknown. A preview does not guarantee a later reservation.
 
 A required name that no worker has verified admits **no worker at all**,
 including when the name is a typo. That is deliberate: silently dropping the
@@ -620,6 +619,70 @@ returns the remote exit status verbatim — so the resulting failure would be
 indistinguishable from the job's own. Selection reports
 `capability_missing:tool:<name>:probe_failed` when a worker declared the tool
 but its probe failed, and `...:not_declared` when nothing declared it.
+
+### Opt-in job interception
+
+The Bash PreToolUse hook can delegate explicitly selected mutation runners and
+quality gates through the same `rch exec --job` path. Add rules to
+`~/.config/rch/config.toml` or a repository's `.rch/config.toml`:
+
+```toml
+[jobs]
+intercept_enabled = true
+
+[[jobs.rules]]
+name = "cargo-mutants"
+argv_prefix = ["cargo", "mutants"]
+result_dirs = ["mutants.out"]
+require_tools = ["cargo-mutants"]
+output_flag = "--output"
+
+[[jobs.rules]]
+name = "mutation-gate"
+argv_prefix = ["my-gate-cli", "gate"]
+required_flags = ["--mutation"]
+result_dirs = [".gate-reports"]
+require_tools = ["my-gate-cli"]
+```
+
+Interception is off by default. The first matching rule wins; the normal
+compilation classifier has precedence. Prefixes match exact executable and
+argument tokens, so a toolchain-qualified invocation such as
+`cargo +nightly mutants` needs its own matching prefix. Rules do not
+unwrap shell, `env`, or other launcher commands. Pipelines, redirections,
+compound commands, and active shell expansions stay local. Quoted literal
+arguments retain their values, and the rewrite preserves tool timeouts,
+background settings, and normal permission checks.
+
+`required_flags` are literal argv tokens before `--`. An optional
+`output_flag` maps one caller-supplied output path onto the rule's single
+default result directory: `--output 'reports/this run'` makes that directory
+the declared result. Long flags accept separate or equals values; short flags
+also accept an attached value (`-oreports`), while ambiguous `-o=reports` is
+declined. Missing or repeated output options, absolute paths, `..`, and invalid
+result roots decline interception before any worker
+reservation. Options after `--` are payload arguments and do not affect the
+rule. Configure the actual output option used by the tool; RCH does not infer
+arbitrary tools' output conventions.
+
+Rule `require_tools` and project `jobs.required_tools` combine and use the
+existing verified worker probes. Declared results are collected on completed
+nonzero exits, and a completed job is not replayed by compiler-failure or signal
+retry heuristics. `general.enabled = false` and `general.force_local = true`
+keep automatic rules local. In its `[jobs]` section, a project can disable
+inherited interception with `intercept_enabled = false` or replace inherited
+rules with `rules = []`.
+
+Inspect a rule's name, resolved result paths, and effective tool requirements
+without reserving or running a job:
+
+```bash
+rch admit -- cargo mutants --output reports/current
+rch diagnose "cargo mutants --output reports/current" --dry-run
+```
+
+Explicit `rch exec --job` and `rch admit --job` keep their explicit
+contracts; they do not inherit a rule's result directories.
 
 ### Same-identity job recovery
 

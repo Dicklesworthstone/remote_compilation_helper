@@ -744,8 +744,49 @@ fn fast_passthrough_allows(input: &str) -> bool {
         return true;
     }
     let command = &hook_input.tool_input.command;
-    !crate::cache::classify_hook_command(command, classify_command).is_compilation
-        && declined_compilation_due_to_structure(command).is_none()
+    if crate::cache::classify_hook_command(command, classify_command).is_compilation
+        || declined_compilation_due_to_structure(command).is_some()
+    {
+        return false;
+    }
+    // Configured prefixes can name any executable. Consult the existing
+    // source-fingerprinted config cache before taking the runtime-free allow
+    // path; a second independent rule cache could silently miss new rules.
+    load_config()
+        .ok()
+        .and_then(|config| configured_job_command(command, &config).ok().flatten())
+        .is_none()
+}
+
+/// Resolve explicitly configured job interception without executing anything.
+/// The ordinary compilation classifier keeps precedence. Both the startup
+/// fast path and the full hook call this helper so an opted-in command cannot
+/// disappear into a compilation-only early return.
+fn configured_job_command(
+    command: &str,
+    config: &rch_common::RchConfig,
+) -> Result<Option<String>, String> {
+    if config_local_policy(config, Some(CompilationKind::Job)).is_some() {
+        return Ok(None);
+    }
+    let Some(matched) = rch_common::job_rules::match_command(&config.jobs, command)? else {
+        return Ok(None);
+    };
+    let mut argv = vec!["rch".to_string(), "exec".to_string(), "--job".to_string()];
+    for directory in &matched.result_dirs {
+        let directory = directory
+            .to_str()
+            .ok_or_else(|| "jobs.rules result directory is not UTF-8".to_string())?;
+        argv.push(format!("--result-dir={directory}"));
+    }
+    for tool in &matched.rule.require_tools {
+        argv.push(format!("--require-tool={tool}"));
+    }
+    argv.push("--".to_string());
+    argv.extend(matched.argv);
+    // Re-encode the literal argv, including empty/quoted arguments. Concatenating
+    // the original shell text would reintroduce shell interpretation.
+    Ok(Some(shell_words::join(argv)))
 }
 
 /// Run the hook, reading from stdin and writing to stdout.
@@ -5046,10 +5087,9 @@ pub async fn run_exec(
         || result_dest.is_some()
         || !required_tools.is_empty();
 
-    // Classify the command. In explicit job-admission mode (`rch exec --job`,
-    // bd-bu3fb) the classifier is bypassed entirely and the command is admitted
-    // as a `CompilationKind::Job`: the hook can never produce this kind, so
-    // auto-delegation of non-compilation workloads remains impossible.
+    // Job admission (`rch exec --job`, bd-bu3fb) bypasses the compilation
+    // classifier. The hook can delegate this mode only through an explicitly
+    // enabled, validated jobs.rules match; the default remains compilation-only.
 
     // Declared job result directories (bd-p0yoo) are validated up front so an
     // unsafe path fails before any worker selection or transfer happens.
@@ -7181,8 +7221,25 @@ async fn process_hook(input: HookInput) -> HookOutput {
     let classification_duration_us = classification_duration.as_micros() as u64;
 
     if !classification.is_compilation {
+        if let Ok(config) = load_config() {
+            match configured_job_command(command, &config) {
+                Ok(Some(modified)) => {
+                    HookReporter::new(config.output.visibility)
+                        .verbose("[RCH] delegating configured job to rch exec --job");
+                    // Arbitrary configured executables retain the user's normal
+                    // tool permission checks; a project rule is not permission
+                    // to auto-approve a command.
+                    return HookOutput::rewrite_with_permission_check(modified);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!("Configured job interception declined: {error}");
+                }
+            }
+        }
+
         // Log non-compilation decision latency (budget: <1ms per AGENTS.md)
-        let duration_ms = classification_duration_us as f64 / 1000.0;
+        let duration_ms = classify_start.elapsed().as_secs_f64() * 1000.0;
         if duration_ms > 1.0 {
             warn!(
                 "Non-compilation decision exceeded 1ms budget: {:.3}ms for '{}'",
@@ -7199,8 +7256,8 @@ async fn process_hook(input: HookInput) -> HookOutput {
         // compilation command in disguise but whose pipe/redirect/background/
         // subshell structure we can't safely offload. On an orchestrator with
         // force_remote=true this would otherwise be an *invisible* local
-        // fallback (a silent rustc/cc storm). Only loads config on this rare
-        // path to avoid touching the hot non-compilation path.
+        // fallback (a silent rustc/cc storm). Reuse the source-fingerprinted
+        // configuration loader for this diagnostic decision.
         if let Some(structure_reason) = declined_compilation_due_to_structure(command) {
             let config = load_config().ok();
             let force_remote = config
