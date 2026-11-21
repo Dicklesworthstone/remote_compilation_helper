@@ -296,6 +296,206 @@ fn custom_profile_cache_excludes(profile_dir: &str) -> Vec<String> {
     .to_vec()
 }
 
+/// Streaming test/check/report paths and non-Cargo commands have no Cargo
+/// build-output contract to narrow. Build-only test/bench kinds are already
+/// mapped to CargoBuild by artifact_delivery_kind.
+pub(super) fn cargo_retrieval_exclusions_apply(kind: Option<CompilationKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            CompilationKind::CargoBuild
+                | CompilationKind::CargoDoc
+                | CompilationKind::CargoZigbuild
+        )
+    )
+}
+
+/// Add only literal, target-root-anchored directory exclusions. Required files
+/// come from the completed Cargo receipt evaluated under the ORIGINAL policy;
+/// testing a nonempty filtered transfer would not prove completeness.
+pub(super) fn cargo_retrieval_patterns(
+    baseline: &[String],
+    transfer: &TransferConfig,
+    required_files: Option<&std::collections::BTreeSet<PathBuf>>,
+) -> anyhow::Result<Vec<String>> {
+    transfer
+        .validate_cargo_retrieval_exclude_dirs()
+        .map_err(anyhow::Error::msg)?;
+    let mut patterns = baseline.to_vec();
+    for directory in &transfer.cargo_retrieval_exclude_dirs {
+        for priority in baseline
+            .iter()
+            .filter_map(|pattern| pattern.strip_prefix("+ "))
+        {
+            anyhow::ensure!(
+                !priority_may_overlap_directory(priority, directory)?,
+                "Cargo retrieval exclusion {directory:?} overlaps priority output {priority:?}"
+            );
+        }
+        if let Some(required) = required_files {
+            let excluded = Path::new(directory);
+            for output in required {
+                anyhow::ensure!(
+                    !output.starts_with(excluded) && !excluded.starts_with(output),
+                    "Cargo retrieval exclusion {directory:?} overlaps required output {}",
+                    output.display()
+                );
+            }
+        }
+        let pattern = format!("- /{directory}/");
+        if !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
+    }
+    Ok(patterns)
+}
+
+/// Decide disjointness component by component. An exhausted prefix or `**`
+/// can overlap the directory's descendants, so uncertainty refuses the rule.
+/// Escaped literal priorities are conservatively protected too.
+fn priority_may_overlap_directory(priority: &str, directory: &str) -> anyhow::Result<bool> {
+    let mut expected = priority.trim_start_matches('/').split('/');
+    let mut actual = directory.split('/');
+    loop {
+        match (expected.next(), actual.next()) {
+            (Some(pattern), Some(component)) => {
+                if pattern == "**" || pattern.contains('\\') {
+                    return Ok(true);
+                }
+                let pattern =
+                    glob::Pattern::new(pattern).context("invalid priority output pattern")?;
+                if !pattern.matches_with(
+                    component,
+                    glob::MatchOptions {
+                        case_sensitive: true,
+                        require_literal_separator: true,
+                        require_literal_leading_dot: false,
+                    },
+                ) {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(true),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cargo_retrieval_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn cargo_retrieval_exclusions_preserve_defaults_and_anchor_cross_profile_roots() {
+        for (command, prefix) in [
+            ("cargo build", "debug"),
+            (
+                "cargo build --release --target aarch64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu/release",
+            ),
+            ("cargo build --profile ci-fast", "ci-fast"),
+            (
+                "cargo build --profile ci-fast --target aarch64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu/ci-fast",
+            ),
+        ] {
+            let baseline = get_custom_target_artifact_patterns(
+                Some(CompilationKind::CargoBuild),
+                Some(command),
+            );
+            let transfer = TransferConfig {
+                cargo_retrieval_exclude_dirs: vec![format!("{prefix}/.wrapper-shims")],
+                ..TransferConfig::default()
+            };
+            let required = BTreeSet::from([PathBuf::from(format!("{prefix}/app"))]);
+            let patterns = cargo_retrieval_patterns(&baseline, &transfer, Some(&required)).unwrap();
+            assert!(patterns.starts_with(&baseline));
+            assert!(patterns.contains(&"- debug/incremental/".to_owned()));
+            let selected = crate::transfer::ArtifactFilters::from_patterns(&patterns).unwrap();
+            assert!(selected.selects(&format!("{prefix}/app")));
+            assert!(selected.selects(&format!("{prefix}/deps/libapp.rlib")));
+            assert!(!selected.selects(&format!("{prefix}/.wrapper-shims/helper.bin")));
+            assert!(!selected.selects(&format!("{prefix}/incremental/private.bin")));
+            assert!(selected.selects(&format!("{prefix}/.wrapper-shims-other/helper.bin")));
+        }
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_refuse_required_and_priority_output_overlap() {
+        let baseline = get_custom_target_artifact_patterns(
+            Some(CompilationKind::CargoBuild),
+            Some("cargo build"),
+        );
+        let required = BTreeSet::from([
+            PathBuf::from("debug/app"),
+            PathBuf::from("debug/deps/libapp.rlib"),
+        ]);
+        for directory in ["debug", "debug/app", "debug/app/nested", "debug/deps"] {
+            let transfer = TransferConfig {
+                cargo_retrieval_exclude_dirs: vec![directory.into()],
+                ..TransferConfig::default()
+            };
+            assert!(
+                cargo_retrieval_patterns(&baseline, &transfer, Some(&required)).is_err(),
+                "{directory}"
+            );
+        }
+        let baseline = get_custom_target_artifact_patterns(
+            Some(CompilationKind::CargoTest),
+            Some("cargo test --no-run"),
+        );
+        for directory in [
+            "debug/build",
+            "debug/build/pkg/hash/out",
+            "aarch64-unknown-linux-gnu/debug/build/pkg",
+        ] {
+            let transfer = TransferConfig {
+                cargo_retrieval_exclude_dirs: vec![directory.into()],
+                ..TransferConfig::default()
+            };
+            assert!(
+                cargo_retrieval_patterns(&baseline, &transfer, None).is_err(),
+                "{directory}"
+            );
+        }
+        let transfer = TransferConfig {
+            cargo_retrieval_exclude_dirs: vec!["debug/.wrapper-shims".into()],
+            ..TransferConfig::default()
+        };
+        assert!(cargo_retrieval_patterns(&baseline, &transfer, None).is_ok());
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_reject_ambiguous_literal_directories() {
+        for directory in [
+            "",
+            ".",
+            "..",
+            "/debug/private",
+            "debug/private/",
+            "debug//private",
+            "debug/../private",
+            "debug/./private",
+            "debug/*",
+            "debug/a?",
+            "debug/[ab]",
+            "debug\\private",
+            "C:/private",
+            " debug/private",
+            "debug/private\n",
+        ] {
+            let transfer = TransferConfig {
+                cargo_retrieval_exclude_dirs: vec![directory.into()],
+                ..TransferConfig::default()
+            };
+            assert!(
+                transfer.validate_cargo_retrieval_exclude_dirs().is_err(),
+                "{directory:?}"
+            );
+        }
+    }
+}
+
 pub(super) fn get_custom_target_artifact_patterns(
     kind: Option<CompilationKind>,
     command: Option<&str>,

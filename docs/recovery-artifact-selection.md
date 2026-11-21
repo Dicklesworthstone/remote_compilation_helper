@@ -1,4 +1,55 @@
-# Recovering Make outputs that include non-deliverable test fixtures
+# Selecting and recovering returned artifacts
+
+## Cargo target exclusions
+
+Keep worker-private caches out of Cargo artifact return with committed project
+configuration in `.rch/config.toml`:
+
+```toml
+[transfer]
+cargo_retrieval_exclude_dirs = [
+  "debug/.wrapper-shims",
+  "debug/.kache-build-script-shims",
+  "release/.wrapper-shims",
+]
+```
+
+Each entry names an exact directory relative to the resolved Cargo target root,
+including custom `CARGO_TARGET_DIR` roots. Cross-compilation and custom profiles
+use their actual directory prefixes, such as
+`aarch64-unknown-linux-gnu/ci-fast/.wrapper-shims`. No globbing, traversal,
+absolute paths, empty components, trailing slashes, backslashes or colons are
+accepted. At most 128 directories of 4096 bytes each are supported. Built-in
+`incremental/`, `.fingerprint/`, `build/` and dep-info exclusions remain active.
+An exclusion does not match a same-prefix sibling or a same-named tree elsewhere.
+
+This opt-in applies to artifact-producing Cargo builds and build-only
+`test/bench --no-run`. It supports the bounded literal Cargo build grammar,
+including full workspaces, libraries, multiple binaries, profiles and target
+triples. The Unix durable execution path retains a complete Cargo JSON receipt
+and validates every Cargo-reported selected library, binary and sidecar before
+publishing anything. Required executables and priority includes cannot be
+excluded. Empty, incomplete, malformed or out-of-root output evidence refuses
+publication; one remaining file cannot stand in for a complete build.
+
+Full builds use their normal human output; explicit caller JSON remains limited
+to the existing named-executable contract. Unsupported explicit message formats,
+opaque flags, documentation/package commands and transports without durable
+Cargo evidence refuse before execution. Streaming check, clippy, ordinary test
+reports, non-Cargo commands and explicitly declared job results are unaffected.
+
+Size planning, payload retrieval, staged-file validation and detached recovery
+use the same persisted selection. Recovery retains the original exclusions even
+when current configuration changes; it never reruns the completed build to
+establish output completeness. An exclusion conflicting with an actual emitted
+output is reported after completion, before publication, with the attempt retained.
+
+`transfer.exclude_patterns` controls source upload only. Project-root
+`.rchignore` is not inherited by the separate Cargo target pull. The target
+root's own `.rchignore` keeps its existing guarded directory-only semantics;
+unlike the project configuration above, that file is removed by `cargo clean`.
+
+## Make outputs that include non-deliverable test fixtures
 
 Make artifact discovery is intentionally broad: a project may produce ordinary
 executables, object files, libraries, reports or distribution archives without

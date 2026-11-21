@@ -3556,6 +3556,11 @@ pub struct TransferConfig {
     /// Patterns to exclude from transfer.
     #[serde(default = "default_excludes")]
     pub exclude_patterns: Vec<String>,
+    /// Literal directories relative to the Cargo target root to omit from
+    /// artifact return. Additive to built-in cache exclusions; never applied
+    /// to source uploads or inherited from their exclude patterns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cargo_retrieval_exclude_dirs: Vec<String>,
     /// Built-in default exclude patterns that a custom `exclude_patterns` list
     /// omits on purpose (for example `*.pem` when TLS test fixtures must reach
     /// workers). Only the omitted-defaults diagnostics read it; it never
@@ -3709,6 +3714,7 @@ impl Default for TransferConfig {
             retrieval_min_free_bytes: 0,
             compression_level: 3,
             exclude_patterns: default_excludes(),
+            cargo_retrieval_exclude_dirs: Vec::new(),
             exclude_defaults_acknowledged: Vec::new(),
             ssh_server_alive_interval_secs: None,
             ssh_control_persist_secs: None,
@@ -3733,6 +3739,32 @@ impl Default for TransferConfig {
 }
 
 impl TransferConfig {
+    /// Keep retrieval policy anchored and literal. A wildcard or an aliasing
+    /// spelling cannot establish that every required Cargo output survives.
+    pub fn validate_cargo_retrieval_exclude_dirs(&self) -> Result<(), String> {
+        if self.cargo_retrieval_exclude_dirs.len() > 128 {
+            return Err(
+                "transfer.cargo_retrieval_exclude_dirs accepts at most 128 directories".into(),
+            );
+        }
+        for (index, directory) in self.cargo_retrieval_exclude_dirs.iter().enumerate() {
+            if directory.is_empty()
+                || directory.len() > 4096
+                || directory.trim() != directory
+                || directory.chars().any(char::is_control)
+                || directory.contains(['\\', ':', '*', '?', '[', ']'])
+                || directory
+                    .split('/')
+                    .any(|part| matches!(part, "" | "." | ".."))
+            {
+                return Err(format!(
+                    "transfer.cargo_retrieval_exclude_dirs[{index}] must be a literal target-relative directory without traversal, glob syntax, or leading/trailing slashes"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Built-in default exclude patterns that `exclude_patterns` lacks and
     /// `exclude_defaults_acknowledged` does not list. A configured list replaces
     /// the defaults, so without this check defaults added after the list was
@@ -5354,7 +5386,10 @@ retry_max = 2
             "tools_present": ["clang"],
         }))
         .unwrap();
-        assert_eq!(legacy.native_tools.missing_reason("clang"), Some("unprobed"));
+        assert_eq!(
+            legacy.native_tools.missing_reason("clang"),
+            Some("unprobed")
+        );
         let observed = serde_json::json!({
             "tools_present": ["gcc"],
             "native_tools": {

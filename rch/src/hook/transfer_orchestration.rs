@@ -1076,6 +1076,33 @@ async fn execute_remote_compilation_inner(
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    if !transfer_config.cargo_retrieval_exclude_dirs.is_empty()
+        && super::artifact_patterns::cargo_retrieval_exclusions_apply(artifact_delivery_kind(
+            kind,
+            Some(command),
+        ))
+    {
+        anyhow::ensure!(
+            forwarded_cargo_target_dir.is_some(),
+            "Cargo retrieval exclusions require a resolved target directory"
+        );
+        let baseline = get_custom_target_artifact_patterns(kind, Some(command));
+        if !baseline.is_empty() {
+            anyhow::ensure!(
+                durable_lease.is_some()
+                    && !WorkerPlatform::from_worker(&worker_config).is_windows()
+                    && !super::ssh::should_skip_remote_preflight(&worker_config),
+                "Cargo retrieval exclusions require durable Unix execution and complete output evidence"
+            );
+            super::artifact_patterns::cargo_retrieval_patterns(&baseline, &transfer_config, None)?;
+            CargoOutputCapture::for_retrieval_policy(
+                kind,
+                command,
+                &baseline,
+                &transfer_config.cargo_retrieval_exclude_dirs,
+            )?;
+        }
+    }
     if let Some(destination) = result_destination {
         anyhow::ensure!(
             kind == Some(CompilationKind::Job)
@@ -2719,7 +2746,8 @@ async fn execute_remote_compilation_inner(
     // command before adding the execution-only JSON option to a managed one.
     let cargo_output_capture = recovery_session
         .as_ref()
-        .and_then(|_| CargoOutputCapture::for_command(kind, policy_command));
+        .and_then(recovery::RecoverySession::cargo_output_capture)
+        .cloned();
     if reporter.cargo_json_stdout {
         anyhow::ensure!(
             cargo_output_capture

@@ -3,6 +3,7 @@ use super::super::artifact_patterns::build_system::{BuildSystemOutputDiscovery, 
 use super::super::artifact_patterns::direct_compiler::{
     NativeOutputContract, NativeOutputPlatform, native_output_contract,
 };
+use super::super::artifact_patterns::{cargo_retrieval_exclusions_apply, cargo_retrieval_patterns};
 use super::super::cargo_output_contract::{
     CargoCallerPaths, CargoOutputCapture, CargoOutputContract,
 };
@@ -645,6 +646,63 @@ impl RecoveryRecipe {
             }
             directories.push(directory);
         }
+        Ok(())
+    }
+
+    fn validate_cargo_retrieval_policy(&self) -> anyhow::Result<()> {
+        self.transfer
+            .validate_cargo_retrieval_exclude_dirs()
+            .map_err(anyhow::Error::msg)?;
+        if !self.prepared {
+            return Ok(());
+        }
+        let capture_baseline = self
+            .cargo_output_capture
+            .as_ref()
+            .and_then(CargoOutputCapture::retrieval_baseline);
+        if !cargo_retrieval_exclusions_apply(self.kind) {
+            anyhow::ensure!(
+                capture_baseline.is_none(),
+                "Cargo retrieval capture belongs to an unrelated command"
+            );
+            return Ok(());
+        }
+        if self.transfer.cargo_retrieval_exclude_dirs.is_empty() {
+            anyhow::ensure!(
+                capture_baseline.is_none(),
+                "Cargo retrieval capture lost its admitted exclusions"
+            );
+            return Ok(());
+        }
+        let mut phases = self
+            .phases
+            .iter()
+            .filter(|phase| phase.custom_target && !phase.patterns.is_empty());
+        let phase = phases
+            .next()
+            .context("Cargo retrieval exclusions lost their target phase")?;
+        let baseline =
+            capture_baseline.context("Cargo retrieval exclusions lack complete output capture")?;
+        let expected = cargo_retrieval_patterns(
+            baseline,
+            &self.transfer,
+            phase
+                .cargo_outputs
+                .as_ref()
+                .map(|outputs| &outputs.required_files),
+        )?;
+        anyhow::ensure!(
+            phases.next().is_none()
+                && phase.output_gate
+                && phase.result_dir.is_none()
+                && phase.native_outputs.is_none()
+                && !WorkerPlatform::from_worker(&self.worker).is_windows()
+                && phase.patterns.ends_with(&expected),
+            "Cargo retrieval exclusions contradict their admitted target selection"
+        );
+        // Once exact priority rules are installed, none may override a
+        // configured exclusion. Recovery validates this before any transfer.
+        cargo_retrieval_patterns(&phase.patterns, &self.transfer, None)?;
         Ok(())
     }
 
@@ -1822,7 +1880,28 @@ impl RecoverySession {
         // Observe only the admitted staged set under the publication lock,
         // before its first write. Old journals still resolve pending renames
         // against their original predecessor before any baseline is refreshed.
-        let cargo_output_capture = CargoOutputCapture::for_command(kind, command);
+        let target_baseline = phases
+            .iter()
+            .find(|phase| phase.custom_target)
+            .map(|phase| phase.patterns.as_slice())
+            .unwrap_or(&[]);
+        let restricted = cargo_retrieval_exclusions_apply(delivery_kind);
+        let cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
+            kind,
+            command,
+            target_baseline,
+            if restricted {
+                &transfer.cargo_retrieval_exclude_dirs
+            } else {
+                &[]
+            },
+        )?;
+        for phase in phases
+            .iter_mut()
+            .filter(|phase| restricted && phase.custom_target)
+        {
+            phase.patterns = cargo_retrieval_patterns(&phase.patterns, &transfer, None)?;
+        }
         anyhow::ensure!(
             cargo_output_capture.is_none()
                 || phases.iter().filter(|phase| phase.output_gate).count() == 1,
@@ -1887,6 +1966,7 @@ impl RecoverySession {
             recipe,
             writer: writer.clone(),
         };
+        session.recipe.validate_cargo_retrieval_policy()?;
         session.persist()?;
         Ok(session)
     }
@@ -2190,6 +2270,9 @@ impl RecoverySession {
             .find(|phase| phase.output_gate)
             .map(|phase| phase.remote.as_str())
     }
+    pub(in crate::hook) fn cargo_output_capture(&self) -> Option<&CargoOutputCapture> {
+        self.recipe.cargo_output_capture.as_ref()
+    }
     /// Complete Cargo evidence authorizes the selected binary executables that
     /// this exact invocation emitted. Persist the contract and transfer policy
     /// together, before either live collection or detached recovery begins.
@@ -2237,6 +2320,13 @@ impl RecoverySession {
                 .position(|phase| phase.output_gate)
                 .context("captured Cargo execution has no artifact output root")?;
             let phase = &self.recipe.phases[index];
+            if phase.custom_target {
+                cargo_retrieval_patterns(
+                    &phase.patterns,
+                    &self.recipe.transfer,
+                    Some(&contract.required_files),
+                )?;
+            }
             if let Some(existing) = &phase.cargo_outputs {
                 anyhow::ensure!(
                     existing.required_files == contract.required_files,
@@ -2249,6 +2339,8 @@ impl RecoverySession {
                 "Cargo output evidence must precede every artifact publication"
             );
             let mut exact_patterns = Vec::new();
+            let baseline_filters = capture.retrieval_baseline()
+                .map(crate::transfer::ArtifactFilters::from_patterns).transpose()?;
             for relative in &contract.required_files {
                 // A project-root collection must never promote a source file
                 // through the priority include below. With a custom Cargo
@@ -2261,6 +2353,13 @@ impl RecoverySession {
                     relative.display()
                 );
                 let name = relative.to_str().context("non-UTF-8 Cargo output path")?;
+                if baseline_filters.as_ref().is_some_and(|filters| filters.selects(name)) {
+                    // Full builds can contain thousands of library outputs.
+                    // Their existing include already selects them; retain
+                    // required-file validation without expanding rsync argv
+                    // or overriding a local .rchignore directory rule.
+                    continue;
+                }
                 let mut literal = String::with_capacity(name.len());
                 for character in name.chars() {
                     if matches!(character, '\\' | '*' | '?' | '[' | ']') {
@@ -2835,6 +2934,7 @@ impl RecoverySession {
         Ok(())
     }
     fn verify_cargo_outputs(&self, index: usize) -> anyhow::Result<()> {
+        self.recipe.validate_cargo_retrieval_policy()?;
         let phase = &self.recipe.phases[index];
         if self.recipe.cargo_output_capture.is_none() || !phase.output_gate {
             return Ok(());
@@ -4497,6 +4597,7 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     // cancellation or retirement of a job that has not exposed any outputs.
     // Publication rechecks the original physical root before every write.
     recipe.validate_result_destination_contract()?;
+    recipe.validate_cargo_retrieval_policy()?;
     anyhow::ensure!(
         recipe.source_cancellation_settled != Some(true)
             || (recipe.returned.is_some_and(|exit| exit != 0) && recipe.source_resources_retired()),
@@ -11269,6 +11370,198 @@ func TestValue(t *testing.T) {{
         };
         session.persist().unwrap();
         (directory, stage_owner, session)
+    }
+
+    #[tokio::test]
+    async fn cargo_retrieval_policy_survives_recovery_and_real_rsync_publication() {
+        let remote = tempfile::tempdir().unwrap();
+        let partial = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("debug/app", &b"worker executable"[..]),
+            ("debug/deps/libmodel.rlib", &b"worker library"[..]),
+            (
+                "debug/.wrapper-shims/helper.bin",
+                &b"worker private cache"[..],
+            ),
+            (
+                "debug/.wrapper-shims-other/keep",
+                &b"unexcluded sibling"[..],
+            ),
+        ] {
+            let path = remote.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::create_dir_all(partial.path().join("debug")).unwrap();
+        std::fs::write(partial.path().join("debug/app"), b"worker executable").unwrap();
+        let (_directory, _stage_owner, mut session) = captured_publication_fixture(
+            CompilationKind::CargoBuild,
+            "cargo build --bin app",
+            remote.path(),
+            true,
+        );
+        let baseline = get_custom_target_artifact_patterns(
+            Some(CompilationKind::CargoBuild),
+            Some("cargo build"),
+        );
+        session.recipe.transfer.cargo_retrieval_exclude_dirs = vec!["debug/.wrapper-shims".into()];
+        session.recipe.cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
+            Some(CompilationKind::CargoBuild),
+            "cargo build",
+            &baseline,
+            &session.recipe.transfer.cargo_retrieval_exclude_dirs,
+        )
+        .unwrap();
+        session.recipe.phases[0].patterns =
+            cargo_retrieval_patterns(&baseline, &session.recipe.transfer, None).unwrap();
+        session.persist().unwrap();
+        let record = |kind: &str, name: &str, relative: &str, executable: bool| {
+            let output = remote.path().join(relative);
+            serde_json::json!({"reason":"compiler-artifact", "target":{"kind":[kind],"name":name}, "filenames":[output], "executable":executable.then_some(&output), "fresh":true})
+        };
+        let unsafe_stdout = format!(
+            "{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
+            record("bin", "helper", "debug/.wrapper-shims/helper.bin", true)
+        );
+        assert!(
+            session
+                .install_cargo_artifact_evidence(unsafe_stdout.as_bytes(), remote.path())
+                .is_err()
+        );
+        assert!(session.recipe.phases[0].cargo_outputs.is_none());
+        assert!(session.recipe.phases[0].published.is_empty());
+        let stdout = format!(
+            "{}\n{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
+            record("bin", "app", "debug/app", true),
+            record("lib", "model", "debug/deps/libmodel.rlib", false)
+        );
+        session
+            .install_complete_cargo_evidence(&crate::transfer::CargoArtifactEvidence {
+                stdout: stdout.into_bytes(),
+                remote_root: remote.path().to_owned(),
+                remote_project_root: None,
+            })
+            .unwrap();
+        let patterns = session.cargo_artifact_patterns("target").unwrap();
+        assert_eq!(
+            patterns.len(),
+            baseline.len() + 1,
+            "full builds reuse the existing includes without one rsync rule per output"
+        );
+        session
+            .apply_retrieval_config(&TransferConfig {
+                cargo_retrieval_exclude_dirs: vec!["debug/deps".into()],
+                ..TransferConfig::default()
+            })
+            .unwrap();
+        let mut session = reload_publication(&session);
+        assert_eq!(
+            session.recipe.transfer.cargo_retrieval_exclude_dirs,
+            ["debug/.wrapper-shims"]
+        );
+        assert_eq!(session.cargo_artifact_patterns("target").unwrap(), patterns);
+        let mut corrupt = session.recipe.clone();
+        corrupt.phases[0]
+            .patterns
+            .retain(|pattern| pattern != "- /debug/.wrapper-shims/");
+        assert!(corrupt.validate_cargo_retrieval_policy().is_err());
+        let local = session.recipe.phases[0].local.clone();
+        std::fs::create_dir_all(local.join("debug")).unwrap();
+        std::fs::write(local.join("debug/app"), b"old local executable").unwrap();
+        let pipeline = TransferPipeline::new(
+            local.clone(),
+            "fixture".into(),
+            "abc123".into(),
+            session.recipe.transfer.clone(),
+        );
+        let worker = session.recipe.worker.clone();
+        for complete in [false, true] {
+            let staged = session.staging_pipeline("target", &pipeline).unwrap();
+            let mut preview =
+                staged.local_artifact_retrieval_for_test(&worker, remote.path(), &patterns);
+            let preview = preview.arg("--dry-run").output().await.unwrap();
+            assert!(
+                preview.status.success(),
+                "{}",
+                String::from_utf8_lossy(&preview.stderr)
+            );
+            assert!(
+                !String::from_utf8_lossy(&preview.stdout).contains(".wrapper-shims/helper.bin")
+            );
+            let mut retrieve = staged.local_artifact_retrieval_for_test(
+                &worker,
+                if complete {
+                    remote.path()
+                } else {
+                    partial.path()
+                },
+                &patterns,
+            );
+            let result = retrieve.output().await.unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(
+                !session
+                    .stage(0)
+                    .join("debug/.wrapper-shims/helper.bin")
+                    .exists()
+            );
+            assert!(
+                staged
+                    .validate_staged_artifact_paths(
+                        &["debug/.wrapper-shims/helper.bin".into()],
+                        &patterns
+                    )
+                    .is_err()
+            );
+            if complete {
+                session.publish("target").await.unwrap();
+                assert_eq!(
+                    std::fs::read(local.join("debug/app")).unwrap(),
+                    b"worker executable"
+                );
+                assert_eq!(
+                    std::fs::read(local.join("debug/deps/libmodel.rlib")).unwrap(),
+                    b"worker library"
+                );
+                assert_eq!(
+                    std::fs::read(local.join("debug/.wrapper-shims-other/keep")).unwrap(),
+                    b"unexcluded sibling"
+                );
+                assert!(!local.join("debug/.wrapper-shims/helper.bin").exists());
+                session = reload_publication(&session);
+                assert!(session.recipe.phases[0].complete);
+            } else {
+                assert!(session.publish("target").await.is_err());
+                assert_eq!(
+                    std::fs::read(local.join("debug/app")).unwrap(),
+                    b"old local executable"
+                );
+                assert!(session.recipe.phases[0].published.is_empty());
+                session = reload_publication(&session);
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_retrieval_policy_does_not_narrow_streaming_or_native_commands() {
+        for kind in [
+            CompilationKind::CargoCheck,
+            CompilationKind::CargoTest,
+            CompilationKind::GoBuild,
+            CompilationKind::Make,
+            CompilationKind::Job,
+        ] {
+            let (_directory, _stage_owner, mut session) = publication_fixture();
+            session.recipe.prepared = true;
+            session.recipe.kind = Some(kind);
+            session.recipe.transfer.cargo_retrieval_exclude_dirs =
+                vec!["debug/.wrapper-shims".into()];
+            session.recipe.validate_cargo_retrieval_policy().unwrap();
+        }
     }
 
     pub(super) async fn assert_cargo_fixture_publication(

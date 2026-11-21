@@ -196,9 +196,19 @@ Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
 
 ### `[transfer]`
 - `compression_level` (u32, default `3`) — zstd compression level.
-- `exclude_patterns` (list) — Patterns excluded from transfer. Defaults include:
+- `exclude_patterns` (list) — Patterns excluded from source upload. Defaults include:
   `target/`, `.git/`, `node_modules/`, common build caches, and
   coverage output. Use `rch config show` to see the full effective list.
+- `cargo_retrieval_exclude_dirs` (list, default `[]`) — Literal directories
+  relative to the Cargo target root that stay on the worker, for example
+  `debug/.wrapper-shims` or `aarch64-unknown-linux-gnu/release/.wrapper-shims`.
+  These add to built-in cache exclusions and never inherit upload exclusions.
+  Successful build and `test/bench --no-run` delivery requires a complete Cargo
+  output receipt; rules overlapping required files or priority includes refuse
+  delivery. Unsupported command/format combinations refuse before execution.
+  Streaming check/test/report paths are unaffected. See
+  [Cargo target exclusions](../recovery-artifact-selection.md#cargo-target-exclusions)
+  for the supported command grammar and immutable recovery behavior.
 - `ssh_server_alive_interval_secs` (u64, optional) — Sets `ssh -o ServerAliveInterval`
   for remote execution and rsync transfers to reduce dropped connections on flaky networks.
 - `ssh_control_persist_secs` (u64, optional) — Positive values opt Unix dispatches

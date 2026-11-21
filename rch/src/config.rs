@@ -160,7 +160,7 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// deserialization drift.
 // Version 9 adds opt-in job interception rules. Only on-disk values are
 // cached; runtime overrides and rule validation still run on every load.
-const CACHE_SCHEMA_VERSION: u32 = 9;
+const CACHE_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {
@@ -474,6 +474,10 @@ fn load_config_uncached_from_paths(
     }
 
     rch_common::job_rules::validate(&config.jobs).map_err(anyhow::Error::msg)?;
+    config
+        .transfer
+        .validate_cargo_retrieval_exclude_dirs()
+        .map_err(anyhow::Error::msg)?;
     Ok(config)
 }
 
@@ -496,6 +500,10 @@ pub fn load_config() -> Result<RchConfig> {
         .clone()
     {
         rch_common::job_rules::validate(&config.jobs).map_err(anyhow::Error::msg)?;
+        config
+            .transfer
+            .validate_cargo_retrieval_exclude_dirs()
+            .map_err(anyhow::Error::msg)?;
         rch_common::timing::install(config.timeouts.scale);
         return Ok(config);
     }
@@ -525,6 +533,10 @@ pub fn load_config() -> Result<RchConfig> {
     let mut config = apply_env_overrides(config);
     apply_timing_env_overrides(&mut config, None, None)?;
     rch_common::job_rules::validate(&config.jobs).map_err(anyhow::Error::msg)?;
+    config
+        .transfer
+        .validate_cargo_retrieval_exclude_dirs()
+        .map_err(anyhow::Error::msg)?;
 
     // br-4zf3p: CLI overrides for self-healing have highest priority
     // (CLI > env > config > defaults). Recorded by main.rs at startup.
@@ -848,6 +860,7 @@ struct PartialTransferConfig {
     retrieval_min_free_bytes: Option<u64>,
     compression_level: Option<u32>,
     exclude_patterns: Option<Vec<String>>,
+    cargo_retrieval_exclude_dirs: Option<Vec<String>>,
     exclude_defaults_acknowledged: Option<Vec<String>>,
     remote_base: Option<String>,
     sync_timeout_ms: Option<u64>,
@@ -1278,6 +1291,9 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
     for (idx, pattern) in config.transfer.exclude_patterns.iter().enumerate() {
         validation.validate_rsync_pattern(&format!("transfer.exclude_patterns[{}]", idx), pattern);
     }
+    if let Err(error) = config.transfer.validate_cargo_retrieval_exclude_dirs() {
+        validation.error(error);
+    }
 
     // Validate remediation knobs (bd-...remediation-ocv9i.17.1). Errors are
     // genuine misconfigurations; warnings flag operator paths outside the
@@ -1551,6 +1567,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "selection.weights.disk",
         "transfer.compression_level",
         "transfer.exclude_patterns",
+        "transfer.cargo_retrieval_exclude_dirs",
         "transfer.exclude_defaults_acknowledged",
         "transfer.sync_timeout_ms",
         "transfer.source_sync_silence_timeout_secs",
@@ -1741,6 +1758,17 @@ fn apply_layer(
     if let Some(patterns) = layer.transfer.exclude_patterns.as_ref() {
         config.transfer.exclude_patterns = patterns.clone();
         set_source(sources, "transfer.exclude_patterns", source.clone());
+    }
+    if let Some(directories) = layer.transfer.cargo_retrieval_exclude_dirs.as_ref() {
+        config
+            .transfer
+            .cargo_retrieval_exclude_dirs
+            .clone_from(directories);
+        set_source(
+            sources,
+            "transfer.cargo_retrieval_exclude_dirs",
+            source.clone(),
+        );
     }
     if let Some(acknowledged) = layer.transfer.exclude_defaults_acknowledged.as_ref() {
         config.transfer.exclude_defaults_acknowledged = acknowledged.clone();
@@ -2217,6 +2245,10 @@ fn merge_transfer(
     // would be confusing)
     if overlay.exclude_patterns != default.exclude_patterns {
         base.exclude_patterns.clone_from(&overlay.exclude_patterns);
+    }
+    if overlay.cargo_retrieval_exclude_dirs != default.cargo_retrieval_exclude_dirs {
+        base.cargo_retrieval_exclude_dirs
+            .clone_from(&overlay.cargo_retrieval_exclude_dirs);
     }
     if overlay.ssh_server_alive_interval_secs != default.ssh_server_alive_interval_secs {
         base.ssh_server_alive_interval_secs = overlay.ssh_server_alive_interval_secs;
@@ -4055,6 +4087,60 @@ identity_file = "/tmp/id_ed25519"
         info!("PASS: Default source detected for general.enabled");
     }
 
+    #[test]
+    fn cargo_retrieval_configuration_layers_independently_of_upload_exclusions() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("user.toml");
+        let project = directory.path().join("project.toml");
+        std::fs::write(&user, "[transfer]\nexclude_patterns=['target/','debug/']\ncargo_retrieval_exclude_dirs=['debug/.global-cache']\n").unwrap();
+        std::fs::write(&project, "[transfer]\ncargo_retrieval_exclude_dirs=['debug/.wrapper-shims','release/.wrapper-shims']\n").unwrap();
+        let environment = HashMap::new();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert_eq!(
+            loaded.config.transfer.exclude_patterns,
+            ["target/", "debug/"]
+        );
+        assert_eq!(
+            loaded.config.transfer.cargo_retrieval_exclude_dirs,
+            ["debug/.wrapper-shims", "release/.wrapper-shims"]
+        );
+        assert_eq!(
+            loaded.sources["transfer.cargo_retrieval_exclude_dirs"],
+            ConfigValueSource::ProjectConfig(project.clone())
+        );
+        std::fs::write(&project, "[transfer]\ncargo_retrieval_exclude_dirs=[]\n").unwrap();
+        assert!(
+            load_config_uncached_from_paths(Some(&user), Some(&project))
+                .unwrap()
+                .transfer
+                .cargo_retrieval_exclude_dirs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cargo_retrieval_configuration_rejects_unsafe_policy_on_load_and_validation() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project.toml");
+        std::fs::write(
+            &project,
+            "[transfer]\ncargo_retrieval_exclude_dirs=['debug/../deps']\n",
+        )
+        .unwrap();
+        let error = load_config_uncached_from_paths(None, Some(&project)).unwrap_err();
+        assert!(error.to_string().contains("cargo_retrieval_exclude_dirs"));
+        assert!(
+            validate_rch_config_file(&project)
+                .errors
+                .iter()
+                .any(|error| error.contains("cargo_retrieval_exclude_dirs"))
+        );
+    }
+
     /// bd-rqjaj: a user layer's acknowledged omissions survive a project layer
     /// that replaces only the exclude list, and are attributed to the user file.
     #[test]
@@ -4309,8 +4395,7 @@ output_flag = "--output"
         )
         .unwrap();
         let no_env = HashMap::new();
-        let loaded =
-            load_config_with_sources_from_paths(Some(&user), None, Some(&no_env)).unwrap();
+        let loaded = load_config_with_sources_from_paths(Some(&user), None, Some(&no_env)).unwrap();
         assert!(loaded.config.jobs.intercept_enabled);
         assert_eq!(loaded.config.jobs.required_tools, ["cargo-mutants"]);
         assert_eq!(loaded.config.jobs.rules[0].name, "mutation");
@@ -4324,10 +4409,7 @@ output_flag = "--output"
         )
         .unwrap()
         .unwrap();
-        assert_eq!(
-            matched.result_dirs,
-            [PathBuf::from("reports/current run")]
-        );
+        assert_eq!(matched.result_dirs, [PathBuf::from("reports/current run")]);
         let cached = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
             socket_path_from_default: false,
@@ -4345,12 +4427,9 @@ output_flag = "--output"
 
         // An explicit false disables inherited rules without discarding them.
         std::fs::write(&project, "[jobs]\nintercept_enabled = false\n").unwrap();
-        let disabled = load_config_with_sources_from_paths(
-            Some(&user),
-            Some(&project),
-            Some(&no_env),
-        )
-        .unwrap();
+        let disabled =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&no_env))
+                .unwrap();
         assert!(!disabled.config.jobs.intercept_enabled);
         assert_eq!(disabled.config.jobs.rules.len(), 1);
         assert_eq!(
@@ -4391,9 +4470,7 @@ result_dirs = ["../outside"]
         )
         .unwrap();
         assert!(load_config_uncached_from_paths(Some(&path), None).is_err());
-        assert!(
-            load_config_with_sources_from_paths(Some(&path), None, Some(&no_env)).is_err()
-        );
+        assert!(load_config_with_sources_from_paths(Some(&path), None, Some(&no_env)).is_err());
         let validation = validate_rch_config_file(&path);
         assert!(
             validation.errors.iter().any(|error| error.contains("jobs")),

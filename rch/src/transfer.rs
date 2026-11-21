@@ -506,14 +506,36 @@ impl WindowsArtifactFilter {
 /// the Windows tar route and for staged-output validation, and it matches the
 /// order the rsync builders emit: priority includes win, then an include
 /// selects a file unless an exclude drops it.
-struct ArtifactFilters {
+pub(crate) struct ArtifactFilters {
     priority: Vec<WindowsArtifactFilter>,
     includes: Vec<WindowsArtifactFilter>,
     excludes: Vec<WindowsArtifactFilter>,
 }
 
 impl ArtifactFilters {
-    fn selects(&self, path: &str) -> bool {
+    /// The command's original output policy without mutable local ignore
+    /// files. Cargo receipt qualification uses this before applying opt-in
+    /// exclusions; transfer and staged validation use the same matcher.
+    pub(crate) fn from_patterns(artifact_patterns: &[String]) -> Result<Self> {
+        let (excludes, includes) = partition_artifact_filters(artifact_patterns);
+        Ok(Self {
+            priority: artifact_patterns
+                .iter()
+                .filter_map(|pattern| artifact_pattern_priority(pattern))
+                .map(|pattern| WindowsArtifactFilter::new(pattern, true))
+                .collect::<Result<Vec<_>>>()?,
+            includes: includes
+                .iter()
+                .map(|pattern| WindowsArtifactFilter::new(pattern, true))
+                .collect::<Result<Vec<_>>>()?,
+            excludes: excludes
+                .iter()
+                .map(|pattern| WindowsArtifactFilter::new(pattern, false))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    pub(crate) fn selects(&self, path: &str) -> bool {
         if is_internal_source_archive(Path::new(path)) {
             return false;
         }

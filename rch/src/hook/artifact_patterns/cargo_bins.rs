@@ -28,6 +28,23 @@ pub(in crate::hook) fn selection(
     kind: Option<CompilationKind>,
     command: &str,
 ) -> Option<NamedCargoSelection> {
+    parse_selection(kind, command, true)
+}
+
+/// The same literal Cargo grammar, with complete build selections permitted.
+/// This does not narrow transfer globs or opt into caller JSON projection.
+pub(in crate::hook) fn retrieval_capture_formats(
+    kind: Option<CompilationKind>,
+    command: &str,
+) -> Option<Vec<String>> {
+    Some(parse_selection(kind, command, false)?.message_formats)
+}
+
+fn parse_selection(
+    kind: Option<CompilationKind>,
+    command: &str,
+    require_named: bool,
+) -> Option<NamedCargoSelection> {
     let kind = kind?;
     let args = build_arguments(kind, command)?;
     let mut bins = BTreeSet::new();
@@ -44,7 +61,7 @@ pub(in crate::hook) fn selection(
             .split_once('=')
             .map_or((arg, None), |(k, v)| (k, Some(v)));
         match flag {
-            "--bin" | "--example" if kind == CompilationKind::CargoBuild => {
+            "--bin" | "--example" if kind == CompilationKind::CargoBuild || !require_named => {
                 let name = inline.or_else(|| iter.next())?;
                 if !component(name) {
                     return None;
@@ -55,14 +72,14 @@ pub(in crate::hook) fn selection(
                     examples.insert(name);
                 }
             }
-            "--test" if kind == CompilationKind::CargoTest => {
+            "--test" if kind == CompilationKind::CargoTest || !require_named => {
                 let name = inline.or_else(|| iter.next())?;
                 if !component(name) {
                     return None;
                 }
                 tests.insert(name);
             }
-            "--bench" if kind == CompilationKind::CargoBench => {
+            "--bench" if kind == CompilationKind::CargoBench || !require_named => {
                 let name = inline.or_else(|| iter.next())?;
                 if !component(name) {
                     return None;
@@ -72,6 +89,8 @@ pub(in crate::hook) fn selection(
             "--no-run" if kind != CompilationKind::CargoBuild && inline.is_none() => {
                 no_run = true;
             }
+            "--bins" | "--examples" | "--lib" | "--tests" | "--benches" | "--all-targets"
+                if !require_named && inline.is_none() => {}
             "--target" => {
                 let target = inline.or_else(|| iter.next())?;
                 // Cargo substitutes host-tuple at runtime; it is not a directory.
@@ -131,7 +150,12 @@ pub(in crate::hook) fn selection(
             _ => return None,
         }
     }
-    if bins.is_empty() && examples.is_empty() && tests.is_empty() && benches.is_empty() {
+    if require_named
+        && bins.is_empty()
+        && examples.is_empty()
+        && tests.is_empty()
+        && benches.is_empty()
+    {
         return None;
     }
     // Executing tests/benches produces a result stream, not caller-owned
