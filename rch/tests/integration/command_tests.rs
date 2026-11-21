@@ -3659,6 +3659,11 @@ fn exec_cargo_single_file_packages_never_reserve_a_worker() {
             "script.rs",
         ],
         vec!["cargo", "check", "--manifest-path=scripts/a file.rs"],
+        vec!["cargo", "-Zscript", "check", "-m", "script.rs"],
+        vec!["cargo", "+nightly", "-Z", "script", "test", "-mscript.rs"],
+        vec!["cargo", "check", "-m=scripts/a file.rs"],
+        vec!["cargo", "check", "-qm", "script.rs"],
+        vec!["cargo", "check", "-vvmscript.rs"],
     ] {
         for (environment_remote, flag_remote) in [(false, false), (true, false), (false, true)] {
             let mut args = Vec::new();

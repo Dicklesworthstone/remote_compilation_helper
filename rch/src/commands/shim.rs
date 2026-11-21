@@ -87,7 +87,10 @@ use crate::ui::theme::StatusIndicator;
 /// `10` keeps Cargo single-file Rust packages out of remote manifest planning.
 /// These use capped local execution unless the caller explicitly requires
 /// remote execution, in which case they fail before contacting the daemon.
-const SHIM_VERSION: &str = "10";
+///
+/// `11` also recognizes the short manifest selector (`-m`), including attached
+/// paths and grouped short options, before sending a build to RCH.
+const SHIM_VERSION: &str = "11";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -160,6 +163,28 @@ cargo_single_file_package() {{
       --index|--registry|--token)
         [ "$#" -ge 2 ] || return 1
         shift 2 ;;
+      --*) shift ;;
+      -?*)
+        # Cargo permits -mfile.rs, -m=file.rs, and groups like -vvm file.rs.
+        # Stop at a value-taking option: an m inside -F/-p/-Z values is data.
+        rch_script_flags=${{1#-}}
+        while :; do
+          case "$rch_script_flags" in
+            [qvrnlhV]*) rch_script_flags=${{rch_script_flags#?}} ;;
+            m)
+              [ "$#" -ge 2 ] || return 1
+              case "$2" in *.rs) return 0 ;; esac
+              shift
+              break ;;
+            m*.rs) return 0 ;;
+            Z|C|p|F|j)
+              [ "$#" -ge 2 ] || return 1
+              shift
+              break ;;
+            *) break ;;
+          esac
+        done
+        shift ;;
       -*|+*) shift ;;
       *)
         if [ "$rch_script_subcommand" = 0 ]; then
@@ -2444,6 +2469,18 @@ exit "${STUB_RCH_EXIT:-0}"
             &["clippy", "-Z", "script", "--manifest-path", "script.rs"],
             &["-Z=script", "build", "--manifest-path", "script.rs"],
             &["-Zscript=yes", "check", "--manifest-path", "script.rs"],
+            &["-Zscript", "check", "-m", "scripts/example.rs"],
+            &["+nightly", "-Z", "script", "test", "-mscripts/example.rs"],
+            &["build", "-m=scripts/example.rs"],
+            &["clippy", "-m", "scripts/a file with ' quotes.rs"],
+            &["check", "-mscripts/a file with ' quotes.rs"],
+            &["check", "-m=scripts/a file with ' quotes.rs"],
+            &["check", "-qm", "scripts/example.rs"],
+            &["check", "-qmscripts/example.rs"],
+            &["check", "-vvm=scripts/example.rs"],
+            &["check", "-rm", "scripts/example.rs"],
+            &["package", "-m", "scripts/example.rs"],
+            &["publish", "--dry-run", "-mscripts/example.rs"],
             &[
                 "check",
                 "--manifest-path",
@@ -2515,6 +2552,14 @@ exit "${STUB_RCH_EXIT:-0}"
                     cargo_clippy_shim_body(strict),
                     vec!["-Z", "script", "--manifest-path", "script.rs"],
                 ),
+                (
+                    cargo_shim_body(strict),
+                    vec!["-Zscript", "check", "-m", "script.rs"],
+                ),
+                (cargo_shim_body(strict), vec!["test", "-mscript.rs"]),
+                (cargo_shim_body(strict), vec!["check", "-vvm=script.rs"]),
+                (cargo_clippy_shim_body(strict), vec!["-m=script.rs"]),
+                (cargo_clippy_shim_body(strict), vec!["-vm", "script.rs"]),
             ] {
                 for remote in ["1", "true", "TRUE", "yes", "on"] {
                     let output =
@@ -2566,6 +2611,21 @@ exit "${STUB_RCH_EXIT:-0}"
             ],
             vec!["check", "--manifest-path=ordinary/Cargo.toml"],
             vec!["check", "--manifest-path", "example.rs.toml"],
+            vec!["check", "-m", "Cargo.toml"],
+            vec!["check", "-mCargo.toml"],
+            vec!["check", "-m=Cargo.toml"],
+            vec!["check", "-qm", "scripts.rs/Cargo.toml"],
+            vec!["check", "-vvm=script.rs.toml"],
+            vec!["check", "-pmanifest.rs"],
+            vec!["check", "-Fmanifest.rs"],
+            vec!["check", "-qF", "manifest.rs"],
+            vec!["check", "-qF", "-mscripts/example.rs"],
+            vec!["check", "-qZ", "script"],
+            vec!["check", "--message-format=json.rs"],
+            vec!["check", "--config", "-mscripts/example.rs"],
+            vec!["test", "--", "-m", "scripts/example.rs"],
+            vec!["run", "--", "-mscripts/example.rs"],
+            vec!["test", "--", "-qm", "scripts/example.rs"],
             vec!["test", "--test", "script.rs"],
             vec!["test", "--", "-Zscript"],
             vec!["test", "--", "-Z", "script"],
@@ -2586,6 +2646,11 @@ exit "${STUB_RCH_EXIT:-0}"
             vec!["-Zscript", "--manifest-path", "script.rs"],
             vec!["--manifest-path", "script.rs"],
             vec!["--manifest-path=script.rs"],
+            vec!["-m", "script.rs"],
+            vec!["-mscript.rs"],
+            vec!["-m=script.rs"],
+            vec!["-qm", "scripts/a file with ' quotes.rs"],
+            vec!["-vvmscript.rs"],
         ] {
             let output = record_shim(&cargo_clippy_shim_body(true), &argv_bytes(&args), &[]);
             assert!(output.status.success(), "{args:?}: {output:?}");

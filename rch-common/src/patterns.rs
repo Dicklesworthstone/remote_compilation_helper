@@ -3114,6 +3114,23 @@ fn cargo_single_file_package(cmd: &str) -> bool {
             _ if arg.starts_with("--manifest-path=") && arg.ends_with(".rs") => {
                 return true;
             }
+            _ if arg.starts_with('-') && !arg.starts_with("--") => {
+                // Cargo accepts -mfile.rs / -m=file.rs and grouped short flags.
+                // Only skip valueless flags: -p/-F/-Z may contain an m in data.
+                let flags = arg[1..].trim_start_matches(['q', 'v', 'r', 'n', 'l', 'h', 'V']);
+                if let Some(path) = flags.strip_prefix('m') {
+                    let path = if path.is_empty() {
+                        args.next()
+                    } else {
+                        Some(path.strip_prefix('=').unwrap_or(path))
+                    };
+                    if path.is_some_and(|path| path.ends_with(".rs")) {
+                        return true;
+                    }
+                } else if matches!(flags, "Z" | "C" | "p" | "F" | "j") {
+                    let _ = args.next();
+                }
+            }
             _ if arg.starts_with('-') || arg.starts_with('+') => {}
             _ if !subcommand_seen => {
                 if arg.ends_with(".rs") {
@@ -3535,7 +3552,11 @@ mod tests {
                 "gcc",
             ),
         ] {
-            assert_eq!(native_tool_for_command(command), Some(expected), "{command}");
+            assert_eq!(
+                native_tool_for_command(command),
+                Some(expected),
+                "{command}"
+            );
         }
         for command in [
             "/opt/toolchain/clang -c source.c",
@@ -3675,6 +3696,18 @@ mod tests {
             "cargo -Zscript=yes check --manifest-path scripts/example.rs",
             "cargo check --manifest-path scripts/example.rs",
             "cargo check --manifest-path=scripts/example.rs",
+            "cargo -Zscript check -m scripts/example.rs",
+            "cargo +nightly -Z script test -mscripts/example.rs",
+            "cargo build -m=scripts/example.rs",
+            "cargo clippy -m 'scripts/a file.rs'",
+            "cargo check '-mscripts/a file.rs'",
+            "cargo check '-m=scripts/a file.rs'",
+            "cargo check -qm scripts/example.rs",
+            "cargo check -qmscripts/example.rs",
+            "cargo check -vvm=scripts/example.rs",
+            "cargo check -rm scripts/example.rs",
+            "cargo package -m scripts/example.rs",
+            "cargo publish --dry-run -mscripts/example.rs",
             "cargo check '--manifest-path=scripts/a file.rs'",
             "cargo check --manifest-path 'scripts/a file.rs'",
             "cargo check --manifest-path scripts/a\\ file.rs",
@@ -3711,6 +3744,21 @@ mod tests {
             "cargo -Z unstable-options check --manifest-path scripts.rs/Cargo.toml",
             "cargo check --manifest-path scripts/example.rs.toml",
             "cargo check --manifest-path=ordinary/Cargo.toml",
+            "cargo check -m Cargo.toml",
+            "cargo check -mCargo.toml",
+            "cargo check -m=Cargo.toml",
+            "cargo check -qm scripts.rs/Cargo.toml",
+            "cargo check -vvm=script.rs.toml",
+            "cargo check -pmanifest.rs",
+            "cargo check -Fmanifest.rs",
+            "cargo check -qF manifest.rs",
+            "cargo check -qF -mscripts/example.rs",
+            "cargo check -qZ script",
+            "cargo check --message-format=json.rs",
+            "cargo check --config '-mscripts/example.rs'",
+            "cargo test -- -m scripts/example.rs",
+            "cargo run -- -mscripts/example.rs",
+            "cargo test -- -qm scripts/example.rs",
             "cargo test --test script.rs",
             "cargo test script.rs",
             "cargo test -- -Zscript",
