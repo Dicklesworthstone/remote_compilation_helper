@@ -149,7 +149,7 @@ impl FreshStage {
     ) -> anyhow::Result<PathBuf> {
         let ownership = writer
             .recovery_ownership
-            .as_ref()
+            .as_deref()
             .context("fresh staging publication requires exclusive recovery ownership")?;
         anyhow::ensure!(
             next["transfer"]["retrieval_staging_dir"] == serde_json::to_value(&self.root)?,
@@ -164,7 +164,7 @@ impl FreshStage {
             ownership.read(&writer.wrapper_id())? == *lease,
             "journal changed before fresh staging publication; all evidence retained"
         );
-        let recipe: RecoveryRecipe = serde_json::from_value(next.clone())?;
+        let mut recipe = decode_recipe_value_for_override(next.clone(), Some(ownership))?;
         let held = HeldRetrievalStage::record_created(
             self.base.try_clone()?,
             self.directory.try_clone()?,
@@ -177,6 +177,33 @@ impl FreshStage {
             .remove("staging_released");
         self.verify_names()?;
         held.verify_empty()?;
+        // The retained snapshot still points at the old publication logs.
+        // Move this attempt to fresh inodes before it can append more events,
+        // preserving all other raw custody fields and historical spellings.
+        recipe.fork_publication_journals(writer)?;
+        let compact = recipe.storage_value()?;
+        let compact_phases = compact["phases"]
+            .as_array()
+            .context("forked retrieval recipe has no phases")?;
+        let next_phases = next
+            .get_mut("phases")
+            .and_then(serde_json::Value::as_array_mut)
+            .context("fresh staging recipe has no phases")?;
+        anyhow::ensure!(
+            next_phases.len() == compact_phases.len(),
+            "fresh staging publication changed the phase set"
+        );
+        for (phase, compact_phase) in next_phases.iter_mut().zip(compact_phases) {
+            if let Some(journal) = compact_phase.get("publication_journal") {
+                let phase = phase
+                    .as_object_mut()
+                    .context("fresh staging phase is not an object")?;
+                phase.insert("publication_journal".into(), journal.clone());
+                phase.remove("baseline");
+                phase.remove("published");
+                phase.remove("pending");
+            }
+        }
         writer.set_recovery(next).with_context(|| {
             format!(
                 "fresh staging publication unverified; prior journal {}",
@@ -633,6 +660,107 @@ mod tests {
         assert_eq!(recovered.recipe.phases[0].published.len(), 1);
         assert!(recovered.recipe.phases[1].complete);
         assert!(recovered.writer.acknowledge_terminal().is_err());
+    }
+
+    #[tokio::test]
+    async fn journaled_relocation_preserves_raw_custody_and_freezes_prior_pending_evidence() {
+        let (root, mut session, _, _) = fixture_with_results(true, &[]);
+        let relative = PathBuf::from("build/pending.o");
+        let local = session.recipe.project_root.clone();
+        let stage = session.stage(0);
+        std::fs::create_dir_all(local.join("build")).unwrap();
+        std::fs::create_dir_all(stage.join("build")).unwrap();
+        std::fs::write(local.join(&relative), b"prior caller output").unwrap();
+        std::fs::write(stage.join(&relative), b"returned worker output").unwrap();
+        let hash = fingerprint(&stage.join(&relative)).unwrap().unwrap();
+        let temporary = local
+            .join("build")
+            .join(format!(".rch-return-{}", session.recipe.identity));
+        let prepared = {
+            let _publication = lock_output_root(&local).await.unwrap();
+            session.ensure_publication_journal(0).unwrap();
+            session
+                .persist_output_baseline(0, std::slice::from_ref(&relative))
+                .unwrap();
+            let prepared =
+                prepare_output_temporary(&stage.join(&relative), &temporary, &hash).unwrap();
+            prepared.directory.sync_all().unwrap();
+            session
+                .persist_pending_output(0, Some((relative.clone(), hash.clone())))
+                .unwrap();
+            prepared
+        };
+        let mut original = session.writer.snapshot().recovery.unwrap();
+        assert!(original["phases"][0].get("publication_journal").is_some());
+        for runtime in ["baseline", "published", "pending"] {
+            assert!(original["phases"][0].get(runtime).is_none());
+        }
+        original["future_custody"] = serde_json::json!({"keep": "original ownership"});
+        original["phases"][0]["future_phase_custody"] = serde_json::json!(["retain", 7]);
+        original
+            .as_object_mut()
+            .unwrap()
+            .remove("cargo_output_capture");
+        session.writer.set_recovery(original.clone()).unwrap();
+        let before = std::fs::read(&session.writer.path).unwrap();
+        let current = TransferConfig {
+            retrieval_staging_dir: Some(root.join("fresh-stage")),
+            ..Default::default()
+        };
+        relocate(&session.writer, &session.writer.wrapper_id(), &current).unwrap();
+        let actual = session.writer.snapshot().recovery.unwrap();
+        assert_ne!(
+            actual["phases"][0]["publication_journal"],
+            original["phases"][0]["publication_journal"]
+        );
+        let mut expected = original.clone();
+        expected["transfer"]["retrieval_staging_dir"] =
+            serde_json::to_value(&current.retrieval_staging_dir).unwrap();
+        expected["staging_ownership"] = actual["staging_ownership"].clone();
+        expected["phases"][0]["publication_journal"] =
+            actual["phases"][0]["publication_journal"].clone();
+        assert_eq!(actual, expected);
+        let backup = std::fs::read_dir(session.writer.path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "before")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+        let mut recovered = RecoverySession {
+            recipe: load_recipe(&session.writer).unwrap(),
+            writer: session.writer.clone(),
+        };
+        let pending = Some((relative.clone(), hash.clone()));
+        assert_eq!(recovered.recipe.phases[0].pending, pending);
+        let baseline = recovered.recipe.phases[0].baseline.clone();
+        {
+            let _publication = lock_output_root(&local).await.unwrap();
+            prepared.publish(&local.join(&relative)).unwrap();
+            recovered
+                .persist_published_output(0, relative.clone(), hash.clone())
+                .unwrap();
+        }
+        let latest = load_recipe(&recovered.writer).unwrap();
+        assert!(latest.phases[0].pending.is_none());
+        assert_eq!(latest.phases[0].published.get(&relative), Some(&hash));
+        let retained: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+        let retained = decode_recipe_value(
+            retained.recovery.unwrap(),
+            recovered.writer.recovery_ownership.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(retained.phases[0].pending, pending);
+        assert_eq!(retained.phases[0].baseline, baseline);
+        assert!(retained.phases[0].published.is_empty());
+        assert_eq!(
+            std::fs::read(stage.join(&relative)).unwrap(),
+            b"returned worker output"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
     }
 
     #[test]

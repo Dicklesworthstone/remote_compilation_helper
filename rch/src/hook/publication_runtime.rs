@@ -94,6 +94,50 @@ impl Drop for PublicationScope<'_> {
     }
 }
 
+fn reload_before_publication(session: &mut RecoverySession) -> Result<()> {
+    let latest = super::load_recipe(&session.writer)
+        .context("replay acknowledged publication state before starting work")?;
+    anyhow::ensure!(
+        session
+            .recipe
+            .phases
+            .iter()
+            .zip(&latest.phases)
+            .all(|(cached, latest)| !cached.complete || latest.complete),
+        "publication cannot discard an already completed phase"
+    );
+    let metadata = |recipe: &RecoveryRecipe| -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(recipe)?;
+        for phase in value["phases"]
+            .as_array_mut()
+            .context("publication recipe has no phase array")?
+        {
+            let phase = phase
+                .as_object_mut()
+                .context("publication recipe has an invalid phase")?;
+            for progress in [
+                "publication_journal",
+                "baseline",
+                "published",
+                "pending",
+                "complete",
+            ] {
+                phase.remove(progress);
+            }
+        }
+        Ok(value)
+    };
+    // The output lock was acquired for the caller's recipe. Adopt newer
+    // publication evidence, including a durable seal, only when every root,
+    // selection rule and other custody field still describes that same work.
+    anyhow::ensure!(
+        metadata(&session.recipe)? == metadata(&latest)?,
+        "publication recipe changed outside its durable progress; reload the retained job"
+    );
+    session.recipe = latest;
+    Ok(())
+}
+
 pub(super) async fn run(
     session: &mut RecoverySession,
     publication_lock: File,
@@ -111,7 +155,31 @@ pub(super) async fn run(
         .name("rch-publication".into())
         .spawn(move || {
             CANCELLED.with(|slot| *slot.borrow_mut() = Some(worker_cancelled));
-            let result = checkpoint().and_then(|()| work(&mut owned));
+            let mut work_started = false;
+            let result = checkpoint().and_then(|()| {
+                // A previous panic may have committed a journal generation
+                // whose replay then failed. Every retry must recover that
+                // authority before a stale session can create another log.
+                // Keep this potentially large replay on the dedicated thread.
+                reload_before_publication(&mut owned)?;
+                work_started = true;
+                work(&mut owned)
+            });
+            if work_started
+                && result.is_err()
+                && owned
+                    .recipe
+                    .phases
+                    .iter()
+                    .any(|phase| phase.publication_journal.is_some())
+                && let Ok(reloaded) = super::load_recipe(&owned.writer)
+            {
+                // An append/sync error may have installed a complete record.
+                // Reconcile it instead of returning an optimistic old cursor
+                // or losing a durable intent in the borrowed session.
+                owned.recipe = reloaded;
+            }
+            owned.recipe.finish_publication_epoch();
             let recipe = owned.recipe;
             // Complete filesystem/ownership teardown before waking the caller.
             // On panic, unwinding drops these and the sender as well.

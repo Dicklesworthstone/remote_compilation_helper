@@ -326,6 +326,7 @@ mod tests {
             baseline: BTreeMap::new(),
             published: BTreeMap::new(),
             pending: None,
+            publication_journal: None,
             complete: false,
             missing_result: None,
         });

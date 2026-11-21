@@ -182,6 +182,7 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
     std::fs::create_dir_all(untouched.parent().unwrap()).unwrap();
     std::fs::write(&untouched, b"unrelated old target artifact").unwrap();
     let journal = session.writer.path.clone();
+    let ownership = session.writer.recovery_ownership.clone().unwrap();
     let mut published = 0;
     let result = session
         .publish_with_observer("docs", move |point, _| {
@@ -192,10 +193,21 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
                     published += 1;
                 }
                 let lease: DurableJobLease = serde_json::from_slice(&std::fs::read(&journal)?)?;
-                let recipe: RecoveryRecipe = serde_json::from_value(lease.recovery.unwrap())?;
+                let stored = lease.recovery.unwrap();
+                assert!(stored["phases"][0].get("publication_journal").is_some());
+                for runtime in ["baseline", "published", "pending"] {
+                    assert!(stored["phases"][0].get(runtime).is_none());
+                }
+                let recipe = decode_recipe_value(stored, Some(ownership.as_ref()))?;
                 let phase = &recipe.phases[0];
                 assert_eq!(phase.published.len(), published);
-                assert_eq!(phase.baseline.len(), 64 - published);
+                // Only a pending rename owns a durable predecessor. Other
+                // observations expire with the output lock and are refreshed
+                // before any later attempt may publish an untouched path.
+                assert_eq!(
+                    phase.baseline.len(),
+                    usize::from(point == PublicationPoint::PendingDurable)
+                );
                 assert!(phase.baseline.keys().all(|path| path.starts_with("doc")));
                 assert!(
                     phase
@@ -207,8 +219,13 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
                     phase.pending.is_some(),
                     point == PublicationPoint::PendingDurable
                 );
-                if let Some((path, _)) = &phase.pending {
-                    assert!(phase.baseline.contains_key(path));
+                if let Some((path, hash)) = &phase.pending {
+                    assert_eq!(path, &relative(published));
+                    assert_eq!(hash, &blake3::hash(bytes(published).as_bytes()).to_hex().to_string());
+                    assert_eq!(
+                        phase.baseline[path],
+                        blake3::hash(predecessor(published).as_bytes()).to_hex().to_string()
+                    );
                 }
                 anyhow::ensure!(published != 23, "interruption after 23 durable outputs");
             }
@@ -217,7 +234,14 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
         .await;
     assert!(result.unwrap_err().to_string().contains("23 durable"));
     assert_eq!(session.recipe.phases[0].published.len(), 23);
-    assert_eq!(session.recipe.phases[0].baseline.len(), 41);
+    assert!(session.recipe.phases[0].baseline.is_empty());
+    for index in 0..64 {
+        assert_eq!(
+            std::fs::read_to_string(local.join(relative(index))).unwrap(),
+            if index < 23 { bytes(index) } else { predecessor(index) },
+            "publication changed the wrong output at {index}"
+        );
+    }
     assert_acknowledged(&session);
     let first_inode = std::fs::metadata(local.join(relative(0))).unwrap().ino();
     // Reload the actual disk recipe while retaining the exact original owner.
@@ -387,7 +411,7 @@ async fn cancellation_keeps_compacted_predecessors_until_publication_is_durable(
         );
         let published = usize::from(point == PublicationPoint::PublishedDurable);
         let phase = &session.recipe.phases[0];
-        assert_eq!(phase.baseline.len(), 3 - published);
+        assert_eq!(phase.baseline.len(), usize::from(published == 0));
         assert_eq!(phase.published.len(), published);
         assert_eq!(phase.pending.is_some(), published == 0);
         assert!(phase.baseline.keys().all(|path| path.starts_with("doc")));
@@ -397,6 +421,21 @@ async fn cancellation_keeps_compacted_predecessors_until_publication_is_durable(
                 blake3::hash(predecessor(0).as_bytes()).to_hex().to_string()
             );
         }
+        for index in 1..3 {
+            assert_eq!(
+                std::fs::read_to_string(phase.local.join(relative(index))).unwrap(),
+                predecessor(index),
+                "cancellation changed an untouched output at {index}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(phase.local.join(relative(0))).unwrap(),
+            if point == PublicationPoint::PendingDurable {
+                predecessor(0)
+            } else {
+                bytes(0)
+            }
+        );
         assert_acknowledged(&session);
         let mut recovered = RecoverySession {
             recipe: disk_recipe(&session),

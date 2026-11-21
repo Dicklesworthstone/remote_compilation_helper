@@ -21,6 +21,11 @@ use publication_copy::prepare_output_temporary;
 #[path = "publication_runtime.rs"]
 mod publication_runtime;
 use publication_runtime::PublicationPoint;
+#[path = "publication_journal.rs"]
+mod publication_journal;
+#[path = "publication_state.rs"]
+mod publication_state;
+use publication_state::{decode_recipe_value, decode_recipe_value_for_override};
 #[cfg(all(test, unix))]
 #[path = "publication_runtime_tests.rs"]
 mod publication_runtime_tests;
@@ -744,18 +749,29 @@ pub(in crate::hook) struct LocalRetirementPending {
 /// as unfinished cleanup. Malformed owned-stage evidence remains recoverable.
 pub(in crate::hook) fn ensure_local_retirement_complete(
     lease: &DurableJobLease,
+    ownership: Option<&recovery_owner::RecoveryOwnership>,
 ) -> anyhow::Result<()> {
     let Some(value) = lease.recovery.as_ref().filter(|value| {
         value
             .get("staging_ownership")
             .is_some_and(|ownership| !ownership.is_null())
+            || value
+                .get("phases")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|phases| {
+                    phases.iter().any(|phase| {
+                        phase
+                            .get("publication_journal")
+                            .is_some_and(|journal| !journal.is_null())
+                    })
+                })
     }) else {
         return Ok(());
     };
     let pending = || LocalRetirementPending {
         wrapper_id: lease.identity.local_wrapper_id.clone(),
     };
-    let recipe: RecoveryRecipe = serde_json::from_value(value.clone()).with_context(pending)?;
+    let recipe = decode_recipe_value(value.clone(), ownership).with_context(pending)?;
     anyhow::ensure!(!recipe.staging_release_pending(), pending());
     Ok(())
 }
@@ -947,6 +963,10 @@ struct RecoveryPhase {
     published: BTreeMap<PathBuf, String>,
     #[serde(default)]
     pending: Option<(PathBuf, String)>,
+    /// Progress lives beside the lease. Inline maps remain the complete runtime
+    /// view, but compact storage omits them whenever this reference is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication_journal: Option<publication_journal::JournalRef>,
     complete: bool,
     /// A failed delivery is terminal evidence, not a completed publication.
     #[serde(default)]
@@ -1660,7 +1680,7 @@ impl RecoverySession {
             pair_released: false,
             retired: false,
         };
-        writer.set_recovery(serde_json::to_value(recipe)?)
+        writer.set_recovery(recipe.storage_value()?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1688,11 +1708,12 @@ impl RecoverySession {
         // executables the live retrieval fetched (bd-b7lot, seen live).
         let delivery_kind = artifact_delivery_kind(kind, Some(command));
         let lease = writer.snapshot();
-        let intent: RecoveryRecipe = serde_json::from_value(
+        let intent = decode_recipe_value(
             lease
                 .recovery
                 .clone()
                 .context("output preparation requires the persisted source intent")?,
+            writer.recovery_ownership.as_deref(),
         )?;
         anyhow::ensure!(
             intent.version == 2
@@ -1749,6 +1770,7 @@ impl RecoverySession {
                 baseline: BTreeMap::new(),
                 published: BTreeMap::new(),
                 pending: None,
+                publication_journal: None,
                 complete: false,
                 missing_result: None,
             });
@@ -1769,6 +1791,7 @@ impl RecoverySession {
                     baseline: BTreeMap::new(),
                     published: BTreeMap::new(),
                     pending: None,
+                    publication_journal: None,
                     complete: false,
                     missing_result: None,
                 });
@@ -1788,6 +1811,7 @@ impl RecoverySession {
                 baseline: BTreeMap::new(),
                 published: BTreeMap::new(),
                 pending: None,
+                publication_journal: None,
                 complete: false,
                 missing_result: None,
             });
@@ -1924,14 +1948,12 @@ impl RecoverySession {
     }
 
     fn persist(&self) -> anyhow::Result<()> {
-        self.writer
-            .set_recovery(serde_json::to_value(&self.recipe)?)
+        self.writer.set_recovery(self.recipe.storage_value()?)
     }
     /// A failed journal publication must not install a successful lifecycle
     /// boundary in this session. Same-session retries use these exact flags.
     fn persist_next_recipe(&mut self, next_recipe: RecoveryRecipe) -> anyhow::Result<()> {
-        self.writer
-            .set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.writer.set_recovery(next_recipe.storage_value()?)?;
         self.recipe = next_recipe;
         Ok(())
     }
@@ -1943,6 +1965,9 @@ impl RecoverySession {
         index: usize,
         pending: Option<(PathBuf, String)>,
     ) -> anyhow::Result<()> {
+        if self.recipe.phases[index].publication_journal.is_some() {
+            return self.append_publication_intent(index, pending);
+        }
         let previous = std::mem::replace(&mut self.recipe.phases[index].pending, pending);
         if let Err(error) = self.persist() {
             self.recipe.phases[index].pending = previous;
@@ -1957,6 +1982,9 @@ impl RecoverySession {
         relative: PathBuf,
         hash: String,
     ) -> anyhow::Result<()> {
+        if self.recipe.phases[index].publication_journal.is_some() {
+            return self.append_publication_commit(index, relative, hash);
+        }
         let phase = &mut self.recipe.phases[index];
         let previous_hash = phase.published.insert(relative.clone(), hash);
         let previous_pending = phase.pending.take();
@@ -2040,6 +2068,12 @@ impl RecoverySession {
                 None => phase.baseline.remove(&relative),
             };
             previous.push((relative, old));
+        }
+        // A journaled Pending record retains its exact predecessor. Untouched
+        // observations belong only to this locked publication epoch; recovery
+        // refreshes them after settling the one pending rename.
+        if self.recipe.phases[index].publication_journal.is_some() {
+            return Ok(());
         }
         if let Err(error) = self.persist() {
             let phase = &mut self.recipe.phases[index];
@@ -2247,8 +2281,7 @@ impl RecoverySession {
         let phase = &mut next_recipe.phases[index];
         phase.patterns = patterns;
         phase.cargo_outputs = Some(contract);
-        self.writer
-            .set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.writer.set_recovery(next_recipe.storage_value()?)?;
         self.recipe = next_recipe;
         Ok(())
     }
@@ -2309,8 +2342,7 @@ impl RecoverySession {
             remote_project_root: remote_project_root.map(Path::to_path_buf),
             exit_code,
         });
-        self.writer
-            .set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.writer.set_recovery(next_recipe.storage_value()?)?;
         self.recipe = next_recipe;
         Ok(())
     }
@@ -2358,8 +2390,7 @@ impl RecoverySession {
         receipt.read()?;
         let mut next_recipe = self.recipe.clone();
         next_recipe.cargo_stderr = Some(receipt);
-        self.writer
-            .set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.writer.set_recovery(next_recipe.storage_value()?)?;
         self.recipe = next_recipe;
         Ok(())
     }
@@ -2536,8 +2567,7 @@ impl RecoverySession {
         delivery.read(receipt)?;
         let mut next_recipe = self.recipe.clone();
         next_recipe.caller_delivery = Some(delivery);
-        self.writer
-            .set_recovery(serde_json::to_value(&next_recipe)?)?;
+        self.writer.set_recovery(next_recipe.storage_value()?)?;
         self.recipe = next_recipe;
         Ok(projected.stdout)
     }
@@ -3246,6 +3276,12 @@ impl RecoverySession {
         mut observe: impl FnMut(PublicationPoint, &Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         publication_runtime::checkpoint()?;
+        // The worker's mandatory replay can discover a durable terminal seal
+        // absent from the caller's cached lease. Its staging may already have
+        // been retired; historical delivery needs no second publication.
+        if self.recipe.phases[index].complete {
+            return Ok(());
+        }
         self.verify_result_destination()?;
         anyhow::ensure!(
             self.recipe.phases[index].result_dir.is_some()
@@ -3269,21 +3305,12 @@ impl RecoverySession {
         #[cfg(not(unix))]
         let mut files = regular_files(&stage)?;
         let phase = &self.recipe.phases[index];
-        if self.recipe.result_destination.is_some() {
-            let directory = phase
-                .result_dir
-                .as_deref()
-                .context("mapped result has no directory")?;
-            for relative in &files {
-                validate_result_member(directory, relative)?;
-            }
-        }
         if let Some((relative, _)) = &phase.pending {
             // Check before the completed shortcut, policy fingerprint or
             // pending rename can observe a redirected descendant as ours.
             validate_output_ancestors(&phase.local, relative)?;
         }
-        if phase.result_dir.is_some() {
+        if let Some(directory) = &phase.result_dir {
             anyhow::ensure!(
                 phase.pending.as_ref().is_none_or(|(relative, _)| {
                     !crate::transfer::is_internal_source_archive(relative)
@@ -3291,6 +3318,9 @@ impl RecoverySession {
                 "internal source archive has a pending publication; retained evidence requires inspection"
             );
             files.retain(|relative| !crate::transfer::is_internal_source_archive(relative));
+            for relative in &files {
+                validate_result_member(directory, relative)?;
+            }
         } else {
             // A resumed transfer can retain files selected by an older
             // collector. Ownership fingerprints alone do not authorize a
@@ -3331,8 +3361,42 @@ impl RecoverySession {
             }
         }
         publication_runtime::checkpoint()?;
+        if phase.publication_journal.is_none() {
+            // Refuse an unsafe selected destination before migrating legacy
+            // evidence or changing the lease. The locked baseline below is
+            // still refreshed after the original pending rename is settled.
+            for relative in &files {
+                if !phase.published.contains_key(relative) {
+                    validate_output_ancestors(&phase.local, relative)?;
+                    fingerprint(&phase.local.join(relative))?;
+                    publication_runtime::checkpoint()?;
+                }
+            }
+        }
+        self.ensure_publication_journal(index)?;
+        if self.recipe.phases[index].complete {
+            return Ok(());
+        }
         if let Some((relative, hash)) = self.recipe.phases[index].pending.clone() {
             self.verify_result_destination()?;
+            // Journal replay can discover an intent whose append completed
+            // just before a previous publisher failed. Validate that hydrated
+            // intent at the same boundary as an inline legacy checkpoint.
+            let phase = &self.recipe.phases[index];
+            validate_output_ancestors(&phase.local, &relative)?;
+            if let Some(directory) = &phase.result_dir {
+                validate_result_member(directory, &relative)?;
+            } else if phase.baseline.contains_key(&relative)
+                || fingerprint(&phase.local.join(&relative))?.as_ref() != Some(&hash)
+            {
+                TransferPipeline::new(
+                    phase.local.clone(),
+                    "recovery-publication".into(),
+                    self.recipe.identity.clone(),
+                    self.recipe.transfer.clone(),
+                )
+                .validate_staged_artifact_paths(std::slice::from_ref(&relative), &phase.patterns)?;
+            }
             let destination = self.recipe.phases[index].local.join(&relative);
             let parent = destination
                 .parent()
@@ -3403,6 +3467,7 @@ impl RecoverySession {
         }
         publication_runtime::checkpoint()?;
         self.verify_result_destination()?;
+        self.seal_publication(index)?;
         let mut next_recipe = self.recipe.clone();
         next_recipe.phases[index].complete = true;
         self.persist_next_recipe(next_recipe)?;
@@ -4242,7 +4307,7 @@ impl RecoverySession {
             held.verify_empty()?;
             let mut next = durable.recipe.clone();
             next.staging_released = true;
-            writer.set_recovery(serde_json::to_value(&next)?)?;
+            writer.set_recovery(next.storage_value()?)?;
             self.recipe = next;
             ownership.verify()?;
         }
@@ -4409,10 +4474,11 @@ impl RecoverySession {
 
 fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     let lease = writer.snapshot();
-    let mut recipe: RecoveryRecipe = serde_json::from_value(
+    let mut recipe = decode_recipe_value(
         lease
             .recovery
             .context("job has no durable source/retrieval recipe")?,
+        writer.recovery_ownership.as_deref(),
     )?;
     // Leases written before bd-4d1hs may carry a trailing-slash root that the
     // source-authority lock plan refuses; recover them under the canonical
@@ -10720,6 +10786,7 @@ func TestValue(t *testing.T) {{
             baseline: BTreeMap::new(),
             published: BTreeMap::new(),
             pending: None,
+            publication_journal: None,
             complete: false,
             missing_result: None,
         });
@@ -11678,6 +11745,7 @@ func TestValue(t *testing.T) {{
                 baseline: BTreeMap::new(),
                 published: BTreeMap::new(),
                 pending: None,
+                publication_journal: None,
                 complete: true,
                 missing_result: None,
             });
@@ -11724,6 +11792,7 @@ func TestValue(t *testing.T) {{
             baseline: BTreeMap::new(),
             published: BTreeMap::new(),
             pending: None,
+            publication_journal: None,
             complete: false,
             missing_result: None,
         });
@@ -13593,6 +13662,7 @@ func TestValue(t *testing.T) {{
             baseline: BTreeMap::new(),
             published: BTreeMap::new(),
             pending: None,
+            publication_journal: None,
             complete: false,
             missing_result: None,
         });
@@ -14158,7 +14228,8 @@ func TestValue(t *testing.T) {{
         assert_eq!(recipe.returned, Some(0));
         assert_eq!(recipe.exit_code, Some(0));
         assert!(recipe.staging_released);
-        ensure_local_retirement_complete(&writer.snapshot()).unwrap();
+        ensure_local_retirement_complete(&writer.snapshot(), writer.recovery_ownership.as_deref())
+            .unwrap();
     }
 
     #[tokio::test]
@@ -14202,6 +14273,7 @@ func TestValue(t *testing.T) {{
                 baseline: BTreeMap::new(),
                 published: BTreeMap::new(),
                 pending: None,
+                publication_journal: None,
                 complete: false,
                 missing_result: None,
             });
@@ -14262,7 +14334,11 @@ func TestValue(t *testing.T) {{
             assert!(recovered.retain_source_lifecycle_evidence());
             // Intentionally retained failed-delivery evidence is settled too;
             // it must not block the same terminal or readmission gates.
-            ensure_local_retirement_complete(&writer.snapshot()).unwrap();
+            ensure_local_retirement_complete(
+                &writer.snapshot(),
+                writer.recovery_ownership.as_deref(),
+            )
+            .unwrap();
             // The caller's source and its published output are never touched.
             for (path, bytes) in [
                 (local.join("source.c"), b"original caller source".as_slice()),
@@ -14336,6 +14412,7 @@ func TestValue(t *testing.T) {{
                 baseline: BTreeMap::new(),
                 published: BTreeMap::new(),
                 pending: None,
+                publication_journal: None,
                 complete: false,
                 missing_result: None,
             });

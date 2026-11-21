@@ -63,6 +63,7 @@ fn docs(count: usize) -> (tempfile::TempDir, RecoverySession) {
         baseline: BTreeMap::new(),
         published: BTreeMap::new(),
         pending: None,
+        publication_journal: None,
         complete: false,
         missing_result: None,
     });
@@ -88,12 +89,19 @@ fn disk_recipe(session: &RecoverySession) -> RecoveryRecipe {
     let lease: DurableJobLease =
         serde_json::from_slice(&std::fs::read(&session.writer.path).unwrap()).unwrap();
     assert!(!lease.terminal_acknowledged);
-    serde_json::from_value(lease.recovery.unwrap()).unwrap()
+    decode_recipe_value(
+        lease.recovery.unwrap(),
+        session.writer.recovery_ownership.as_deref(),
+    )
+    .unwrap()
 }
 
 fn assert_acknowledged(session: &RecoverySession) {
     let recipe = serde_json::to_value(&session.recipe).unwrap();
-    assert_eq!(recipe, session.writer.snapshot().recovery.unwrap());
+    let snapshot = session.writer.snapshot().recovery.unwrap();
+    assert_eq!(session.recipe.storage_value().unwrap(), snapshot);
+    let cached = decode_recipe_value(snapshot, session.writer.recovery_ownership.as_deref()).unwrap();
+    assert_eq!(recipe, serde_json::to_value(cached).unwrap());
     assert_eq!(recipe, serde_json::to_value(disk_recipe(session)).unwrap());
 }
 
@@ -615,3 +623,9 @@ async fn large_set_resumes_after_partial_durable_publication() {
 
 #[path = "publication_baseline_tests.rs"]
 mod baseline_tests;
+
+#[path = "publication_journal_runtime_tests.rs"]
+mod journal_tests;
+
+#[path = "publication_runtime_consistency_tests.rs"]
+mod consistency_tests;

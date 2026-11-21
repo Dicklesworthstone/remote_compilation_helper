@@ -1,7 +1,10 @@
 //! Finish detached recovery's daemon reservation before acknowledging the client.
 //! Output retirement is not slot release. The original wrapper may have died
 //! before its release request, or that request's reply may have been lost.
-use super::{DurableJobLease, DurableLeaseWriter, RecoveryRecipe, load_recipe};
+use super::{
+    DurableJobLease, DurableLeaseWriter, RecoveryRecipe, decode_recipe_value, load_recipe,
+    recovery_owner::RecoveryOwnership,
+};
 use crate::hook::artifact_patterns::kind_produces_transferable_artifacts;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -141,14 +144,19 @@ fn validate_successful_delivery(recipe: &RecoveryRecipe) -> Result<()> {
 /// Pending collection and truthful failures retain their existing semantics.
 /// Do not compare the outer exit here: recovery can deliver successfully
 /// while the wrapper still records its original retrieval failure (102).
-pub(super) fn validate_recorded_delivery(lease: &DurableJobLease) -> Result<()> {
+pub(super) fn validate_recorded_delivery(
+    lease: &DurableJobLease,
+    ownership: Option<&RecoveryOwnership>,
+) -> Result<()> {
     let Some(value) = lease.recovery.as_ref() else {
         return Ok(());
     };
     if value.get("returned").and_then(Value::as_i64) != Some(0) {
         return Ok(());
     }
-    let recipe: RecoveryRecipe = serde_json::from_value(value.clone())
+    // The live publisher holds its lease mutex. Decode the prospective value
+    // through the held directory without taking another writer snapshot.
+    let recipe = decode_recipe_value(value.clone(), ownership)
         .context("successful recovery has an invalid retained delivery recipe")?;
     anyhow::ensure!(
         recipe.version == 2
@@ -191,7 +199,7 @@ pub(super) async fn finish(
         .returned
         .context("recovery delivery is not settled")?;
     validate_successful_delivery(&recipe)?;
-    super::ensure_local_retirement_complete(&lease)?;
+    super::ensure_local_retirement_complete(&lease, writer.recovery_ownership.as_deref())?;
     anyhow::ensure!(
         recipe.retired
             && recipe.build_id > 0
@@ -450,11 +458,110 @@ mod tests {
             output_gate: false,
             cargo_outputs: None,
             native_outputs: None,
+            publication_journal: None,
             baseline: Default::default(),
             published: Default::default(),
             pending: None,
             complete,
             missing_result: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_publication_evidence_controls_the_live_success_boundary() {
+        use super::super::{PublicationPoint, RecoverySession};
+        use crate::hook::artifact_patterns::direct_compiler::NativeOutputContract;
+
+        for interrupted in [false, true] {
+            let (directory, mut writer) = fixture(0);
+            let mut recipe = load_recipe(&writer).unwrap();
+            recipe.project_root = directory.path().join("caller");
+            std::fs::create_dir(&recipe.project_root).unwrap();
+            recipe.transfer.retrieval_staging_dir = Some(directory.path().join("stage"));
+            recipe.kind = Some(rch_common::CompilationKind::Gcc);
+            recipe.returned = None;
+            recipe.retired = false;
+            recipe.sources_released = false;
+            let relative = std::path::PathBuf::from("build/app");
+            let contract = NativeOutputContract {
+                required_files: [relative.clone()].into(),
+            };
+            let mut phase = output_phase(&recipe, false, false);
+            phase.patterns = contract.patterns().unwrap();
+            phase.native_outputs = Some(contract);
+            recipe.phases = vec![phase];
+            writer
+                .set_recovery(recipe.storage_value().unwrap())
+                .unwrap();
+            // This fixture owns its synthetic wrapper from construction; only
+            // journal/publication boundaries are exercised, with no worker RPC.
+            writer.recovery_ownership = Some(Arc::new(
+                super::super::recovery_owner::acquire_gate(&writer.path).unwrap(),
+            ));
+            let mut session = RecoverySession {
+                recipe: load_recipe(&writer).unwrap(),
+                writer: writer.clone(),
+            };
+            session.prepare_staging(0).unwrap();
+            let staged = session.stage(0).join(&relative);
+            std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+            std::fs::write(&staged, b"this invocation's returned output").unwrap();
+            let published = session
+                .publish_with_observer("project", move |point, _| {
+                    if interrupted && point == PublicationPoint::PendingDurable {
+                        anyhow::bail!("stop after durable pending evidence");
+                    }
+                    Ok(())
+                })
+                .await;
+            let compact = writer.snapshot().recovery.unwrap();
+            assert!(compact["phases"][0].get("publication_journal").is_some());
+            for runtime in ["baseline", "published", "pending"] {
+                assert!(compact["phases"][0].get(runtime).is_none());
+            }
+            if interrupted {
+                assert!(published.is_err());
+                assert!(session.recipe.phases[0].pending.is_some());
+                let before = std::fs::read(&writer.path).unwrap();
+                let lease = writer.snapshot();
+                let count = std::fs::read_dir(writer.path.parent().unwrap())
+                    .unwrap()
+                    .count();
+                let mut premature = compact;
+                premature["returned"] = serde_json::json!(0);
+                premature["phases"][0]["complete"] = serde_json::json!(true);
+                assert!(writer.set_recovery(premature).is_err());
+                assert_eq!(writer.snapshot(), lease);
+                assert_eq!(std::fs::read(&writer.path).unwrap(), before);
+                assert_eq!(
+                    std::fs::read_dir(writer.path.parent().unwrap())
+                        .unwrap()
+                        .count(),
+                    count
+                );
+                assert!(!session.recipe.project_root.join(&relative).exists());
+            } else {
+                published.unwrap();
+                session.returned(0).unwrap();
+                let lease = writer.snapshot();
+                validate_recorded_delivery(&lease, writer.recovery_ownership.as_deref()).unwrap();
+                assert!(validate_recorded_delivery(&lease, None).is_err());
+                // Success validates the original journal receipts, not bytes a
+                // later build may legitimately have placed at the same name.
+                std::fs::write(
+                    session.recipe.project_root.join(&relative),
+                    b"a later invocation's output",
+                )
+                .unwrap();
+                validate_recorded_delivery(&lease, writer.recovery_ownership.as_deref()).unwrap();
+                let mut foreign = lease;
+                foreign.recovery.as_mut().unwrap()["phases"][0]["local"] =
+                    serde_json::to_value(directory.path().join("foreign-caller")).unwrap();
+                assert!(
+                    validate_recorded_delivery(&foreign, writer.recovery_ownership.as_deref())
+                        .is_err()
+                );
+            }
         }
     }
 

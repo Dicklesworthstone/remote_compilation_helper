@@ -2670,7 +2670,10 @@ impl DurableLeaseWriter {
                 "previous remote source ownership is unresolved; recover this wrapper before another admission"
             );
         }
-        transfer_orchestration::recovery::ensure_local_retirement_complete(&lease)?;
+        transfer_orchestration::recovery::ensure_local_retirement_complete(
+            &lease,
+            self.recovery_ownership.as_deref(),
+        )?;
         let mut next = lease.clone();
         next.recovery = None;
         next.exit_code = None;
@@ -2693,7 +2696,10 @@ impl DurableLeaseWriter {
                 lease.identity.local_wrapper_id
             );
         }
-        transfer_orchestration::recovery::ensure_local_retirement_complete(&lease)?;
+        transfer_orchestration::recovery::ensure_local_retirement_complete(
+            &lease,
+            self.recovery_ownership.as_deref(),
+        )?;
         Ok(())
     }
 
@@ -2723,7 +2729,10 @@ impl DurableLeaseWriter {
                 "previous remote source ownership is unresolved; retry refused"
             );
         }
-        transfer_orchestration::recovery::ensure_local_retirement_complete(&lease)?;
+        transfer_orchestration::recovery::ensure_local_retirement_complete(
+            &lease,
+            self.recovery_ownership.as_deref(),
+        )?;
         let previous = lease.clone();
         let mut pending = previous.clone();
         pending.identity.remote_build_id = None;
@@ -2902,7 +2911,7 @@ impl DurableLeaseWriter {
                     .and_then(|returned| i32::try_from(returned).ok())
             })
             .context("terminal command exit is not observed; acknowledgement refused")?;
-        Self::ensure_terminal_evidence(&lease, exit_code)?;
+        Self::ensure_terminal_evidence(&lease, exit_code, self.recovery_ownership.as_deref())?;
         let mut next = lease.clone();
         // A retired delivery receipt is an observed result too. Publish its
         // exact finite exit and acknowledgement in the same transition.
@@ -2930,7 +2939,7 @@ impl DurableLeaseWriter {
                 && lease.worker_id == observed.worker_id,
             "observed completion belongs to another admission; acknowledgement refused"
         );
-        Self::ensure_terminal_evidence(&lease, exit_code)?;
+        Self::ensure_terminal_evidence(&lease, exit_code, self.recovery_ownership.as_deref())?;
         if lease.terminal_acknowledged {
             anyhow::ensure!(
                 lease.exit_code == Some(exit_code),
@@ -2976,7 +2985,11 @@ impl DurableLeaseWriter {
         }
     }
 
-    fn ensure_terminal_evidence(lease: &DurableJobLease, exit_code: i32) -> anyhow::Result<()> {
+    fn ensure_terminal_evidence(
+        lease: &DurableJobLease,
+        exit_code: i32,
+        ownership: Option<&transfer_orchestration::recovery::recovery_owner::RecoveryOwnership>,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             !selection_is_pending(lease),
             "selection is pending; terminal acknowledgement refused"
@@ -3007,7 +3020,7 @@ impl DurableLeaseWriter {
                 "terminal command result contradicts durable delivery; acknowledgement refused"
             );
         }
-        transfer_orchestration::recovery::ensure_local_retirement_complete(lease)?;
+        transfer_orchestration::recovery::ensure_local_retirement_complete(lease, ownership)?;
         Ok(())
     }
 
@@ -8268,7 +8281,7 @@ mod source_cancellation_retirement_tests {
             let before = recipe.clone();
             assert!(DurableLeaseWriter::cancellation_allows_retirement(&recipe));
             let lease = lease(recipe);
-            DurableLeaseWriter::ensure_terminal_evidence(&lease, 137).unwrap();
+            DurableLeaseWriter::ensure_terminal_evidence(&lease, 137, None).unwrap();
             assert_eq!(lease.recovery.as_ref(), Some(&before));
 
             let mut no_source = before;
@@ -8314,7 +8327,7 @@ mod source_cancellation_retirement_tests {
             );
             let lease = lease(recipe);
             assert!(
-                DurableLeaseWriter::ensure_terminal_evidence(&lease, 137).is_err(),
+                DurableLeaseWriter::ensure_terminal_evidence(&lease, 137, None).is_err(),
                 "{key}"
             );
             assert_eq!(lease.recovery.as_ref(), Some(&before));

@@ -211,6 +211,59 @@ fn plan(
     Ok(changed.then_some(next))
 }
 
+/// A journal can keep its admitted checkpoints across an explicitly narrowed
+/// implicit Make selector. Reuse the operator policy checks instead of treating
+/// any changed pattern list as permission to rebind old publication evidence.
+pub(super) fn validate_publication_rebind(
+    lease: &DurableJobLease,
+    previous: &RecoveryRecipe,
+    next: &RecoveryRecipe,
+    index: usize,
+) -> anyhow::Result<()> {
+    let prior_phase = previous
+        .phases
+        .get(index)
+        .context("publication policy names no prior phase")?;
+    let next_phase = next
+        .phases
+        .get(index)
+        .context("publication policy names no proposed phase")?;
+    let added = next_phase
+        .patterns
+        .len()
+        .checked_sub(prior_phase.patterns.len())
+        .context("publication policy removed an admitted output rule")?;
+    anyhow::ensure!(
+        added > 0 && &next_phase.patterns[added..] == prior_phase.patterns.as_slice(),
+        "publication policy must preserve every prior output rule in order"
+    );
+    let directories = next_phase.patterns[..added]
+        .iter()
+        .rev()
+        .map(|rule| {
+            rule.strip_prefix("- /")
+                .and_then(|directory| directory.strip_suffix('/'))
+                .context("publication policy adds a rule other than a literal directory exclusion")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let request = Request::parse(&serde_json::to_string(&serde_json::json!({
+        "wrapper_id": previous.wrapper_id,
+        "directories": directories,
+    }))?)?;
+    let planned = plan(lease, previous, &request)?
+        .context("publication policy does not introduce an authorized narrowing")?;
+    anyhow::ensure!(
+        planned.phases.len() == next.phases.len()
+            && planned
+                .phases
+                .iter()
+                .zip(&next.phases)
+                .all(|(planned, next)| planned.patterns == next.patterns),
+        "publication policy changes output rules beyond the validated exclusions"
+    );
+    Ok(())
+}
+
 /// Retain the exact previous journal through the already-held directory. This
 /// is evidence, not a second writer or a replacement recovery journal.
 fn retain_previous_journal(
@@ -336,7 +389,7 @@ fn apply(
     let reserve = current
         .retrieval_min_free_bytes
         .max(recipe.transfer.retrieval_min_free_bytes);
-    let previous = stage.publish(writer, &lease, serde_json::to_value(next)?, reserve)?;
+    let previous = stage.publish(writer, &lease, next.storage_value()?, reserve)?;
     eprintln!(
         "[RCH] refined implicit Make artifact selection for {}: excluded directories {:?}; prior journal {}; prior staging retained; compilation was not replayed",
         request.wrapper_id,
@@ -554,6 +607,51 @@ mod tests {
         let mut terminal = writer.snapshot();
         terminal.terminal_acknowledged = true;
         assert!(plan(&terminal, &next, &input).unwrap().is_none());
+    }
+
+    #[test]
+    fn publication_rebind_accepts_only_exact_disjoint_policy_narrowing() {
+        let (root, mut session, _, _) = fixture_with_results(true, &["reports".into()]);
+        session.recipe.phases[0]
+            .published
+            .insert("build/delivered.o".into(), "published-hash".into());
+        session.recipe.phases[0].pending = Some(("out/pending.o".into(), "pending-hash".into()));
+        let lease = session.writer.snapshot();
+        let previous = &session.recipe;
+        let input = request(&session, &["build/tools", "out/generated"]);
+        let mut next = plan(&lease, previous, &input).unwrap().unwrap();
+        next.transfer.retrieval_staging_dir = Some(root.join("fresh-stage"));
+        validate_publication_rebind(&lease, previous, &next, 0).unwrap();
+        assert!(validate_publication_rebind(&lease, previous, &next, 1).is_err());
+        let before = std::fs::read(&session.writer.path).unwrap();
+        for rule in [
+            "- /build/delivered.o/",
+            "- /out/pending.o/",
+            "- /reports/",
+            "- /build/*/",
+            "new-output/**",
+        ] {
+            let mut invalid = previous.clone();
+            invalid.phases[0].patterns.insert(0, rule.into());
+            assert!(
+                validate_publication_rebind(&lease, previous, &invalid, 0).is_err(),
+                "{rule}"
+            );
+        }
+        let mut changed_prior = next.clone();
+        changed_prior.phases[0]
+            .patterns
+            .last_mut()
+            .unwrap()
+            .push_str("-changed");
+        assert!(validate_publication_rebind(&lease, previous, &changed_prior, 0).is_err());
+        let mut changed_result = next.clone();
+        changed_result.phases[1].patterns.push("extra/**".into());
+        assert!(validate_publication_rebind(&lease, previous, &changed_result, 0).is_err());
+        let duplicate = next.phases[0].patterns[0].clone();
+        next.phases[0].patterns.insert(0, duplicate);
+        assert!(validate_publication_rebind(&lease, previous, &next, 0).is_err());
+        assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
     }
 
     #[test]
@@ -814,6 +912,7 @@ mod tests {
         let pending_temporary = local.join("out").join(&temporary_name);
         {
             let _publication = lock_output_root(&local).await.unwrap();
+            session.ensure_publication_journal(0).unwrap();
             session
                 .persist_output_baseline(0, &[done.clone(), pending.clone()])
                 .unwrap();
@@ -863,15 +962,19 @@ mod tests {
             recipe: load_recipe(&session.writer).unwrap(),
             writer: session.writer.clone(),
         };
-        let mut expected_phase = old_phase;
+        let mut expected_phase = old_phase.clone();
         expected_phase["patterns"]
             .as_array_mut()
             .unwrap()
             .insert(0, "- /build/tools/".into());
-        assert_eq!(
-            serde_json::to_value(&recovered.recipe.phases[0]).unwrap(),
-            expected_phase
+        let forked = serde_json::to_value(&recovered.recipe.phases[0]).unwrap();
+        assert!(old_phase.get("publication_journal").is_some());
+        assert_ne!(
+            forked["publication_journal"],
+            old_phase["publication_journal"]
         );
+        expected_phase["publication_journal"] = forked["publication_journal"].clone();
+        assert_eq!(forked, expected_phase);
         assert_eq!(
             recovered.writer.snapshot().exit_code,
             Some(EXIT_ARTIFACT_TRANSFER_FAILED)
@@ -886,7 +989,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             disk.recovery.unwrap(),
-            serde_json::to_value(&recovered.recipe).unwrap()
+            recovered.recipe.storage_value().unwrap()
         );
         let backups: Vec<_> = std::fs::read_dir(recovered.writer.path.parent().unwrap())
             .unwrap()
@@ -932,6 +1035,18 @@ mod tests {
         assert_eq!(recovered.recipe.phases[0].published.len(), 2);
         assert!(recovered.recipe.phases[0].complete);
         recovered.returned(0).unwrap();
+        let retained: DurableJobLease =
+            serde_json::from_slice(&std::fs::read(&backups[0]).unwrap()).unwrap();
+        let retained = decode_recipe_value(
+            retained.recovery.unwrap(),
+            recovered.writer.recovery_ownership.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained.phases[0]).unwrap(),
+            old_phase,
+            "later publication changed the retained snapshot's evidence"
+        );
         assert!(recovered.writer.acknowledge_terminal().is_err());
         assert!(!recovered.recipe.sources_released);
         let committed = std::fs::read(&recovered.writer.path).unwrap();
@@ -1022,7 +1137,7 @@ mod tests {
         session.publish("result:reports").await.unwrap();
         let report = root.join("caller/reports/summary.txt");
         let report_inode = std::fs::metadata(&report).unwrap().ino();
-        let result_phase = serde_json::to_value(&session.recipe.phases[1]).unwrap();
+        let mut result_phase = serde_json::to_value(&session.recipe.phases[1]).unwrap();
         assert!(session.recipe.phases[1].complete);
         assert!(!session.recipe.phases[0].complete);
         assert!(!session.writer.snapshot().terminal_acknowledged);
@@ -1039,10 +1154,14 @@ mod tests {
             recipe: load_recipe(&session.writer).unwrap(),
             writer: session.writer.clone(),
         };
-        assert_eq!(
-            serde_json::to_value(&recovered.recipe.phases[1]).unwrap(),
-            result_phase
+        let forked_result = serde_json::to_value(&recovered.recipe.phases[1]).unwrap();
+        assert!(result_phase.get("publication_journal").is_some());
+        assert_ne!(
+            forked_result["publication_journal"],
+            result_phase["publication_journal"]
         );
+        result_phase["publication_journal"] = forked_result["publication_journal"].clone();
+        assert_eq!(forked_result, result_phase);
         assert_eq!(std::fs::metadata(&report).unwrap().ino(), report_inode);
         assert_eq!(
             recovered.writer.snapshot().exit_code,

@@ -26,6 +26,13 @@ impl RecoveryOwnership {
         self.gate.verify()
     }
 
+    /// Publication journals share the lease's held directory and owner gate.
+    /// Never resolve their names against an unverified replacement directory.
+    pub(in crate::hook) fn publication_directory(&self) -> anyhow::Result<&File> {
+        self.verify()?;
+        Ok(self.gate.directory())
+    }
+
     pub(in crate::hook) fn read(&self, wrapper_id: &str) -> anyhow::Result<DurableJobLease> {
         let (_, bytes) = self.gate.read_snapshot()?;
         DurableLeaseWriter::decode_journal(&bytes, wrapper_id)
@@ -100,7 +107,7 @@ impl RecoveryOwnership {
         // these exact serialized bytes, not a snapshot from the writer.
         let prospective: DurableJobLease =
             serde_json::from_slice(bytes).context("invalid prospective recovery journal")?;
-        super::recovery_completion::validate_recorded_delivery(&prospective)?;
+        super::recovery_completion::validate_recorded_delivery(&prospective, Some(self))?;
         // An exclusive fresh name cannot truncate an existing receipt. A failed
         // publication retains its temporary bytes for diagnosis, never cleanup.
         let temporary =
@@ -175,6 +182,15 @@ pub(in crate::hook) fn acquire_gate(lease_path: &Path) -> anyhow::Result<Recover
     Ok(RecoveryOwnership {
         gate: JobJournalGate::try_acquire(lease_path)?.ok_or(JobJournalBusy)?,
     })
+}
+
+pub(super) fn validate_publication_rebind(
+    lease: &DurableJobLease,
+    previous: &RecoveryRecipe,
+    next: &RecoveryRecipe,
+    index: usize,
+) -> anyhow::Result<()> {
+    artifact_policy::validate_publication_rebind(lease, previous, next, index)
 }
 
 fn validate_same_owner(observed: &DurableJobLease, latest: &DurableJobLease) -> anyhow::Result<()> {
@@ -317,7 +333,7 @@ where
     // A legacy premature `returned = 0` must not reach source retirement or
     // the acknowledged shortcut. This is read-only and precedes every peer
     // probe and artifact-policy/config mutation under the recovered owner.
-    super::recovery_completion::validate_recorded_delivery(&latest)?;
+    super::recovery_completion::validate_recorded_delivery(&latest, Some(&ownership))?;
     if !latest.terminal_acknowledged {
         anyhow::ensure!(
             inspect(latest.clone()).await?,
@@ -631,6 +647,7 @@ mod tests {
             output_gate: false,
             cargo_outputs: None,
             native_outputs: None,
+            publication_journal: None,
             baseline: BTreeMap::new(),
             published: BTreeMap::new(),
             pending: None,
@@ -984,6 +1001,18 @@ mod tests {
         let clone = bound.clone();
         drop(bound);
         assert!(acquire_gate(&writer.path).is_err());
+        assert_eq!(
+            clone
+                .recovery_ownership
+                .as_ref()
+                .unwrap()
+                .publication_directory()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .ino(),
+            std::fs::metadata(root.join("jobs")).unwrap().ino()
+        );
         clone.record_exit(102).unwrap();
         clone.acknowledge_terminal().unwrap();
         let wrapper = clone.wrapper_id();
@@ -1001,6 +1030,14 @@ mod tests {
         let before = std::fs::read_dir(root.join("jobs")).unwrap().count();
         assert!(clone.record_exit(103).is_err());
         assert!(clone.persist().is_err());
+        assert!(
+            clone
+                .recovery_ownership
+                .as_ref()
+                .unwrap()
+                .publication_directory()
+                .is_err()
+        );
         assert!(
             clone
                 .terminal_job_report(&wrapper, "recovered", Some(102))
@@ -1054,6 +1091,14 @@ mod tests {
             .unwrap();
         assert!(bound.record_exit(103).is_err());
         assert!(bound.persist().is_err());
+        assert!(
+            bound
+                .recovery_ownership
+                .as_ref()
+                .unwrap()
+                .publication_directory()
+                .is_err()
+        );
         assert_eq!(bound.snapshot(), original);
         assert_eq!(std::fs::read(&writer.path).unwrap(), bytes);
         assert_eq!(
