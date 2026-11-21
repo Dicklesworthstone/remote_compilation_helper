@@ -500,6 +500,9 @@ auto-delegation of ordinary commands is impossible.
 rch exec --job -- ./run_shards.sh
 # Declared result directories sync back on ANY exit code (including failures):
 rch exec --job --result-dir fuzz/corpus --result-dir crashes -- ./fuzz_target.sh
+# Keep job reports outside a shared or read-only checkout:
+mkdir -m 700 /var/tmp/verification-output
+rch exec --job --result-dir reports --result-dest /var/tmp/verification-output -- ./verify.sh
 ```
 
 Semantics: the remote exit status surfaces verbatim; no toolchain/worker-env
@@ -507,6 +510,18 @@ rerun heuristics apply. A declared `--result-dir` that is missing or only
 partially transferable fails loudly (`RCH-E309`, exit 102) regardless of the
 job's own exit status. Paths must be repository-relative; conflicts with
 `--clean-overlay` / `--source-content-receipt` are refused.
+
+`--result-dest ROOT` publishes each declared directory beneath an existing,
+absolute, caller-owned output root: `--result-dir reports` becomes
+`ROOT/reports`. Declared directories must not overlap each other. The root
+must not be writable by other users, overlap source or
+RCH state directories, or change identity while the job runs or is recovered.
+Traversal and symlink escapes below the root are refused. Delivery still runs
+after a nonzero job exit, and the JSON receipt records `remote_source` and
+`local_destination` for every collected directory. This option requires remote
+execution and guarded publication; it never falls back to a local job. An
+interrupted collection uses the same persisted destination with
+`rch jobs recover`.
 
 Native Apple commands can use job mode too: direct `xcodebuild` and `xcrun`
 invocations require a worker declaring `os = "darwin"`. This preserves the OS

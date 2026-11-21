@@ -67,6 +67,10 @@ pub(crate) struct RecoveryRecipe {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     staging_released: bool,
     project_root: PathBuf,
+    /// An explicit caller-owned result root is pinned before admission. Recovery
+    /// may deliver only into that same directory, never a replacement at its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_destination: Option<JobResultDestination>,
     kind: Option<CompilationKind>,
     expected_triple: String,
     pinned_triple: Option<String>,
@@ -166,6 +170,113 @@ struct StagingOwnership {
     stage_device: u64,
     stage_inode: u64,
     marker: String,
+}
+
+/// The caller's explicit result root, captured before any remote admission.
+/// Resolve an intentional root alias once; descendants remain relative and
+/// cannot redirect publication outside this exact directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JobResultDestination {
+    root: PathBuf,
+    device: u64,
+    inode: u64,
+    owner: u32,
+}
+
+impl JobResultDestination {
+    pub(crate) fn resolve(root: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            root.is_absolute()
+                && !root
+                    .components()
+                    .any(|part| { matches!(part, std::path::Component::ParentDir) })
+                && root
+                    .to_str()
+                    .is_some_and(|path| !path.chars().any(char::is_control)),
+            "--result-dest requires an absolute directory without traversal or control characters"
+        );
+        let root = root.canonicalize().with_context(|| {
+            format!(
+                "--result-dest must name an existing directory: {}",
+                root.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(&root)?;
+            let destination = Self {
+                root,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                owner: metadata.uid(),
+            };
+            destination.verify()?;
+            Ok(destination)
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("--result-dest requires Unix directory identity support")
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn validate_contract(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.root.is_absolute()
+                && self.root.components().all(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                })
+                && self
+                    .root
+                    .to_str()
+                    .is_some_and(|path| !path.chars().any(char::is_control)),
+            "mapped result root has an invalid persisted path"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn verify(&self) -> anyhow::Result<()> {
+        self.validate_contract()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(&self.root)
+                .context("mapped result root disappeared; original destination retained")?;
+            anyhow::ensure!(
+                metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.dev() == self.device
+                    && metadata.ino() == self.inode
+                    && metadata.uid() == self.owner
+                    && self.owner == rustix::process::geteuid().as_raw()
+                    && metadata.mode() & 0o022 == 0
+                    && self.root.canonicalize()? == self.root,
+                "mapped result root identity, ownership or permissions changed; refusing publication into {}",
+                self.root.display()
+            );
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("mapped results require Unix directory identity support")
+    }
+
+    /// Source and control files must never become declared output authority.
+    pub(crate) fn verify_separate_from(&self, protected: &Path) -> anyhow::Result<()> {
+        self.verify()?;
+        let protected = output_lock_root_identity(protected)?;
+        anyhow::ensure!(
+            !self.root.starts_with(&protected) && !protected.starts_with(&self.root),
+            "--result-dest overlaps source, lease or retrieval state: {}",
+            protected.display()
+        );
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -462,6 +573,62 @@ impl HeldRetrievalStage {
 }
 
 impl RecoveryRecipe {
+    fn validate_result_destination_contract(&self) -> anyhow::Result<()> {
+        let Some(destination) = &self.result_destination else {
+            return Ok(());
+        };
+        destination.validate_contract()?;
+        anyhow::ensure!(
+            self.prepared
+                && self.kind == Some(CompilationKind::Job)
+                && !self.phases.is_empty()
+                && !WorkerPlatform::from_worker(&self.worker).is_windows(),
+            "mapped result destination requires a prepared Unix job with declared results"
+        );
+        let mut directories: Vec<&Path> = Vec::new();
+        for phase in &self.phases {
+            let directory = phase
+                .result_dir
+                .as_deref()
+                .context("mapped result destination cannot change an artifact publication phase")?;
+            let normalized =
+                crate::hook::normalize_repository_relative_path("--result-dir", directory)?;
+            anyhow::ensure!(
+                normalized == directory
+                    && !crate::transfer::is_internal_source_archive(directory)
+                    && phase.name == format!("result:{}", directory.display())
+                    && phase.local == destination.root
+                    && Path::new(&phase.remote).is_absolute()
+                    && !phase.remote.chars().any(char::is_control)
+                    && !Path::new(&phase.remote)
+                        .components()
+                        .any(|part| { matches!(part, std::path::Component::ParentDir) })
+                    && !phase.custom_target
+                    && !phase.output_gate
+                    && phase.patterns.is_empty()
+                    && phase.cargo_outputs.is_none()
+                    && phase.native_outputs.is_none(),
+                "mapped result phase contradicts its admitted source/destination contract"
+            );
+            anyhow::ensure!(
+                directories.iter().all(|prior| {
+                    !directory.starts_with(prior) && !prior.starts_with(directory)
+                }),
+                "mapped result directories overlap"
+            );
+            for relative in phase
+                .baseline
+                .keys()
+                .chain(phase.published.keys())
+                .chain(phase.pending.as_ref().map(|(relative, _)| relative))
+            {
+                validate_result_member(directory, relative)?;
+            }
+            directories.push(directory);
+        }
+        Ok(())
+    }
+
     fn validate_go_output_contract(&self) -> anyhow::Result<()> {
         let mut phases = self.phases.iter().filter(|phase| phase.name == "project");
         let phase = phases
@@ -849,6 +1016,20 @@ fn validate_output_ancestors(root: &Path, relative: &Path) -> anyhow::Result<()>
         }
         ancestor = path.parent();
     }
+    Ok(())
+}
+
+fn validate_result_member(directory: &Path, relative: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        relative.starts_with(directory)
+            && relative != directory
+            && relative
+                .components()
+                .all(|part| { matches!(part, std::path::Component::Normal(_)) })
+            && !crate::transfer::is_internal_source_archive(relative),
+        "mapped result output is outside its declared directory: {}",
+        relative.display()
+    );
     Ok(())
 }
 
@@ -1437,6 +1618,7 @@ impl RecoverySession {
             staging_ownership: None,
             staging_released: false,
             project_root,
+            result_destination: None,
             kind: None,
             expected_triple: String::new(),
             pinned_triple: None,
@@ -1626,6 +1808,7 @@ impl RecoverySession {
             staging_ownership: None,
             staging_released: false,
             project_root,
+            result_destination: None,
             kind: delivery_kind,
             expected_triple: pinned_triple
                 .clone()
@@ -1668,6 +1851,62 @@ impl RecoverySession {
         };
         session.persist()?;
         Ok(session)
+    }
+
+    /// Bind the caller's previously resolved root before execution. The
+    /// ordinary staged publisher and its failure/recovery state machine stay
+    /// authoritative; rsync never writes directly into the declared root.
+    pub(crate) fn set_result_destination(
+        &mut self,
+        destination: &JobResultDestination,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.prepared
+                && self.recipe.result_destination.is_none()
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && !self.recipe.sources_released
+                && !self.recipe.pair_released
+                && !self.recipe.tree_retired
+                && !self.recipe.retired
+                && self.recipe.exit_code.is_none()
+                && self.recipe.returned.is_none()
+                && self.recipe.phases.iter().all(|phase| {
+                    !phase.complete
+                        && phase.baseline.is_empty()
+                        && phase.published.is_empty()
+                        && phase.pending.is_none()
+                        && phase.missing_result.is_none()
+                }),
+            "result destination must be bound before execution or publication"
+        );
+        destination.verify_separate_from(&self.recipe.project_root)?;
+        destination.verify_separate_from(&default_job_lease_directory())?;
+        destination.verify_separate_from(
+            self.writer
+                .path
+                .parent()
+                .context("job lease has no parent")?,
+        )?;
+        destination.verify_separate_from(
+            self.stage(0)
+                .parent()
+                .context("retrieval stage has no owner root")?,
+        )?;
+        let mut next = self.recipe.clone();
+        next.result_destination = Some(destination.clone());
+        for phase in &mut next.phases {
+            phase.local = destination.root.clone();
+        }
+        next.validate_result_destination_contract()?;
+        self.persist_next_recipe(next)
+    }
+
+    fn verify_result_destination(&self) -> anyhow::Result<()> {
+        if let Some(destination) = &self.recipe.result_destination {
+            destination.verify()?;
+        }
+        Ok(())
     }
 
     fn persist(&self) -> anyhow::Result<()> {
@@ -2594,6 +2833,7 @@ impl RecoverySession {
     where
         F: FnMut(&Path) -> anyhow::Result<()> + Send + 'static,
     {
+        self.verify_result_destination()?;
         anyhow::ensure!(
             self.recipe.prepared
                 && !self.recipe.execution_started
@@ -2624,6 +2864,7 @@ impl RecoverySession {
             let observe = std::sync::Arc::clone(&observe);
             publication_runtime::run(self, publication, move |session| {
                 publication_runtime::checkpoint()?;
+                session.verify_result_destination()?;
                 let (identity, existing) = output_root_identity_and_existing_prefix(&root)?;
                 #[cfg(unix)]
                 publication_copy::probe_output_directory(
@@ -2645,6 +2886,7 @@ impl RecoverySession {
                     "output publication root changed during suitability probe: {}",
                     root.display()
                 );
+                session.verify_result_destination()?;
                 Ok(())
             })
             .await?;
@@ -2711,6 +2953,7 @@ impl RecoverySession {
     }
 
     pub(crate) fn starting_execution(&mut self) -> anyhow::Result<()> {
+        self.verify_result_destination()?;
         anyhow::ensure!(
             self.recipe.prepared
                 && !self.recipe.execution_started
@@ -2770,6 +3013,9 @@ impl RecoverySession {
     /// into deletion authority from its current path, contents or permissions.
     fn prepare_staging(&mut self, index: usize) -> anyhow::Result<()> {
         let stage = self.stage(index);
+        if let Some(destination) = &self.recipe.result_destination {
+            destination.verify_separate_from(&stage)?;
+        }
         anyhow::ensure!(
             stage.is_absolute() && !self.recipe.staging_released && !self.recipe.retired,
             "retrieval staging requires an absolute, unreleased live stage"
@@ -2961,6 +3207,7 @@ impl RecoverySession {
         if self.recipe.phases[index].complete {
             return Ok(());
         }
+        self.verify_result_destination()?;
         // Keep the asynchronous, cancellable lock wait. The worker owns the
         // acquired descriptor until it stops, including on future cancellation.
         let publication = lock_output_root(&self.recipe.phases[index].local).await?;
@@ -2976,6 +3223,7 @@ impl RecoverySession {
         mut observe: impl FnMut(PublicationPoint, &Path) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         publication_runtime::checkpoint()?;
+        self.verify_result_destination()?;
         anyhow::ensure!(
             self.recipe.phases[index].result_dir.is_some()
                 || self
@@ -2998,6 +3246,15 @@ impl RecoverySession {
         #[cfg(not(unix))]
         let mut files = regular_files(&stage)?;
         let phase = &self.recipe.phases[index];
+        if self.recipe.result_destination.is_some() {
+            let directory = phase
+                .result_dir
+                .as_deref()
+                .context("mapped result has no directory")?;
+            for relative in &files {
+                validate_result_member(directory, relative)?;
+            }
+        }
         if let Some((relative, _)) = &phase.pending {
             // Check before the completed shortcut, policy fingerprint or
             // pending rename can observe a redirected descendant as ours.
@@ -3052,6 +3309,7 @@ impl RecoverySession {
         }
         publication_runtime::checkpoint()?;
         if let Some((relative, hash)) = self.recipe.phases[index].pending.clone() {
+            self.verify_result_destination()?;
             let destination = self.recipe.phases[index].local.join(&relative);
             let parent = destination
                 .parent()
@@ -3065,8 +3323,11 @@ impl RecoverySession {
                     destination.display()
                 );
                 let prepared = PreparedOutput::existing(File::open(parent)?, &temporary, &hash)?;
+                self.verify_result_destination()?;
+                validate_output_ancestors(&self.recipe.phases[index].local, &relative)?;
                 prepared.publish(&destination)?;
             }
+            self.verify_result_destination()?;
             self.persist_published_output(index, relative, hash)?;
         }
         // Observe the predecessors of this admitted staged set while holding
@@ -3076,6 +3337,7 @@ impl RecoverySession {
         self.persist_publication_baseline(index, &files)?;
         for relative in files {
             publication_runtime::checkpoint()?;
+            self.verify_result_destination()?;
             let phase = &self.recipe.phases[index];
             if phase.published.contains_key(&relative) {
                 continue;
@@ -3083,6 +3345,7 @@ impl RecoverySession {
             let destination = phase.local.join(&relative);
             observe(PublicationPoint::BeforeFile, &destination)?;
             publication_runtime::checkpoint()?;
+            self.verify_result_destination()?;
             validate_output_ancestors(&phase.local, &relative)?;
             let source = stage.join(&relative);
             let hash = fingerprint(&source)?.context("staged output disappeared")?;
@@ -3096,9 +3359,12 @@ impl RecoverySession {
             let temporary = parent.join(format!(".rch-return-{}", self.recipe.identity));
             let prepared = prepare_output_temporary(&source, &temporary, &hash)?;
             prepared.directory.sync_all()?;
+            self.verify_result_destination()?;
             self.persist_pending_output(index, Some((relative.clone(), hash.clone())))?;
             observe(PublicationPoint::PendingDurable, &destination)?;
             publication_runtime::checkpoint()?;
+            self.verify_result_destination()?;
+            validate_output_ancestors(&self.recipe.phases[index].local, &relative)?;
             anyhow::ensure!(
                 fingerprint(&destination)?.as_ref()
                     == self.recipe.phases[index].baseline.get(&relative),
@@ -3108,10 +3374,12 @@ impl RecoverySession {
             prepared.publish(&destination)?;
             observe(PublicationPoint::Renamed, &destination)?;
             publication_runtime::checkpoint()?;
+            self.verify_result_destination()?;
             self.persist_published_output(index, relative, hash)?;
             observe(PublicationPoint::PublishedDurable, &destination)?;
         }
         publication_runtime::checkpoint()?;
+        self.verify_result_destination()?;
         let mut next_recipe = self.recipe.clone();
         next_recipe.phases[index].complete = true;
         self.persist_next_recipe(next_recipe)?;
@@ -4136,6 +4404,10 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
             && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),
         "recovery recipe identity mismatch or unsupported source ownership version"
     );
+    // Structural validation only: an unavailable output root must not prevent
+    // cancellation or retirement of a job that has not exposed any outputs.
+    // Publication rechecks the original physical root before every write.
+    recipe.validate_result_destination_contract()?;
     anyhow::ensure!(
         recipe.source_cancellation_settled != Some(true)
             || (recipe.returned.is_some_and(|exit| exit != 0) && recipe.source_resources_retired()),
@@ -10212,6 +10484,224 @@ func TestValue(t *testing.T) {{
             recipe: load_recipe(&writer).unwrap(),
             writer,
         }
+    }
+
+    fn mapped_result_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        RecoverySession,
+    ) {
+        let (source, stage, mut session) = publication_fixture();
+        let output = tempfile::Builder::new()
+            .prefix("mapped-result-")
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        session.recipe.prepared = true;
+        session.recipe.kind = Some(CompilationKind::Job);
+        let phase = &mut session.recipe.phases[0];
+        phase.name = "result:reports".into();
+        phase.result_dir = Some("reports".into());
+        phase.patterns.clear();
+        let destination = JobResultDestination::resolve(output.path()).unwrap();
+        session.set_result_destination(&destination).unwrap();
+        (source, stage, output, session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_result_root_requires_existing_owned_directory_and_resolves_root_alias_once() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let root = directory.path().join("outputs");
+        std::fs::create_dir(&root).unwrap();
+        let alias = directory.path().join("outputs-alias");
+        symlink(&root, &alias).unwrap();
+        let selected = JobResultDestination::resolve(&alias).unwrap();
+        assert_eq!(selected.root(), root.canonicalize().unwrap());
+        selected.verify().unwrap();
+        for invalid in [
+            PathBuf::from("relative"),
+            root.join("../outputs"),
+            root.join("missing"),
+        ] {
+            assert!(
+                JobResultDestination::resolve(&invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        std::fs::write(root.join("file"), b"not a directory").unwrap();
+        assert!(JobResultDestination::resolve(&root.join("file")).is_err());
+        let mut wrong_owner = selected.clone();
+        wrong_owner.owner = wrong_owner.owner.wrapping_add(1);
+        assert!(wrong_owner.verify().is_err());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(selected.verify().is_err());
+        assert!(JobResultDestination::resolve(&root).is_err());
+    }
+
+    #[tokio::test]
+    async fn mapped_results_publish_failed_job_outputs_and_reopen_without_touching_checkout() {
+        let (_source, _stage, output, mut session) = mapped_result_fixture();
+        let checkout = session.recipe.project_root.clone();
+        std::fs::write(checkout.join("source.rs"), b"caller source").unwrap();
+        session.verify_publication_suitability().await.unwrap();
+        session.starting_execution().unwrap();
+        session.completed(7).unwrap();
+        let stage = session.stage(0);
+        std::fs::create_dir_all(stage.join("reports/nested")).unwrap();
+        std::fs::write(
+            stage.join("reports/nested/failure.json"),
+            b"failed workload report",
+        )
+        .unwrap();
+        let original_mapping = session.recipe.result_destination.clone();
+        let mut reopened = reload_publication(&session);
+        assert_eq!(reopened.recipe.result_destination, original_mapping);
+        assert_eq!(reopened.recipe.phases[0].remote, "/unused/remote");
+        assert_eq!(
+            reopened.recipe.phases[0].local,
+            output.path().canonicalize().unwrap()
+        );
+        reopened.publish("result:reports").await.unwrap();
+        reopened.returned(7).unwrap();
+        assert_eq!(
+            std::fs::read(output.path().join("reports/nested/failure.json")).unwrap(),
+            b"failed workload report"
+        );
+        assert!(!checkout.join("reports").exists());
+        assert_eq!(
+            std::fs::read(checkout.join("source.rs")).unwrap(),
+            b"caller source"
+        );
+        assert_eq!(reload_publication(&reopened).recipe.returned, Some(7));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mapped_results_refuse_descendant_symlinks_and_out_of_contract_staging() {
+        for escaped_stage in [false, true] {
+            let (_source, _stage, output, mut session) = mapped_result_fixture();
+            let elsewhere = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let stage = session.stage(0);
+            std::fs::create_dir(stage.join("reports")).unwrap();
+            std::fs::write(stage.join("reports/result.json"), b"report").unwrap();
+            if escaped_stage {
+                std::fs::write(stage.join("not-declared.txt"), b"unowned").unwrap();
+            } else {
+                std::os::unix::fs::symlink(elsewhere.path(), output.path().join("reports"))
+                    .unwrap();
+            }
+            let journal = std::fs::read(&session.writer.path).unwrap();
+            assert!(session.publish("result:reports").await.is_err());
+            assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
+            assert!(!elsewhere.path().join("result.json").exists());
+            assert!(!output.path().join("not-declared.txt").exists());
+            assert_eq!(
+                std::fs::read(stage.join("reports/result.json")).unwrap(),
+                b"report"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mapped_result_root_replacement_refuses_execution_and_publication_but_keeps_recovery() {
+        let (_source, _stage, output, mut session) = mapped_result_fixture();
+        let original = output.path().to_owned();
+        let retained = original.with_extension("original");
+        std::fs::rename(&original, &retained).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let before = std::fs::read(&session.writer.path).unwrap();
+        assert!(session.starting_execution().is_err());
+        assert!(session.verify_publication_suitability().await.is_err());
+        // Loading remains possible so the caller can cancel an unexecuted job.
+        let mut reopened = reload_publication(&session);
+        assert!(reopened.publish("result:reports").await.is_err());
+        assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+        assert!(!reopened.recipe.execution_started);
+        assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mapped_result_pending_rename_cannot_follow_retargeted_root_and_resumes_original() {
+        let (_source, _stage, output, mut session) = mapped_result_fixture();
+        let root = output.path().to_owned();
+        let retained = root.with_extension("retained");
+        let redirected = root.with_extension("redirected");
+        std::fs::create_dir(&redirected).unwrap();
+        let stage = session.stage(0);
+        std::fs::create_dir(stage.join("reports")).unwrap();
+        std::fs::write(stage.join("reports/result.json"), b"exact retained output").unwrap();
+        let (replace_root, retain_root, redirect_root) =
+            (root.clone(), retained.clone(), redirected.clone());
+        let error = session
+            .publish_with_observer("result:reports", move |point, _| {
+                if point == PublicationPoint::PendingDurable {
+                    std::fs::rename(&replace_root, &retain_root)?;
+                    std::os::unix::fs::symlink(&redirect_root, &replace_root)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("mapped result root"),
+            "{error:#}"
+        );
+        assert!(!redirected.join("reports/result.json").exists());
+        assert!(!retained.join("reports/result.json").exists());
+        assert!(session.recipe.phases[0].pending.is_some());
+        std::fs::rename(&root, root.with_extension("rejected-alias")).unwrap();
+        std::fs::rename(&retained, &root).unwrap();
+        let mut reopened = reload_publication(&session);
+        reopened.publish("result:reports").await.unwrap();
+        assert_eq!(
+            std::fs::read(root.join("reports/result.json")).unwrap(),
+            b"exact retained output"
+        );
+        assert!(reopened.recipe.phases[0].pending.is_none());
+        assert!(reopened.recipe.phases[0].complete);
+    }
+
+    #[test]
+    fn mapped_result_contract_refuses_overlapping_dirs_and_rewritten_destination() {
+        let (_source, _stage, output, session) = mapped_result_fixture();
+        let mut recipe = session.recipe.clone();
+        let mut nested = recipe.phases[0].clone();
+        nested.name = "result:reports/nested".into();
+        nested.result_dir = Some("reports/nested".into());
+        recipe.phases.push(nested);
+        assert!(recipe.validate_result_destination_contract().is_err());
+        let mut recipe = session.recipe.clone();
+        recipe.phases[0].local = recipe.project_root.clone();
+        assert!(recipe.validate_result_destination_contract().is_err());
+        let mut recipe = session.recipe.clone();
+        recipe.phases[0].pending = Some(("outside/file".into(), "digest".into()));
+        assert!(recipe.validate_result_destination_contract().is_err());
+        let mapping = session.recipe.result_destination.as_ref().unwrap();
+        assert!(mapping.verify_separate_from(output.path()).is_err());
+        assert!(
+            mapping
+                .verify_separate_from(&output.path().join("nested"))
+                .is_err()
+        );
+        assert!(
+            mapping
+                .verify_separate_from(output.path().parent().unwrap())
+                .is_err()
+        );
+        mapping
+            .verify_separate_from(&session.recipe.project_root)
+            .unwrap();
     }
 
     fn captured_publication_fixture(

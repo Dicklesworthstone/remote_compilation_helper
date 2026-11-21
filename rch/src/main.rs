@@ -625,6 +625,7 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     rch exec --base HEAD --clean-overlay --no-overlay -- cargo check
     rch exec --job -- sharded_tests/run.sh
     rch exec --job --result-dir fuzz/corpus --result-dir crashes -- ./fuzz_target.sh
+    rch exec --job --result-dir reports --result-dest /var/tmp/run-output -- ./verify.sh
 
 USAGE:
     This command is primarily used internally by the PreToolUse hook.
@@ -687,6 +688,12 @@ USAGE:
         /// loudly (exit 102) regardless of the job's own exit status.
         #[arg(long, value_name = "DIR", requires = "job")]
         result_dir: Vec<PathBuf>,
+        /// Publish declared result directories under this existing absolute
+        /// caller-owned directory instead of the working tree. For example,
+        /// --result-dir reports writes ROOT/reports. Requires remote execution;
+        /// the root's identity is retained for safe interrupted-job recovery.
+        #[arg(long, value_name = "ROOT", requires_all = ["job", "result_dir"])]
+        result_dest: Option<PathBuf>,
         /// Require a verified named tool or exact node@VERSION / bun@VERSION.
         /// Plain names refer to operator-declared worker tool probes.
         /// Repeatable for compilation or jobs; all requirements must match.
@@ -2538,6 +2545,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 source_content_receipt,
                 job,
                 result_dir,
+                result_dest,
                 require_tool,
                 worker,
                 require_remote,
@@ -2552,6 +2560,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     source_content_receipt,
                     job,
                     result_dir,
+                    result_dest,
                     require_tool,
                     worker,
                     require_remote,
@@ -4728,10 +4737,7 @@ async fn discover_worker_gc_roots(
 ) -> (rch_common::gc_roots::GcRootSet, serde_json::Value) {
     let mut roots = configured.clone();
     if transfer::WorkerPlatform::from_worker(worker).is_windows() {
-        return (
-            roots,
-            serde_json::json!({"status": "unsupported-platform"}),
-        );
+        return (roots, serde_json::json!({"status": "unsupported-platform"}));
     }
     let command = rch_common::gc_roots::source_claim_roots_command();
     let report = match run_gc_surface_command(worker, &command, deadline, output_budget).await {
@@ -4762,7 +4768,9 @@ fn print_gc_root_discovery_warning(report: &serde_json::Value) {
         eprintln!(
             "[rch] {}: source-root discovery unavailable; inventory covers configured roots only: {}",
             report["id"].as_str().unwrap_or("?"),
-            report["root_discovery"]["error"].as_str().unwrap_or("unknown error")
+            report["root_discovery"]["error"]
+                .as_str()
+                .unwrap_or("unknown error")
         );
     }
 }
@@ -5634,7 +5642,8 @@ async fn handle_gc(
     let worker_reports = collect_gc_reports(tasks, |report| {
         print_gc_root_discovery_warning(report);
         eprintln!("{}", gc_progress(report));
-    }).await;
+    })
+    .await;
     let failed = gc_failed(&worker_reports);
     let timed_out_workers: Vec<&str> = worker_reports
         .iter()
@@ -6150,8 +6159,12 @@ async fn handle_cache_status(
         let windows = transfer::WorkerPlatform::from_worker(worker).is_windows();
         let mut output_budget = GC_OUTPUT_LIMIT;
         let (roots, root_discovery) = discover_worker_gc_roots(
-            worker, surface.roots_for(worker), deadline, &mut output_budget,
-        ).await;
+            worker,
+            surface.roots_for(worker),
+            deadline,
+            &mut output_budget,
+        )
+        .await;
         let worker_bases = roots.scan_bases();
         let scan = scan_cache_status_roots(
             &worker_bases,
@@ -6172,9 +6185,8 @@ async fn handle_cache_status(
             now_unix,
             scan,
         );
-        report["partial"] = serde_json::json!(
-            report["partial"] == true || root_discovery["status"] == "error"
-        );
+        report["partial"] =
+            serde_json::json!(report["partial"] == true || root_discovery["status"] == "error");
         report["root_discovery"] = root_discovery;
         report
     });
@@ -6310,7 +6322,9 @@ async fn handle_cache_status(
                 );
             }
             if gc_root_discovery_failed(report) {
-                println!("    totals cover configured roots only; recorded source roots were unavailable");
+                println!(
+                    "    totals cover configured roots only; recorded source roots were unavailable"
+                );
             }
             if report["inventory_only"] == true {
                 println!(
@@ -7617,7 +7631,8 @@ mod tests {
         let mirror = "/private/tmp/claude-501/session/project";
         let inventory = serde_json::json!({
             "schema_version": 1, "roots": [mirror, mirror],
-        }).to_string();
+        })
+        .to_string();
         assert_eq!(merge_worker_gc_roots(&mut roots, &inventory).unwrap(), 1);
         let accepted = roots.scan_bases();
         assert!(accepted.iter().any(|root| root == mirror));
@@ -7639,7 +7654,8 @@ mod tests {
             .collect();
         let oversized = serde_json::json!({
             "schema_version": 1, "roots": oversized,
-        }).to_string();
+        })
+        .to_string();
         assert!(merge_worker_gc_roots(&mut roots, &oversized).is_err());
         assert_eq!(roots.scan_bases(), accepted);
     }
@@ -7651,9 +7667,14 @@ mod tests {
         let mut roots = rch_common::gc_roots::derive_gc_roots(&Default::default(), &[]);
         let configured = roots.scan_bases()[0].clone();
         let mirror = "/private/tmp/claude-501/session/project";
-        merge_worker_gc_roots(&mut roots, &serde_json::json!({
-            "schema_version": 1, "roots": [mirror],
-        }).to_string()).unwrap();
+        merge_worker_gc_roots(
+            &mut roots,
+            &serde_json::json!({
+                "schema_version": 1, "roots": [mirror],
+            })
+            .to_string(),
+        )
+        .unwrap();
         let bases = roots.scan_bases();
         let evidence = format!(
             "RCH_GC_ROOT base {configured}\n\
@@ -7673,7 +7694,10 @@ mod tests {
         let budget = GC_OUTPUT_LIMIT - 100;
         let mut calls = 0;
         let scan = scan_cache_status_roots(
-            &bases, false, deadline, budget,
+            &bases,
+            false,
+            deadline,
+            budget,
             |command, received_deadline, received_budget| {
                 calls += 1;
                 assert_eq!(received_deadline, deadline);
@@ -7684,20 +7708,28 @@ mod tests {
                 let remaining = received_budget - evidence.len() as u64;
                 std::future::ready((
                     Ok(rch_common::CommandResult {
-                        exit_code: 0, stdout: evidence.clone(),
-                        stderr: String::new(), duration_ms: 1,
+                        exit_code: 0,
+                        stdout: evidence.clone(),
+                        stderr: String::new(),
+                        duration_ms: 1,
                     }),
                     remaining,
                 ))
             },
-        ).await;
+        )
+        .await;
         assert_eq!(calls, 1);
         let report = cache_status_worker_report(
-            "worker", false, &roots,
+            "worker",
+            false,
+            &roots,
             &rch_common::stale_target_reap::GcPolicy {
-                idle_secs: 1, pooled_idle_secs: Some(1), cache_idle_secs: Some(1),
+                idle_secs: 1,
+                pooled_idle_secs: Some(1),
+                cache_idle_secs: Some(1),
             },
-            10_000_000, scan,
+            10_000_000,
+            scan,
         );
         assert_eq!(report["ok"], true);
         assert_eq!(report["scanned_roots"].as_array().unwrap().len(), 3);
@@ -8517,6 +8549,7 @@ mod tests {
                 source_content_receipt,
                 job,
                 result_dir,
+                result_dest: _,
                 require_tool: _,
                 worker: _,
                 require_remote: _,
@@ -8565,6 +8598,7 @@ mod tests {
                 source_content_receipt,
                 job,
                 result_dir,
+                result_dest: _,
                 require_tool: _,
                 worker: _,
                 require_remote: _,
@@ -8982,6 +9016,71 @@ mod tests {
             result.is_err(),
             "--result-dir without --job must be refused"
         );
+    }
+
+    #[test]
+    fn cli_parses_external_job_result_destination() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--job",
+            "--result-dir",
+            "reports/shard-a",
+            "--result-dir",
+            "crashes",
+            "--result-dest",
+            "/var/tmp/job-output",
+            "--",
+            "./verify.sh",
+        ])
+        .unwrap();
+        let Some(Commands::Exec {
+            job,
+            result_dir,
+            result_dest,
+            command,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected an exec command");
+        };
+        assert!(job);
+        assert_eq!(
+            result_dir,
+            [PathBuf::from("reports/shard-a"), PathBuf::from("crashes")]
+        );
+        assert_eq!(result_dest, Some(PathBuf::from("/var/tmp/job-output")));
+        assert_eq!(command, ["./verify.sh"]);
+    }
+
+    #[test]
+    fn cli_rejects_result_destination_without_declared_job_outputs() {
+        let _guard = test_guard!();
+        for arguments in [
+            vec!["rch", "exec", "--result-dest", "/tmp/output", "--", "true"],
+            vec![
+                "rch",
+                "exec",
+                "--job",
+                "--result-dest",
+                "/tmp/output",
+                "--",
+                "true",
+            ],
+            vec![
+                "rch",
+                "exec",
+                "--result-dir",
+                "reports",
+                "--result-dest",
+                "/tmp/output",
+                "--",
+                "true",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
     }
 
     #[test]

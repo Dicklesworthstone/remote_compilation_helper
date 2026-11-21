@@ -4939,6 +4939,7 @@ pub async fn run_exec(
     source_content_receipt: bool,
     job: bool,
     result_dirs: Vec<PathBuf>,
+    result_dest: Option<PathBuf>,
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
     caller_requires_remote: bool,
@@ -5005,6 +5006,7 @@ pub async fn run_exec(
         || source_content_receipt
         || cargo_json_stdout
         || exact_worker_requested
+        || result_dest.is_some()
         || !required_tools.is_empty();
 
     // Classify the command. In explicit job-admission mode (`rch exec --job`,
@@ -5014,7 +5016,30 @@ pub async fn run_exec(
 
     // Declared job result directories (bd-p0yoo) are validated up front so an
     // unsafe path fails before any worker selection or transfer happens.
-    let result_dirs = match validate_job_result_dirs(result_dirs) {
+    let (result_dirs, result_destination) = match (|| -> anyhow::Result<_> {
+        let dirs = validate_job_result_dirs(result_dirs)?;
+        anyhow::ensure!(
+            result_dest.is_none() || (job && !dirs.is_empty()),
+            "--result-dest requires --job and at least one --result-dir"
+        );
+        let destination = result_dest
+            .as_deref()
+            .map(recovery::JobResultDestination::resolve)
+            .transpose()?;
+        if let Some(destination) = destination.as_ref() {
+            destination.verify_separate_from(&std::env::current_dir()?)?;
+            destination.verify_separate_from(&default_job_lease_directory())?;
+            for (index, directory) in dirs.iter().enumerate() {
+                anyhow::ensure!(
+                    dirs[..index].iter().all(|prior| {
+                        !directory.starts_with(prior) && !prior.starts_with(directory)
+                    }),
+                    "mapped result directories must not overlap"
+                );
+            }
+        }
+        Ok((dirs, destination))
+    })() {
         Ok(validated) => validated,
         Err(e) => {
             let reporter = HookReporter::new(OutputVisibility::Summary);
@@ -5104,6 +5129,7 @@ pub async fn run_exec(
                 || source_content_receipt
                 || cargo_json_stdout
                 || exact_worker_requested
+                || result_destination.is_some()
                 || caller_requires_remote
                 || required_tools_requested
         } else {
@@ -5752,6 +5778,7 @@ pub async fn run_exec(
             clean_overlay_spec.as_ref(),
             source_content_receipt,
             &result_dirs,
+            result_destination.as_ref(),
             &layer0_env,
             config.remediation.pooled_target.reaper_pooled_idle_hours,
             config.remediation.pooled_target.store_base.as_deref(),
@@ -7376,6 +7403,7 @@ async fn handle_selection_response(
         None,
         false,
         &[],
+        None,
         &[],
         config.remediation.pooled_target.reaper_pooled_idle_hours,
         config.remediation.pooled_target.store_base.as_deref(),

@@ -57,6 +57,7 @@ pub async fn run_exec(
     source_content_receipt: bool,
     job: bool,
     result_dirs: Vec<PathBuf>,
+    result_dest: Option<PathBuf>,
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
     caller_requires_remote: bool,
@@ -90,6 +91,9 @@ pub async fn run_exec(
     }
     if !result_dirs.is_empty() {
         anyhow::bail!("--result-dir requires the Unix rsync transport");
+    }
+    if result_dest.is_some() {
+        anyhow::bail!("--result-dest requires guarded publication through the Unix transport");
     }
     if !required_tools.is_empty() {
         anyhow::bail!("--require-tool requires the Unix daemon transport");

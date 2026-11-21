@@ -3714,6 +3714,83 @@ fn exec_cargo_single_file_packages_never_reserve_a_worker() {
 
 #[cfg(unix)]
 #[test]
+fn exec_result_destination_refuses_unusable_roots_before_admission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::Builder::new()
+        .prefix("rch-result-dest-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let file = root.path().join("regular-file");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let writable_by_others = root.path().join("shared");
+    std::fs::create_dir(&writable_by_others).unwrap();
+    std::fs::set_permissions(&writable_by_others, std::fs::Permissions::from_mode(0o777)).unwrap();
+    for destination in [
+        std::path::PathBuf::from("relative-output"),
+        root.path().join("missing"),
+        root.path().join("../escape"),
+        file,
+        writable_by_others,
+    ] {
+        let run = run_isolated_exec_with_socket(
+            "",
+            true,
+            true,
+            false,
+            &[
+                "--job",
+                "--result-dir",
+                "reports",
+                "--result-dest",
+                destination.to_str().unwrap(),
+                "--",
+                "make",
+            ],
+            FallbackDaemonFixture::UnconfirmedSelection,
+        );
+        let context = format!("{}: {}", destination.display(), run.stderr);
+        assert_eq!(run.status.code(), Some(2), "{context}");
+        assert_eq!(run.envelope()["error_code"], "RCH-E001", "{context}");
+        assert!(run.daemon_requests.is_empty(), "{context}");
+        assert!(run.job_leases.is_empty(), "{context}");
+        assert!(!run.local_cargo_ran && !run.ssh_ran, "{context}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_result_destination_never_falls_back_to_an_unmapped_local_job() {
+    let destination = tempfile::Builder::new()
+        .prefix("rch-result-dest-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    for policy in ["force_local = true\n", "enabled = false\n", ""] {
+        let run = run_isolated_exec(
+            policy,
+            true,
+            true,
+            false,
+            &[
+                "--job",
+                "--result-dir",
+                "reports",
+                "--result-dest",
+                destination.path().to_str().unwrap(),
+                "--",
+                "make",
+            ],
+        );
+        let context = format!("{policy:?}: {}", run.stderr);
+        assert!(!run.status.success(), "{context}");
+        assert!(!run.local_cargo_ran && !run.ssh_ran, "{context}");
+        assert_eq!(run.envelope()["outcome"], "refused", "{context}");
+        assert!(!destination.path().join("reports").exists(), "{context}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn exec_require_remote_flag_outranks_force_local_config() {
     init_test_logging();
     // #123: RCH_REQUIRE_REMOTE=1 yields to an explicit `force_local = true`

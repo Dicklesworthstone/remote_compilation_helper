@@ -872,6 +872,7 @@ pub(super) async fn execute_remote_compilation(
     // that is missing or only partially transferable fails the invocation
     // loudly instead of surfacing the job's bare exit status.
     result_dirs: &[PathBuf],
+    result_destination: Option<&recovery::JobResultDestination>,
     // Resolved Layer 0 pack env pairs (bd-bqu38), forced onto the remote
     // build regardless of the ambient environment.
     layer0_env: &[(String, String)],
@@ -908,6 +909,7 @@ pub(super) async fn execute_remote_compilation(
             clean_overlay,
             source_content_receipt,
             result_dirs,
+            result_destination,
             layer0_env,
             pooled_target_prune_idle_hours,
             pooled_target_store_base,
@@ -1068,11 +1070,21 @@ async fn execute_remote_compilation_inner(
     clean_overlay: Option<&CleanOverlaySpec>,
     source_content_receipt: bool,
     result_dirs: &[PathBuf],
+    result_destination: Option<&recovery::JobResultDestination>,
     layer0_env: &[(String, String)],
     pooled_target_prune_idle_hours: u32,
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    if let Some(destination) = result_destination {
+        anyhow::ensure!(
+            kind == Some(CompilationKind::Job)
+                && !result_dirs.is_empty()
+                && durable_lease.is_some(),
+            "--result-dest requires a durable job with declared result directories"
+        );
+        destination.verify()?;
+    }
     // Validate before source transfer. Native schedulers otherwise default to
     // all worker CPUs (or accept unlimited -j), independently of admission.
     // Keep the original command for output discovery and durable recovery;
@@ -2645,6 +2657,12 @@ async fn execute_remote_compilation_inner(
         } else {
             None
         };
+    if let Some(destination) = result_destination {
+        recovery_session
+            .as_mut()
+            .context("--result-dest requires guarded, recoverable result publication")?
+            .set_result_destination(destination)?;
+    }
     if let Some(environment) = go_build_environment.as_ref() {
         recovery_session
             .as_mut()
@@ -3856,6 +3874,17 @@ async fn execute_remote_compilation_inner(
             loop_ref.flush().await;
         }
         for dir in result_dirs {
+            let remote_source = format!(
+                "{}/{}",
+                pipeline.remote_path().trim_end_matches('/'),
+                dir.display()
+            );
+            let local_destination = result_destination
+                .map(recovery::JobResultDestination::root)
+                .unwrap_or(&normalized_invocation_root)
+                .join(dir)
+                .display()
+                .to_string();
             let phase_name = format!("result:{}", dir.display());
             let result_pipeline = match recovery_session.as_mut() {
                 Some(session) => session.staging_pipeline(&phase_name, &pipeline)?,
@@ -3884,6 +3913,8 @@ async fn execute_remote_compilation_inner(
                     ));
                     exec_dir_stats.push(ExecResultDirStat {
                         path: dir.display().to_string(),
+                        remote_source,
+                        local_destination,
                         files: u64::from(retrieved.files_transferred),
                         bytes: retrieved.bytes_transferred,
                         status: "ok".to_string(),
@@ -3899,6 +3930,8 @@ async fn execute_remote_compilation_inner(
                     result_dir_failures.push(format!("{}: {}", dir.display(), e));
                     exec_dir_stats.push(ExecResultDirStat {
                         path: dir.display().to_string(),
+                        remote_source,
+                        local_destination,
                         files: 0,
                         bytes: 0,
                         status: "collection_failed".to_string(),

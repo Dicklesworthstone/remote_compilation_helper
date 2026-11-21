@@ -57,6 +57,9 @@ pub(super) struct RemoteExecutionResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub(super) struct ExecResultDirStat {
     pub path: String,
+    /// Exact worker source and caller destination for this collection.
+    pub remote_source: String,
+    pub local_destination: String,
     pub files: u64,
     pub bytes: u64,
     /// "ok" or a short failure classification ("missing", "transfer_failed").
