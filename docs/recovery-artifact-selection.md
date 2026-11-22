@@ -29,8 +29,21 @@ including full workspaces, libraries, multiple binaries, profiles and target
 triples. The Unix durable execution path retains a complete Cargo JSON receipt
 and validates every Cargo-reported selected library, binary and sidecar before
 publishing anything. Required executables and priority includes cannot be
-excluded. Empty, incomplete, malformed or out-of-root output evidence refuses
-publication; one remaining file cannot stand in for a complete build.
+excluded. Empty, incomplete or malformed output evidence and out-of-root
+executables refuse publication; one remaining file cannot stand in for a
+complete build. Rust `.rlib`/`.rmeta` and procedural-macro intermediates in a
+separate Cargo build directory remain outside target delivery, while every
+selected target-root library and executable is still required. Other library
+outputs outside that root refuse delivery. This also supports ordinary mirror
+builds that retain a configured `build.build-dir`.
+
+Cargo-reported `.dSYM` debug-symbol bundles are required directories. Their
+staged contents must include regular files, and the entire bundle is checked
+for symlinks and other unsupported entries before publication. An exclusion
+cannot omit a required bundle or one of its subdirectories. Recovery confirms
+that bundle contents were published before reporting successful delivery.
+Explicit named Cargo JSON retains the bundle directory in `filenames` while
+binding its retained contents to the files published by the completed job.
 
 Full builds use their normal human output; explicit caller JSON remains limited
 to the existing named-executable contract. Unsupported explicit message formats,

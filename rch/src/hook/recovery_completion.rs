@@ -109,10 +109,10 @@ fn validate_successful_delivery(recipe: &RecoveryRecipe) -> Result<()> {
                 phase.complete
                     && phase.missing_result.is_none()
                     && (!captured_output
-                        || phase
-                            .cargo_outputs
-                            .as_ref()
-                            .is_some_and(|contract| !contract.required_files.is_empty())),
+                        || phase.cargo_outputs.as_ref().is_some_and(|contract| {
+                            !contract.required_files.is_empty()
+                                || !contract.required_directories.is_empty()
+                        })),
                 "successful recovery has incomplete required delivery in {}; ownership retained",
                 phase.name
             );
@@ -131,6 +131,20 @@ fn validate_successful_delivery(recipe: &RecoveryRecipe) -> Result<()> {
                     phase.published.contains_key(relative),
                     "successful recovery lacks a required publication checkpoint for {}; ownership retained",
                     relative.display()
+                );
+            }
+            for directory in phase
+                .cargo_outputs
+                .iter()
+                .flat_map(|contract| &contract.required_directories)
+            {
+                anyhow::ensure!(
+                    phase
+                        .published
+                        .keys()
+                        .any(|path| path != directory && path.starts_with(directory)),
+                    "successful recovery lacks published contents for required Cargo bundle {}; ownership retained",
+                    directory.display()
                 );
             }
         }
@@ -677,6 +691,7 @@ mod tests {
                 phase.output_gate = true;
                 phase.cargo_outputs = Some(CargoOutputContract {
                     required_files: [relative.clone()].into(),
+                    ..Default::default()
                 });
             } else {
                 recipe.kind = Some(rch_common::CompilationKind::Gcc);
@@ -707,6 +722,7 @@ mod tests {
                     None,
                     Some(CargoOutputContract {
                         required_files: Default::default(),
+                        ..Default::default()
                     }),
                 ] {
                     recipe.phases[0].cargo_outputs = invalid;
@@ -753,6 +769,40 @@ mod tests {
                 b"a later build owns these bytes"
             );
         }
+    }
+
+    #[test]
+    fn captured_bundle_completion_requires_published_descendants() {
+        use crate::hook::cargo_output_contract::{CargoOutputCapture, CargoOutputContract};
+        let (_directory, writer) = fixture(0);
+        let mut recipe = load_recipe(&writer).unwrap();
+        recipe.kind = Some(rch_common::CompilationKind::CargoBuild);
+        recipe.prepared = true;
+        recipe.execution_started = true;
+        recipe.exit_code = Some(0);
+        recipe.returned = Some(0);
+        recipe.cargo_output_capture =
+            CargoOutputCapture::for_command(recipe.kind, "cargo build --bin app");
+        let mut phase = output_phase(&recipe, false, true);
+        phase.output_gate = true;
+        phase.complete = true;
+        let bundle = std::path::PathBuf::from("target/debug/app.dSYM");
+        phase.cargo_outputs = Some(CargoOutputContract {
+            required_directories: [bundle.clone()].into(),
+            ..Default::default()
+        });
+        phase.published.clear();
+        recipe.phases = vec![phase];
+        assert!(validate_successful_delivery(&recipe).is_err());
+        recipe.phases[0]
+            .published
+            .insert(bundle.clone(), "root-is-not-contents".into());
+        assert!(validate_successful_delivery(&recipe).is_err());
+        recipe.phases[0].published.insert(
+            bundle.join("Contents/Resources/symbols"),
+            "published-content-fingerprint".into(),
+        );
+        validate_successful_delivery(&recipe).unwrap();
     }
 
     #[tokio::test]

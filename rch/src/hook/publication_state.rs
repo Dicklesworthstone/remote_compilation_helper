@@ -32,7 +32,10 @@ impl RecoveryRecipe {
     }
 
     fn publication_binding(&self, index: usize, include_patterns: bool) -> anyhow::Result<String> {
-        let phase = self.phases.get(index).context("missing publication phase")?;
+        let phase = self
+            .phases
+            .get(index)
+            .context("missing publication phase")?;
         let authority = serde_json::json!({
             "version": 1,
             "wrapper_id": self.wrapper_id,
@@ -64,7 +67,10 @@ impl RecoveryRecipe {
 
     /// An override retains the previous lease bytes. Fork its logs too so
     /// subsequent publication cannot change that snapshot's historical state.
-    pub(super) fn fork_publication_journals(&mut self, writer: &DurableLeaseWriter) -> anyhow::Result<()> {
+    pub(super) fn fork_publication_journals(
+        &mut self,
+        writer: &DurableLeaseWriter,
+    ) -> anyhow::Result<()> {
         if !self
             .phases
             .iter()
@@ -132,7 +138,9 @@ impl RecoveryRecipe {
         for phase in &mut self.phases {
             if phase.publication_journal.is_some() {
                 let pending = phase.pending.as_ref().map(|(relative, _)| relative);
-                phase.baseline.retain(|relative, _| pending == Some(relative));
+                phase
+                    .baseline
+                    .retain(|relative, _| pending == Some(relative));
             }
         }
     }
@@ -158,6 +166,20 @@ fn validate_sealed_phase(phase: &RecoveryPhase) -> anyhow::Result<()> {
             phase.published.contains_key(relative),
             "sealed publication lacks a required output: {}",
             relative.display()
+        );
+    }
+    for directory in phase
+        .cargo_outputs
+        .iter()
+        .flat_map(|contract| &contract.required_directories)
+    {
+        anyhow::ensure!(
+            phase
+                .published
+                .keys()
+                .any(|path| path != directory && path.starts_with(directory)),
+            "sealed publication lacks required Cargo bundle contents: {}",
+            directory.display()
         );
     }
     Ok(())
@@ -308,7 +330,8 @@ impl RecoverySession {
         index: usize,
         pending: Option<(PathBuf, String)>,
     ) -> anyhow::Result<()> {
-        let (relative, hash) = pending.context("a publication journal intent cannot clear progress")?;
+        let (relative, hash) =
+            pending.context("a publication journal intent cannot clear progress")?;
         let phase = &mut self.recipe.phases[index];
         anyhow::ensure!(
             phase.pending.is_none() && !phase.published.contains_key(&relative),
@@ -379,5 +402,59 @@ impl RecoverySession {
             owner.verify()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sealed_cargo_bundle_replay_requires_published_descendants() {
+        let bundle = PathBuf::from("debug/app.dSYM");
+        let phase = RecoveryPhase {
+            name: "target".into(),
+            local: PathBuf::from("/caller/target"),
+            remote: "/worker/target".into(),
+            patterns: Vec::new(),
+            result_dir: None,
+            custom_target: true,
+            output_gate: true,
+            cargo_outputs: Some(CargoOutputContract {
+                required_files: [PathBuf::from("debug/app")].into(),
+                required_directories: [bundle.clone()].into(),
+            }),
+            native_outputs: None,
+            baseline: BTreeMap::new(),
+            published: BTreeMap::new(),
+            pending: None,
+            publication_journal: None,
+            complete: false,
+            missing_result: None,
+        };
+        for extra in [
+            None,
+            Some(bundle.clone()),
+            Some(bundle.join("Contents/symbols")),
+        ] {
+            let mut replayed = phase.clone();
+            let mut published =
+                BTreeMap::from([(PathBuf::from("debug/app"), "executable-fingerprint".into())]);
+            let complete_bundle = extra.as_ref().is_some_and(|path| path != &bundle);
+            if let Some(path) = extra {
+                published.insert(path, "bundle-content-fingerprint".into());
+            }
+            let result = apply_replay(
+                &mut replayed,
+                Replay {
+                    published,
+                    pending: None,
+                    torn_tail: false,
+                    sealed: true,
+                },
+            );
+            assert_eq!(result.is_ok(), complete_bundle);
+            assert_eq!(replayed.complete, complete_bundle);
+        }
     }
 }

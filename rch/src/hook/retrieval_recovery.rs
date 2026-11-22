@@ -683,14 +683,14 @@ impl RecoveryRecipe {
             .context("Cargo retrieval exclusions lost their target phase")?;
         let baseline =
             capture_baseline.context("Cargo retrieval exclusions lack complete output capture")?;
-        let expected = cargo_retrieval_patterns(
-            baseline,
-            &self.transfer,
-            phase
-                .cargo_outputs
-                .as_ref()
-                .map(|outputs| &outputs.required_files),
-        )?;
+        let required = phase.cargo_outputs.as_ref().map(|outputs| {
+            outputs
+                .required_files
+                .union(&outputs.required_directories)
+                .cloned()
+                .collect()
+        });
+        let expected = cargo_retrieval_patterns(baseline, &self.transfer, required.as_ref())?;
         anyhow::ensure!(
             phases.next().is_none()
                 && phase.output_gate
@@ -920,6 +920,7 @@ impl RetainedCargoDelivery {
         );
         CargoOutputContract {
             required_files: self.files.keys().cloned().collect(),
+            ..Default::default()
         }
         .verify_staged(&self.output_root)?;
         for (relative, expected) in &self.files {
@@ -2305,13 +2306,19 @@ impl RecoverySession {
                 let receipt = self.recipe.cargo_stdout.as_ref().context("caller Cargo output requires complete retained producer evidence before publication")?;
                 anyhow::ensure!(receipt.exit_code == 0 && receipt.blake3 == blake3::hash(stdout).to_hex().to_string(), "caller Cargo output contradicts its retained producer receipt");
                 let source_root = self.recipe.caller_local_source_root().canonicalize()?;
-                contract.required_files.extend(capture.validate_caller_metadata(
+                for relative in capture.validate_caller_metadata(
                     stdout,
                     &[Path::new(configured_root), canonical_remote_root],
                     &[project, receipt.remote_project_root.as_deref()
                         .context("caller Cargo output has no retained verified source root")?],
                     &source_root,
-                )?);
+                )? {
+                    if relative.extension().is_some_and(|extension| extension == "dSYM") {
+                        contract.required_directories.insert(relative);
+                    } else {
+                        contract.required_files.insert(relative);
+                    }
+                }
             }
             let index = self
                 .recipe
@@ -2321,15 +2328,20 @@ impl RecoverySession {
                 .context("captured Cargo execution has no artifact output root")?;
             let phase = &self.recipe.phases[index];
             if phase.custom_target {
+                let required = contract
+                    .required_files
+                    .union(&contract.required_directories)
+                    .cloned()
+                    .collect();
                 cargo_retrieval_patterns(
                     &phase.patterns,
                     &self.recipe.transfer,
-                    Some(&contract.required_files),
+                    Some(&required),
                 )?;
             }
             if let Some(existing) = &phase.cargo_outputs {
                 anyhow::ensure!(
-                    existing.required_files == contract.required_files,
+                    existing == &contract,
                     "Cargo output evidence contradicts the persisted required output set"
                 );
                 return Ok(None);
@@ -2341,7 +2353,12 @@ impl RecoverySession {
             let mut exact_patterns = Vec::new();
             let baseline_filters = capture.retrieval_baseline()
                 .map(crate::transfer::ArtifactFilters::from_patterns).transpose()?;
-            for relative in &contract.required_files {
+            for (relative, directory) in contract
+                .required_files
+                .iter()
+                .map(|path| (path, false))
+                .chain(contract.required_directories.iter().map(|path| (path, true)))
+            {
                 // A project-root collection must never promote a source file
                 // through the priority include below. With a custom Cargo
                 // target, the phase root already is the designated output
@@ -2353,7 +2370,7 @@ impl RecoverySession {
                     relative.display()
                 );
                 let name = relative.to_str().context("non-UTF-8 Cargo output path")?;
-                if baseline_filters.as_ref().is_some_and(|filters| filters.selects(name)) {
+                if !directory && baseline_filters.as_ref().is_some_and(|filters| filters.selects(name)) {
                     // Full builds can contain thousands of library outputs.
                     // Their existing include already selects them; retain
                     // required-file validation without expanding rsync argv
@@ -2368,6 +2385,11 @@ impl RecoverySession {
                     literal.push(character);
                 }
                 exact_patterns.push(format!("+ {literal}"));
+                if directory {
+                    // A bundle's root alone is not its deliverable. Preserve
+                    // every descendant, then validate the complete staged tree.
+                    exact_patterns.push(format!("+ {literal}/**"));
+                }
             }
             exact_patterns.extend(phase.patterns.iter().cloned());
             Ok(Some((index, contract, exact_patterns)))
@@ -2616,6 +2638,7 @@ impl RecoverySession {
         )?;
         CargoOutputContract {
             required_files: projected.files.clone(),
+            ..Default::default()
         }
         .verify_staged(&delivery_source)?;
         for relative in &projected.files {
@@ -2633,6 +2656,7 @@ impl RecoverySession {
         File::open(&caller_parent)?.sync_all()?;
         CargoOutputContract {
             required_files: projected.files.clone(),
+            ..Default::default()
         }
         .verify_staged(&caller_root)?;
         let limit = super::super::cargo_output_contract::MAX_CARGO_OUTPUT_RECEIPT_BYTES
@@ -11546,6 +11570,138 @@ func TestValue(t *testing.T) {{
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_retrieval_bundle_keeps_its_subtree_and_contract_after_recovery() {
+        let remote = tempfile::tempdir().unwrap();
+        for (relative, bytes) in [
+            ("debug/app", b"new executable".as_slice()),
+            (
+                "debug/app.dSYM/Contents/Info.plist",
+                b"bundle metadata".as_slice(),
+            ),
+            (
+                "debug/app.dSYM/Contents/Resources/DWARF/app",
+                b"debug symbols".as_slice(),
+            ),
+            ("debug/.wrapper-shims/helper", b"private cache".as_slice()),
+        ] {
+            let path = remote.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let command = "cargo build --bin app";
+        let (_directory, _stage_owner, mut session) =
+            captured_publication_fixture(CompilationKind::CargoBuild, command, remote.path(), true);
+        let baseline =
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild), Some(command));
+        session.recipe.transfer.cargo_retrieval_exclude_dirs = vec!["debug/.wrapper-shims".into()];
+        session.recipe.cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
+            Some(CompilationKind::CargoBuild),
+            command,
+            &baseline,
+            &session.recipe.transfer.cargo_retrieval_exclude_dirs,
+        )
+        .unwrap();
+        session.recipe.phases[0].patterns =
+            cargo_retrieval_patterns(&baseline, &session.recipe.transfer, None).unwrap();
+        session.persist().unwrap();
+        let stdout = format!(
+            "{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
+            serde_json::json!({"reason":"compiler-artifact", "target":{"kind":["bin"],"name":"app"}, "filenames":[remote.path().join("debug/app"), remote.path().join("debug/app.dSYM")], "executable":remote.path().join("debug/app"), "fresh":true}),
+        );
+        for excluded in ["debug", "debug/app.dSYM", "debug/app.dSYM/Contents"] {
+            let mut rejected = RecoverySession {
+                recipe: session.recipe.clone(),
+                writer: session.writer.clone(),
+            };
+            rejected.recipe.transfer.cargo_retrieval_exclude_dirs = vec![excluded.into()];
+            rejected.recipe.phases[0].patterns =
+                cargo_retrieval_patterns(&baseline, &rejected.recipe.transfer, None).unwrap();
+            assert!(
+                rejected
+                    .install_cargo_artifact_evidence(stdout.as_bytes(), remote.path())
+                    .is_err(),
+                "an exclusion hid required bundle contents: {excluded}"
+            );
+            assert!(rejected.recipe.phases[0].cargo_outputs.is_none());
+        }
+        session
+            .install_cargo_artifact_evidence(stdout.as_bytes(), remote.path())
+            .unwrap();
+        let original = session.recipe.phases[0].cargo_outputs.clone().unwrap();
+        assert_eq!(
+            original.required_directories,
+            [PathBuf::from("debug/app.dSYM")].into()
+        );
+        session.recipe.phases[0]
+            .cargo_outputs
+            .as_mut()
+            .unwrap()
+            .required_directories
+            .clear();
+        assert!(
+            session
+                .install_cargo_artifact_evidence(stdout.as_bytes(), remote.path())
+                .is_err()
+        );
+        session.recipe.phases[0].cargo_outputs = Some(original);
+        let mut session = reload_publication(&session);
+        let patterns = session.cargo_artifact_patterns("target").unwrap();
+        assert!(patterns.contains(&"+ debug/app.dSYM".to_string()));
+        assert!(patterns.contains(&"+ debug/app.dSYM/**".to_string()));
+        let mut conflicting = session.recipe.clone();
+        conflicting.transfer.cargo_retrieval_exclude_dirs = vec!["debug/app.dSYM/Contents".into()];
+        assert!(conflicting.validate_cargo_retrieval_policy().is_err());
+
+        let local = session.recipe.phases[0].local.clone();
+        let stage = session.stage(0);
+        for root in [&local, &stage] {
+            std::fs::create_dir_all(root.join("debug")).unwrap();
+        }
+        std::fs::write(local.join("debug/app"), b"old executable").unwrap();
+        std::fs::write(stage.join("debug/app"), b"new executable").unwrap();
+        let before = std::fs::read(&session.writer.path).unwrap();
+        assert!(session.publish("target").await.is_err());
+        assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(local.join("debug/app")).unwrap(),
+            b"old executable"
+        );
+        let pipeline = TransferPipeline::new(
+            local.clone(),
+            "bundle-fixture".into(),
+            "bundle-fixture".into(),
+            session.recipe.transfer.clone(),
+        );
+        let staged = session.staging_pipeline("target", &pipeline).unwrap();
+        let result = staged
+            .local_artifact_retrieval_for_test(&session.recipe.worker, remote.path(), &patterns)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!stage.join("debug/.wrapper-shims/helper").exists());
+        let mut session = reload_publication(&session);
+        session.publish("target").await.unwrap();
+        for relative in [
+            "debug/app",
+            "debug/app.dSYM/Contents/Info.plist",
+            "debug/app.dSYM/Contents/Resources/DWARF/app",
+        ] {
+            assert_eq!(
+                std::fs::read(local.join(relative)).unwrap(),
+                std::fs::read(remote.path().join(relative)).unwrap()
+            );
+        }
+        assert!(session.recipe.phases[0].complete);
+        assert!(!local.join("debug/.wrapper-shims/helper").exists());
+    }
+
     #[test]
     fn cargo_retrieval_policy_does_not_narrow_streaming_or_native_commands() {
         for kind in [
@@ -12014,6 +12170,15 @@ func TestValue(t *testing.T) {{
         retained_source: bool,
         custom_target: bool,
     ) -> (PathBuf, RecoverySession) {
+        caller_delivery_fixture_with_bundle(retained_source, custom_target, false)
+    }
+
+    #[cfg(unix)]
+    fn caller_delivery_fixture_with_bundle(
+        retained_source: bool,
+        custom_target: bool,
+        bundle: bool,
+    ) -> (PathBuf, RecoverySession) {
         let (directory, writer, _worker) = retained_preparation_fixture();
         std::fs::create_dir_all(default_job_lease_directory()).unwrap();
         let mut session = RecoverySession {
@@ -12102,12 +12267,16 @@ func TestValue(t *testing.T) {{
         let mut stdout = Vec::new();
         for name in ["app", "helper"] {
             let path = output_remote.join(output_relative).join(name);
+            let mut filenames = vec![path.clone()];
+            if bundle && name == "app" {
+                filenames.push(path.with_extension("dSYM"));
+            }
             let record = serde_json::json!({
                 "reason": "compiler-artifact",
                 "target": {"name": name, "kind": ["bin"]},
                 "profile": {"test": false},
                 "manifest_path": remote.join("Cargo.toml"),
-                "filenames": [path], "executable": path, "fresh": true
+                "filenames": filenames, "executable": path, "fresh": true
             });
             stdout.extend(serde_json::to_vec(&record).unwrap());
             stdout.push(b'\n');
@@ -12145,7 +12314,86 @@ func TestValue(t *testing.T) {{
         for name in ["app", "helper"] {
             std::fs::write(stage.join(output_relative).join(name), name.as_bytes()).unwrap();
         }
+        if bundle {
+            let root = stage.join(output_relative).join("app.dSYM");
+            std::fs::create_dir_all(root.join("Contents/Resources/DWARF")).unwrap();
+            std::fs::write(root.join("Contents/Info.plist"), b"bundle metadata").unwrap();
+            std::fs::write(root.join("Contents/Resources/DWARF/app"), b"debug symbols").unwrap();
+        }
         (directory, session)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caller_cargo_json_bundle_recovers_retained_descendant_copies() {
+        let _guard = test_guard!();
+        for custom_target in [false, true] {
+            let (_directory, mut session) =
+                caller_delivery_fixture_with_bundle(true, custom_target, true);
+            let index = session.recipe.phases.len() - 1;
+            let phase = session.recipe.phases[index].clone();
+            let bundle = PathBuf::from(if custom_target {
+                "lean/app.dSYM"
+            } else {
+                "target/lean/app.dSYM"
+            });
+            let contract = phase.cargo_outputs.as_ref().unwrap();
+            assert!(contract.required_directories.contains(&bundle));
+            assert!(!contract.required_files.contains(&bundle));
+            let stage = session.stage(index);
+            session.publish(&phase.name).await.unwrap();
+            assert!(!session.recipe.phases[index].published.contains_key(&bundle));
+            session.returned(0).unwrap();
+            let stdout = session.caller_cargo_json().await.unwrap();
+            let delivery = session.recipe.caller_delivery.clone().unwrap();
+            assert_eq!(delivery.files.len(), 4);
+            assert!(!delivery.files.contains_key(&bundle));
+            for line in std::str::from_utf8(&stdout).unwrap().lines() {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                if record["target"]["name"] == "app" {
+                    let filenames = record["filenames"].as_array().unwrap();
+                    assert!(
+                        filenames.contains(&serde_json::json!(delivery.output_root.join(&bundle)))
+                    );
+                    assert!(delivery.output_root.join(&bundle).is_dir());
+                }
+            }
+            session.persist_tree_retirement(Some(true)).unwrap();
+            session.pair_released().unwrap();
+            session.sources_released().unwrap();
+            session.retired().unwrap();
+            session.writer.record_exit(0).unwrap();
+            session.writer.acknowledge_terminal().unwrap();
+            assert!(!stage.exists());
+            for relative in delivery.files.keys() {
+                std::fs::write(phase.local.join(relative), b"a later build's bytes").unwrap();
+            }
+            let recovered = reload_publication(&session);
+            let (exit, recovered_stdout, _) =
+                recover_job_cargo_json(&recovered.writer).await.unwrap();
+            assert_eq!(exit, 0);
+            assert_eq!(recovered_stdout.as_deref(), Some(stdout.as_slice()));
+            assert_eq!(
+                std::fs::read(
+                    delivery
+                        .output_root
+                        .join(&bundle)
+                        .join("Contents/Info.plist")
+                )
+                .unwrap(),
+                b"bundle metadata"
+            );
+            assert_eq!(
+                std::fs::read(
+                    delivery
+                        .output_root
+                        .join(&bundle)
+                        .join("Contents/Resources/DWARF/app")
+                )
+                .unwrap(),
+                b"debug symbols"
+            );
+        }
     }
 
     #[cfg(unix)]

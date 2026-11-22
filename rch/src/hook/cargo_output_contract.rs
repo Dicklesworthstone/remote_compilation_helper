@@ -62,9 +62,14 @@ pub(super) struct CargoOutputCapture {
 /// Cargo's `executable` field is authoritative. With retrieval exclusions,
 /// originally selected `filenames` also become required, protecting libraries
 /// and sidecars without promoting private intermediates into deliverables.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct CargoOutputContract {
     pub(super) required_files: BTreeSet<PathBuf>,
+    /// Cargo lists macOS debug-symbol bundles in `filenames`, although they
+    /// are directory trees. Their contents must be collected and validated as
+    /// a whole instead of treating the bundle root as a regular file.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(super) required_directories: BTreeSet<PathBuf>,
 }
 
 pub(super) struct CargoCallerPaths<'a> {
@@ -294,6 +299,7 @@ impl CargoOutputCapture {
         let text = std::str::from_utf8(stdout).context("Cargo output receipt is not UTF-8")?;
         let mut seen = BTreeSet::new();
         let mut required_files = BTreeSet::new();
+        let mut required_directories = BTreeSet::new();
         let mut finished = false;
         for line in text.lines() {
             if line == PIGGYBACK_MARKER {
@@ -343,6 +349,13 @@ impl CargoOutputCapture {
                                 !artifact.filenames.is_empty(),
                                 "Cargo compiler-artifact has no emitted filenames"
                             );
+                            anyhow::ensure!(
+                                artifact.executable.is_some()
+                                    || !artifact.target.kind.iter().any(|kind| {
+                                        matches!(kind.as_str(), "bin" | "test" | "bench")
+                                    }),
+                                "Cargo executable target has no executable filename"
+                            );
                             if let Some(executable) = &artifact.executable {
                                 anyhow::ensure!(
                                     artifact.filenames.contains(executable),
@@ -354,12 +367,62 @@ impl CargoOutputCapture {
                                 required_files
                                     .insert(relative_output_path(executable, remote_phase_roots)?);
                             }
+                            let library_intermediate = artifact.executable.is_none()
+                                && artifact.target.kind.iter().all(|kind| {
+                                    matches!(
+                                        kind.as_str(),
+                                        "lib"
+                                            | "rlib"
+                                            | "dylib"
+                                            | "cdylib"
+                                            | "staticlib"
+                                            | "proc-macro"
+                                    )
+                                });
                             for filename in &artifact.filenames {
+                                let path = Path::new(filename);
+                                validate_absolute_path(path)?;
+                                let private_intermediate =
+                                    path.extension().is_some_and(|extension| {
+                                        extension == "rlib"
+                                            || extension == "rmeta"
+                                            || (artifact.target.kind.as_slice() == ["proc-macro"]
+                                                && matches!(
+                                                    extension.to_str(),
+                                                    Some("so" | "dylib")
+                                                ))
+                                    });
+                                if library_intermediate
+                                    && private_intermediate
+                                    && remote_phase_roots
+                                        .iter()
+                                        .all(|root| !path.starts_with(root))
+                                {
+                                    // Cargo may place rlib/rmeta intermediates
+                                    // and compiler plugins in a separate
+                                    // build.build-dir. Target-root exclusions
+                                    // cannot affect them. Executables and
+                                    // runtime/static libraries remain bound
+                                    // to the admitted output roots.
+                                    continue;
+                                }
                                 let relative = relative_output_path(filename, remote_phase_roots)?;
                                 let name =
                                     relative.to_str().context("non-UTF-8 Cargo output path")?;
-                                if filters.selects(name) {
-                                    required_files.insert(relative);
+                                let directory = relative
+                                    .extension()
+                                    .is_some_and(|extension| extension == "dSYM");
+                                // A sidecar-only glob such as `*.dSYM/**`
+                                // selects the bundle contents without matching
+                                // its bare root, which is what Cargo reports.
+                                if filters.selects(name)
+                                    || (directory && filters.selects(&format!("{name}/")))
+                                {
+                                    if directory {
+                                        required_directories.insert(relative);
+                                    } else {
+                                        required_files.insert(relative);
+                                    }
                                 }
                             }
                         }
@@ -427,8 +490,14 @@ impl CargoOutputCapture {
             "Cargo output receipt is missing selected executables: {}",
             missing.join(", ")
         );
-        anyhow::ensure!(!required_files.is_empty(), "Cargo output contract is empty");
-        Ok(CargoOutputContract { required_files })
+        anyhow::ensure!(
+            !required_files.is_empty() || !required_directories.is_empty(),
+            "Cargo output contract is empty"
+        );
+        Ok(CargoOutputContract {
+            required_files,
+            required_directories,
+        })
     }
 
     /// Validate selected caller metadata before any file can be published and
@@ -560,6 +629,15 @@ impl CargoOutputCapture {
                 .all(|file| published.contains_key(file)),
             "caller JSON cannot name an executable outside this invocation's published set"
         );
+        for directory in &contract.required_directories {
+            anyhow::ensure!(
+                published
+                    .keys()
+                    .any(|path| path != directory && path.starts_with(directory)),
+                "caller JSON cannot name a bundle without published contents: {}",
+                directory.display()
+            );
+        }
         let mut output = Vec::new();
         let mut files = BTreeSet::new();
         for line in std::str::from_utf8(stdout)?.split_inclusive('\n') {
@@ -612,13 +690,33 @@ impl CargoOutputCapture {
                     .as_str()
                     .context("selected Cargo filename is not a string")?;
                 let relative = relative_output_path(filename, remote_output_roots)?;
-                anyhow::ensure!(
-                    published.contains_key(&relative),
-                    "selected Cargo filename was not published by this invocation: {}",
-                    relative.display()
-                );
+                if relative
+                    .extension()
+                    .is_some_and(|extension| extension == "dSYM")
+                {
+                    let mut descendants = 0usize;
+                    for path in published
+                        .keys()
+                        .filter(|path| *path != &relative && path.starts_with(&relative))
+                    {
+                        validate_relative_path(path)?;
+                        files.insert(path.clone());
+                        descendants += 1;
+                    }
+                    anyhow::ensure!(
+                        descendants > 0,
+                        "selected Cargo bundle has no published contents: {}",
+                        relative.display()
+                    );
+                } else {
+                    anyhow::ensure!(
+                        published.contains_key(&relative),
+                        "selected Cargo filename was not published by this invocation: {}",
+                        relative.display()
+                    );
+                    files.insert(relative.clone());
+                }
                 local_filenames.push(local_output_root.join(&relative));
-                files.insert(relative);
             }
             value["filenames"] = serde_json::to_value(local_filenames)?;
             if let Some(source) = original
@@ -654,7 +752,7 @@ impl CargoOutputContract {
     /// root cannot satisfy a required executable, even when their targets exist.
     pub(super) fn verify_staged(&self, stage_root: &Path) -> Result<()> {
         anyhow::ensure!(
-            !self.required_files.is_empty(),
+            !self.required_files.is_empty() || !self.required_directories.is_empty(),
             "Cargo output contract is empty"
         );
         let root = std::fs::symlink_metadata(stage_root).with_context(|| {
@@ -668,7 +766,12 @@ impl CargoOutputContract {
             "Cargo staging root is not a directory: {}",
             stage_root.display()
         );
-        for relative in &self.required_files {
+        for (relative, directory) in self
+            .required_files
+            .iter()
+            .map(|path| (path, false))
+            .chain(self.required_directories.iter().map(|path| (path, true)))
+        {
             validate_relative_path(relative)?;
             let mut path = stage_root.to_owned();
             let mut components = relative.components().peekable();
@@ -682,20 +785,52 @@ impl CargoOutputContract {
                     "required Cargo output has a symlink component: {}",
                     path.display()
                 );
-                let correct_kind = if components.peek().is_some() {
+                let correct_kind = if components.peek().is_some() || directory {
                     metadata.is_dir()
                 } else {
                     metadata.is_file()
                 };
                 anyhow::ensure!(
                     correct_kind,
-                    "required Cargo output is not a regular file under directories: {}",
+                    "required Cargo output has an unexpected file type: {}",
+                    path.display()
+                );
+            }
+            if directory {
+                anyhow::ensure!(
+                    directory_has_output(&path)?,
+                    "required Cargo output bundle is empty: {}",
                     path.display()
                 );
             }
         }
         Ok(())
     }
+}
+
+fn directory_has_output(root: &Path) -> Result<bool> {
+    let mut pending = vec![root.to_owned()];
+    let mut inspected = 0usize;
+    let mut has_output = false;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            inspected += 1;
+            anyhow::ensure!(
+                inspected <= 100_000,
+                "Cargo output bundle exceeds inspection bound"
+            );
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            anyhow::ensure!(!kind.is_symlink(), "Cargo output bundle contains a symlink");
+            if kind.is_file() {
+                has_output = true;
+                continue;
+            }
+            anyhow::ensure!(kind.is_dir(), "Cargo output bundle contains a special file");
+            pending.push(entry.path());
+        }
+    }
+    Ok(has_output)
 }
 
 fn explicit_json_format(value: &str) -> bool {
@@ -1186,6 +1321,197 @@ mod tests {
                         assert_eq!(value["fresh"], true);
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_retrieval_real_cargo_keeps_separate_build_dir_intermediates_private() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let target = fixture.path().join("target");
+        let intermediates = fixture.path().join("private build cache");
+        for directory in ["app/src", "helper/src", "compile_macro/src", ".cargo"] {
+            std::fs::create_dir_all(source.join(directory)).unwrap();
+        }
+        std::fs::write(
+            source.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\", \"helper\", \"compile_macro\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("helper/Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("helper/src/lib.rs"),
+            "pub fn value() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("compile_macro/Cargo.toml"),
+            "[package]\nname = \"compile_macro\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[lib]\nproc-macro = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("compile_macro/src/lib.rs"),
+            "extern crate proc_macro;\n#[proc_macro]\npub fn answer(_: proc_macro::TokenStream) -> proc_macro::TokenStream { \"42u32\".parse().unwrap() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[dependencies]\nhelper = { path = \"../helper\" }\ncompile_macro = { path = \"../compile_macro\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("app/src/main.rs"),
+            "fn main() { assert_eq!(helper::value(), compile_macro::answer!()); }\n",
+        )
+        .unwrap();
+        // Ordinary mirroring preserves this Cargo configuration. The owned
+        // source/clean-overlay route separately binds build-dir into its pool.
+        std::fs::write(
+            source.join(".cargo/config.toml"),
+            format!(
+                "[build]\nbuild-dir = {}\n",
+                serde_json::to_string(&intermediates).unwrap()
+            ),
+        )
+        .unwrap();
+        let command = "cargo build --package app --offline --jobs=1";
+        let kind = Some(CompilationKind::CargoBuild);
+        let baseline = super::super::artifact_patterns::get_custom_target_artifact_patterns(
+            kind,
+            Some(command),
+        );
+        let capture = CargoOutputCapture::for_retrieval_policy(
+            kind,
+            command,
+            &baseline,
+            &["debug/.wrapper-shims".into()],
+        )
+        .unwrap()
+        .unwrap();
+        for warm in [false, true] {
+            let output = std::process::Command::new(env!("CARGO"))
+                .args([
+                    "build",
+                    "--package",
+                    "app",
+                    "--offline",
+                    "--jobs=1",
+                    "--message-format=json,json-render-diagnostics",
+                    "--target-dir",
+                ])
+                .arg(&target)
+                .current_dir(&source)
+                .env("CARGO_HOME", fixture.path().join("cargo-home"))
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .env_remove("CARGO_BUILD_RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("RUSTFLAGS")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let records: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let canonical_intermediates = intermediates.canonicalize().unwrap();
+            for name in ["helper", "compile_macro"] {
+                let dependency = records
+                    .iter()
+                    .find(|record| {
+                        record["reason"] == "compiler-artifact" && record["target"]["name"] == name
+                    })
+                    .unwrap();
+                assert!(dependency["executable"].is_null());
+                let files = dependency["filenames"].as_array().unwrap();
+                assert!(!files.is_empty());
+                for file in files {
+                    let path = Path::new(file.as_str().unwrap());
+                    assert!(
+                        path.starts_with(&intermediates)
+                            || path.starts_with(&canonical_intermediates)
+                    );
+                }
+                if name == "compile_macro" {
+                    assert_eq!(dependency["target"]["kind"], json!(["proc-macro"]));
+                    assert!(files.iter().any(|file| {
+                        Path::new(file.as_str().unwrap())
+                            .extension()
+                            .is_some_and(|extension| {
+                                matches!(extension.to_str(), Some("so" | "dylib"))
+                            })
+                    }));
+                }
+                if warm {
+                    assert_eq!(dependency["fresh"], true);
+                }
+            }
+            let canonical_target = target.canonicalize().unwrap();
+            let roots = [target.as_path(), canonical_target.as_path()];
+            let contract = capture
+                .parse_receipt_with_roots(&output.stdout, &roots)
+                .unwrap();
+            assert_eq!(contract.required_files, [PathBuf::from("debug/app")].into());
+            assert!(contract.required_directories.is_empty());
+            contract.verify_staged(&target).unwrap();
+
+            // Ignoring private library bytes does not authorize an executable
+            // outside the output root, nor a malformed intermediate path.
+            for invalid_case in [
+                "outside executable",
+                "outside runtime library",
+                "malformed path",
+                "missing executable",
+            ] {
+                let mut invalid = records.clone();
+                let dependency = invalid
+                    .iter_mut()
+                    .find(|record| record["target"]["name"] == "helper")
+                    .unwrap();
+                match invalid_case {
+                    "outside executable" => {
+                        dependency["executable"] = dependency["filenames"][0].clone();
+                    }
+                    "outside runtime library" => {
+                        dependency["target"]["kind"] = json!(["dylib"]);
+                        dependency["filenames"] =
+                            json!([canonical_intermediates.join("libhelper.so")]);
+                    }
+                    "malformed path" => {
+                        dependency["filenames"][0] = json!(format!(
+                            "{}/../escaped.rlib",
+                            canonical_intermediates.display()
+                        ));
+                    }
+                    _ => {
+                        dependency["target"]["kind"] = json!(["bin"]);
+                        dependency["filenames"] = json!([canonical_target.join("debug/app")]);
+                    }
+                }
+                let invalid = invalid
+                    .iter()
+                    .map(|record| format!("{record}\n"))
+                    .collect::<String>();
+                assert!(
+                    capture
+                        .parse_receipt_with_roots(invalid.as_bytes(), &roots)
+                        .is_err(),
+                    "accepted {invalid_case}"
+                );
             }
         }
     }
@@ -2151,6 +2477,168 @@ mod tests {
     }
 
     #[test]
+    fn complete_receipt_requires_nonempty_debug_bundles() {
+        let baseline = crate::hook::artifact_patterns::get_custom_target_artifact_patterns(
+            Some(CompilationKind::CargoBuild),
+            Some("cargo build --bin app"),
+        );
+        let filters = crate::transfer::ArtifactFilters::from_patterns(&baseline).unwrap();
+        assert!(filters.selects("debug/app.dSYM"));
+        assert!(!filters.selects("debug/deps/libneeded.dSYM"));
+        let captured = CargoOutputCapture::for_retrieval_policy(
+            Some(CompilationKind::CargoBuild),
+            "cargo build --bin app",
+            &baseline,
+            &["debug/.cache".into()],
+        )
+        .unwrap()
+        .unwrap();
+        let data = receipt(&[
+            artifact(
+                "bin",
+                "app",
+                &["/worker/target/debug/app", "/worker/target/debug/app.dSYM"],
+                Some("/worker/target/debug/app"),
+                true,
+            ),
+            artifact(
+                "lib",
+                "needed",
+                &[
+                    "/worker/target/debug/deps/libneeded.dylib",
+                    "/worker/target/debug/deps/libneeded.dSYM",
+                ],
+                None,
+                true,
+            ),
+        ]);
+        let contract = captured
+            .parse_receipt(&data, Path::new("/worker/target"))
+            .unwrap();
+        assert_eq!(
+            contract.required_directories,
+            [
+                PathBuf::from("debug/app.dSYM"),
+                PathBuf::from("debug/deps/libneeded.dSYM"),
+            ]
+            .into()
+        );
+        assert_eq!(
+            contract.required_files,
+            [
+                PathBuf::from("debug/app"),
+                PathBuf::from("debug/deps/libneeded.dylib"),
+            ]
+            .into()
+        );
+        let restored: CargoOutputContract =
+            serde_json::from_slice(&serde_json::to_vec(&contract).unwrap()).unwrap();
+        assert_eq!(restored, contract);
+        let legacy: CargoOutputContract =
+            serde_json::from_value(json!({"required_files":["debug/app"]})).unwrap();
+        assert!(legacy.required_directories.is_empty());
+
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(stage.path().join("debug/deps")).unwrap();
+        std::fs::write(stage.path().join("debug/app"), b"executable").unwrap();
+        std::fs::write(stage.path().join("debug/deps/libneeded.dylib"), b"library").unwrap();
+        assert!(contract.verify_staged(stage.path()).is_err());
+        for bundle in &contract.required_directories {
+            std::fs::create_dir_all(stage.path().join(bundle).join("Contents/Resources")).unwrap();
+        }
+        assert!(contract.verify_staged(stage.path()).is_err());
+        for bundle in &contract.required_directories {
+            std::fs::write(
+                stage.path().join(bundle).join("Contents/Resources/symbols"),
+                b"debug symbols",
+            )
+            .unwrap();
+        }
+        contract.verify_staged(stage.path()).unwrap();
+    }
+
+    #[test]
+    fn caller_json_bundle_requires_strict_published_file_descendants() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let source_root = source.path().canonicalize().unwrap();
+        let local_output = source_root.join("delivered");
+        let capture = capture("cargo build --bin app --message-format=json");
+        let mut record = artifact(
+            "bin",
+            "app",
+            &["/worker/target/debug/app", "/worker/target/debug/app.dSYM"],
+            Some("/worker/target/debug/app"),
+            true,
+        );
+        record["manifest_path"] = json!("/worker/source/Cargo.toml");
+        record["profile"] = json!({"test":false});
+        let data = receipt(&[record]);
+        let bundle = PathBuf::from("debug/app.dSYM");
+        let mut published = BTreeMap::from([
+            (PathBuf::from("debug/app"), "executable-fingerprint".into()),
+            (bundle.clone(), "root-is-not-file-evidence".into()),
+        ]);
+        let binding = json!({"fixture":"caller-bundle"});
+        let project = |published: &BTreeMap<PathBuf, String>| {
+            capture.caller_json(
+                &data,
+                &CargoCallerPaths {
+                    remote_output_roots: &[Path::new("/worker/target")],
+                    local_output_root: &local_output,
+                    remote_project_roots: &[Path::new("/worker/source")],
+                    local_project_root: &source_root,
+                    published,
+                    receipt_binding: &binding,
+                },
+            )
+        };
+        assert!(project(&published).is_err());
+        let symbols = bundle.join("Contents/Resources/DWARF/app");
+        published.insert(symbols.clone(), "symbols-fingerprint".into());
+        let projected = project(&published).unwrap();
+        assert_eq!(
+            projected.files,
+            [PathBuf::from("debug/app"), symbols].into()
+        );
+        let record: serde_json::Value = serde_json::from_str(
+            std::str::from_utf8(&projected.stdout)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["filenames"][1], json!(local_output.join(&bundle)));
+        assert!(!projected.files.contains(&bundle));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_bundle_validation_checks_entries_after_a_regular_file() {
+        let stage = tempfile::tempdir().unwrap();
+        let bundle = stage.path().join("debug/app.dSYM");
+        std::fs::create_dir_all(bundle.join("Contents/Resources")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), b"bundle metadata").unwrap();
+        std::os::unix::fs::symlink(
+            "/unowned/symbols",
+            bundle.join("Contents/Resources/symbols"),
+        )
+        .unwrap();
+        let contract = CargoOutputContract {
+            required_directories: [PathBuf::from("debug/app.dSYM")].into(),
+            ..Default::default()
+        };
+        assert!(
+            contract
+                .verify_staged(stage.path())
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+        );
+    }
+
+    #[test]
     fn staged_contract_cannot_use_existing_outputs_to_hide_a_missing_file() {
         let root = tempfile::tempdir().unwrap();
         let stage = root.path().join("stage");
@@ -2165,6 +2653,7 @@ mod tests {
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
+            ..Default::default()
         };
         assert!(contract.verify_staged(&stage).is_err());
         assert_eq!(
@@ -2192,6 +2681,7 @@ mod tests {
         for name in ["linked-dir/app", "linked-file", "../outside/app"] {
             let contract = CargoOutputContract {
                 required_files: [PathBuf::from(name)].into_iter().collect(),
+                ..Default::default()
             };
             assert!(contract.verify_staged(&stage).is_err(), "{name}");
         }
