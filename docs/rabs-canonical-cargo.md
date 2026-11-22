@@ -51,6 +51,60 @@ clients share its existing worker pool and action ownership. Each client receive
 its own verified output tree. The native `rabsd --canonical-compile-remote`
 entrypoint remains available for explicit one-off profiles.
 
+## Native Cargo subcommand
+
+The `rabs-cli` crate also builds a native `cargo-rabs` executable. Cargo discovers
+it as `cargo rabs` when its installation directory is on `PATH`. It uses the
+same Rust execution and recovery owners as `rabs-cargo` and `rabs-recover`.
+
+```sh
+cargo install --locked --path rabs-cli --profile wrapper-release \
+  --bin cargo-rabs --bin rabs-cargo --bin rabs-recover
+
+cargo rabs check --workspace
+cargo rabs --rabs-no-start --rabs-require-daemon -- test --no-run
+cargo rabs --rabs-remote -- build --release
+cargo rabs --rabs-canonical-local LOCAL.json -- check --workspace
+cargo rabs --rabs-canonical-remote REMOTE.json -- build --workspace
+cargo rabs --rabs-canonical WORKER.json -- build --bin application
+cargo rabs --rabs-recover /absolute/cargo-OPERATION
+```
+
+For an installation alongside the legacy launcher, add a separate `--root`
+to `cargo install` and put that root's `bin` directory first on `PATH`.
+Cargo's `--force` option explicitly replaces an existing executable instead.
+
+This source installation requires the matching native helpers. Ordinary local
+Cargo uses `rch-wkr`, selected by `CARGO_RABS_WORKER`, physical sibling or `PATH`;
+cache preparation uses matching `rabs-wrap` and `rabsd`. Remote RCH mode uses
+`rch`; canonical and recovery modes use `rabsd`. Explicit helper overrides keep
+their existing validation and never silently select another executable.
+
+No arguments selects ordinary local `build`. Cargo's injected `rabs` argument
+is consumed once. Launcher options precede Cargo arguments; a launcher `--`
+ends that option parsing, and Cargo's later `--` preserves program/test arguments
+literally. Local execution preserves non-UTF-8 Unix arguments, inherited stdin,
+jobserver descriptors, exit status and signals through one native exec chain.
+
+`--rabs-no-start` only attaches to an already ready, authenticated daemon. A
+missing or stale endpoint is left untouched. `--rabs-require-daemon` refuses
+before Cargo starts when preparation cannot verify readiness; it can combine
+with `--rabs-no-start`. Without the strict option, confirmed setup failure uses
+ordinary Cargo. Unconfirmed cleanup never starts Cargo. These local-daemon
+options cannot combine with remote or canonical modes.
+
+The canonical aliases retain their established no-command defaults: `check` for
+local/shared-coordinator profiles and `build` for a direct worker profile.
+`--rabs-recover` performs the existing result-only recovery/wait using the saved
+operation identity. It never submits another build. The standalone
+`rabs-recover` command continues to default to inspection.
+
+The legacy `scripts/install-rabs` bundle installer still selects the script
+launcher; installing this native Cargo subcommand uses the Cargo command above.
+Migration of that installer's generation and release-validation contracts is
+separate. Installing the native frontend does not establish a new release,
+fleet rollout, compiler-cache hit or performance result.
+
 ## Native canonical Cargo entry point
 
 `rabs-cargo` is the Rust command-line entry point for ordinary local Cargo,

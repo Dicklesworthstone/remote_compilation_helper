@@ -30,6 +30,14 @@ fn absolute(path: PathBuf) -> io::Result<PathBuf> {
     }
 }
 
+/// Explicit setup policy for the Cargo subcommand. The ordinary native cache
+/// frontend and RCH workers retain their existing best-effort startup policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Policy {
+    pub no_start: bool,
+    pub require_daemon: bool,
+}
+
 fn cargo_executable(frontend: &Path, worker: &Path) -> io::Result<PathBuf> {
     let selected = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     if selected.is_empty() {
@@ -60,14 +68,9 @@ fn cargo_executable(frontend: &Path, worker: &Path) -> io::Result<PathBuf> {
     absolute(selected)
 }
 
-pub(crate) fn run(arguments: &[OsString], frontend: &Path) -> io::Result<()> {
-    let arguments = arguments
-        .strip_prefix(&[OsString::from("--")])
-        .unwrap_or(arguments);
-    // Frontend controls cannot silently become Cargo controls. Literal
-    // program/test arguments after Cargo's own delimiter remain untouched,
-    // as do opaque Unix bytes throughout the native local execution chain.
-    crate::cargo_rch::reject_frontend_controls(arguments)?;
+/// Execute Cargo arguments after the caller has consumed its own controls and
+/// delimiter. Do not strip another delimiter or reinterpret literal Cargo data.
+pub(crate) fn run(arguments: &[OsString], frontend: &Path, policy: Policy) -> io::Result<()> {
     let worker = crate::cargo_rch::executable("rch-wkr", "CARGO_RABS_WORKER", frontend)?;
     let cargo = cargo_executable(frontend, &worker)?;
     let root_keys = [
@@ -93,7 +96,14 @@ pub(crate) fn run(arguments: &[OsString], frontend: &Path) -> io::Result<()> {
         None
     };
     let mut command = Command::new(worker);
-    command.args(["worker-cache", "--protocol", "v1", "--"]);
+    command.args(["worker-cache", "--protocol", "v1"]);
+    if policy.no_start {
+        command.arg("--no-start");
+    }
+    if policy.require_daemon {
+        command.arg("--require-daemon");
+    }
+    command.arg("--");
     if let Some(root_helper) = root_helper {
         // Explicit admission stays in the one execution chain even when cache
         // preparation declines. Only the native root owner validates cgroup

@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "rabs-cargo"
 path = "src/cargo_main.rs"
 
+[[bin]]
+name = "cargo-rabs"
+path = "src/cargo_subcommand.rs"
+
 # Operator-only dependency cone. Selection uses shared sandbox validators;
 # execution and authenticated transport remain in the separate native driver.
 [dependencies]

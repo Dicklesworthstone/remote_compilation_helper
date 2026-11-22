@@ -105,7 +105,11 @@ fn run(arguments: &[OsString]) -> Result<(), String> {
         {
             let executable = std::env::current_exe()
                 .map_err(|_| "frontend executable identity is unavailable".to_owned())?;
-            return cargo_rch::run(&arguments[1..], &executable).map_err(|error| error.to_string());
+            let arguments = arguments[1..]
+                .strip_prefix(&[OsString::from("--")])
+                .unwrap_or(&arguments[1..]);
+            cargo_rch::reject_frontend_controls(arguments).map_err(|error| error.to_string())?;
+            return cargo_rch::run(arguments, &executable).map_err(|error| error.to_string());
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return Err("RCH remote dispatch requires Linux or macOS".into());
@@ -121,7 +125,11 @@ fn run(arguments: &[OsString]) -> Result<(), String> {
         {
             let executable = std::env::current_exe()
                 .map_err(|_| "frontend executable identity is unavailable".to_owned())?;
-            return cargo_cache::run(&arguments[1..], &executable)
+            let arguments = arguments[1..]
+                .strip_prefix(&[OsString::from("--")])
+                .unwrap_or(&arguments[1..]);
+            cargo_rch::reject_frontend_controls(arguments).map_err(|error| error.to_string())?;
+            return cargo_cache::run(arguments, &executable, cargo_cache::Policy::default())
                 .map_err(|error| error.to_string());
         }
         #[cfg(not(target_os = "linux"))]

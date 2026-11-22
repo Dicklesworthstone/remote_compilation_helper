@@ -287,6 +287,7 @@ where
             | "rabs-delivery-cas"
             | "rabs-recover"
             | "rabs-cargo"
+            | "cargo-rabs"
     ) {
         return None;
     }
@@ -688,6 +689,10 @@ mod tests {
             .expect("native canonical Cargo entry point must identify its compiled source");
         assert!(cargo.contains("\"tool\":\"rabs-cargo\""));
         assert!(build_info_for_args("rabs-cargo", ["--rabs-build-info", "run"]).is_none());
+        let subcommand = build_info_for_args("cargo-rabs", ["--rabs-build-info"])
+            .expect("native Cargo subcommand must identify its own compiled tool");
+        assert!(subcommand.contains("\"tool\":\"cargo-rabs\""));
+        assert!(build_info_for_args("cargo-rabs", ["--rabs-build-info", "run"]).is_none());
         for args in [
             vec![],
             vec!["--version"],

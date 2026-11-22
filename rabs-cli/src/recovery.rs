@@ -1088,6 +1088,32 @@ fn operation(intent: &Intent, options: &Options) -> Result<(Vec<OsString>, PathB
             vec!["--resume".into()]
         };
         Ok((flags, destination))
+    } else if options.resume_current {
+        require(
+            options.acknowledge.is_none() && !options.no_prefix && options.prefix_from.is_none(),
+            "current-delivery recovery cannot combine with acknowledgment or prefix selection",
+        )?;
+        let original = intent.root.join("delivery");
+        let destination = options
+            .delivery
+            .as_deref()
+            .map(absolute_os)
+            .transpose()?
+            .unwrap_or_else(|| original.clone());
+        require(
+            destination == original || !paths_overlap(&intent.root, &destination),
+            "recovery delivery overlaps retained intent or inputs",
+        )?;
+        if options.delivery.is_some() || lexists(&destination)? {
+            private_directory(&destination)?;
+        } else {
+            open_directory(
+                destination
+                    .parent()
+                    .ok_or(Refused("delivery parent is unavailable"))?,
+            )?;
+        }
+        Ok((vec!["--resume".into()], destination))
     } else {
         require(
             options.acknowledge.is_some() && !options.no_prefix && options.prefix_from.is_none(),
@@ -1247,6 +1273,7 @@ fn job_operation(intent: &JobIntent, options: &Options) -> Result<Vec<OsString>>
 
 fn run_job(intent: &JobIntent, options: &Options, current_executable: &Path) -> Result<()> {
     if options.job_control.is_none()
+        && !options.resume_current
         && options.resume_to.is_none()
         && options.delivery.is_none()
         && options.acknowledge.is_none()
@@ -1255,7 +1282,20 @@ fn run_job(intent: &JobIntent, options: &Options, current_executable: &Path) -> 
         writeln!(io::stdout().lock(), "{}", intent.inspection())?;
         return Ok(());
     }
-    let arguments = job_operation(intent, options)?;
+    let arguments = if options.resume_current
+        && options.job_control.is_none()
+        && options.resume_to.is_none()
+        && options.delivery.is_none()
+        && options.acknowledge.is_none()
+    {
+        let wait = Options {
+            job_control: Some(crate::cli::JobControl::Wait),
+            ..Options::default()
+        };
+        job_operation(intent, &wait)?
+    } else {
+        job_operation(intent, options)?
+    };
     let daemon = daemon_path(options.daemon.as_deref(), current_executable)?;
     let endpoint = job_endpoint(&intent.socket)?;
     intent.verify_unchanged()?;
@@ -1280,10 +1320,10 @@ pub(crate) fn run(options: &Options, current_executable: &Path) -> Result<()> {
         RetainedIntent::Job(intent) => return run_job(&intent, options, current_executable),
     };
     require(
-        options.job_control.is_none() && options.delivery.is_none(),
+        options.job_control.is_none() && (options.delivery.is_none() || options.resume_current),
         "wait, status, cancellation and local delivery recovery require a daemon-owned job",
     )?;
-    if options.resume_to.is_none() && options.acknowledge.is_none() {
+    if !options.resume_current && options.resume_to.is_none() && options.acknowledge.is_none() {
         writeln!(io::stdout().lock(), "{}", intent.inspection())?;
         return Ok(());
     }

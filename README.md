@@ -419,6 +419,13 @@ profiles support Rustup toolchain selection and a separate output root. See
 [remote Cargo profiles and command support](docs/rabs-canonical-cargo.md#submit-through-cargo-with-a-reusable-remote-profile)
 for setup, supported commands and the current qualification limits.
 
+The `rabs-cli` crate provides a native Rust `cargo-rabs` executable for Cargo's
+standard `cargo rabs` subcommand. It supports local cache preparation, strict
+or attach-only daemon setup, RCH dispatch, canonical profiles and retained-result
+recovery through the existing native owners. See the [native Cargo subcommand
+installation and usage](docs/rabs-canonical-cargo.md#native-cargo-subcommand);
+the legacy bundle installer still selects the script launcher.
+
 The native Rust `rabs-cargo` entry point accepts local and shared-coordinator
 profiles, including `run` and executing `bench` with closed or captured file
 input. For example:

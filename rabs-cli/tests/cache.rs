@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rabs-cargo");
+const SUBCOMMAND: &str = env!("CARGO_BIN_EXE_cargo-rabs");
 const INPUT: &[u8] = b"original input\0\xff\n";
 
 fn executable(path: &Path, source: &str) {
@@ -45,8 +46,12 @@ printf 'worker\n' >> "$CACHE_TEST_ROOT/worker.calls"
 printf '%s\0' "$@" > "$CACHE_TEST_ROOT/worker.argv"
 printf '%s' "$$" > "$CACHE_TEST_ROOT/worker.pid"
 if [ "${CACHE_TEST_WORKER_REFUSE-0}" != 0 ]; then exit "$CACHE_TEST_WORKER_REFUSE"; fi
-[ "$1" = worker-cache ] && [ "$2" = --protocol ] && [ "$3" = v1 ] && [ "$4" = -- ] || exit 91
-shift 4
+[ "$1" = worker-cache ] && [ "$2" = --protocol ] && [ "$3" = v1 ] || exit 91
+shift 3
+while [ "$1" != -- ]; do
+    case "$1" in --no-start|--require-daemon) shift ;; *) exit 91 ;; esac
+done
+shift
 exec "$@"
 "#,
         );
@@ -78,9 +83,17 @@ exit "${CACHE_TEST_EXIT-23}"
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(BINARY);
+        self.command_using(BINARY, "--cache")
+    }
+
+    fn subcommand(&self) -> Command {
+        self.command_using(SUBCOMMAND, "rabs")
+    }
+
+    fn command_using(&self, binary: &str, mode: &str) -> Command {
+        let mut command = Command::new(binary);
         command
-            .arg("--cache")
+            .arg(mode)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &self.root)
@@ -267,6 +280,10 @@ fn native_cache_exec_retains_signal_termination() {
 
 #[test]
 fn native_cache_keeps_inherited_jobserver_descriptors() {
+    assert_inherited_jobserver(BINARY, "--cache");
+}
+
+fn assert_inherited_jobserver(binary: &str, mode: &str) {
     let fixture = Fixture::new();
     // The shell intentionally opens inherited FD 7 before exec, exactly like
     // an existing Cargo jobserver owner. The frontend never closes/reopens it.
@@ -280,7 +297,7 @@ fn native_cache_keeps_inherited_jobserver_descriptors() {
     let mut shell = Command::new("/bin/sh");
     shell
         .arg("-c")
-        .arg("exec 7<\"$CACHE_TEST_TOKEN\"; exec \"$CACHE_TEST_BINARY\" --cache -- check")
+        .arg("exec 7<\"$CACHE_TEST_TOKEN\"; exec \"$CACHE_TEST_BINARY\" \"$CACHE_TEST_MODE\" -- check")
         .env_clear()
         .current_dir(&fixture.root)
         .stdin(Stdio::piped())
@@ -292,7 +309,8 @@ fn native_cache_keeps_inherited_jobserver_descriptors() {
         }
     }
     shell
-        .env("CACHE_TEST_BINARY", BINARY)
+        .env("CACHE_TEST_BINARY", binary)
+        .env("CACHE_TEST_MODE", mode)
         .env("CACHE_TEST_TOKEN", &token)
         .env("CACHE_TEST_JOB_FD", "7")
         .env("CARGO_MAKEFLAGS", "--jobserver-auth=7,8 -j");
@@ -338,4 +356,119 @@ exec "$@"
         fixture.fields("worker.argv")[4],
         root_helper.as_os_str().as_bytes()
     );
+}
+
+#[test]
+fn cargo_subcommand_preserves_opaque_arguments_and_streams_without_an_interpreter_path() {
+    let fixture = Fixture::new();
+    let path = fixture.root.join("native-only-bin");
+    fs::create_dir(&path).unwrap();
+    symlink(SUBCOMMAND, path.join("cargo-rabs")).unwrap();
+    let arguments = vec![
+        "+nightly-selected".into(),
+        "test".into(),
+        "--".into(),
+        "literal 'quotes' and spaces".into(),
+        OsString::new(),
+        OsString::from_vec(b"opaque-\xff".to_vec()),
+        "--rabs-remote".into(),
+    ];
+    let output = run(fixture.subcommand().env("PATH", &path).args(&arguments));
+    fixture.assert_cargo(&output, &arguments);
+    assert_eq!(fs::read_dir(path).unwrap().count(), 1);
+}
+
+#[test]
+fn cargo_subcommand_emits_exact_cache_policy_before_the_owned_command() {
+    for (controls, expected) in [
+        (vec!["--rabs-no-start"], vec!["--no-start"]),
+        (vec!["--rabs-require-daemon"], vec!["--require-daemon"]),
+        (
+            vec!["--rabs-no-start", "--rabs-require-daemon"],
+            vec!["--no-start", "--require-daemon"],
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let output = run(fixture.subcommand().args(controls).arg("check"));
+        fixture.assert_cargo(&output, &["check".into()]);
+        let mut argv: Vec<Vec<u8>> = ["worker-cache", "--protocol", "v1"]
+            .into_iter()
+            .chain(expected)
+            .chain(["--"])
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        argv.push(fixture.cargo.as_os_str().as_bytes().to_vec());
+        argv.push(b"check".to_vec());
+        assert_eq!(fixture.fields("worker.argv"), argv);
+    }
+}
+
+#[test]
+fn cargo_subcommand_defaults_and_delimiters_are_preserved_exactly() {
+    for (input, expected) in [
+        (vec![], vec!["build"]),
+        (vec!["--"], vec!["build"]),
+        (vec!["--", "--rabs-remote"], vec!["--rabs-remote"]),
+        (
+            vec!["--", "--", "--rabs-recover"],
+            vec!["--", "--rabs-recover"],
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let output = run(fixture.subcommand().args(input));
+        fixture.assert_cargo(
+            &output,
+            &expected.iter().map(OsString::from).collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn cargo_subcommand_keeps_jobserver_signal_and_terminal_worker_refusal() {
+    assert_inherited_jobserver(SUBCOMMAND, "rabs");
+    let fixture = Fixture::new();
+    let output = run(fixture.subcommand().env("CACHE_TEST_SIGNAL", "TERM"));
+    assert_eq!(output.status.signal(), Some(15));
+    assert_eq!(
+        fs::read(fixture.root.join("cargo.calls")).unwrap(),
+        b"cargo\n"
+    );
+
+    let fixture = Fixture::new();
+    let output = run(fixture.subcommand().env("CACHE_TEST_WORKER_REFUSE", "255"));
+    assert_eq!(output.status.code(), Some(255));
+    assert!(!fixture.root.join("cargo.calls").exists());
+    assert_eq!(
+        fs::read(fixture.root.join("worker.calls")).unwrap(),
+        b"worker\n"
+    );
+}
+
+#[test]
+fn real_cargo_discovers_the_native_subcommand_with_only_it_on_path() {
+    let fixture = Fixture::new();
+    let path = fixture.root.join("cargo-extensions");
+    fs::create_dir(&path).unwrap();
+    symlink(SUBCOMMAND, path.join("cargo-rabs")).unwrap();
+    // This is Cargo's real external-subcommand discovery and injected `rabs`
+    // argument. No worker, daemon, compiler or cache hit is claimed by help.
+    for argument in ["--help", "--version", "--rabs-build-info"] {
+        let output = Command::new(env!("CARGO"))
+            .args(["rabs", argument])
+            .env("PATH", &path)
+            .env("CARGO_RABS_WORKER", "/missing/native-worker")
+            .current_dir(&fixture.root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{argument}: {output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        if argument == "--rabs-build-info" {
+            let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(info["tool"], "cargo-rabs");
+        } else {
+            assert!(!output.stdout.is_empty());
+        }
+    }
+    assert!(!fixture.root.join("worker.calls").exists());
+    assert!(!fixture.root.join("cargo.calls").exists());
 }

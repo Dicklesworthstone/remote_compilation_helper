@@ -89,11 +89,9 @@ pub(crate) fn executable(name: &str, override_name: &str, current: &Path) -> io:
     Ok(selected)
 }
 
+/// Handoff after the Cargo subcommand has consumed its launcher controls. All
+/// remaining arguments are Cargo data, including any additional delimiters.
 pub(crate) fn run(arguments: &[OsString], current: &Path) -> io::Result<()> {
-    let arguments = arguments
-        .strip_prefix(&[OsString::from("--")])
-        .unwrap_or(arguments);
-    reject_frontend_controls(arguments)?;
     // RCH's command boundary is Vec<String>. Refuse opaque bytes instead of
     // silently replacing them; stdin and inherited descriptors remain opaque.
     if arguments.iter().any(|argument| {

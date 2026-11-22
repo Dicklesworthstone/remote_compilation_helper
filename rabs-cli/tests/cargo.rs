@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rabs-cargo");
+const SUBCOMMAND: &str = env!("CARGO_BIN_EXE_cargo-rabs");
 const PIN: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
 fn private_directory(path: &Path) {
@@ -161,8 +162,17 @@ impl Fixture {
 
     fn command_using(&self, remote: bool, binary: &Path) -> Command {
         let mut command = Command::new(binary);
+        let subcommand = binary == Path::new(SUBCOMMAND);
+        if subcommand {
+            command.arg("rabs");
+        }
         command
-            .arg(if remote { "--remote" } else { "--local" })
+            .arg(match (subcommand, remote) {
+                (true, true) => "--rabs-canonical-remote",
+                (true, false) => "--rabs-canonical-local",
+                (false, true) => "--remote",
+                (false, false) => "--local",
+            })
             .arg(if remote { &self.remote } else { &self.local })
             .env_remove("CARGO_RABS_DAEMON")
             .env_remove("CARGO_RABS_RUSTUP")
@@ -428,6 +438,87 @@ fn help_version_and_release_identity_do_not_need_profiles_or_a_driver() {
             assert_eq!(value["tool"], "rabs-cargo");
         }
     }
+}
+
+#[test]
+fn cargo_subcommand_canonical_aliases_keep_check_defaults_and_explicit_literal_selection() {
+    for remote in [false, true] {
+        for explicit in [false, true] {
+            let fixture = Fixture::new();
+            let before = fs::read(if remote {
+                &fixture.remote
+            } else {
+                &fixture.local
+            })
+            .unwrap();
+            let mut command = fixture.command_using(remote, Path::new(SUBCOMMAND));
+            command.env("CARGO_RABS_DAEMON", &fixture.daemon);
+            if explicit {
+                command.args(["--", "test", "--no-run", "--", "--rabs-remote", "literal α"]);
+            }
+            let report = fixture.handed_off(command.output().unwrap());
+            let profile = if remote {
+                &report["profile"]["settings"]
+            } else {
+                &report["profile"]
+            };
+            assert_eq!(profile["command"], if explicit { "test" } else { "check" });
+            if explicit {
+                assert_eq!(profile["selection"]["no_run"], true);
+                assert_eq!(
+                    profile["selection"]["test_args"],
+                    json!(["--rabs-remote", "literal α"])
+                );
+            } else {
+                assert_eq!(profile["selection"]["packages"], json!([]));
+                assert_eq!(profile["selection"]["release"], false);
+            }
+            assert_eq!(
+                fs::read(if remote {
+                    &fixture.remote
+                } else {
+                    &fixture.local
+                })
+                .unwrap(),
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn cargo_subcommand_rustup_discovery_reexecutes_its_native_guard() {
+    let fixture = Fixture::new();
+    rewrite_json(&fixture.local, |profile| {
+        profile.as_object_mut().unwrap().remove("toolchain_root");
+        profile["toolchain"] = "rustup".into();
+    });
+    let rustup = fixture.root.join("rustup fixture");
+    rustup_fixture(&rustup);
+    let output = fixture
+        .command_using(false, Path::new(SUBCOMMAND))
+        .env("CARGO_RABS_DAEMON", &fixture.daemon)
+        .env("CARGO_RABS_RUSTUP", &rustup)
+        .env(
+            "RABS_CARGO_TEST_RUSTUP_PATH",
+            fixture.toolchain.join("bin/rustc"),
+        )
+        .env(
+            "RABS_CARGO_TEST_RUSTUP_REPORT",
+            fixture.root.join("rustup-report.json"),
+        )
+        .args(["--", "+selected-native", "check"])
+        .output()
+        .unwrap();
+    let report = fixture.handed_off(output);
+    assert_eq!(
+        report["profile"]["toolchain_root"],
+        json!(fixture.toolchain)
+    );
+    assert_eq!(
+        fixture.rustup_report()["argv"],
+        json!(["which", "--toolchain", "selected-native", "rustc"])
+    );
 }
 
 #[test]
@@ -1525,6 +1616,36 @@ fn rch_handoff_defaults_to_build_and_preserves_failure_and_signal_status() {
         Some(rustix::process::Signal::TERM.as_raw())
     );
     assert_eq!(fixture.report()["required"], "1");
+}
+
+#[test]
+fn cargo_subcommand_remote_alias_uses_only_rch_and_never_retries_locally() {
+    for arguments in [
+        vec![],
+        vec!["--", "+nightly-selected", "test", "--", "--rabs-no-start"],
+    ] {
+        let fixture = RchFixture::new();
+        let mut command = Command::new(SUBCOMMAND);
+        fixture.configure(&mut command);
+        let output = command
+            .args(["rabs", "--rabs-remote"])
+            .args(&arguments)
+            .env("RABS_RCH_TEST_STATUS", "255")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(255), "{output:?}");
+        let mut expected = vec!["exec", "--source-content-receipt", "--", "cargo"];
+        if arguments.is_empty() {
+            expected.push("build");
+        } else {
+            expected.extend_from_slice(&arguments[1..]);
+        }
+        let report = fixture.report();
+        assert_eq!(report["argv"], json!(expected));
+        assert_eq!(report["required"], "1");
+        assert_eq!(report["cache"], "1");
+        assert_eq!(report["toolchain"], "selected-custom-toolchain");
+    }
 }
 
 #[test]

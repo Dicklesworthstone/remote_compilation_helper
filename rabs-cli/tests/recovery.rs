@@ -17,6 +17,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_rabs-recover");
+const SUBCOMMAND: &str = env!("CARGO_BIN_EXE_cargo-rabs");
 const PIN: &str = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
 fn private_directory(path: &Path) {
@@ -174,6 +175,9 @@ impl Fixture {
 
     fn command_using(&self, binary: &Path) -> Command {
         let mut command = Command::new(binary);
+        if binary == Path::new(SUBCOMMAND) {
+            command.args(["rabs", "--rabs-recover"]);
+        }
         command
             .arg(&self.intent)
             .env_remove("CARGO_RABS_DAEMON")
@@ -326,6 +330,74 @@ fn inspect_both_schemas_without_credentials_or_native_transport() {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-be-printed"));
         assert!(!fixture.report.exists());
         assert!(!fixture.intent.join("delivery").exists());
+    }
+}
+
+#[test]
+fn cargo_subcommand_recovery_resumes_the_exact_retained_delivery_without_reexecution() {
+    for kind in ["default-new", "default-existing", "explicit-delivery"] {
+        let fixture = Fixture::canonical(false);
+        let before = fs::read(&fixture.record).unwrap();
+        let destination = if kind == "explicit-delivery" {
+            fixture.root.join("retained delivery")
+        } else {
+            fixture.intent.join("delivery")
+        };
+        if kind != "default-new" {
+            private_directory(&destination);
+            new_file(
+                &destination.join("untrusted-prefix"),
+                b"retained partial bytes",
+                0o600,
+            );
+        }
+        let mut command = fixture.command_using(Path::new(SUBCOMMAND));
+        command.env("CARGO_RABS_DAEMON", &fixture.daemon);
+        if kind == "explicit-delivery" {
+            command.arg("--delivery").arg(&destination);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(37), "{kind}: {output:?}");
+        let report = fixture.report();
+        assert_eq!(report["argv"][0], "--worker-exec-tls");
+        assert_eq!(report["argv"][1], "--resume");
+        assert_eq!(
+            report["argv"].as_array().unwrap().last().unwrap(),
+            &json!(destination)
+        );
+        assert_eq!(report["request"], json!(fixture.request_bytes));
+        assert_eq!(report["state"], json!(fixture.state));
+        assert_eq!(report["sealed"], true);
+        assert_eq!(fs::read(&fixture.record).unwrap(), before);
+        assert_eq!(fs::read(&fixture.request).unwrap(), fixture.request_bytes);
+        assert!(!fixture.intent.join("outputs").exists());
+        if kind != "default-new" {
+            assert_eq!(
+                fs::read(destination.join("untrusted-prefix")).unwrap(),
+                b"retained partial bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn cargo_subcommand_recovery_refuses_public_or_overlapping_retained_delivery() {
+    for public in [false, true] {
+        let fixture = Fixture::canonical(false);
+        let mut command = fixture.command_using(Path::new(SUBCOMMAND));
+        command.env("CARGO_RABS_DAEMON", &fixture.daemon);
+        if public {
+            let delivery = fixture.intent.join("delivery");
+            private_directory(&delivery);
+            fs::set_permissions(&delivery, fs::Permissions::from_mode(0o755)).unwrap();
+        } else {
+            command.arg("--delivery").arg(fixture.intent.join("bundle"));
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!fixture.report.exists());
+        assert_eq!(fs::read(&fixture.request).unwrap(), fixture.request_bytes);
     }
 }
 
@@ -932,7 +1004,14 @@ impl JobFixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(BINARY);
+        self.command_using(BINARY)
+    }
+
+    fn command_using(&self, binary: &str) -> Command {
+        let mut command = Command::new(binary);
+        if binary == SUBCOMMAND {
+            command.args(["rabs", "--rabs-recover"]);
+        }
         command
             .arg(&self.operation)
             .current_dir(&self.root)
@@ -1322,6 +1401,34 @@ fn daemon_job_controls_use_the_same_owner_without_source_or_client_tls() {
                 fixture.unchanged(&before);
             }
         }
+    }
+}
+
+#[test]
+fn cargo_subcommand_recovery_defaults_to_wait_and_preserves_explicit_job_controls() {
+    for (option, action) in [
+        (None, "--job-wait"),
+        (Some("--status"), "--job-status"),
+        (Some("--cancel"), "--job-cancel"),
+    ] {
+        let fixture = JobFixture::new(true, Some(true), true);
+        let before = fs::read(&fixture.record).unwrap();
+        let mut command = fixture.command_using(SUBCOMMAND);
+        if let Some(option) = option {
+            command.arg(option);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(37), "{output:?}");
+        let expected = if option.is_none() {
+            json!([action, "--live-stderr", JOB_ID])
+        } else {
+            json!([action, JOB_ID])
+        };
+        let report = fixture.report();
+        assert_eq!(report["argv"], expected);
+        assert_eq!(report["socket"], json!(fixture.socket));
+        assert_eq!(report["tls"], json!([null, null, null]));
+        fixture.unchanged(&before);
     }
 }
 

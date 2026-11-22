@@ -12,6 +12,10 @@ pub(crate) enum JobControl {
 #[derive(Debug, Default)]
 pub(crate) struct Options {
     pub directory: OsString,
+    /// The Cargo subcommand's explicit recovery mode resumes the retained
+    /// destination (or waits for its daemon job). Standalone rabs-recover keeps
+    /// inspection as its no-operation default; this is not a public parser flag.
+    pub resume_current: bool,
     pub job_control: Option<JobControl>,
     pub resume_to: Option<OsString>,
     pub delivery: Option<OsString>,
