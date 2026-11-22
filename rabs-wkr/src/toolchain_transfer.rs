@@ -1808,6 +1808,7 @@ mod tests {
                 dependency_context: None,
                 jobserver_grant: None,
                 command_context: Default::default(),
+                captured_stdin: None,
             }
         }
 

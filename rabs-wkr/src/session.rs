@@ -69,6 +69,9 @@ pub struct CanonicalExecRequest {
     /// Explicit, validated environment additions and canonical working directory.
     /// Absence on the wire uses the canonical workspace and pinned base only.
     pub command_context: CommandContext,
+    /// Optional exact source member copied to immutable runtime stdin. Only an
+    /// executing Cargo contract with uploaded source may select this input.
+    pub captured_stdin: Option<rabs_sandbox::source_transfer::SourceFile>,
     /// Separately negotiated leaf rustc execution with an explicit original or
     /// canonical Cargo path policy. This never changes the semantics of an
     /// ordinary canonical command context.
@@ -1287,6 +1290,32 @@ fn execute_canonical_inner(
     };
     let execution_home = homes.home(home_backing);
     let execution_cargo_home = homes.cargo_home(cargo_home_backing);
+    let mut captured_stdin = match request
+        .captured_stdin
+        .as_ref()
+        .map(|expected| {
+            if !artifact_plan
+                .as_ref()
+                .and_then(ArtifactPlan::cargo_mode)
+                .is_some_and(rabs_sandbox::cargo_artifacts::CargoArtifactMode::is_execution)
+                || request.dependency_context.is_some()
+            {
+                return Err(std::io::Error::other(
+                    "captured stdin requires an executing Cargo contract",
+                ));
+            }
+            source
+                .ok_or_else(|| std::io::Error::other("captured stdin requires owned source"))?
+                .capture_stdin(request.request_id, expected, &|| control.reason().is_some())
+        })
+        .transpose()
+    {
+        Ok(input) => input,
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("runtime input preparation: {error}")));
+            return exec_error(request.request_id);
+        }
+    };
     // This fresh empty tree is a separate owner: exposing it under writable
     // HOME as well would let a compiler populate a supposedly empty input.
     let dependency_empty = if request.dependency_context.is_some() {
@@ -1614,8 +1643,19 @@ fn execute_canonical_inner(
 
     // Managed process-group execution (G006) with concurrent bounded G007 drains.
     let mut command = command_for(&launch);
+    let stdin = match captured_stdin
+        .as_mut()
+        .map(|input| input.take_stdio(&|| control.reason().is_some()))
+        .transpose()
+    {
+        Ok(input) => input.unwrap_or_else(Stdio::null),
+        Err(error) => {
+            let _ = control.retain_outputs(Err(format!("runtime input handoff: {error}")));
+            return exec_error(request.request_id);
+        }
+    };
     command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let attribution = Attribution {
@@ -1789,6 +1829,14 @@ fn execute_canonical_inner(
             // Interrupted execution cannot offer successful artifacts, but its
             // diagnostics must still drain and be delivered. Do not turn an
             // intentional stop during this verification into lost output.
+            if let Some(input) = &captured_stdin
+                && let Err(error) = input.verify(&|| false)
+            {
+                let _ = control.retain_outputs(Err(format!(
+                    "runtime input post-execution verification: {error}"
+                )));
+                return exec_error(request.request_id);
+            }
             if control.reason().is_none()
                 && let Err(error) = toolchain.verify(|| control.reason().is_some())
                 && control.reason().is_none()
@@ -2206,6 +2254,7 @@ mod tests {
             workspace_backing: "/ws".into(),
             jobserver_grant: None,
             command_context: CommandContext::default(),
+            captured_stdin: None,
             dependency_context: None,
         };
         let result = execute_canonical(
@@ -2230,6 +2279,7 @@ mod tests {
             workspace_backing: dir.path().join("absent-workspace").display().to_string(),
             jobserver_grant: Some(2),
             command_context: CommandContext::default(),
+            captured_stdin: None,
             dependency_context: None,
         };
         let control = ExecutionControl::new(std::time::Duration::from_secs(10)).unwrap();

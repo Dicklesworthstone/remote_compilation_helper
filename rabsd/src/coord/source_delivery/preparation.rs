@@ -34,6 +34,7 @@ pub(super) struct SourcePreparation {
     selections: Vec<(String, Vec<String>)>,
     closure: bool,
     cargo: Option<cargo::CargoSource>,
+    stdin_file: Option<String>,
 }
 
 fn selected_files(value: &Value) -> io::Result<Vec<String>> {
@@ -101,6 +102,8 @@ impl SourcePreparation {
 
         let mut roots = Vec::new();
         let mut selections = Vec::new();
+        let stdin_file =
+            rabs_sandbox::captured_stdin::selected_path(specification)?.map(str::to_owned);
         let cargo = specification
             .get("cargo_source")
             .map(|value| cargo::CargoSource::parse_request(value, specification, context))
@@ -121,6 +124,11 @@ impl SourcePreparation {
             }
             roots.push(("workspace".to_owned(), base.to_path_buf()));
             selections.push(("workspace".to_owned(), vec![cargo.manifest().to_owned()]));
+            if let Some(path) = &stdin_file
+                && path != cargo.manifest()
+            {
+                selections[0].1.push(path.clone());
+            }
         } else if closure {
             require(
                 specification.get("source_files").is_none(),
@@ -217,6 +225,7 @@ impl SourcePreparation {
             selections,
             closure,
             cargo,
+            stdin_file,
         })
     }
 
@@ -252,8 +261,33 @@ impl SourcePreparation {
             .map_err(|error| capture_error("source closure capture refused", error))?,
         );
         control.checkpoint()?;
+        if let Some(path) = &self.stdin_file {
+            let (root, relative) = if self.closure {
+                path.split_once('/')
+                    .ok_or_else(|| invalid("captured stdin closure member lacks its root"))?
+            } else {
+                ("workspace", path.as_str())
+            };
+            let bytes = image
+                .file_bytes(root, relative)
+                .ok_or_else(|| invalid("captured stdin is not an ordinary captured source file"))?;
+            require(
+                bytes.len() as u64 <= rabs_sandbox::captured_stdin::MAX_CAPTURED_STDIN_BYTES,
+                "captured worker stdin exceeds the 16 MiB byte bound",
+            )?;
+        }
         if let Some(cargo) = &self.cargo {
-            let (image, files) = cargo.prepare_controlled(image, planning_toolchain, control)?;
+            let (image, mut files) =
+                cargo.prepare_controlled(image, planning_toolchain, control)?;
+            // Runtime input comes from the same coherent snapshot as Cargo's
+            // selected sources, including an otherwise unselected member.
+            // The snapshot upload constructor verifies ordinary membership,
+            // content identity and the aggregate source byte/file bounds.
+            if let Some(path) = &self.stdin_file
+                && !files.contains(path)
+            {
+                files.push(path.clone());
+            }
             SourceUpload::from_snapshot_controlled(image, "workspace", &files, control)
         } else if self.closure {
             SourceUpload::from_snapshot_closure_controlled(image, &self.selections, control)
@@ -541,6 +575,72 @@ mod selected_route_tests {
     use std::fs;
     use std::process::Command;
     use std::time::Duration;
+
+    #[test]
+    fn captured_stdin_cargo_preparation_uses_the_same_sealed_source_snapshot() {
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("source");
+        fs::create_dir_all(source.join("app/src")).unwrap();
+        fs::create_dir(source.join("inputs")).unwrap();
+        fs::write(
+            source.join("app/Cargo.toml"),
+            "[package]\nname='stdin-preparation'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("app/Cargo.lock"),
+            "version=4\n[[package]]\nname='stdin-preparation'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(source.join("app/src/main.rs"), "fn main() {}\n").unwrap();
+        let bytes = b"\0runtime input\xff\n";
+        fs::write(source.join("inputs/request.bin"), bytes).unwrap();
+        let specification = json!({
+            "kind":"canonical-exec", "request_id":71,
+            "program":"/__rabs/toolchain/bin/cargo", "toolchain_backing":"/captured-sdk",
+            "args":["run", "--locked", "--offline", "--message-format=json",
+                "--manifest-path", "/__rabs/workspace/app/Cargo.toml", "--target-dir", "/__rabs/out/cargo"],
+            "cargo_source":{"manifest":"app/Cargo.toml"},
+            "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":"cargo-run-json-v1"},
+            "captured_stdin":{"version":"source-file-stdin-v1", "path":"inputs/request.bin"},
+        });
+        let plan =
+            SourcePreparation::parse(&source, &specification, PreparationContext::RemoteRequest)
+                .unwrap();
+        let upload = plan
+            .capture_controlled(None, &PreparationControl::uncontrolled())
+            .unwrap();
+        fs::write(source.join("inputs/request.bin"), b"changed after capture").unwrap();
+        assert_eq!(upload.file_bytes("inputs/request.bin").unwrap(), bytes);
+        let mut request = specification.clone();
+        request.as_object_mut().unwrap().remove("cargo_source");
+        request["source_manifest"] = upload.wire_manifest();
+        super::super::validate_request(&request).unwrap();
+        let manifest = request_manifest(&request).unwrap().unwrap();
+        let expected = rabs_sandbox::captured_stdin::validate_request(&request, Some(&manifest))
+            .unwrap()
+            .unwrap();
+        assert_eq!(expected.len, bytes.len() as u64);
+        assert_eq!(expected.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+
+        for path in ["../outside", "/dev/stdin", ".git/config", ".env"] {
+            let mut refused = specification.clone();
+            refused["captured_stdin"]["path"] = json!(path);
+            assert!(
+                SourcePreparation::parse(&source, &refused, PreparationContext::RemoteRequest)
+                    .is_err(),
+                "{path}"
+            );
+        }
+        let mut missing = specification;
+        missing["captured_stdin"]["path"] = json!("inputs/absent.bin");
+        let plan =
+            SourcePreparation::parse(&source, &missing, PreparationContext::RemoteRequest).unwrap();
+        assert!(
+            plan.capture_controlled(None, &PreparationControl::uncontrolled())
+                .is_err()
+        );
+    }
 
     #[test]
     fn allocated_selected_preparation_uses_captured_sdk_and_replays_through_worker_projection() {

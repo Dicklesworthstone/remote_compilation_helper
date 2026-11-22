@@ -1657,6 +1657,7 @@ fn main() { println!("{}", answer()); }
                 )
                 .unwrap(),
                 dependency_context: None,
+                captured_stdin: None,
                 toolchain_backing: "/fixture/toolchain".into(),
                 toolchain_identity: Some(ToolchainIdentity {
                     sha256: [1; 32],

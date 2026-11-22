@@ -264,16 +264,30 @@ pub(super) fn validate_profile(
             && profile.keys().all(|field| FIELDS.contains(&field.as_str())),
         "worker mode requires only canonical-cargo-v1 profile fields",
     )?;
-    require(
-        matches!(
-            options.input.as_ref(),
-            None | Some(Input::Policy(CompilationStdin::Closed))
-        ),
-        "direct worker input is closed; inherited or captured-file stdin is unavailable",
-    )?;
     let (command, selection) = selected(options)?;
     selection.cargo_arguments(command)?;
     selection.runtime_arguments(command)?;
+    match options.input.as_ref() {
+        None | Some(Input::Policy(CompilationStdin::Closed)) => {}
+        Some(Input::Policy(CompilationStdin::Inherit)) => {
+            return Err(invalid(
+                "direct workers do not forward inherited stdin; select --stdin-file or --stdin closed",
+            ));
+        }
+        Some(Input::File(path)) => {
+            require(
+                relative_member(path)
+                    && matches!(
+                        command,
+                        CompilationCommand::Run
+                            | CompilationCommand::Test
+                            | CompilationCommand::Bench
+                    )
+                    && !selection.no_run,
+                "captured stdin requires an ordinary source-relative file and run, test or bench execution",
+            )?;
+        }
+    }
     require(
         selection.target.len() <= 1
             && selection.target.iter().all(|target| {
@@ -331,7 +345,25 @@ pub(super) fn validate_profile(
     }
     context(profile, command)?;
     let source = plain_absolute(string(profile, "source_root")?)?;
-    open_directory(&source)?;
+    let source_directory = open_directory(&source)?;
+    if let Some(Input::File(path)) = &options.input {
+        let input = File::from(rustix::fs::openat2(
+            &source_directory,
+            path.as_str(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+            FileMode::empty(),
+            rustix::fs::ResolveFlags::BENEATH
+                | rustix::fs::ResolveFlags::NO_SYMLINKS
+                | rustix::fs::ResolveFlags::NO_MAGICLINKS
+                | rustix::fs::ResolveFlags::NO_XDEV,
+        )?);
+        let metadata = input.metadata()?;
+        require(
+            metadata.is_file()
+                && metadata.len() <= rabs_sandbox::captured_stdin::MAX_CAPTURED_STDIN_BYTES,
+            "captured worker stdin must be an ordinary file of at most 16 MiB",
+        )?;
+    }
     let mut roots = vec![source];
     if let Some(toolchain) = profile.get("toolchain_root") {
         let root = plain_absolute(
@@ -443,6 +475,12 @@ fn specification(profile: &Map<String, Value>, options: &Options) -> io::Result<
     });
     if let Some(grant) = profile.get("jobserver_grant") {
         spec["jobserver_grant"] = grant.clone();
+    }
+    if let Some(Input::File(path)) = &options.input {
+        spec["captured_stdin"] = json!({
+            "version":rabs_sandbox::captured_stdin::CAPTURED_STDIN_VERSION,
+            "path":path,
+        });
     }
     Ok(spec)
 }
@@ -954,11 +992,79 @@ mod tests {
         assert!(validate_profile(&conflicting, &build_options).is_err());
         for input in [
             Input::Policy(CompilationStdin::Inherit),
-            Input::File("input.bin".into()),
+            Input::File("../input.bin".into()),
         ] {
             let mut options = options(&["run"]);
             options.input = Some(input);
             assert!(validate_profile(&baseline, &options).is_err());
+        }
+        assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn worker_captured_stdin_preserves_execution_selection_and_exact_request() {
+        let (root, profile) = filesystem_profile();
+        fs::create_dir(root.join("source/inputs")).unwrap();
+        fs::write(root.join("source/inputs/request.bin"), b"\0input\xff").unwrap();
+        for command in ["run", "test", "bench"] {
+            let mut options = options(&[command]);
+            let closed = specification(&profile, &options).unwrap();
+            options.input = Some(Input::File("inputs/request.bin".into()));
+            validate_profile(&profile, &options).unwrap();
+            let mut request = specification(&profile, &options).unwrap();
+            assert_eq!(
+                request["captured_stdin"],
+                json!({
+                    "version":"source-file-stdin-v1", "path":"inputs/request.bin",
+                })
+            );
+            request.as_object_mut().unwrap().remove("captured_stdin");
+            assert_eq!(
+                request, closed,
+                "runtime input must preserve the Cargo command"
+            );
+        }
+        for arguments in [
+            vec!["build"],
+            vec!["check"],
+            vec!["test", "--no-run"],
+            vec!["bench", "--no-run"],
+        ] {
+            let mut options = options(&arguments);
+            options.input = Some(Input::File("inputs/request.bin".into()));
+            assert!(
+                validate_profile(&profile, &options).is_err(),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_captured_stdin_refuses_oversize_and_nonregular_input_before_retention() {
+        let (root, profile) = filesystem_profile();
+        let input = File::create(root.join("source/input.bin")).unwrap();
+        let mut options = options(&["run"]);
+        options.input = Some(Input::File("input.bin".into()));
+        validate_profile(&profile, &options).unwrap();
+        input
+            .set_len(rabs_sandbox::captured_stdin::MAX_CAPTURED_STDIN_BYTES)
+            .unwrap();
+        validate_profile(&profile, &options).unwrap();
+        input
+            .set_len(rabs_sandbox::captured_stdin::MAX_CAPTURED_STDIN_BYTES + 1)
+            .unwrap();
+        assert!(validate_profile(&profile, &options).is_err());
+        symlink("input.bin", root.join("source/alias")).unwrap();
+        fs::create_dir(root.join("source/directory")).unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            root.join("source/fifo"),
+            FileMode::RUSR | FileMode::WUSR,
+        )
+        .unwrap();
+        for path in ["alias", "directory", "fifo", "absent"] {
+            options.input = Some(Input::File(path.into()));
+            assert!(validate_profile(&profile, &options).is_err(), "{path}");
         }
         assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
     }

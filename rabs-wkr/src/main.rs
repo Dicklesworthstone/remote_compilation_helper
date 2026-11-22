@@ -42,9 +42,9 @@ use rabs_wkr::execution::{
 use rabs_wkr::host_budget::HostBudget;
 use rabs_wkr::output::{CapturedOutputs, MAX_OUTPUT_CHUNK_BYTES};
 use rabs_wkr::request_journal::{RECOVERY_PROTOCOL, WorkerJournal};
-use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient};
 #[cfg(test)]
 use rabs_wkr::result_spool::RetentionTarget;
+use rabs_wkr::result_spool::{RESULT_RETENTION, ResultRecipient};
 use rabs_wkr::session::{
     CanonicalExecRequest, ExecutionResources, PressureSample, UploadedInputs,
     execute_canonical_controlled, execute_uploaded_canonical_controlled, parse_command_context,
@@ -2284,6 +2284,7 @@ fn worker_hello(
         "output_previews": [OUTPUT_PREVIEW_VERSION],
         "metadata_prefetches": if cfg!(target_os = "linux") { vec![METADATA_PREFETCH_VERSION] } else { Vec::<&str>::new() },
         "source_transfers": [SOURCE_TRANSFER],
+        "captured_stdin_versions": if cfg!(target_os = "linux") { vec![rabs_sandbox::captured_stdin::CAPTURED_STDIN_VERSION] } else { Vec::<&str>::new() },
         "toolchain_transfers": [TOOLCHAIN_TRANSFER_VERSION],
         "toolchain_reuses": [TOOLCHAIN_REUSE_VERSION],
         "toolchain_file_reuses": if toolchain_file_cache_enabled { vec![TOOLCHAIN_FILE_REUSE_VERSION] } else { Vec::<&str>::new() },
@@ -2910,6 +2911,9 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
     }
     let program = text("program")?;
     let source_manifest = source_transfer::request_manifest(value)?;
+    let captured_stdin =
+        rabs_sandbox::captured_stdin::validate_request(value, source_manifest.as_ref())
+            .map_err(|error| error.to_string())?;
     let transferred_toolchain = toolchain_transfer::request_identity(value)?;
     let toolchain_identity = rabs_wkr::session::parse_toolchain_identity(value)?;
     if let Some(context) = &dependency_context
@@ -2948,6 +2952,7 @@ fn parse_exec_request(value: &serde_json::Value) -> Result<CanonicalExecRequest,
         workspace_backing,
         jobserver_grant,
         command_context: parse_command_context(value)?,
+        captured_stdin,
         dependency_context,
     };
     if request.dependency_context.is_some() {
@@ -4383,8 +4388,10 @@ mod tests {
             workspace_backing,
             jobserver_grant,
             command_context,
+            captured_stdin,
             dependency_context,
         } = parse_exec_request(&frame).expect("parses");
+        assert!(captured_stdin.is_none());
         assert!(dependency_context.is_none());
         assert_eq!(toolchain_identity, None);
         assert_eq!(request_id, 1);
@@ -4397,6 +4404,76 @@ mod tests {
             command_context,
             rabs_sandbox::process_context::CommandContext::default()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_stdin_request_is_bound_before_admission_and_across_restart() {
+        use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        let bytes = b"\0input\xff";
+        let files: Vec<_> = ["input-a.bin", "input-b.bin"]
+            .into_iter()
+            .map(|path| SourceFile {
+                path: path.into(),
+                len: bytes.len() as u64,
+                sha256: Sha256::digest(bytes).into(),
+                executable: false,
+            })
+            .collect();
+        let manifest = SourceManifest::new(files.clone()).unwrap();
+        let mut original = json!({
+            "kind":"canonical-exec", "request_id":171,
+            "program":"/__rabs/toolchain/bin/cargo", "toolchain_backing":"/tc",
+            "args":["run", "--message-format=json", "--target-dir=/__rabs/out/cargo"],
+            "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":"cargo-run-json-v1"},
+            "captured_stdin":{"version":"source-file-stdin-v1", "path":"input-a.bin"},
+            "source_manifest":{"manifest_sha256":source_transfer::hex(&manifest.digest()),
+                "files":files.iter().map(|file| json!({"path":file.path, "bytes":file.len,
+                    "sha256":source_transfer::hex(&file.sha256), "executable":file.executable})).collect::<Vec<_>>()},
+        });
+        assert_eq!(
+            parse_exec_request(&original).unwrap().captured_stdin,
+            Some(files[0].clone())
+        );
+        let root = private_root();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        assert_eq!(
+            journal.admit(&original, DEFAULT_EXECUTION_TIMEOUT).unwrap(),
+            None
+        );
+        journal
+            .finish(
+                171,
+                &json!({"kind":"exec-result", "request_id":171, "exit_code":0}),
+                true,
+            )
+            .unwrap();
+        drop(journal);
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        assert_eq!(
+            journal.admit(&original, DEFAULT_EXECUTION_TIMEOUT).unwrap(),
+            Some("durable-request-already-admitted")
+        );
+        original["captured_stdin"]["path"] = json!("input-b.bin");
+        assert_eq!(
+            parse_exec_request(&original).unwrap().captured_stdin,
+            Some(files[1].clone())
+        );
+        assert_eq!(
+            journal.admit(&original, DEFAULT_EXECUTION_TIMEOUT).unwrap(),
+            Some("durable-request-conflict")
+        );
+        for selection in [
+            json!({"version":"source-file-stdin-v0","path":"input-a.bin"}),
+            json!({"version":"source-file-stdin-v1","path":"../input-a.bin"}),
+            json!({"version":"source-file-stdin-v1","path":"missing.bin"}),
+            serde_json::Value::Null,
+        ] {
+            original["captured_stdin"] = selection;
+            assert!(parse_exec_request(&original).is_err());
+        }
     }
 
     #[test]
@@ -5360,7 +5437,10 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         assert_eq!(peer.replies()[1]["reason"], "prior-execution-uncertain");
         assert_eq!(journal.status(380)["status"], "execution-uncertain");
-        assert_eq!(journal.status(380)["receipt"]["execution_may_have_run"], true);
+        assert_eq!(
+            journal.status(380)["receipt"]["execution_may_have_run"],
+            true
+        );
     }
 
     #[cfg(unix)]
@@ -5403,7 +5483,10 @@ mod tests {
         assert_eq!(replies[0]["exit_code"], 130);
         assert_eq!(replies[0]["stop_reason"], "cancelled");
         assert_eq!(journal.status(390)["status"], "terminal-observed");
-        assert_eq!(journal.status(390)["receipt"]["execution_may_have_run"], false);
+        assert_eq!(
+            journal.status(390)["receipt"]["execution_may_have_run"],
+            false
+        );
         assert!(!runtime.exists());
         drop(journal);
 
@@ -5421,7 +5504,9 @@ mod tests {
             false,
             |request, timeout, _| {
                 launched.fetch_add(1, Ordering::SeqCst);
-                ExecutionTask::spawn(request.request_id, timeout, move |_| result(request.request_id))
+                ExecutionTask::spawn(request.request_id, timeout, move |_| {
+                    result(request.request_id)
+                })
             },
             pressure,
         ))

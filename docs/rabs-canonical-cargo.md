@@ -132,6 +132,10 @@ cargo build --locked --profile wrapper-release -p rabs-cli --bin rabs-cargo
 target/wrapper-release/rabs-cargo --worker WORKER.json \
   --rabsd /absolute/path/to/rabsd -- build --workspace
 
+target/wrapper-release/rabs-cargo --worker WORKER.json \
+  --rabsd /absolute/path/to/rabsd --stdin-file fixtures/request.bin \
+  -- run --bin application
+
 target/wrapper-release/rabs-cargo --remote REMOTE.json \
   --rabsd /absolute/path/to/rabsd --stdin closed -- run --bin application
 
@@ -159,8 +163,17 @@ service submissions require explicit closed or captured file input for `run`
 and executing `bench`; `test` defaults to EOF and also accepts captured input.
 `--stdin inherit` is available for direct local `run`, executing `test`, and
 executing `bench`, subject to the driver's noninteractive-input rules.
-`--worker` accepts an explicit `--stdin closed`; inherited input and
-`--stdin-file` are refused before creating an operation.
+`--worker` defaults to EOF and also accepts `--stdin-file` for `run`, executing
+`test`, and executing `bench`, with a **16 MiB** input limit. This works with a
+direct worker, a daemon-owned worker, or an ordered worker pool. The file must be
+an ordinary, nonsymlink member of the approved `source_root`; paths are relative
+to that root even when the Cargo manifest is in a subdirectory. The worker
+receives the exact snapshot bytes through an immutable descriptor, including
+empty files and binary input. Worker capability `source-file-stdin-v1` is checked
+before upload or execution; older workers refuse this request. Inherited input
+and captured input for compilation-only commands or `--no-run` are refused.
+Recovery retains the original source identity and input selection and never executes the
+command again to reproduce its input or result.
 
 The profile selects exactly one of an explicit physical `toolchain_root` or
 `"toolchain": "rustup"`. The Rustup option resolves the installed compiler in the

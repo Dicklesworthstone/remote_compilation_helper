@@ -176,6 +176,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
             dependency_context: None,
             jobserver_grant: requested_grant,
             command_context: CommandContext::default(),
+            captured_stdin: None,
         };
         let result = execute_canonical(
             &request,
@@ -272,6 +273,7 @@ fn canonical_action_observes_only_worker_authored_jobserver_env() {
         dependency_context: None,
         jobserver_grant: Some(2),
         command_context: CommandContext::default(),
+        captured_stdin: None,
     };
     let resources = ExecutionResources {
         slots: 6,
@@ -355,6 +357,7 @@ fn jobserver_setup_failure_refuses_execution() {
         dependency_context: None,
         jobserver_grant: Some(2),
         command_context: CommandContext::default(),
+        captured_stdin: None,
     };
     let result = execute_canonical(
         &request,
@@ -433,6 +436,7 @@ fn main() {
             ("EXACT_CONTEXT".into(), "spaces \"quotes\" $HOME\n雪".into()),
             ("EXPLICIT_EMPTY".into(), String::new()),
         ]).unwrap(),
+        captured_stdin: None,
     };
     let original = request.clone();
     let control = ExecutionControl::new(std::time::Duration::from_secs(120)).unwrap();
@@ -687,6 +691,7 @@ pub const INCLUDED: &str = include_str!("message.txt");
             args: args.clone(),
             command_context: CommandContext::default(),
             dependency_context: Some(context),
+            captured_stdin: None,
             toolchain_backing: visible_toolchain.clone(),
             toolchain_identity: Some(identity),
             workspace_backing: String::new(),
@@ -1219,6 +1224,7 @@ pub const SOURCE: &str = file!();
             args: args.clone(),
             command_context: CommandContext::default(),
             dependency_context: Some(context),
+            captured_stdin: None,
             toolchain_backing: toolchain.path().to_str().unwrap().to_owned(),
             toolchain_identity: Some(identity),
             workspace_backing: String::new(),

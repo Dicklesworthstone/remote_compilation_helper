@@ -291,6 +291,16 @@ fn execution_capabilities(
             "worker lacks required env-cwd-v1 command context capability",
         )?;
     }
+    if request.get("captured_stdin").is_some() {
+        require(
+            supports(
+                hello,
+                "captured_stdin_versions",
+                rabs_sandbox::captured_stdin::CAPTURED_STDIN_VERSION,
+            ),
+            "worker lacks required source-file-stdin-v1 execution input capability",
+        )?;
+    }
     if request.get("toolchain_identity").is_some() {
         require(
             supports(hello, "toolchain_datasets", TOOLCHAIN_DATASET_VERSION),
@@ -763,13 +773,15 @@ fn validate_request_fields(request: &Value) -> io::Result<()> {
     // The worker owns the backing directory for a transferred projection.
     // Validate its canonical manifest here, including the mutually exclusive
     // workspace_backing rule. Recovery validates identity without source bytes.
-    if super::source_manifest::request_manifest(request)?.is_none() {
+    let source_manifest = super::source_manifest::request_manifest(request)?;
+    if source_manifest.is_none() {
         let backing = text(request, "workspace_backing")?;
         require(
             !backing.is_empty() && !backing.contains('\0'),
             "invalid workspace backing",
         )?;
     }
+    rabs_sandbox::captured_stdin::validate_request(request, source_manifest.as_ref())?;
     if let Some(args) = request.get("args") {
         require(
             args.as_array().is_some_and(|args| {
@@ -1773,6 +1785,51 @@ mod tests {
         wrong_mode["dependency_context"]["execution_mode"] = json!("metadata");
         offered["dependency_execution_modes"] = json!(["metadata", "closed-metadata"]);
         assert!(validate_worker_execution_capabilities(&offered, &wrong_mode).is_err());
+    }
+
+    #[test]
+    fn captured_stdin_requires_worker_capability_before_upload_or_execution() {
+        let source = tempfile::tempdir().unwrap();
+        let (_upload, mut request) = source_request(source.path());
+        request["program"] = json!("/__rabs/toolchain/bin/cargo");
+        request["args"] = json!([
+            "run",
+            "--message-format=json",
+            "--target-dir=/__rabs/out/cargo"
+        ]);
+        request["artifacts"] = json!({"unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":"cargo-run-json-v1"});
+        request["captured_stdin"] = json!({"version":"source-file-stdin-v1", "path":"lib.rs"});
+        validate_request(&request).unwrap();
+        for versions in [
+            Value::Null,
+            json!("source-file-stdin-v1"),
+            json!([]),
+            json!(["source-file-stdin-v0"]),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let destination = parent.path().join("refused");
+            let mut peer = fixture(&destination);
+            peer.replies[0]["captured_stdin_versions"] = versions;
+            let error = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(!error.execution_may_have_run);
+            assert!(error.detail.contains("source-file-stdin-v1"));
+            assert!(
+                peer.sent.is_empty(),
+                "no admission, source upload or execution"
+            );
+            assert!(!destination.exists());
+        }
+        let mut hello = fixture(Path::new("/unused-stdin-capability")).replies[0].clone();
+        hello["captured_stdin_versions"] = json!(["source-file-stdin-v1"]);
+        validate_worker_execution_capabilities(&hello, &request).unwrap();
+        // Retrieval remains possible without reasserting execution capability.
+        hello
+            .as_object_mut()
+            .unwrap()
+            .remove("captured_stdin_versions");
+        delivery_capabilities(&hello, false).unwrap();
+        request["captured_stdin"]["path"] = json!("absent.bin");
+        assert!(validate_request(&request).is_err());
     }
 
     #[test]

@@ -594,6 +594,23 @@ impl SourceOwner {
         self.receiver.manifest()
     }
 
+    /// Runtime input can only come from this admitted, completely sealed upload.
+    /// The anonymous copy retains the manifest's bytes independently of later
+    /// source/cache cleanup and has no writable alias inside the namespace.
+    pub(crate) fn capture_stdin(
+        &self,
+        request_id: u64,
+        expected: &SourceFile,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<rabs_sandbox::captured_stdin::CapturedStdin> {
+        if !self.execution_owned || self.source_failed || self.request_id != request_id {
+            return Err(io::Error::other(
+                "captured stdin source does not match execution admission",
+            ));
+        }
+        rabs_sandbox::captured_stdin::CapturedStdin::capture(&self.receiver, expected, stopped)
+    }
+
     /// Only the exact admitted upload's explicit byte-reuse selection permits
     /// retaining its produced library bytes for later input negotiation. The
     /// source transfer's old cancellation/deadline owner is not carried into
@@ -2322,6 +2339,25 @@ mod tests {
         }
         state.handle(&seal(&manifest, 91), true, false).unwrap();
         state.take_prepared(&request).unwrap().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn captured_stdin_requires_the_exact_admitted_source_owner() {
+        let mut owner =
+            uploaded_dependency_bundle(&[("inputs/request.bin", b"\0input\xff", false)]);
+        let expected = owner.manifest().files()[0].clone();
+        assert!(owner.capture_stdin(92, &expected, &|| false).is_err());
+        let input = owner.capture_stdin(91, &expected, &|| false).unwrap();
+        input.verify(&|| false).unwrap();
+        owner.execution_owned = false;
+        assert!(owner.capture_stdin(91, &expected, &|| false).is_err());
+        owner.execution_owned = true;
+        owner.source_failed = true;
+        assert!(owner.capture_stdin(91, &expected, &|| false).is_err());
+        // The transferred descriptor's bytes outlive the upload/cache owner.
+        drop(owner);
+        input.verify(&|| false).unwrap();
     }
 
     #[test]

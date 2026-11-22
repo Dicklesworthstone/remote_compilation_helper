@@ -71,6 +71,7 @@ fn fixture_request() -> CanonicalExecRequest {
             "--offline".to_owned(),
         ],
         command_context: CommandContext::default(),
+        captured_stdin: None,
         dependency_context: None,
         toolchain_backing: "/private/toolchain".to_owned(),
         toolchain_identity: Some(ToolchainIdentity {

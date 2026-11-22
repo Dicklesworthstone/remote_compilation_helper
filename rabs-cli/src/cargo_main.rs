@@ -63,10 +63,12 @@ Worker profiles require an explicit command and retain the existing direct-worke
 contract: one pinned TLS endpoint, or an ordered worker pool with daemon_socket.
 The native driver captures inputs, allocates the request identity, executes once
 and returns verified artifacts. A private cargo-ID operation retains spec.json,
-operation.json and an optional pool.json for rabs-recover. Worker stdin is closed;
---stdin closed is accepted, while inherited or captured-file stdin is unavailable
-on this route. Profiles may select incremental state, jobserver_grant and daemon
-live_stderr. TLS credentials remain in the local driver environment.
+operation.json and an optional pool.json for rabs-recover. Worker stdin defaults
+to EOF. --stdin-file selects a captured source-relative regular file of at most
+16 MiB for run, executing test or bench; inherited stdin remains unavailable.
+The worker must support source-file-stdin-v1. Profiles may select incremental
+state, jobserver_grant and daemon live_stderr. TLS credentials remain in the
+local driver environment.
 
 Profiles select toolchain_root or toolchain: rustup. A leading +TOOLCHAIN requires
 the Rustup profile and a Cargo command. Discovery honors the caller's directory
