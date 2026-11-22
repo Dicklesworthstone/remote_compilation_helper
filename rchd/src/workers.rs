@@ -2385,6 +2385,20 @@ impl WorkerState {
         self.toolchain_preflight.write().await.invalidate();
     }
 
+    /// Join the current probe for this toolchain or become its scoped owner.
+    /// The registry lock never spans remote I/O, and dropping an owner removes
+    /// its entry even when selection is cancelled before a verdict is stored.
+    pub(crate) async fn claim_toolchain_preflight(
+        &self,
+        toolchain: &str,
+    ) -> ToolchainPreflightAdmission {
+        self.toolchain_preflight
+            .read()
+            .await
+            .flights
+            .claim(toolchain)
+    }
+
     /// Register the latest attempt for one toolchain before remote I/O.
     /// Different toolchains can probe concurrently. For the same toolchain,
     /// only the newest attempt may publish, regardless of completion order.
@@ -2802,6 +2816,7 @@ struct ToolchainPreflightCache {
     epoch: Arc<()>,
     probes: HashMap<String, Arc<()>>,
     verdicts: HashMap<String, ToolchainPreflightEvidence>,
+    flights: ToolchainPreflightFlights,
 }
 
 impl ToolchainPreflightCache {
@@ -2809,6 +2824,103 @@ impl ToolchainPreflightCache {
         self.epoch = Arc::new(());
         self.probes.clear();
         self.verdicts.clear();
+        self.flights.invalidate();
+    }
+}
+
+/// Only live probe owners occupy this registry. In particular, arbitrary
+/// requested toolchain names do not leave a permanent map of mutexes behind.
+#[derive(Debug, Default)]
+struct ToolchainPreflightFlights {
+    owners: Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<ToolchainPreflightFlight>>>>,
+}
+
+#[derive(Debug)]
+struct ToolchainPreflightFlight {
+    current: watch::Sender<bool>,
+}
+
+pub(crate) enum ToolchainPreflightAdmission {
+    Owner(ToolchainPreflightOwner),
+    Waiting(watch::Receiver<bool>),
+}
+
+pub(crate) struct ToolchainPreflightOwner {
+    toolchain: String,
+    flight: Arc<ToolchainPreflightFlight>,
+    owners: Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<ToolchainPreflightFlight>>>>,
+}
+
+impl ToolchainPreflightFlights {
+    fn claim(&self, toolchain: &str) -> ToolchainPreflightAdmission {
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(current) = owners.get(toolchain).and_then(std::sync::Weak::upgrade) {
+            return ToolchainPreflightAdmission::Waiting(current.current.subscribe());
+        }
+        let (current, _) = watch::channel(true);
+        let flight = Arc::new(ToolchainPreflightFlight { current });
+        owners.insert(toolchain.to_owned(), Arc::downgrade(&flight));
+        ToolchainPreflightAdmission::Owner(ToolchainPreflightOwner {
+            toolchain: toolchain.to_owned(),
+            flight,
+            owners: Arc::clone(&self.owners),
+        })
+    }
+
+    fn invalidate(&self) {
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for owner in owners.drain().filter_map(|(_, owner)| owner.upgrade()) {
+            // Wake existing waiters and cancel obsolete probe work. A fresh
+            // request can claim this toolchain without waiting for old I/O.
+            owner.current.send_replace(false);
+        }
+    }
+}
+
+impl ToolchainPreflightOwner {
+    pub(crate) fn run<F: std::future::Future>(
+        &mut self,
+        operation: F,
+    ) -> impl std::future::Future<Output = Option<F::Output>> {
+        // Match BackgroundProbe: box before an async state machine captures
+        // the large selection/SSH future, rather than storing it twice.
+        let operation = Box::pin(operation);
+        async move {
+            let mut current = self.flight.current.subscribe();
+            if !*current.borrow() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = current.changed() => None,
+                result = operation => (*current.borrow()).then_some(result),
+            }
+        }
+    }
+}
+
+impl Drop for ToolchainPreflightOwner {
+    fn drop(&mut self) {
+        let mut owners = self
+            .owners
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if owners
+            .get(&self.toolchain)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|owner| Arc::ptr_eq(&owner, &self.flight))
+        {
+            owners.remove(&self.toolchain);
+        }
+        // Completion, cancellation and unwind all release waiters. This is
+        // only a wakeup: they must reload current, fenced cache evidence.
+        self.flight.current.send_replace(false);
     }
 }
 
@@ -10091,6 +10203,51 @@ mod tests {
                 Some("retained failure")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn coalesced_toolchain_registry_reclaims_completed_cancelled_and_panicked_owners() {
+        let flights = ToolchainPreflightFlights::default();
+        for index in 0..128 {
+            let toolchain = format!("requested-toolchain-{index}");
+            let ToolchainPreflightAdmission::Owner(mut owner) = flights.claim(&toolchain) else {
+                panic!("an unused toolchain must have an owner");
+            };
+            let ToolchainPreflightAdmission::Waiting(mut waiter) = flights.claim(&toolchain) else {
+                panic!("the second request must wait for the first observation");
+            };
+            assert!(*waiter.borrow());
+            if index % 2 == 0 {
+                assert_eq!(owner.run(async { index }).await, Some(index));
+            }
+            // The odd cases cancel before polling any remote work. Neither
+            // those names nor successfully completed names remain registered.
+            drop(owner);
+            waiter.changed().await.unwrap();
+            assert!(!*waiter.borrow());
+            assert!(flights.owners.lock().unwrap().is_empty());
+        }
+
+        let ToolchainPreflightAdmission::Owner(owner) = flights.claim("panicked-toolchain") else {
+            panic!("the panic fixture must own its probe");
+        };
+        let ToolchainPreflightAdmission::Waiting(mut waiter) = flights.claim("panicked-toolchain")
+        else {
+            panic!("the second panic-fixture request must wait");
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owner = owner;
+            panic!("probe owner panic fixture");
+        }));
+        assert!(result.is_err());
+        waiter.changed().await.unwrap();
+        assert!(!*waiter.borrow());
+        assert!(flights.owners.lock().unwrap().is_empty());
+        assert!(matches!(
+            flights.claim("panicked-toolchain"),
+            ToolchainPreflightAdmission::Owner(_)
+        ));
+        assert!(flights.owners.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

@@ -24,7 +24,9 @@ use crate::metrics::{
     latency::{DecisionTimer, DecisionType},
 };
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
-use crate::workers::{WorkerEndpointSnapshot, WorkerPool, WorkerState};
+use crate::workers::{
+    ToolchainPreflightAdmission, WorkerEndpointSnapshot, WorkerPool, WorkerState,
+};
 use rand::RngExt;
 #[cfg(test)]
 use rch_common::WorkerCapabilities;
@@ -3429,7 +3431,7 @@ impl WorkerSelector {
     ) -> Option<String> {
         let toolchain_name = requirements.preflight_toolchain()?;
 
-        toolchain_preflight_with(worker, toolchain_name, |endpoint, deadline| {
+        coalesced_toolchain_preflight_with(worker, toolchain_name, |endpoint, deadline| {
             probe_worker_toolchain(endpoint, toolchain_name, self.ssh_pool.as_ref(), deadline)
         })
         .await
@@ -4508,6 +4510,90 @@ fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
 #[cfg(test)]
 mod exact_runtime_tests;
 
+fn toolchain_preflight_deadline() -> Option<tokio::time::Instant> {
+    // Keep the connect and command allowances, plus a fixed local teardown
+    // allowance. The same elapsed budget covers admission, SSH and cache
+    // publication, so a stalled local lock cannot extend remote evidence.
+    let budget = scale_duration(
+        TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT.saturating_add(TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT),
+    )
+    .saturating_add(Duration::from_secs(1))
+    .min(MAX_CONTROL_TIMEOUT);
+    tokio::time::Instant::now().checked_add(budget)
+}
+
+async fn coalesced_toolchain_preflight_with<F, Fut>(
+    worker: &WorkerState,
+    toolchain_name: &str,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce(rch_common::WorkerConfig, tokio::time::Instant) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let Some(deadline) = toolchain_preflight_deadline() else {
+        return Some("toolchain_preflight_timeout".to_string());
+    };
+    coalesced_toolchain_preflight_until(worker, toolchain_name, deadline, |endpoint| {
+        probe(endpoint, deadline)
+    })
+    .await
+}
+
+/// A cold cache is one shared observation, not one mutually superseding SSH
+/// probe per waiting build. Every caller retains its own original deadline;
+/// cancellation of the current owner wakes a successor without detached work.
+async fn coalesced_toolchain_preflight_until<F, Fut>(
+    worker: &WorkerState,
+    toolchain_name: &str,
+    deadline: tokio::time::Instant,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce(rch_common::WorkerConfig) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    if tokio::time::Instant::now() >= deadline {
+        return Some("toolchain_preflight_timeout".to_string());
+    }
+    let result = tokio::time::timeout_at(deadline, async {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Some("toolchain_preflight_timeout".to_string());
+            }
+            match worker.claim_toolchain_preflight(toolchain_name).await {
+                ToolchainPreflightAdmission::Waiting(mut changed) => {
+                    let running = *changed.borrow();
+                    if running {
+                        let _ = changed.changed().await;
+                    }
+                    // A wakeup is not a successful verdict. Claim again and
+                    // check the original endpoint/lifecycle-bound cache before
+                    // deciding whether another concrete probe is necessary.
+                }
+                ToolchainPreflightAdmission::Owner(mut owner) => {
+                    return owner
+                        .run(toolchain_preflight_until(
+                            worker,
+                            toolchain_name,
+                            deadline,
+                            probe,
+                        ))
+                        .await
+                        .unwrap_or_else(|| Some("toolchain_preflight_superseded".to_string()));
+                }
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(result) if tokio::time::Instant::now() < deadline => result,
+        _ => Some("toolchain_preflight_timeout".to_string()),
+    }
+}
+
+/// Exercise publication fencing independently of production coalescing.
+#[cfg(test)]
 async fn toolchain_preflight_with<F, Fut>(
     worker: &WorkerState,
     toolchain_name: &str,
@@ -4517,15 +4603,7 @@ where
     F: FnOnce(rch_common::WorkerConfig, tokio::time::Instant) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    // Keep the connect and command allowances, plus a fixed local teardown
-    // allowance. The same elapsed budget covers admission, SSH and cache
-    // publication, so a stalled local lock cannot extend remote evidence.
-    let budget = scale_duration(
-        TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT.saturating_add(TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT),
-    )
-    .saturating_add(Duration::from_secs(1))
-    .min(MAX_CONTROL_TIMEOUT);
-    let Some(deadline) = tokio::time::Instant::now().checked_add(budget) else {
+    let Some(deadline) = toolchain_preflight_deadline() else {
         return Some("toolchain_preflight_timeout".to_string());
     };
     toolchain_preflight_until(worker, toolchain_name, deadline, |endpoint| {
@@ -9237,6 +9315,280 @@ mod tests {
             std::task::Poll::Ready(())
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn coalesced_toolchain_preflight_burst_shares_one_current_verdict() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for usable in [false, true] {
+            let worker = Arc::new(make_worker("shared-toolchain", 8, 50.0));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let (release, completion) = tokio::sync::oneshot::channel();
+            let mut owner = Box::pin(coalesced_toolchain_preflight_with(
+                &worker,
+                "nightly",
+                |_, _| async move {
+                    observed_calls.fetch_add(1, Ordering::SeqCst);
+                    completion.await.unwrap()
+                },
+            ));
+            assert_toolchain_probe_pending(owner.as_mut()).await;
+
+            let mut callers = tokio::task::JoinSet::new();
+            let mut started = Vec::new();
+            for _ in 0..15 {
+                let worker = Arc::clone(&worker);
+                let (polled, started_rx) = tokio::sync::oneshot::channel();
+                started.push(started_rx);
+                callers.spawn(async move {
+                    let mut waiter = Box::pin(coalesced_toolchain_preflight_with(
+                        &worker,
+                        "nightly",
+                        |_, _| async {
+                            panic!("a follower must reuse the current completed verdict")
+                        },
+                    ));
+                    assert_toolchain_probe_pending(waiter.as_mut()).await;
+                    polled.send(()).unwrap();
+                    waiter.await
+                });
+            }
+            for started in started {
+                started.await.unwrap();
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            // Sharing is scoped to one toolchain on one worker. Independent
+            // useful capacity stays available while this concrete probe waits.
+            let independent = make_worker("independent-toolchain", 8, 50.0);
+            for (worker, toolchain) in [(&*worker, "stable"), (&independent, "nightly")] {
+                assert!(
+                    coalesced_toolchain_preflight_with(worker, toolchain, |_, _| async { Ok(()) })
+                        .await
+                        .is_none()
+                );
+            }
+
+            let verdict = if usable {
+                Ok(())
+            } else {
+                Err("toolchain_preflight_command_failed:1:not installed".to_owned())
+            };
+            let expected = verdict.clone().err();
+            release.send(verdict).unwrap();
+            assert_eq!(owner.await, expected);
+            let mut completed = 0;
+            while let Some(result) = callers.join_next().await {
+                assert_eq!(result.unwrap(), expected);
+                completed += 1;
+            }
+            assert_eq!(completed, 15);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let cached = worker.toolchain_preflight_status("nightly").await.unwrap();
+            assert_eq!(cached.usable, usable);
+            assert_eq!(cached.reason, expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_toolchain_waiter_deadline_does_not_cancel_the_owner() {
+        let worker = make_worker("toolchain-waiter-deadline", 8, 50.0);
+        let now = tokio::time::Instant::now();
+        let (release, completion) = tokio::sync::oneshot::channel();
+        let mut owner = Box::pin(coalesced_toolchain_preflight_until(
+            &worker,
+            "nightly",
+            now + Duration::from_secs(30),
+            |_| async { completion.await.unwrap() },
+        ));
+        assert_toolchain_probe_pending(owner.as_mut()).await;
+        let mut waiter = Box::pin(coalesced_toolchain_preflight_until(
+            &worker,
+            "nightly",
+            now + Duration::from_secs(1),
+            |_| async { panic!("an expired follower must not start remote I/O") },
+        ));
+        assert_toolchain_probe_pending(waiter.as_mut()).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(waiter.await.as_deref(), Some("toolchain_preflight_timeout"));
+        assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+        release.send(Ok(())).unwrap();
+        assert!(owner.await.is_none());
+        assert!(
+            worker
+                .toolchain_preflight_status("nightly")
+                .await
+                .unwrap()
+                .usable
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_toolchain_cancelled_owner_yields_without_renewing_waiter_deadline() {
+        for finish_in_time in [false, true] {
+            let worker = make_worker("toolchain-cancelled-owner", 8, 50.0);
+            let now = tokio::time::Instant::now();
+            let (release_old, old_completion) = tokio::sync::oneshot::channel();
+            let mut owner = Box::pin(coalesced_toolchain_preflight_until(
+                &worker,
+                "nightly",
+                now + Duration::from_secs(30),
+                |_| async { old_completion.await.unwrap() },
+            ));
+            assert_toolchain_probe_pending(owner.as_mut()).await;
+            let started = std::cell::Cell::new(false);
+            let (release_new, new_completion) = tokio::sync::oneshot::channel();
+            let mut waiter = Box::pin(coalesced_toolchain_preflight_until(
+                &worker,
+                "nightly",
+                now + Duration::from_secs(3),
+                |_| async {
+                    started.set(true);
+                    new_completion.await.unwrap()
+                },
+            ));
+            assert_toolchain_probe_pending(waiter.as_mut()).await;
+            assert!(!started.get());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            drop(owner);
+            assert!(
+                release_old.send(Ok(())).is_err(),
+                "cancelled probe must be dropped"
+            );
+            assert_toolchain_probe_pending(waiter.as_mut()).await;
+            assert!(
+                started.get(),
+                "a waiting build takes over the cancelled probe"
+            );
+
+            if finish_in_time {
+                release_new.send(Ok(())).unwrap();
+                assert!(waiter.await.is_none());
+                assert!(
+                    worker
+                        .toolchain_preflight_status("nightly")
+                        .await
+                        .unwrap()
+                        .usable
+                );
+            } else {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                assert_eq!(waiter.await.as_deref(), Some("toolchain_preflight_timeout"));
+                assert!(
+                    release_new.send(Ok(())).is_err(),
+                    "expired successor must be dropped"
+                );
+                assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+                assert!(
+                    coalesced_toolchain_preflight_until(
+                        &worker,
+                        "nightly",
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                        |_| async { Ok(()) },
+                    )
+                    .await
+                    .is_none(),
+                    "a later request must not inherit an abandoned flight"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_toolchain_refresh_wakes_waiters_and_fences_old_owners() {
+        for reload in [false, true] {
+            let worker = make_worker("toolchain-flight-refresh", 8, 50.0);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (release_old, old_completion) = tokio::sync::oneshot::channel();
+            let mut old = Box::pin(coalesced_toolchain_preflight_until(
+                &worker,
+                "nightly",
+                deadline,
+                |_| async { old_completion.await.unwrap() },
+            ));
+            assert_toolchain_probe_pending(old.as_mut()).await;
+            let started = std::cell::Cell::new(false);
+            let (release_new, new_completion) = tokio::sync::oneshot::channel();
+            let mut fresh = Box::pin(coalesced_toolchain_preflight_until(
+                &worker,
+                "nightly",
+                deadline,
+                |_| async {
+                    started.set(true);
+                    new_completion.await.unwrap()
+                },
+            ));
+            assert_toolchain_probe_pending(fresh.as_mut()).await;
+            if reload {
+                worker.invalidate_toolchain_preflight().await;
+            } else {
+                worker
+                    .set_capabilities(WorkerCapabilities::mock_with_rust())
+                    .await;
+            }
+            // The new generation can start before the obsolete probe is even
+            // polled again. Refresh does not wait for its network allowance.
+            assert_toolchain_probe_pending(fresh.as_mut()).await;
+            assert!(started.get());
+            release_old.send(Ok(())).unwrap();
+            assert_eq!(old.await.as_deref(), Some("toolchain_preflight_superseded"));
+            assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+
+            // Dropping the revoked owner must not erase the replacement's
+            // flight and let a third selection supersede the fresh probe.
+            let mut follower = Box::pin(coalesced_toolchain_preflight_until(
+                &worker,
+                "nightly",
+                deadline,
+                |_| async { panic!("a revoked owner cannot release its replacement") },
+            ));
+            assert_toolchain_probe_pending(follower.as_mut()).await;
+            let reason = "toolchain_preflight_command_failed:1:removed after refresh";
+            release_new.send(Err(reason.to_owned())).unwrap();
+            assert_eq!(fresh.await.as_deref(), Some(reason));
+            assert_eq!(follower.await.as_deref(), Some(reason));
+            let cached = worker.toolchain_preflight_status("nightly").await.unwrap();
+            assert!(!cached.usable);
+            assert_eq!(cached.reason.as_deref(), Some(reason));
+        }
+    }
+
+    #[tokio::test]
+    async fn coalesced_toolchain_disable_revokes_owner_and_never_probes_for_waiters() {
+        let worker = make_worker("toolchain-flight-disabled", 8, 50.0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (release, completion) = tokio::sync::oneshot::channel();
+        let mut owner = Box::pin(coalesced_toolchain_preflight_until(
+            &worker,
+            "nightly",
+            deadline,
+            |_| async { completion.await.unwrap() },
+        ));
+        assert_toolchain_probe_pending(owner.as_mut()).await;
+        let mut waiter = Box::pin(coalesced_toolchain_preflight_until(
+            &worker,
+            "nightly",
+            deadline,
+            |_| async { panic!("a disabled worker cannot start a successor probe") },
+        ));
+        assert_toolchain_probe_pending(waiter.as_mut()).await;
+        worker.disable(Some("operator request".to_owned())).await;
+        assert_eq!(
+            owner.await.as_deref(),
+            Some("toolchain_preflight_lifecycle_changed")
+        );
+        assert!(
+            release.send(Ok(())).is_err(),
+            "revoked remote work must be dropped"
+        );
+        assert_eq!(
+            waiter.await.as_deref(),
+            Some("toolchain_preflight_lifecycle_changed")
+        );
+        assert!(worker.toolchain_preflight_status("nightly").await.is_none());
+        assert!(worker.is_disabled().await);
     }
 
     #[test]
