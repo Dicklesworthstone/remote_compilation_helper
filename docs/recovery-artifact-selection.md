@@ -68,6 +68,14 @@ output is reported after completion, before publication, with the attempt retain
 root's own `.rchignore` keeps its existing guarded directory-only semantics;
 unlike the project configuration above, that file is removed by `cargo clean`.
 
+Before publication changes the recovery journal or destination, RCH rechecks the
+actual selected staged files against the retained Cargo output contract. A local
+`.rchignore` change cannot silently drop a required regular file or a file within
+a required bundle: a conflicting selection stops publication while retaining the
+stage and Cargo receipt. Correct the conflicting local ignore rule, then resume
+the same attempt with `rch jobs recover <wrapper-id>`; the completed build is not
+rerun.
+
 ## Make outputs that include non-deliverable test fixtures
 
 Make artifact discovery is intentionally broad: a project may produce ordinary

@@ -819,6 +819,23 @@ impl CargoOutputCapture {
 }
 
 impl CargoOutputContract {
+    /// Staged presence cannot prove delivery if the publication filters later
+    /// reject required files or any part of a required bundle. Check the exact
+    /// partition before the publisher changes its journal or destination.
+    pub(super) fn validate_publication_selection(&self, outside: &[PathBuf]) -> Result<()> {
+        for path in outside {
+            anyhow::ensure!(
+                !self.required_files.contains(path)
+                    && !path
+                        .ancestors()
+                        .any(|ancestor| self.required_directories.contains(ancestor)),
+                "required Cargo output is outside the effective publication policy: {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Verify the owned staging tree, never a pre-existing local executable
     /// that could hide a failed delivery. Symlinks anywhere below the stage
     /// root cannot satisfy a required executable, even when their targets exist.
@@ -3030,6 +3047,53 @@ mod tests {
                 .to_string()
                 .contains("symlink")
         );
+    }
+
+    #[test]
+    fn publication_selection_preserves_required_files_and_bundle_contents() {
+        let contract = CargoOutputContract {
+            required_files: [
+                PathBuf::from("target/lean/app"),
+                PathBuf::from("target/lean/deps/libsupport.rlib"),
+            ]
+            .into(),
+            required_directories: [PathBuf::from("target/lean/app.dSYM")].into(),
+        };
+        for excluded in [
+            "target/lean/app",
+            "target/lean/deps/libsupport.rlib",
+            "target/lean/app.dSYM",
+            "target/lean/app.dSYM/Contents/Info.plist",
+            "target/lean/app.dSYM/Contents/Resources/DWARF/app",
+        ] {
+            let error = contract
+                .validate_publication_selection(&[
+                    PathBuf::from("target/lean/.worker-cache/private"),
+                    PathBuf::from(excluded),
+                ])
+                .unwrap_err();
+            assert!(error.to_string().contains(excluded));
+        }
+        // Removing a whole bundle and removing only one member must both
+        // fail, even if other bundle files are still eligible for publication.
+        assert!(
+            contract
+                .validate_publication_selection(&[
+                    PathBuf::from("target/lean/app.dSYM/Contents/Info.plist"),
+                    PathBuf::from("target/lean/app.dSYM/Contents/Resources/DWARF/app"),
+                ])
+                .is_err()
+        );
+        contract.validate_publication_selection(&[]).unwrap();
+        contract
+            .validate_publication_selection(&[
+                PathBuf::from("target/lean/app-helper"),
+                PathBuf::from("target/lean/deps/libsupport.rlib.backup"),
+                PathBuf::from("target/lean/app.dSYM-other/Contents/Info.plist"),
+                PathBuf::from("other/target/lean/app.dSYM/Contents/Info.plist"),
+                PathBuf::from("target/lean/.worker-cache/private"),
+            ])
+            .unwrap();
     }
 
     #[test]
