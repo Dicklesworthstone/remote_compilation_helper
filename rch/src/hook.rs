@@ -6937,6 +6937,7 @@ mod progress_reporting;
 // telemetry-forwarding helpers) lives in the `transfer_orchestration` submodule.
 // `execute_remote_compilation` is imported so `run_hook` / `run_exec` call it
 // unqualified.
+mod go_workspace;
 mod node_workspace;
 mod transfer_orchestration;
 use transfer_orchestration::execute_remote_compilation;

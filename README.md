@@ -97,7 +97,30 @@ test binary. The binary uses the same fresh-file publication and collection-only
 recovery as `go build`, and its caches and temporary files stay outside the
 selected source tree.
 Package discovery for implicit builds and compile-only tests requires Go 1.18
-or newer with workspace mode disabled. Test profiling, fuzz corpora, and
+or newer. Go modules and workspaces preserve the invocation directory while
+uploading the complete admitted source root. RCH asks the caller's Go executable
+for the selected `GOMOD` and `GOWORK`, then reads Go's parsed `use` and `replace`
+declarations. Workspace members and effective relative local replacements must
+remain inside the selected workspace directory. A standalone module can include
+sibling replacements inside its enclosing Git repository. Nested package
+invocations, including `go build`, `go test -c`, ordinary `go test`, and `go vet`,
+retain their original command and output paths.
+
+Go's selected control files must be included by the actual source transfer;
+`.rchignore` cannot leave a stale worker manifest in place. Before execution the
+native worker verifies their exact bytes, absent sum files, and selected module.
+Both package discovery and workspace execution use a private workspace copy
+outside the sources, with member paths relocated by Go itself. This preserves
+explicit `GOWORK` selection and keeps generated workspace sums and runtime
+caches out of the source tree. Ordinary tests support common controls such as
+`-run`, `-count`, `-timeout`, `-race`, and `-vet`; source closure requires empty
+`GOFLAGS` and the durable Unix worker path.
+
+Absolute local declarations, symlinked or escaping source paths, alternate
+module/overlay files, and unbounded command forms remain unsupported. Workspace
+vendoring is supported when it does not combine with local replacements:
+Go records those replacement spellings in `vendor/modules.txt`, so that
+combination is refused rather than changing its resolution. Test profiling, fuzz corpora, and
 output-producing test execution (`-coverprofile`, `-cpuprofile`, `-trace`, `-fuzz`,
 `-o` without `-c`, and related `-test.*` forms)
 stay local. Strict remote mode refuses unsupported forms instead of executing

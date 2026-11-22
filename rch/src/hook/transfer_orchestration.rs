@@ -383,6 +383,35 @@ async fn validate_clean_overlay_source_inputs(
     spec.verify_overlay_unchanged(root)
 }
 
+/// Go control files must belong to the whole selected source image. A live
+/// clean-overlay upload contains only its changed paths; unchanged controls
+/// still arrive through the pinned Git archive. Ordinary uploads retain their
+/// exact rsync/.rchignore selection, and receipt mode reuses its captured image.
+async fn go_source_files_for_transfer(
+    root: &Path,
+    pipeline: &TransferPipeline,
+    prepared: Option<&PreparedSourceContentRoot>,
+    clean_overlay: Option<&CleanOverlaySpec>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if let Some(prepared) = prepared {
+        return Ok(prepared.selected_file_paths());
+    }
+    if let Some(spec) = clean_overlay {
+        return Ok(super::selected_clean_overlay_cargo_tree(root, spec, false)
+            .await?
+            .into_iter()
+            .filter_map(|(path, entry)| {
+                matches!(
+                    entry,
+                    rch_common::cargo_path_deps::SelectedCargoEntry::File(_)
+                )
+                .then_some(path)
+            })
+            .collect());
+    }
+    Ok(pipeline.enumerate_source_content_selection().await?.0)
+}
+
 pub(super) fn source_sync_terminal_summary(
     attempts: &[crate::transfer::TransferAttemptDiagnostic],
     clean_overlay: bool,
@@ -1205,6 +1234,19 @@ async fn execute_remote_compilation_inner(
         reporter.verbose(&format!("[RCH] project path normalized: {}", decision));
     }
     let normalized_invocation_root = normalized_project.canonical_path().to_path_buf();
+    let go_source_plan = if matches!(
+        kind,
+        Some(CompilationKind::GoBuild | CompilationKind::GoTest | CompilationKind::GoVet)
+    ) {
+        super::artifact_patterns::direct_compiler::discover_go_source(
+            command,
+            &normalized_invocation_root,
+            topology_policy,
+        )
+        .await?
+    } else {
+        None
+    };
     let normalized_project_root = if let Some(spec) = clean_overlay {
         anyhow::ensure!(
             normalized_invocation_root == spec.invocation_root(),
@@ -1216,7 +1258,15 @@ async fn execute_remote_compilation_inner(
             root.canonical_path() == spec.repository_root,
             "clean-overlay Git root changed after admission"
         );
+        if let Some(plan) = &go_source_plan {
+            anyhow::ensure!(
+                plan.source_root.starts_with(&spec.repository_root),
+                "Go source closure escapes its selected clean-overlay repository"
+            );
+        }
         spec.repository_root.clone()
+    } else if let Some(plan) = &go_source_plan {
+        plan.source_root.clone()
     } else {
         super::node_workspace::source_root(&normalized_invocation_root, kind, topology_policy)?
     };
@@ -1225,6 +1275,14 @@ async fn execute_remote_compilation_inner(
     // needs drive-letter paths, so their whole remote layout lives under the
     // Windows build base and syncs via tar-over-ssh (no rsync/streaming).
     let worker_is_windows = WorkerPlatform::from_worker(&worker_config).is_windows();
+    if go_source_plan.is_some() {
+        anyhow::ensure!(
+            !worker_is_windows
+                && durable_lease.is_some()
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "Go module/workspace source closure requires the durable Unix worker path"
+        );
+    }
     anyhow::ensure!(
         !worker_is_windows
             || clean_overlay.is_none_or(|spec| spec.invocation_directory.as_os_str().is_empty()),
@@ -1249,10 +1307,11 @@ async fn execute_remote_compilation_inner(
             "Go output delivery requires the durable Unix worker path"
         );
         Some(
-            super::artifact_patterns::direct_compiler::validate_go_build_output(
+            super::artifact_patterns::direct_compiler::validate_go_build_output_in_source(
                 command,
                 &normalized_invocation_root,
                 &normalized_project_root,
+                go_source_plan.as_ref(),
             )
             .await?,
         )
@@ -1548,6 +1607,11 @@ async fn execute_remote_compilation_inner(
             topology_policy,
         )
     };
+    if go_source_plan.is_some() && clean_overlay.is_none() {
+        // Go's selected work/module graph already supplies the complete root.
+        // An unrelated enclosing Cargo workspace cannot add source authority.
+        sync_plan.retain(|entry| entry.is_primary);
+    }
     let mut coalesced_source_roots = std::collections::BTreeMap::new();
     if source_content_receipt && clean_overlay.is_none() {
         (sync_plan, coalesced_source_roots) = coalesce_source_content_plan(
@@ -1869,7 +1933,7 @@ async fn execute_remote_compilation_inner(
         clean_overlay.is_some() || owned_source_content_pair,
         &transfer_config.remote_base,
     );
-    let pooled_target_dir_override = if go_build_environment.is_some() {
+    let pooled_target_dir_override = if go_build_environment.is_some() || go_source_plan.is_some() {
         let base = pooled_store_base_for(
             false,
             pooled_target_store_base,
@@ -2208,6 +2272,7 @@ async fn execute_remote_compilation_inner(
         .with_compilation_config(compilation_config.clone())
         .with_compilation_kind(kind)
         .with_go_test_output(go_test_output)
+        .with_go_source_closure(go_source_plan.is_some())
         .with_remote_path_override(entry.remote_root.clone())
         .with_worker_platform(WorkerPlatform::from_worker(&worker_config))
         .with_build_id(build_id)
@@ -2274,7 +2339,7 @@ async fn execute_remote_compilation_inner(
         }
         root_pipeline = apply_source_sync_integrity_policy(
             root_pipeline,
-            exact_dependency_closure_sync,
+            exact_dependency_closure_sync || go_source_plan.is_some(),
             source_content_receipt,
         );
         if root_overlay.is_some()
@@ -2325,12 +2390,33 @@ async fn execute_remote_compilation_inner(
             .await?;
         }
 
+        if entry.is_primary
+            && let Some(plan) = &go_source_plan
+        {
+            let selected = go_source_files_for_transfer(
+                &entry.local_root,
+                &root_pipeline,
+                prepared_source_root.as_ref(),
+                root_overlay,
+            )
+            .await?;
+            super::artifact_patterns::direct_compiler::verify_go_source_selection(
+                plan,
+                &entry.local_root,
+                &selected,
+                topology_policy,
+            )?;
+        }
+
         if let Some(spec) = root_overlay {
             reporter.verbose(&format!(
                 "[RCH] clean-overlay transfer estimator bypassed for immutable base {}",
                 spec.base_commit()
             ));
-        } else if exact_dependency_closure_sync || source_content_receipt {
+        } else if exact_dependency_closure_sync
+            || source_content_receipt
+            || go_source_plan.is_some()
+        {
             reporter.verbose(&format!(
                 "[RCH] exact source sync required; bypassing transfer estimator for {}",
                 entry.local_root.display()
@@ -3089,6 +3175,19 @@ async fn execute_remote_compilation_inner(
                 Some(&runtime),
             )
             .context("Go build lost its validated file output contract")?,
+        )
+    } else if let Some(plan) = &go_source_plan {
+        let runtime = pipeline
+            .managed_go_runtime_environment()
+            .context("Go source closure lost its granted runtime environment")?;
+        Some(
+            super::artifact_patterns::direct_compiler::go_source_execution_command(
+                command,
+                &normalized_invocation_root,
+                &normalized_project_root,
+                plan,
+                &runtime,
+            )?,
         )
     } else {
         None
@@ -4468,6 +4567,151 @@ async fn execute_remote_compilation_inner(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_clean_overlay_selection_includes_pinned_controls_without_receipt() {
+        use super::super::go_workspace::GoSourcePlan;
+        use super::*;
+
+        let storage = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let root = storage.join("project");
+        std::fs::create_dir(&root).unwrap();
+        let manifest = "module example.invalid/selection\n\ngo 1.23\n";
+        std::fs::write(root.join("go.mod"), manifest).unwrap();
+        std::fs::write(root.join("main.go"), "package main\nfunc main() {}\n").unwrap();
+        std::fs::write(root.join("removed.txt"), "selected deletion\n").unwrap();
+        git_output(&root, &["init", "-q", "-b", "main"])
+            .await
+            .unwrap();
+        git_output(&root, &["add", "."]).await.unwrap();
+        git_output(
+            &root,
+            &[
+                "-c",
+                "user.name=RCH Test",
+                "-c",
+                "user.email=rch-test@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "selected Go base",
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            root.join("main.go"),
+            "package main\nfunc main() { println(1) }\n",
+        )
+        .unwrap();
+        std::fs::rename(
+            root.join("removed.txt"),
+            storage.join("retained-removed.txt"),
+        )
+        .unwrap();
+        std::fs::write(root.join("ambient.go"), "unselected working-tree input\n").unwrap();
+        let spec = prepare_clean_overlay_spec(
+            &root,
+            Some("HEAD".into()),
+            true,
+            vec![PathBuf::from("main.go"), PathBuf::from("removed.txt")],
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pipeline = TransferPipeline::new(
+            root.clone(),
+            "go-selection".into(),
+            "selection-hash".into(),
+            TransferConfig::default(),
+        )
+        .with_sync_include_patterns(
+            clean_overlay_include_patterns(&root, &spec.live_overlay_paths()).unwrap(),
+        )
+        .with_clean_overlay_deletions(&spec.overlay_deletions)
+        .unwrap()
+        .with_sync_delete(false)
+        .with_sync_checksum(true);
+        let overlay_only = pipeline
+            .enumerate_source_content_selection()
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(overlay_only, vec![PathBuf::from("main.go")]);
+        let selected = go_source_files_for_transfer(&root, &pipeline, None, Some(&spec))
+            .await
+            .unwrap();
+        assert!(selected.contains(&PathBuf::from("go.mod")));
+        assert!(selected.contains(&PathBuf::from("main.go")));
+        assert!(!selected.contains(&PathBuf::from("removed.txt")));
+        assert!(!selected.contains(&PathBuf::from("ambient.go")));
+        let plan = GoSourcePlan {
+            source_root: root.clone(),
+            selected_module: Some(root.join("go.mod")),
+            workspace: None,
+            required_files: [(root.join("go.mod"), manifest.to_owned())].into(),
+            absent_files: vec![root.join("go.sum")],
+            workspace_edit_args: Vec::new(),
+        };
+        let topology = PathTopologyPolicy::new(storage.clone(), storage.join("alias"));
+        super::super::artifact_patterns::direct_compiler::verify_go_source_selection(
+            &plan, &root, &selected, &topology,
+        )
+        .unwrap();
+        let base_only = prepare_clean_overlay_spec(&root, Some("HEAD".into()), true, vec![], true)
+            .await
+            .unwrap()
+            .unwrap();
+        let base_selected = go_source_files_for_transfer(&root, &pipeline, None, Some(&base_only))
+            .await
+            .unwrap();
+        assert!(base_selected.contains(&PathBuf::from("go.mod")));
+        assert!(base_selected.contains(&PathBuf::from("removed.txt")));
+        assert!(!base_selected.contains(&PathBuf::from("ambient.go")));
+
+        // Expanding the overlay image must not admit an excluded control in
+        // the ordinary rsync path, nor relax byte and absent-file witnesses.
+        std::fs::write(root.join(".rchignore"), "go.mod\n").unwrap();
+        let ordinary = TransferPipeline::new(
+            root.clone(),
+            "go-selection".into(),
+            "selection-hash".into(),
+            TransferConfig::default(),
+        );
+        let ordinary_selected = go_source_files_for_transfer(&root, &ordinary, None, None)
+            .await
+            .unwrap();
+        assert!(!ordinary_selected.contains(&PathBuf::from("go.mod")));
+        assert!(
+            super::super::artifact_patterns::direct_compiler::verify_go_source_selection(
+                &plan,
+                &root,
+                &ordinary_selected,
+                &topology,
+            )
+            .is_err()
+        );
+        std::fs::write(root.join("go.mod"), "module example.invalid/changed\n").unwrap();
+        assert!(
+            super::super::artifact_patterns::direct_compiler::verify_go_source_selection(
+                &plan, &root, &selected, &topology,
+            )
+            .is_err()
+        );
+        std::fs::write(root.join("go.mod"), manifest).unwrap();
+        std::fs::write(root.join("go.sum"), "newly appeared\n").unwrap();
+        assert!(
+            super::super::artifact_patterns::direct_compiler::verify_go_source_selection(
+                &plan, &root, &selected, &topology,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn ordinary_node_workspace_plan_owns_full_root_and_rebases_execution_and_retrieval() {
         use super::*;

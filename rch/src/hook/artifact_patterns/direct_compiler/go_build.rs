@@ -11,9 +11,11 @@
 //! worker before compilation. Its package-index cache is disabled.
 
 use super::{NativeOutputContract, compiler_arguments, literal_words};
+use crate::hook::go_workspace::{self, GoSourcePlan};
 use anyhow::{Context, Result, ensure};
+use rch_common::path_topology::PathTopologyPolicy;
 use rch_common::patterns::GoBuildOutput;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 const MAX_PROBE_BYTES: usize = 65_536;
@@ -106,6 +108,593 @@ impl LocalProbeRuntime {
         }
         anyhow::bail!("no private Go control temporary directory outside protected source")
     }
+}
+
+/// A bounded command grammar shared with exact Go output admission. Streaming
+/// tests add only test controls that do not introduce another input/output
+/// path; their original argv is preserved for execution.
+fn source_packages(command: &str) -> Option<Vec<String>> {
+    if let Some(invocation) = invocation(command) {
+        return Some(invocation.packages);
+    }
+    let args = compiler_arguments(command, &["go"])?;
+    let subcommand = args.first()?.as_str();
+    if !matches!(subcommand, "test" | "vet") {
+        return None;
+    }
+    let mut query = if subcommand == "test" {
+        vec!["go".to_owned(), "test".to_owned(), "-c".to_owned()]
+    } else {
+        vec!["go".to_owned(), "build".to_owned()]
+    };
+    let mut index = 1;
+    while let Some(argument) = args.get(index) {
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(flag, value)| {
+                (flag, Some(value))
+            });
+        if subcommand == "test"
+            && matches!(
+                flag,
+                "-run"
+                    | "-skip"
+                    | "-count"
+                    | "-timeout"
+                    | "-parallel"
+                    | "-bench"
+                    | "-benchtime"
+                    | "-shuffle"
+                    | "-cpu"
+                    | "-list"
+                    | "-vet"
+            )
+        {
+            if inline.is_none() {
+                index += 1;
+                args.get(index)?;
+            }
+        } else if subcommand == "test"
+            && matches!(
+                flag,
+                "-benchmem" | "-json" | "-failfast" | "-short" | "-fullpath"
+            )
+        {
+            if inline.is_some_and(|value| !matches!(value, "true" | "false")) {
+                return None;
+            }
+        } else {
+            query.push(argument.clone());
+            if inline.is_none()
+                && matches!(
+                    flag,
+                    "-buildmode"
+                        | "-compiler"
+                        | "-p"
+                        | "-tags"
+                        | "-covermode"
+                        | "-coverpkg"
+                        | "-ldflags"
+                        | "-mod"
+                )
+            {
+                index += 1;
+                query.push(args.get(index)?.clone());
+            }
+        }
+        index += 1;
+    }
+    let query = shell_words::join(query);
+    if subcommand == "test" {
+        let parsed = rch_common::patterns::go_test_invocation(&query)?;
+        parsed.output.is_none().then_some(parsed.packages)
+    } else {
+        let parsed = rch_common::patterns::go_build_invocation(&query)?;
+        parsed.output.is_none().then_some(parsed.packages)
+    }
+}
+
+async fn metadata_json(
+    command: &str,
+    invocation_root: &Path,
+    runtime: &LocalProbeRuntime,
+    topology: &PathTopologyPolicy,
+    path: &Path,
+    workspace: bool,
+    index: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    // `edit -json` reads this immutable private copy. A source edit cannot
+    // associate one graph's JSON with another graph's transferred manifest.
+    let bytes = go_workspace::read_control_file(path, topology)?;
+    let copied = runtime._directory.path().join(format!(
+        "manifest-{index}.{}",
+        if workspace { "work" } else { "mod" }
+    ));
+    std::fs::write(&copied, &bytes).context("capture Go discovery manifest")?;
+    let copied = shell_escape::escape(copied.to_str().context("non-UTF-8 Go probe path")?.into());
+    let subcommand = if workspace { "work" } else { "mod" };
+    let query = shell_command(
+        command,
+        format!(
+            "{}GOWORK=off GOTOOLCHAIN=local \"$rch_go\" {subcommand} edit -json {copied}",
+            runtime.assignments
+        ),
+        &[],
+    )
+    .context("Go source discovery has unsupported wrappers")?;
+    Ok((bytes, probe(&query, invocation_root, deadline).await?))
+}
+
+/// Ask the selected Go executable which module/workspace it really uses, then
+/// close the declared local module graph before choosing a transfer root.
+pub(in crate::hook) async fn discover_go_source(
+    command: &str,
+    invocation_root: &Path,
+    topology: &PathTopologyPolicy,
+) -> Result<Option<GoSourcePlan>> {
+    let packages = source_packages(command)
+        .context("Go source closure requires supported literal build/test/vet arguments")?;
+    // The eventual module/workspace root may be an ancestor of the cwd. Keep
+    // discovery scratch outside the entire admitted topology until that
+    // boundary is known, not merely outside the invoking package directory.
+    let runtime = LocalProbeRuntime::create(topology.canonical_root())?;
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    let query = shell_command(
+        command,
+        format!(
+            "{}GOTOOLCHAIN=local \"$rch_go\" env -json GOMOD GOWORK GOFLAGS",
+            runtime.assignments
+        ),
+        &[],
+    )
+    .context("Go source discovery has unsupported wrappers")?;
+    let settings: BTreeMap<String, String> =
+        serde_json::from_slice(&probe(&query, invocation_root, deadline).await?)
+            .context("invalid selected Go source environment")?;
+    ensure!(
+        settings.len() == 3
+            && ["GOMOD", "GOWORK", "GOFLAGS"]
+                .iter()
+                .all(|name| settings.contains_key(*name))
+            && settings["GOFLAGS"].is_empty(),
+        "Go source closure requires empty GOFLAGS and a complete module environment"
+    );
+    let selected = |name: &str, sentinels: &[&str]| -> Result<Option<PathBuf>> {
+        let value = &settings[name];
+        if sentinels.contains(&value.as_str()) {
+            return Ok(None);
+        }
+        let path = PathBuf::from(value);
+        ensure!(
+            path.is_absolute() && !value.chars().any(char::is_control),
+            "Go selected an invalid {name} path"
+        );
+        Ok(Some(path))
+    };
+    let module = selected("GOMOD", &["", "/dev/null"])?;
+    let workspace = selected("GOWORK", &["", "off"])?;
+    if module.is_none() && workspace.is_none() {
+        return Ok(None);
+    }
+    let mut captured = BTreeMap::new();
+    let workspace_json = if let Some(path) = &workspace {
+        let (bytes, json) = metadata_json(
+            command,
+            invocation_root,
+            &runtime,
+            topology,
+            path,
+            true,
+            0,
+            deadline,
+        )
+        .await?;
+        captured.insert(path.clone(), bytes);
+        Some(json)
+    } else {
+        None
+    };
+    let modules = match (&workspace, &workspace_json) {
+        (Some(path), Some(json)) => go_workspace::workspace_modules(path, json, topology)?,
+        _ => vec![
+            module
+                .as_ref()
+                .context("Go module selection disappeared")?
+                .parent()
+                .context("Go module has no source directory")?
+                .to_owned(),
+        ],
+    };
+    let mut module_json = BTreeMap::new();
+    for (index, root) in modules.into_iter().enumerate() {
+        let path = root.join("go.mod");
+        let (bytes, json) = metadata_json(
+            command,
+            invocation_root,
+            &runtime,
+            topology,
+            &path,
+            false,
+            index + 1,
+            deadline,
+        )
+        .await?;
+        captured.insert(path, bytes);
+        module_json.insert(root, json);
+    }
+    let plan = go_workspace::plan(
+        invocation_root,
+        module.as_deref(),
+        workspace.as_deref(),
+        workspace_json.as_deref(),
+        &module_json,
+        topology,
+    )?;
+    for (path, bytes) in captured {
+        ensure!(
+            plan.required_files
+                .get(&path)
+                .is_some_and(|content| content.as_bytes() == bytes),
+            "Go control input changed while discovering its source closure: {}",
+            path.display()
+        );
+    }
+    for package in packages {
+        if package.starts_with('.') || package.ends_with(".go") || Path::new(&package).is_absolute()
+        {
+            ensure!(
+                !Path::new(&package).is_absolute(),
+                "absolute Go package inputs are unsupported"
+            );
+            let mut path = invocation_root.to_owned();
+            for part in Path::new(&package).components() {
+                match part {
+                    Component::CurDir => {}
+                    Component::ParentDir => {
+                        ensure!(path.pop(), "Go package escapes its source root");
+                    }
+                    Component::Normal(name) if name == "..." => break,
+                    Component::Normal(name) => path.push(name),
+                    _ => anyhow::bail!("invalid Go package path"),
+                }
+                ensure!(
+                    path.starts_with(&plan.source_root),
+                    "Go package is outside its source closure"
+                );
+                if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+                    ensure!(
+                        !metadata.file_type().is_symlink(),
+                        "Go package input contains a symlink"
+                    );
+                }
+            }
+        }
+    }
+    Ok(Some(plan))
+}
+
+/// Use the upload's actual selected file paths, not another interpretation of
+/// .rchignore. Retained excluded control files cannot satisfy this closure.
+pub(in crate::hook) fn verify_go_source_selection(
+    plan: &GoSourcePlan,
+    transfer_root: &Path,
+    selected: &[PathBuf],
+    topology: &PathTopologyPolicy,
+) -> Result<()> {
+    let selected: BTreeSet<_> = selected.iter().collect();
+    for (path, expected) in &plan.required_files {
+        let relative = path
+            .strip_prefix(transfer_root)
+            .context("Go source input is outside its covering transfer")?;
+        ensure!(
+            selected.contains(&relative.to_path_buf()),
+            "required Go source input {} is excluded from the actual source transfer",
+            path.display()
+        );
+        ensure!(
+            go_workspace::read_control_file(path, topology)? == expected.as_bytes(),
+            "Go source input changed after closure discovery: {}",
+            path.display()
+        );
+    }
+    for path in &plan.absent_files {
+        ensure!(
+            matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "absent Go source input appeared after closure discovery: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn relative_source_path<'a>(root: &Path, path: &'a Path) -> Result<&'a str> {
+    let relative = path
+        .strip_prefix(root)
+        .context("Go control input escaped source root")?;
+    ensure!(
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "invalid relative Go control input"
+    );
+    let text = relative.to_str().context("non-UTF-8 Go control input")?;
+    ensure!(
+        !text.chars().any(char::is_control),
+        "Go control input contains control characters"
+    );
+    Ok(text)
+}
+
+#[derive(Clone, Debug)]
+struct GoSourceGuard {
+    source_ancestors: usize,
+    manifest: String,
+    file_count: usize,
+    byte_count: usize,
+    absent: Vec<String>,
+    workspace: Option<String>,
+    workspace_sum: bool,
+    workspace_vendor: bool,
+    workspace_edits: String,
+    selected_module: Option<String>,
+}
+
+impl GoSourceGuard {
+    fn new(plan: &GoSourcePlan, invocation_root: &Path) -> Result<Self> {
+        use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut manifest = String::new();
+        let mut byte_count = 0;
+        for (path, bytes) in &plan.required_files {
+            let relative = relative_source_path(&plan.source_root, path)?;
+            let mode = usize::from(std::fs::metadata(path)?.permissions().mode() & 0o111 != 0);
+            let mut hash = String::with_capacity(64);
+            for byte in Sha256::digest(bytes.as_bytes()) {
+                write!(hash, "{byte:02x}")?;
+            }
+            manifest.push_str(&format!("{hash}\t{}\t{mode}\t{relative}\n", bytes.len()));
+            byte_count += bytes.len();
+        }
+        let mut workspace_edits = String::new();
+        for argument in &plan.workspace_edit_args {
+            let edit = if argument.starts_with("-dropuse=") {
+                shell_escape::escape(argument.as_str().into()).into_owned()
+            } else {
+                let (prefix, path) = if let Some(path) = argument.strip_prefix("-use=") {
+                    ("-use=".to_owned(), path)
+                } else {
+                    let (identity, path) = argument
+                        .strip_prefix("-replace=")
+                        .and_then(|value| value.split_once('='))
+                        .context("invalid Go workspace relocation argument")?;
+                    (format!("-replace={identity}="), path)
+                };
+                let relative = if Path::new(path) == plan.source_root {
+                    "."
+                } else {
+                    relative_source_path(&plan.source_root, Path::new(path))?
+                };
+                format!(
+                    "{}\"$rch_go_closure_root\"/{}",
+                    shell_escape::escape(prefix.into()),
+                    shell_escape::escape(relative.into())
+                )
+            };
+            workspace_edits.push(' ');
+            workspace_edits.push_str(&edit);
+        }
+        let workspace = plan
+            .workspace
+            .as_ref()
+            .map(|path| relative_source_path(&plan.source_root, path).map(str::to_owned))
+            .transpose()?;
+        let workspace_sum = plan.workspace.as_ref().is_some_and(|path| {
+            let mut sum = path.as_os_str().to_os_string();
+            sum.push(".sum");
+            plan.required_files.contains_key(&PathBuf::from(sum))
+        });
+        Ok(Self {
+            source_ancestors: source_ancestor_depth(invocation_root, &plan.source_root)?,
+            manifest,
+            file_count: plan.required_files.len(),
+            byte_count,
+            absent: plan
+                .absent_files
+                .iter()
+                .map(|path| relative_source_path(&plan.source_root, path).map(str::to_owned))
+                .collect::<Result<_>>()?,
+            workspace,
+            workspace_sum,
+            workspace_vendor: plan
+                .required_files
+                .contains_key(&plan.source_root.join("vendor/modules.txt")),
+            workspace_edits,
+            selected_module: plan
+                .selected_module
+                .as_ref()
+                .map(|path| relative_source_path(&plan.source_root, path).map(str::to_owned))
+                .transpose()?,
+        })
+    }
+
+    fn worker_setup(&self) -> String {
+        let source = ancestor_path(self.source_ancestors);
+        let mut script = format!(
+            "CDPATH= cd -P . || exit 113; \
+             rch_go_closure_root=$(CDPATH= cd -P {source} && pwd -P) || exit 113; \
+             {}\n\
+             if ! rch_wkr_locate || \
+                ! rch_go_verifier=$(\"$RCH_WKR\" verify-source-content probe </dev/null 2>/dev/null) || \
+                [ \"$rch_go_verifier\" != RCH_SOURCE_CONTENT_VERIFIER_V1 ]; then \
+               printf '%s\\n' 'RCH: Go source verification requires an up-to-date rch-wkr' >&2; exit 113; fi; \
+             printf '%s' {} | \"$RCH_WKR\" verify-source-content verify \
+               \"$rch_go_closure_root\" {} {} >/dev/null || exit 113; ",
+            rch_common::wkr_locate::WKR_LOCATE_SHELL,
+            shell_escape::escape(self.manifest.as_str().into()),
+            self.file_count,
+            self.byte_count,
+        );
+        for path in &self.absent {
+            let path = shell_escape::escape(path.as_str().into());
+            script.push_str(&format!(
+                "if [ -e \"$rch_go_closure_root\"/{path} ] || [ -L \"$rch_go_closure_root\"/{path} ]; then \
+                 printf '%s\\n' 'RCH: worker has a stale Go control input absent from the dispatcher' >&2; exit 113; fi; "
+            ));
+        }
+        if let Some(workspace) = &self.workspace {
+            let workspace = shell_escape::escape(workspace.as_str().into());
+            script.push_str(&format!(
+                "cp \"$rch_go_closure_root\"/{workspace} \"$rch_go_build/selection.work\" || exit 113; "
+            ));
+            if self.workspace_sum {
+                script.push_str(&format!(
+                    "cp \"$rch_go_closure_root\"/{workspace}.sum \"$rch_go_build/selection.work.sum\" || exit 113; "
+                ));
+            }
+            if self.workspace_vendor {
+                script.push_str(
+                    "ln -s \"$rch_go_closure_root/vendor\" \"$rch_go_build/vendor\" || exit 113; ",
+                );
+            }
+            script.push_str(&format!(
+                "GOWORK=off GOTOOLCHAIN=local \"$rch_go\" work edit{} \"$rch_go_build/selection.work\" || exit 113; \
+                 export GOWORK=\"$rch_go_build/selection.work\"; ", self.workspace_edits
+            ));
+        } else {
+            script.push_str("export GOWORK=off; ");
+        }
+        let empty_flags = shell_escape::escape("\n".into());
+        script.push_str(&format!(
+            "rch_go_capture \"$rch_go\" env GOFLAGS || exit 113; \
+             if [ \"$rch_go_capture_output\" != {empty_flags} ]; then \
+               printf '%s\\n' 'RCH: worker Go source closure requires empty GOFLAGS' >&2; exit 113; fi; \
+             rch_go_capture \"$rch_go\" env GOMOD || exit 113; "
+        ));
+        let selected = self.selected_module.as_ref().map_or_else(
+            || shell_escape::escape("/dev/null\n".into()).into_owned(),
+            |module| {
+                format!(
+                    "\"$rch_go_closure_root\"/{}",
+                    shell_escape::escape(format!("{module}\n").into())
+                )
+            },
+        );
+        script.push_str(&format!(
+            "if [ \"$rch_go_capture_output\" != {selected} ]; then \
+               printf '%s\\n' 'RCH: worker selected a different Go module' >&2; exit 113; fi; "
+        ));
+        script
+    }
+}
+
+fn ancestor_path(depth: usize) -> String {
+    if depth == 0 {
+        ".".to_owned()
+    } else {
+        vec![".."; depth].join("/")
+    }
+}
+
+async fn local_workspace_environment(
+    command: &str,
+    invocation_root: &Path,
+    plan: &GoSourcePlan,
+    runtime: &LocalProbeRuntime,
+    deadline: tokio::time::Instant,
+) -> Result<String> {
+    let Some(workspace) = &plan.workspace else {
+        return Ok("export GOWORK=off; ".into());
+    };
+    let directory = runtime._directory.path();
+    let copy = directory.join("selection.work");
+    std::fs::write(
+        &copy,
+        plan.required_files
+            .get(workspace)
+            .context("Go workspace lost its captured bytes")?,
+    )?;
+    let mut sum = workspace.as_os_str().to_os_string();
+    sum.push(".sum");
+    if let Some(bytes) = plan.required_files.get(&PathBuf::from(sum)) {
+        std::fs::write(directory.join("selection.work.sum"), bytes)?;
+    }
+    if plan
+        .required_files
+        .contains_key(&plan.source_root.join("vendor/modules.txt"))
+    {
+        std::os::unix::fs::symlink(plan.source_root.join("vendor"), directory.join("vendor"))?;
+    }
+    let copy = shell_escape::escape(
+        copy.to_str()
+            .context("non-UTF-8 private Go workspace")?
+            .into(),
+    );
+    let edits = shell_words::join(&plan.workspace_edit_args);
+    let query = shell_command(
+        command,
+        format!(
+            "{}GOWORK=off GOTOOLCHAIN=local \"$rch_go\" work edit {edits} {copy}",
+            runtime.assignments,
+        ),
+        &[],
+    )
+    .context("Go workspace relocation exceeds its command bound")?;
+    let output = probe(&query, invocation_root, deadline).await?;
+    ensure!(
+        output.is_empty(),
+        "Go workspace editor returned unexpected output"
+    );
+    Ok(format!("export GOWORK={copy}; "))
+}
+
+/// A private external directory serves both the Go workspace copy/sums and
+/// the fresh output stage. Its fixed filenames are removed by the same owned
+/// process on success, build failure, or signal; none are source inputs.
+fn build_temporary_directory(source_ancestors: usize) -> String {
+    let source = ancestor_path(source_ancestors);
+    format!(
+        "rch_go_root=$(CDPATH= cd -P {source} && pwd -P) || exit 113; \
+         rch_go_build=$(mktemp -d \"${{TMPDIR:-/tmp}}/rch-go-build.XXXXXXXXXX\") || exit 113; \
+         rch_go_stage=; \
+         trap 'rm -f \"$rch_go_build/output\" \"$rch_go_build/selection.work\" \
+           \"$rch_go_build/selection.work.sum\" \"$rch_go_build/vendor\"; rmdir \"$rch_go_build\"; \
+           if [ -n \"$rch_go_stage\" ]; then rm -f \"$rch_go_stage/output\"; rmdir \"$rch_go_stage\"; fi' EXIT; \
+         trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+         rch_go_build_root=$(cd \"$rch_go_build\" && pwd -P) || exit 113; \
+         case \"$rch_go_build_root/\" in \"${{rch_go_root%/}}/\"*) \
+           printf '%s\\n' 'RCH: Go build temporary directory must be outside the source root' >&2; exit 113;; esac; "
+    )
+}
+
+pub(in crate::hook) fn go_source_execution_command(
+    command: &str,
+    invocation_root: &Path,
+    source_root: &Path,
+    plan: &GoSourcePlan,
+    managed_runtime: &BTreeMap<String, String>,
+) -> Result<String> {
+    source_packages(command).context("Go command lost its admitted source grammar")?;
+    let args =
+        compiler_arguments(command, &["go"]).context("Go command lost its literal arguments")?;
+    let guard = GoSourceGuard::new(plan, invocation_root)?;
+    let depth = source_ancestor_depth(invocation_root, source_root)?;
+    let runtime = managed_runtime_assignments(Some(managed_runtime))
+        .context("Go command lost its managed runtime")?;
+    shell_command(
+        command,
+        format!(
+            "{runtime}{}{}export GOWORK=off; {}{}\"$rch_go\" \"$@\"",
+            build_temporary_directory(depth),
+            capture_function(),
+            module_cache_check(depth),
+            guard.worker_setup(),
+        ),
+        &args,
+    )
+    .context("Go source execution guard exceeds its command bound")
 }
 
 // Query names explicitly: older Go versions return an empty string for newer
@@ -322,6 +911,7 @@ pub(in crate::hook) struct GoBuildEnvironment {
     implicit: Option<PackageWitness>,
     test_package: Option<TestPackageWitness>,
     source_ancestors: usize,
+    source: Option<GoSourceGuard>,
 }
 
 impl GoBuildEnvironment {
@@ -474,7 +1064,7 @@ fn package_query_preflight(source_ancestors: usize) -> String {
     )
 }
 
-fn package_query(invocation: &GoCompileInvocation) -> String {
+fn package_query(invocation: &GoCompileInvocation, workspace: bool) -> String {
     let implicit_test = invocation.mode == GoCompileMode::Test && invocation.output.is_none();
     let mut args = vec!["list".to_owned()];
     args.extend_from_slice(&invocation.build_flags);
@@ -501,8 +1091,9 @@ fn package_query(invocation: &GoCompileInvocation) -> String {
         // GO111MODULE=auto is not an effective mode. GOMOD is empty only
         // when module mode is disabled; /dev/null still means enabled. The
         // absolute module filename is placement, not part of the witness.
+        let work = if workspace { "" } else { "GOWORK=off " };
         format!(
-            "GOWORK=off rch_go_capture \"$rch_go\" env GOMOD || exit 113; \
+            "{work}rch_go_capture \"$rch_go\" env GOMOD || exit 113; \
              case \"$rch_go_capture_output\" in {empty}) \
                rch_go_module_mode={disabled}; rch_go_module_setting=off;; \
                *) rch_go_read_path || exit 113; \
@@ -521,8 +1112,9 @@ fn package_query(invocation: &GoCompileInvocation) -> String {
     } else {
         ""
     };
+    let work = if workspace { "" } else { "GOWORK=off " };
     format!(
-        "{module_mode}{module_environment}GOCACHE=off GOWORK=off rch_go_capture \"$rch_go\" {query} || exit 113; \
+        "{module_mode}{module_environment}GOCACHE=off {work}rch_go_capture \"$rch_go\" {query} || exit 113; \
          rch_go_package=\"{record}\"; "
     )
 }
@@ -672,29 +1264,49 @@ fn source_ancestor_depth(invocation_root: &Path, source_root: &Path) -> Result<u
 /// Resolve the caller's exact promised file before upload or compilation.
 /// A successful library/multiple-package build promises no implicit binary and
 /// must not be changed into one by injecting our private execution -o option.
+#[cfg(test)]
 pub(in crate::hook) async fn validate_go_build_output(
     command: &str,
     project_root: &Path,
     source_root: &Path,
 ) -> Result<GoBuildEnvironment> {
+    validate_go_build_output_in_source(command, project_root, source_root, None).await
+}
+
+pub(in crate::hook) async fn validate_go_build_output_in_source(
+    command: &str,
+    project_root: &Path,
+    source_root: &Path,
+    source_plan: Option<&GoSourcePlan>,
+) -> Result<GoBuildEnvironment> {
     let invocation = invocation(command).context("Go build has no supported output contract")?;
     let runtime = LocalProbeRuntime::create(source_root)?;
     let needs_package_query = invocation.output.is_none() || invocation.mode == GoCompileMode::Test;
-    let source_ancestors = if needs_package_query {
+    let source_ancestors = if needs_package_query || source_plan.is_some() {
         source_ancestor_depth(project_root, source_root)?
     } else {
         0
     };
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    let workspace_environment = if let Some(plan) = source_plan {
+        local_workspace_environment(command, project_root, plan, &runtime, deadline).await?
+    } else {
+        String::new()
+    };
+    let workspace = source_plan.is_some_and(|plan| plan.workspace.is_some());
     let query = shell_words::join(GO_BUILD_ENVIRONMENT);
-    let initial_paths = if needs_package_query {
+    let initial_paths = if needs_package_query || source_plan.is_some() {
         // Toolchain startup may download into GOMODCACHE before executing
         // `go env`. Inspect its placement with GOTOOLCHAIN=local first; the
         // subsequent settings probe still selects the caller's real toolchain.
         format!(
             "{}{}",
             capture_function(),
-            package_query_preflight(source_ancestors)
+            if source_plan.is_some() {
+                module_cache_check(source_ancestors)
+            } else {
+                package_query_preflight(source_ancestors)
+            }
         )
     } else {
         String::new()
@@ -702,7 +1314,7 @@ pub(in crate::hook) async fn validate_go_build_output(
     let environment_command = shell_command(
         command,
         format!(
-            "{}{initial_paths}\"$rch_go\" env -json {query}",
+            "{}{workspace_environment}{initial_paths}\"$rch_go\" env -json {query}",
             runtime.assignments
         ),
         &[],
@@ -730,12 +1342,16 @@ pub(in crate::hook) async fn validate_go_build_output(
             "Go output discovery requires a release Go toolchain version 1.18 or newer"
         );
         let script = format!(
-            "{}{}{}{}{}printf '%s' \"$rch_go_package\"",
+            "{}{workspace_environment}{}{}{}{}printf '%s' \"$rch_go_package\"",
             runtime.assignments,
             capture_function(),
-            package_query_preflight(source_ancestors),
+            if source_plan.is_some() {
+                module_cache_check(source_ancestors)
+            } else {
+                package_query_preflight(source_ancestors)
+            },
             environment_check(&settings),
-            package_query(&invocation),
+            package_query(&invocation, workspace),
         );
         let query_command = shell_command(command, script, &[])
             .context("Go package query exceeds its command bound")?;
@@ -786,6 +1402,9 @@ pub(in crate::hook) async fn validate_go_build_output(
         implicit,
         test_package,
         source_ancestors,
+        source: source_plan
+            .map(|plan| GoSourceGuard::new(plan, project_root))
+            .transpose()?,
     };
     ensure!(
         go_build_execution_command(command, &environment, None).is_some(),
@@ -890,25 +1509,38 @@ pub(in crate::hook) fn go_build_execution_command(
          printf '%s\\n' 'RCH: Go output must name a regular file, not a directory or symlink' >&2; return 113; fi; "
     ));
     let mut preflight = capture_function();
-    if environment.implicit.is_some() || environment.test_package.is_some() {
+    let workspace = environment
+        .source
+        .as_ref()
+        .is_some_and(|source| source.workspace.is_some());
+    if let Some(source) = &environment.source {
+        // The caller may spell GOWORK as a dispatcher absolute path. Cache
+        // admission does not depend on it; source proof installs the exact
+        // relocated workspace before querying compiler/package settings.
+        preflight.push_str("export GOWORK=off; ");
+        preflight.push_str(&module_cache_check(environment.source_ancestors));
+        preflight.push_str(&source.worker_setup());
+    } else if environment.implicit.is_some() || environment.test_package.is_some() {
         // Cheap path admission precedes costly CGO environment probes. A
         // source-local module cache is refused without warming any cache.
         preflight.push_str(&package_query_preflight(environment.source_ancestors));
     }
     preflight.push_str(&environment_check(&environment.settings));
     let build_environment = if let Some(witness) = &environment.implicit {
-        preflight.push_str(&package_query(&invocation));
+        preflight.push_str(&package_query(&invocation, workspace));
         preflight.push_str(&witness.worker_check());
         // Freeze the no-workspace mode just admitted by both sides. A new
         // ancestor go.work between discovery and compilation cannot silently
         // change selection or cause a supposedly readonly query to write sums.
-        "GOWORK=off "
+        if workspace { "" } else { "GOWORK=off " }
     } else if let Some(witness) = &environment.test_package {
-        preflight.push_str(&package_query(&invocation));
+        preflight.push_str(&package_query(&invocation, workspace));
         preflight.push_str(&witness.worker_check());
         match witness.implicit.as_ref().map(|output| output.module_mode) {
+            Some(true) if workspace => "GO111MODULE=on ",
             Some(true) => "GOWORK=off GO111MODULE=on ",
             Some(false) => "GOWORK=off GO111MODULE=off ",
+            None if workspace => "",
             None => "GOWORK=off ",
         }
     } else {
@@ -925,19 +1557,12 @@ pub(in crate::hook) fn go_build_execution_command(
     // applies its outer environment. Compiler selection and settings remain
     // unchanged, and the actual build keeps its managed cache enabled.
     let runtime = managed_runtime_assignments(managed_runtime)?;
+    let temporary = build_temporary_directory(environment.source_ancestors);
     let script = format!(
         "{runtime}rch_go_check_output() {{ {path_checks} return 0; }}; \
          rch_go_check_output || exit 113; \
+         {temporary}\
          {preflight}\
-         rch_go_root=$(pwd -P) || exit 113; \
-         rch_go_build=$(mktemp -d \"${{TMPDIR:-/tmp}}/rch-go-build.XXXXXXXXXX\") || exit 113; \
-         rch_go_stage=; \
-         trap 'rm -f \"$rch_go_build/output\"; rmdir \"$rch_go_build\"; \
-           if [ -n \"$rch_go_stage\" ]; then rm -f \"$rch_go_stage/output\"; rmdir \"$rch_go_stage\"; fi' EXIT; \
-         trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
-         rch_go_build_root=$(cd \"$rch_go_build\" && pwd -P) || exit 113; \
-         case \"$rch_go_build_root/\" in \"${{rch_go_root%/}}/\"*) \
-           printf '%s\\n' 'RCH: Go build temporary directory must be outside the source root' >&2; exit 113;; esac; \
          {build_environment}\"$rch_go\" {subcommand} -o \"$rch_go_build/output\" \"$@\"; \
          rch_go_status=$?; \
          if [ \"$rch_go_status\" -ne 0 ]; then exit \"$rch_go_status\"; fi; \
@@ -960,6 +1585,457 @@ pub(in crate::hook) fn go_build_execution_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_argument_grammar_preserves_build_values_and_bounds_test_controls() {
+        for command in [
+            "go build -tags -run ./cmd/server",
+            "go test -run TestSelected -count=1 ./...",
+            "go test ./... -race -timeout 2m",
+            "go test -c -p=1 ./server",
+            "go vet -tags=selected ./...",
+        ] {
+            assert!(source_packages(command).is_some(), "{command}");
+        }
+        for command in [
+            "go test -modfile other.mod ./...",
+            "go test -overlay=outside.json ./...",
+            "go test -coverprofile coverage.out ./...",
+            "go test -exec ./wrapper ./...",
+            "go test ./... -args ./outside",
+            "go vet -vettool ../tool ./...",
+            "go -C ../other test ./...",
+        ] {
+            assert!(source_packages(command).is_none(), "{command}");
+        }
+        assert_eq!(
+            source_packages("go test -run 'literal -modfile' -tags -run ./..."),
+            Some(vec!["./...".into()])
+        );
+    }
+
+    #[cfg(unix)]
+    struct WorkspaceFixture {
+        directory: PathBuf,
+        source: PathBuf,
+        topology: PathTopologyPolicy,
+    }
+
+    #[cfg(unix)]
+    impl WorkspaceFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let source = directory.join("source workspace");
+            for directory in ["app/cmd/server", "library with spaces", "helper"] {
+                std::fs::create_dir_all(source.join(directory)).unwrap();
+            }
+            for (path, bytes) in [
+                (
+                    "selected.work",
+                    "go 1.22\nuse (\n ./app\n \"./library with spaces\"\n)\nreplace example.invalid/helper => ./helper\n",
+                ),
+                // An explicitly selected workspace must win over this ambient
+                // ancestor on both dispatcher and relocated worker.
+                ("go.work", "go 1.22\nuse ./unselected-absent\n"),
+                ("app/go.mod", "module example.invalid/app\ngo 1.22\n"),
+                (
+                    "library with spaces/go.mod",
+                    "module example.invalid/library\ngo 1.22\nrequire example.invalid/helper v0.0.0\nreplace example.invalid/helper => ../unselected-absent\n",
+                ),
+                ("helper/go.mod", "module example.invalid/helper\ngo 1.22\n"),
+                (
+                    "helper/helper.go",
+                    "package helper\nconst Value = \"workspace-ok\"\n",
+                ),
+                (
+                    "library with spaces/library.go",
+                    "package library\nimport \"example.invalid/helper\"\nconst Value = helper.Value\n",
+                ),
+                (
+                    "app/cmd/server/main.go",
+                    "package main\nimport (\"fmt\"; \"example.invalid/library\")\nfunc main() { fmt.Println(library.Value) }\n",
+                ),
+                (
+                    "app/cmd/server/main_test.go",
+                    "package main\nimport (\"testing\"; \"example.invalid/library\")\nfunc TestSelected(t *testing.T) { if library.Value != \"workspace-ok\" { t.Fatal(library.Value) } }\n",
+                ),
+            ] {
+                std::fs::write(source.join(path), bytes).unwrap();
+            }
+            let topology = PathTopologyPolicy::new(directory.clone(), directory.join("alias"));
+            Self {
+                directory,
+                source,
+                topology,
+            }
+        }
+
+        fn cwd(&self) -> PathBuf {
+            self.source.join("app/cmd/server")
+        }
+
+        fn command(&self, args: &[&str]) -> String {
+            let mut words: Vec<String> = [
+                "env",
+                "GOENV=off",
+                "GOTOOLCHAIN=local",
+                "GOFLAGS=",
+                "GOPROXY=off",
+                "GOSUMDB=off",
+                "GO111MODULE=on",
+                "CGO_ENABLED=0",
+                "GOMAXPROCS=2",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            words.push(format!(
+                "GOWORK={}",
+                self.source.join("selected.work").display()
+            ));
+            words.push(format!(
+                "GOMODCACHE={}",
+                self.directory.join("caller-modules").display()
+            ));
+            words.push("go".into());
+            words.extend(args.iter().copied().map(str::to_owned));
+            shell_words::join(words)
+        }
+
+        fn runtime(&self) -> BTreeMap<String, String> {
+            [
+                "GOCACHE",
+                "GOMODCACHE",
+                "GOPATH",
+                "GOTMPDIR",
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+            ]
+            .into_iter()
+            .map(|key| {
+                let path = self.directory.join("worker-runtime").join(key);
+                std::fs::create_dir_all(&path).unwrap();
+                (key.to_owned(), path.to_str().unwrap().to_owned())
+            })
+            .collect()
+        }
+
+        fn materialize(&self, name: &str, tree: &BTreeMap<PathBuf, Vec<u8>>) -> PathBuf {
+            let worker = self.directory.join(name);
+            for (path, bytes) in tree {
+                let path = worker.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            worker
+        }
+    }
+
+    #[cfg(unix)]
+    fn source_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, directory: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    visit(root, &entry.path(), result);
+                } else {
+                    assert!(metadata.is_file());
+                    result.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut result = BTreeMap::new();
+        visit(root, root, &mut result);
+        result
+    }
+
+    #[cfg(unix)]
+    async fn run_fixture(command: &str, cwd: &Path) -> std::process::Output {
+        let mut process = tokio::process::Command::new("sh");
+        process
+            .args(["-c", command])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        tokio::time::timeout(std::time::Duration::from_secs(120), process.output())
+            .await
+            .expect("Go workspace fixture exceeded its deadline")
+            .expect("Go is required for the workspace regression")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_workspace_queries_preserve_source_and_select_exact_nested_outputs() {
+        let fixture = WorkspaceFixture::new();
+        let before = source_tree(&fixture.source);
+        for (arguments, output) in [
+            (vec!["build", "-p=1", "."], "server"),
+            (vec!["test", "-c", "-p=1"], "server.test"),
+            (
+                vec!["build", "-p=1", "-o", "out/selected", "."],
+                "out/selected",
+            ),
+        ] {
+            let command = fixture.command(&arguments);
+            let plan = discover_go_source(&command, &fixture.cwd(), &fixture.topology)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.source_root, fixture.source);
+            assert_eq!(plan.workspace, Some(fixture.source.join("selected.work")));
+            assert!(
+                plan.required_files
+                    .contains_key(&fixture.source.join("helper/go.mod"))
+            );
+            assert!(
+                !plan
+                    .required_files
+                    .contains_key(&fixture.source.join("go.work"))
+            );
+            let environment = validate_go_build_output_in_source(
+                &command,
+                &fixture.cwd(),
+                &fixture.source,
+                Some(&plan),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                environment.output.required_files,
+                BTreeSet::from([PathBuf::from(output)])
+            );
+            let selected: Vec<_> = before.keys().cloned().collect();
+            verify_go_source_selection(&plan, &fixture.source, &selected, &fixture.topology)
+                .unwrap();
+            let omitted: Vec<_> = selected
+                .into_iter()
+                .filter(|path| path != Path::new("library with spaces/go.mod"))
+                .collect();
+            assert!(
+                verify_go_source_selection(&plan, &fixture.source, &omitted, &fixture.topology)
+                    .is_err()
+            );
+            assert_eq!(
+                source_tree(&fixture.source),
+                before,
+                "Go query mutated source"
+            );
+        }
+        let escaping = fixture.command(&["build", "-o", "out", "../../../../outside.go"]);
+        assert!(
+            discover_go_source(&escaping, &fixture.cwd(), &fixture.topology)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_standalone_module_closes_relative_replace_inside_owning_repository() {
+        let fixture = WorkspaceFixture::new();
+        std::fs::create_dir(fixture.source.join(".git")).unwrap();
+        std::fs::write(fixture.source.join("app/go.mod"),
+            "module example.invalid/app\ngo 1.22\nrequire example.invalid/library v0.0.0\nrequire example.invalid/helper v0.0.0 // indirect\nreplace example.invalid/library => \"../library with spaces\"\nreplace example.invalid/helper => ../helper\n").unwrap();
+        let command = format!(
+            "{} GOWORK=off go build -p=1 .",
+            fixture.command(&[]).strip_suffix("go").unwrap()
+        );
+        let before = source_tree(&fixture.source);
+        let plan = discover_go_source(&command, &fixture.cwd(), &fixture.topology)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.source_root, fixture.source);
+        assert!(plan.workspace.is_none());
+        assert!(
+            plan.required_files
+                .contains_key(&fixture.source.join("helper/go.mod"))
+        );
+        // The dependency's own invalid replacement must not alter main-module
+        // resolution or trigger an unrelated source transfer.
+        let environment = validate_go_build_output_in_source(
+            &command,
+            &fixture.cwd(),
+            &fixture.source,
+            Some(&plan),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            environment.output.required_files,
+            BTreeSet::from(["server".into()])
+        );
+        assert_eq!(source_tree(&fixture.source), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_workspace_vendor_mode_preserves_metadata_and_refuses_local_relocation() {
+        let fixture = WorkspaceFixture::new();
+        let vendor = run_fixture(&fixture.command(&["work", "vendor"]), &fixture.source).await;
+        assert!(vendor.status.success(), "{vendor:?}");
+        let command = fixture.command(&["build", "-p=1", "."]);
+        let error = discover_go_source(&command, &fixture.cwd(), &fixture.topology)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("vendor"), "{error:#}");
+
+        // Pure workspace members keep their ordinary vendoring semantics:
+        // unlike replacement paths, use paths do not enter modules.txt.
+        let plain = WorkspaceFixture::new();
+        std::fs::write(
+            plain.source.join("selected.work"),
+            "go 1.22\nuse (\n ./app\n \"./library with spaces\"\n ./helper\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            plain.source.join("library with spaces/go.mod"),
+            "module example.invalid/library\ngo 1.22\n",
+        )
+        .unwrap();
+        let vendor = run_fixture(&plain.command(&["work", "vendor"]), &plain.source).await;
+        assert!(vendor.status.success(), "{vendor:?}");
+        let before = source_tree(&plain.source);
+        for arguments in [
+            vec!["build", "-p=1", "."],
+            vec!["build", "-p=1", "-mod=vendor", "."],
+        ] {
+            let command = plain.command(&arguments);
+            let plan = discover_go_source(&command, &plain.cwd(), &plain.topology)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                plan.required_files
+                    .contains_key(&plain.source.join("vendor/modules.txt"))
+            );
+            let environment = validate_go_build_output_in_source(
+                &command,
+                &plain.cwd(),
+                &plain.source,
+                Some(&plan),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                environment.output.required_files,
+                BTreeSet::from(["server".into()])
+            );
+            assert_eq!(
+                source_tree(&plain.source),
+                before,
+                "vendoring query changed source"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires Go and a compiled rch-wkr via RCH_WKR_BIN"]
+    async fn real_go_relocated_workspace_executes_and_refuses_stale_worker_metadata() {
+        assert!(
+            std::env::var_os("RCH_WKR_BIN").is_some(),
+            "set RCH_WKR_BIN to the native worker verifier"
+        );
+        let fixture = WorkspaceFixture::new();
+        let before = source_tree(&fixture.source);
+        let command = fixture.command(&["build", "-p=1", "."]);
+        let plan = discover_go_source(&command, &fixture.cwd(), &fixture.topology)
+            .await
+            .unwrap()
+            .unwrap();
+        let environment = validate_go_build_output_in_source(
+            &command,
+            &fixture.cwd(),
+            &fixture.source,
+            Some(&plan),
+        )
+        .await
+        .unwrap();
+        let runtime = fixture.runtime();
+        let guarded = go_build_execution_command(&command, &environment, Some(&runtime)).unwrap();
+        let worker = fixture.materialize("relocated worker", &before);
+        let cwd = worker.join("app/cmd/server");
+        // A surviving dispatcher absolute workspace/member path would read
+        // this later edit instead of the bytes already materialized remotely.
+        std::fs::write(
+            fixture.source.join("helper/helper.go"),
+            "package helper\nconst Value = \"wrong-dispatcher-source\"\n",
+        )
+        .unwrap();
+        let built = run_fixture(&guarded, &cwd).await;
+        assert!(built.status.success(), "{built:?}");
+        let binary = run_fixture("./server", &cwd).await;
+        assert_eq!(binary.stdout, b"workspace-ok\n");
+        environment.output.verify_staged(&cwd).unwrap();
+        for arguments in [
+            vec!["test", "-p=1", "-run", "TestSelected", "-count=1", "./..."],
+            vec!["vet", "-p=1", "./..."],
+        ] {
+            let command = fixture.command(&arguments);
+            let guarded = go_source_execution_command(
+                &command,
+                &fixture.cwd(),
+                &fixture.source,
+                &plan,
+                &runtime,
+            )
+            .unwrap();
+            let output = run_fixture(&guarded, &cwd).await;
+            assert!(output.status.success(), "{arguments:?}: {output:?}");
+        }
+        let test = fixture.command(&["test", "-c", "-p=1"]);
+        let test_environment =
+            validate_go_build_output_in_source(&test, &fixture.cwd(), &fixture.source, Some(&plan))
+                .await
+                .unwrap();
+        let test_command =
+            go_build_execution_command(&test, &test_environment, Some(&runtime)).unwrap();
+        let compiled = run_fixture(&test_command, &cwd).await;
+        assert!(compiled.status.success(), "{compiled:?}");
+        assert!(run_fixture("./server.test", &cwd).await.status.success());
+        let mut expected = before.clone();
+        let worker_tree = source_tree(&worker);
+        for output in ["app/cmd/server/server", "app/cmd/server/server.test"] {
+            expected.insert(
+                output.into(),
+                worker_tree.get(Path::new(output)).unwrap().clone(),
+            );
+        }
+        assert_eq!(
+            worker_tree, expected,
+            "workspace execution changed source controls"
+        );
+        for (name, relative, contents) in [
+            (
+                "changed-control",
+                "helper/go.mod",
+                "module example.invalid/changed\ngo 1.22\n",
+            ),
+            ("stale-sum", "selected.work.sum", "stale-worker-only-sum\n"),
+            (
+                "nested-module",
+                "app/cmd/server/go.mod",
+                "module example.invalid/unselected\ngo 1.22\n",
+            ),
+        ] {
+            let worker = fixture.materialize(name, &before);
+            std::fs::write(worker.join(relative), contents).unwrap();
+            let cwd = worker.join("app/cmd/server");
+            std::fs::write(cwd.join("server"), b"old output must survive refusal").unwrap();
+            let output = run_fixture(&guarded, &cwd).await;
+            assert_eq!(output.status.code(), Some(113), "{name}: {output:?}");
+            assert_eq!(
+                std::fs::read(cwd.join("server")).unwrap(),
+                b"old output must survive refusal"
+            );
+        }
+    }
 
     #[test]
     fn test_package_witness_requires_one_package_with_actual_test_inputs() {

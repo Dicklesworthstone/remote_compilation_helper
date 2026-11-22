@@ -14,7 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 mod go_build;
-pub(in crate::hook) use go_build::{go_build_execution_command, validate_go_build_output};
+#[cfg(test)]
+pub(in crate::hook) use go_build::validate_go_build_output;
+pub(in crate::hook) use go_build::{
+    discover_go_source, go_build_execution_command, go_source_execution_command,
+    validate_go_build_output_in_source, verify_go_source_selection,
+};
 
 /// Every file a supported native command promises to its caller. Persist this
 /// before execution: neither a stale destination nor one returned object can

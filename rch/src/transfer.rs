@@ -3173,6 +3173,9 @@ pub struct TransferPipeline {
     /// An admitted `go test -c -o` has the external runtime/output contract
     /// of a Go build while retaining its test execution kind and time budget.
     go_test_output: bool,
+    /// An admitted Go module/workspace closure keeps control probes, private
+    /// workspace sums and compiler caches outside every selected source root.
+    go_source_closure: bool,
     /// Compilation configuration for timeouts and other settings.
     ///
     /// Provides configurable external timeout values per command type and
@@ -3351,6 +3354,7 @@ impl TransferPipeline {
             env_overrides: None,
             compilation_kind: None,
             go_test_output: false,
+            go_source_closure: false,
             compilation_config: rch_common::CompilationConfig::default(),
             estimated_transfer_bytes: None,
             remote_path_override: None,
@@ -4540,9 +4544,19 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
         self
     }
 
+    pub(crate) fn with_go_source_closure(mut self, enabled: bool) -> Self {
+        self.go_source_closure = enabled;
+        self
+    }
+
     fn uses_external_go_runtime(&self) -> bool {
         self.compilation_kind == Some(CompilationKind::GoBuild)
             || (self.go_test_output && self.compilation_kind == Some(CompilationKind::GoTest))
+            || (self.go_source_closure
+                && matches!(
+                    self.compilation_kind,
+                    Some(CompilationKind::GoTest | CompilationKind::GoVet)
+                ))
     }
 
     /// Set the compilation configuration for timeout settings.
@@ -20404,6 +20418,47 @@ cargo --version\n\"$RCH_TEST_TOOLCHAIN_CARGO\" --version\ncargo test --locked\n"
                 .managed_go_runtime_environment()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn go_workspace_tests_and_vet_use_the_granted_external_runtime() {
+        for kind in [CompilationKind::GoTest, CompilationKind::GoVet] {
+            let pipeline = TransferPipeline::new(
+                PathBuf::from("/source/workspace/app"),
+                "workspace".into(),
+                "source-hash".into(),
+                TransferConfig::default(),
+            )
+            .with_compilation_kind(Some(kind))
+            .with_go_source_closure(true)
+            .with_remote_path_override("/source/workspace/app")
+            .with_remote_cargo_target_dir_override("/managed/go-runtime");
+            let runtime = pipeline.managed_go_runtime_environment().unwrap();
+            let plan = pipeline.build_remote_env_plan_with_environment(
+                "/source/workspace/app",
+                std::iter::empty(),
+            );
+            assert_eq!(pipeline.compilation_kind, Some(kind));
+            assert_eq!(runtime.len(), 7);
+            for (key, value) in runtime {
+                assert!(
+                    Path::new(&value).starts_with("/managed/go-runtime"),
+                    "{kind:?}/{key}"
+                );
+                assert!(plan.ensure_dirs.contains(&value));
+                assert!(
+                    plan.env_prefix
+                        .prefix
+                        .contains(&managed_assignment(&key, &value))
+                );
+            }
+            assert!(
+                pipeline
+                    .with_go_source_closure(false)
+                    .managed_go_runtime_environment()
+                    .is_none()
+            );
+        }
     }
 
     #[cfg(unix)]
