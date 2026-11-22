@@ -367,7 +367,8 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
     ) {
         return None;
     }
-    Some(tokens.into_iter().skip(index + 1).collect())
+    let args: Vec<_> = tokens.into_iter().skip(index + 1).collect();
+    rch_common::cargo_args::normalize_manifest_options(&args).ok()
 }
 
 #[cfg(test)]
@@ -441,6 +442,39 @@ mod tests {
                 .unwrap()
                 .contains(&"target/b/debug/app".into())
         );
+    }
+
+    #[test]
+    fn short_manifest_selectors_preserve_named_outputs_and_retrieval_capture() {
+        let expected =
+            select("cargo build --manifest-path 'crates/an app/Cargo.toml' --bin app --release")
+                .unwrap();
+        for selector in [
+            "-m 'crates/an app/Cargo.toml' -r",
+            "'-mcrates/an app/Cargo.toml' -r",
+            "'-m=crates/an app/Cargo.toml' -r",
+            "-qrm 'crates/an app/Cargo.toml'",
+            "'-vvrm=crates/an app/Cargo.toml'",
+        ] {
+            let command = format!("cargo build {selector} --bin app");
+            assert_eq!(select(&command).unwrap(), expected, "{command}");
+            let capture = retrieval_selection(Some(CompilationKind::CargoBuild), &command).unwrap();
+            assert_eq!(capture.bins, BTreeSet::from(["app".to_owned()]));
+            assert_eq!(capture.profile, "release");
+            let command = format!("cargo test {selector} --test suite --no-run");
+            let capture = retrieval_selection(Some(CompilationKind::CargoTest), &command).unwrap();
+            assert_eq!(capture.tests, BTreeSet::from(["suite".to_owned()]));
+            assert_eq!(capture.profile, "release");
+        }
+        for command in [
+            "cargo build --bin app -m",
+            "cargo build --bin app -qm=",
+            "cargo build --bin app -m Cargo.toml --manifest-path other/Cargo.toml",
+            "cargo build --bin app -- -m crates/app/Cargo.toml",
+        ] {
+            assert!(select(command).is_none(), "{command}");
+            assert!(retrieval_selection(Some(CompilationKind::CargoBuild), command).is_none());
+        }
     }
 
     #[test]

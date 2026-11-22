@@ -416,44 +416,7 @@ fn option_takes_value(option: &str, program: &str) -> bool {
                 | "--forbid"
         )
     } else {
-        matches!(
-            option,
-            "--color"
-                | "--config"
-                | "-Z"
-                | "-C"
-                | "--manifest-path"
-                | "--target-dir"
-                | "--build-dir"
-                | "--message-format"
-                | "--profile"
-                | "-p"
-                | "--package"
-                | "--exclude"
-                | "-F"
-                | "--features"
-                | "--bin"
-                | "--example"
-                | "--test"
-                | "--bench"
-                | "-j"
-                | "--jobs"
-                | "--out-dir"
-                | "--artifact-dir"
-                | "--crate-type"
-                | "--filter-expr"
-                | "-E"
-                | "--filterset"
-                | "-P"
-                | "--partition"
-                | "--status-level"
-                | "--final-status-level"
-                | "--failure-output"
-                | "--success-output"
-                | "--archive-file"
-                | "--workspace-remap"
-                | "--test-threads"
-        )
+        crate::cargo_args::takes_separate_value(option)
     }
 }
 
@@ -467,6 +430,14 @@ fn opaque_argument_is_value(prefix: &str, program: &str) -> bool {
         .split_once('=')
         .is_some_and(|(flag, _)| option_takes_value(flag, program))
     {
+        return true;
+    }
+    if !matches!(program, "clang" | "clang++" | "rustc")
+        && crate::cargo_args::short_value_option(prefix)
+            .is_some_and(|(_, offset)| offset.is_some_and(|offset| offset < prefix.len()))
+    {
+        // A grouped manifest option still owns its attached literal prefix.
+        // Expanding the remainder cannot turn that operand into --target.
         return true;
     }
     let short: &[&str] = if matches!(program, "clang" | "clang++") {
@@ -540,11 +511,13 @@ fn compiler_target_options(words: &[AdmissionArgument]) -> Vec<String> {
 /// invoked compiler's own options. CMake build targets, TypeScript targets,
 /// and test-program arguments are never Rust standard-library requirements.
 fn derive_capabilities(command: &str, kind: Option<CompilationKind>) -> DerivedCapabilities {
-    let mut req = RequiredCapabilities::default();
-    req.needs_native_tools = native_tool_for_command(command)
-        .map(str::to_owned)
-        .into_iter()
-        .collect();
+    let mut req = RequiredCapabilities {
+        needs_native_tools: native_tool_for_command(command)
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        ..RequiredCapabilities::default()
+    };
     if let Some(kind) = kind {
         req.needs_cargo = is_rust_kind(kind);
         req.needs_bun = matches!(

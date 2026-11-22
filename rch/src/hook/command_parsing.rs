@@ -73,33 +73,7 @@ fn cargo_jobs_from_args(tokens: &[String]) -> Option<Option<u32>> {
 }
 
 fn cargo_option_takes_value(option: &str) -> bool {
-    matches!(
-        option,
-        "--config"
-            | "--target"
-            | "--target-dir"
-            | "--build-dir"
-            | "--manifest-path"
-            | "--lockfile-path"
-            | "--package"
-            | "-p"
-            | "--exclude"
-            | "--features"
-            | "-F"
-            | "--bin"
-            | "--example"
-            | "--test"
-            | "--bench"
-            | "--profile"
-            | "--color"
-            | "--message-format"
-            | "--jobs"
-            | "-j"
-            | "-Z"
-            | "-C"
-            | "--artifact-dir"
-            | "--out-dir"
-    )
+    rch_common::cargo_args::takes_separate_value(option)
 }
 
 /// The job count the REMOTE build will actually use, when the command says so:
@@ -179,17 +153,57 @@ fn tokenize_command(command: &str) -> Vec<String> {
 ///
 /// Returns true if the command appears to filter tests by name.
 pub(super) fn is_filtered_test_command(command: &str) -> bool {
-    let tokens = tokenize_command(command);
+    // Cargo's short manifest selector may carry a grouped flag prefix and a
+    // separate path. Normalize only its actual argv, so the path cannot become
+    // a test-name filter. Other runners retain their existing argument grammar.
+    let (tokens, cargo) =
+        if let Some((tokens, cargo_index, _)) = cargo_scheduling_tokens_raw(command) {
+            let Ok(args) =
+                rch_common::cargo_args::normalize_manifest_options(&tokens[cargo_index + 1..])
+            else {
+                return false;
+            };
+            (args, true)
+        } else {
+            (tokenize_command(command), false)
+        };
 
-    // Find the position of "test" or "run" (for nextest) in the command
-    let test_pos = tokens
-        .iter()
-        .position(|t| t == "test" || t == "t" || t == "run");
+    // A wrapper or global Cargo option value named "test" is not the command.
+    let test_pos = if cargo {
+        let mut args = tokens.iter().enumerate();
+        let mut selected = None;
+        while let Some((index, token)) = args.next() {
+            if token == "--" {
+                break;
+            }
+            if rch_common::cargo_args::takes_separate_value(token) {
+                let _ = args.next();
+                continue;
+            }
+            if token.starts_with('-') || token.starts_with('+') {
+                continue;
+            }
+            selected = match token.as_str() {
+                "test" | "t" => Some(index),
+                "nextest" => args
+                    .next()
+                    .and_then(|(index, token)| (token == "run").then_some(index)),
+                _ => None,
+            };
+            break;
+        }
+        selected
+    } else {
+        tokens
+            .iter()
+            .position(|t| t == "test" || t == "t" || t == "run")
+    };
     let Some(test_idx) = test_pos else {
         return false;
     };
 
-    // Flags that take a separate argument (not using =)
+    // Preserve the existing non-Cargo grammar. Cargo uses the shared arity
+    // rules below, including grouped short options such as -qF.
     let flags_with_args = [
         "-p",
         "--package",
@@ -227,7 +241,12 @@ pub(super) fn is_filtered_test_command(command: &str) -> bool {
         }
 
         // Check if this is a flag that takes an argument
-        if flags_with_args.contains(&token.as_str()) {
+        let takes_value = if cargo {
+            rch_common::cargo_args::takes_separate_value(token)
+        } else {
+            flags_with_args.contains(&token.as_str())
+        };
+        if takes_value {
             i += 2;
             continue;
         }
@@ -284,6 +303,17 @@ fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
 /// environment in order. Env clears/unsets and later assignments take effect;
 /// option payloads and command arguments never create environment bindings.
 fn cargo_scheduling_tokens(command: &str) -> Option<(Vec<String>, usize, Option<u32>)> {
+    let (mut tokens, cargo_index, inline_jobs) = cargo_scheduling_tokens_raw(command)?;
+    let args =
+        rch_common::cargo_args::normalize_manifest_options(&tokens[cargo_index + 1..]).ok()?;
+    tokens.truncate(cargo_index + 1);
+    tokens.extend(args);
+    Some((tokens, cargo_index, inline_jobs))
+}
+
+/// Resolve wrappers before normalizing Cargo options, preserving the distinction
+/// between an unknown runner and malformed options on a known Cargo command.
+fn cargo_scheduling_tokens_raw(command: &str) -> Option<(Vec<String>, usize, Option<u32>)> {
     let tokens = shell_words::split(command).ok()?;
     let assignment = |word: &str| {
         word.split_once('=')
@@ -1530,6 +1560,211 @@ mod go_parallelism_tests {
 #[cfg(test)]
 mod cargo_profile_tests {
     use super::cargo_custom_profile_output_dir;
+
+    #[test]
+    fn short_manifest_options_preserve_build_only_artifact_and_scheduler_policy() {
+        use super::{CompilationKind, cargo_build_only_test, estimate_cores_for_command};
+        let config = rch_common::CompilationConfig {
+            build_slots: 12,
+            test_slots: 4,
+            ..Default::default()
+        };
+        for selector in [
+            "-m 'crates/an app/Cargo.toml'",
+            "'-mcrates/an app/Cargo.toml'",
+            "'-m=crates/an app/Cargo.toml'",
+            "-qm 'crates/an app/Cargo.toml'",
+            "'-vvm=crates/an app/Cargo.toml'",
+        ] {
+            for (kind, verb) in [
+                (CompilationKind::CargoTest, "test"),
+                (CompilationKind::CargoBench, "bench"),
+            ] {
+                let command = format!(
+                    "env -u NOTE -- cargo +nightly {verb} {selector} --no-run --profile release-perf -- --test-threads=1"
+                );
+                assert!(cargo_build_only_test(Some(kind), &command), "{command}");
+                assert_eq!(
+                    estimate_cores_for_command(Some(kind), &command, &config),
+                    12,
+                    "{command}"
+                );
+                assert_eq!(
+                    cargo_custom_profile_output_dir(&command).as_deref(),
+                    Some("release-perf"),
+                    "{command}"
+                );
+                let command = format!(
+                    "cargo {verb} {selector} --no-run --jobs=3 -- --jobs=99 --test-threads=1"
+                );
+                assert_eq!(
+                    estimate_cores_for_command(Some(kind), &command, &config),
+                    3,
+                    "{command}"
+                );
+            }
+        }
+        let release = "cargo test -vrmcrates/app/Cargo.toml --no-run";
+        assert!(cargo_build_only_test(
+            Some(CompilationKind::CargoTest),
+            release
+        ));
+        assert_eq!(
+            estimate_cores_for_command(Some(CompilationKind::CargoTest), release, &config),
+            12
+        );
+        assert_eq!(cargo_custom_profile_output_dir(release), None);
+    }
+
+    #[test]
+    fn short_manifest_paths_are_not_running_test_filters() {
+        use super::{CompilationKind, estimate_cores_for_command, is_filtered_test_command};
+        let config = rch_common::CompilationConfig {
+            test_slots: 8,
+            ..Default::default()
+        };
+        for (kind, command) in [
+            (
+                CompilationKind::CargoTest,
+                "cargo test -m 'crates/an app/Cargo.toml'",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "env -u test -- cargo test -qm crates/app/Cargo.toml",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "time -f test -- cargo --config test test -m=crates/app/Cargo.toml",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test -vvmcrates/app/Cargo.toml",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test -m crates/app/Cargo.toml -F manifest_helpers",
+            ),
+            (
+                CompilationKind::CargoTest,
+                "cargo test -qF manifest_helpers -qmcrates/app/Cargo.toml",
+            ),
+            (
+                CompilationKind::CargoNextest,
+                "cargo nextest run -m crates/app/Cargo.toml",
+            ),
+        ] {
+            assert!(!is_filtered_test_command(command), "{command}");
+            assert_eq!(
+                estimate_cores_for_command(Some(kind), command, &config),
+                8,
+                "{command}"
+            );
+            let filtered = format!("{command} actual_test_filter");
+            assert!(is_filtered_test_command(&filtered), "{filtered}");
+            assert_eq!(
+                estimate_cores_for_command(Some(kind), &filtered, &config),
+                4,
+                "{filtered}"
+            );
+        }
+        assert!(is_filtered_test_command("bun test tests/suite.test.ts"));
+        assert!(!is_filtered_test_command("bun test --coverage"));
+    }
+
+    #[test]
+    fn short_manifest_values_and_passthrough_do_not_create_cargo_controls() {
+        use super::{
+            CompilationKind, cargo_build_only_test, cargo_job_count_for_command,
+            is_filtered_test_command,
+        };
+        for command in [
+            "cargo test --config '-mcrates/decoy/Cargo.toml' --no-run --jobs=3 --profile release-perf",
+            "cargo test -F '-mcrates/decoy/Cargo.toml' --no-run --jobs=3 --profile release-perf",
+            "time -f '-mcrates/decoy/Cargo.toml' -- cargo test --no-run --jobs=3 --profile release-perf",
+            "cargo test -m '--jobs=99' --no-run --jobs=3 --profile release-perf",
+            "cargo test -qm '--profile=decoy' --no-run --jobs=3 --profile release-perf",
+        ] {
+            assert!(
+                cargo_build_only_test(Some(CompilationKind::CargoTest), command),
+                "{command}"
+            );
+            assert_eq!(cargo_job_count_for_command(command), Some(3), "{command}");
+            assert_eq!(
+                cargo_custom_profile_output_dir(command).as_deref(),
+                Some("release-perf"),
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo test -qF --jobs=1 -m Cargo.toml",
+            "cargo test -qF --profile=decoy -m Cargo.toml",
+        ] {
+            assert_eq!(cargo_job_count_for_command(command), None, "{command}");
+            assert_eq!(cargo_custom_profile_output_dir(command), None, "{command}");
+            assert!(!is_filtered_test_command(command), "{command}");
+        }
+        let command =
+            "cargo test -qF --jobs=1 -m Cargo.toml --jobs=3 --no-run --profile release-perf";
+        assert_eq!(cargo_job_count_for_command(command), Some(3));
+        assert_eq!(
+            cargo_custom_profile_output_dir(command).as_deref(),
+            Some("release-perf")
+        );
+        assert!(cargo_build_only_test(
+            Some(CompilationKind::CargoTest),
+            command
+        ));
+        for command in [
+            "cargo test -- -m crates/app/Cargo.toml --no-run --jobs=99 --profile decoy",
+            "cargo test --config '-m --no-run --jobs=99 --profile decoy'",
+            "cargo test --no-run -m",
+            "cargo test --no-run -m=",
+            "cargo test --no-run -m Cargo.toml --manifest-path other/Cargo.toml",
+            "cargo test --no-run -qm Cargo.toml -mOther.toml",
+        ] {
+            assert!(
+                !cargo_build_only_test(Some(CompilationKind::CargoTest), command),
+                "{command}"
+            );
+            assert_eq!(cargo_job_count_for_command(command), None, "{command}");
+            assert_eq!(cargo_custom_profile_output_dir(command), None, "{command}");
+            assert!(!is_filtered_test_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn nextest_option_operands_preserve_scheduler_evidence() {
+        use super::{CompilationKind, estimate_cores_for_command, is_filtered_test_command};
+        let config = rch_common::CompilationConfig {
+            test_slots: 8,
+            ..Default::default()
+        };
+        for (option, expected_slots) in [
+            ("-E 'all()'", 8),
+            ("--filter-expr 'all()'", 8),
+            ("--filterset 'test(fast)'", 8),
+            ("-P ci", 8),
+            ("--profile ci", 8),
+            ("--test-threads 4", 4),
+            ("--test-threads=4", 4),
+            ("--test-threads num-cpus", 8),
+            ("--status-level pass", 8),
+        ] {
+            let command = format!("cargo nextest run -m Cargo.toml {option}");
+            // A filter expression can select the full suite. Its syntax alone
+            // does not prove a reduced reservation, unlike a positional filter.
+            assert!(!is_filtered_test_command(&command), "{command}");
+            assert_eq!(
+                estimate_cores_for_command(Some(CompilationKind::CargoNextest), &command, &config),
+                expected_slots,
+                "{command}"
+            );
+            assert!(
+                is_filtered_test_command(&format!("{command} actual_test_filter")),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn build_only_test_mode_belongs_to_cargo_not_option_values_or_libtest() {

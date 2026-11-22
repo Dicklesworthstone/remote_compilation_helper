@@ -2909,6 +2909,13 @@ pub fn is_cargo_package_verification(command: &str) -> bool {
     if tokens.next() != Some("cargo") {
         return false;
     }
+    let args: Vec<String> = tokens.map(str::to_owned).collect();
+    let Ok(args) = crate::cargo_args::normalize_manifest_options(&args) else {
+        return false;
+    };
+    // Only actual manifest selectors are expanded. A dry-run-looking operand
+    // remains an operand and must still pass the conservative allowlist below.
+    let mut tokens = args.iter().map(String::as_str);
 
     let mut subcommand = None;
     let mut dry_run = false;

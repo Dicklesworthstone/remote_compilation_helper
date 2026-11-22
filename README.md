@@ -1592,8 +1592,12 @@ an interrupted move without replacing an existing retained tree. Python 3 and
 the Linux rename capability are checked before source ownership is acquired.
 
 This owned route validates Cargo manifests and configuration against the
-captured transfer inventory. Relative and absolute `--manifest-path` selectors
-map into that inventory. File-based `--config`, custom target-specification
+captured transfer inventory. Relative and absolute `--manifest-path` and `-m`
+selectors map into that inventory, including attached (`-mcrates/app/Cargo.toml`),
+equals (`-m=crates/app/Cargo.toml`), and grouped (`-qm crates/app/Cargo.toml`)
+forms. Planning, source relocation, artifact selection, and worker scheduling
+use the same manifest operand; duplicate or incomplete selectors refuse.
+File-based `--config`, custom target-specification
 files, directory-changing wrappers, and caller overrides of managed output
 paths or Cargo home currently refuse before execution. Other Unix platforms,
 invocations with `RCH_DISABLE_TARGET_REUSE=1`, and external Cargo drivers such

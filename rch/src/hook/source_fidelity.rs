@@ -14,6 +14,7 @@ use super::dependency_closure::{
 };
 use super::ssh::run_offload_ssh_command_with_stdin;
 use super::*;
+use rch_common::cargo_args::parse_manifest_selection;
 use rch_common::prepared_dependencies::PreparedDependencyAttestation;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -1524,6 +1525,17 @@ pub(super) fn validate_owned_source_content_closure(
         }
     }
     let (mut tokens, cargo_index) = cargo_target_dir::managed_clean_overlay_cargo_tokens(command)?;
+    let selection =
+        parse_manifest_selection(&tokens[cargo_index + 1..]).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        !selection.changes_directory,
+        "owned Cargo source validation does not support Cargo -C"
+    );
+    let manifest_selector = selection.manifest.map(|mut selector| {
+        selector.option_index += cargo_index + 1;
+        selector.value_index += cargo_index + 1;
+        selector
+    });
     anyhow::ensure!(
         !tokens[..cargo_index].iter().any(|token| {
             matches!(token.as_str(), "-C" | "--chdir") || token.starts_with("--chdir=")
@@ -1538,17 +1550,50 @@ pub(super) fn validate_owned_source_content_closure(
         }),
         "owned Cargo command cannot override its managed target or Cargo home"
     );
-    let mut manifest_count = 0;
     let mut index = cargo_index + 1;
     while index < tokens.len() {
         let token = tokens[index].clone();
         if token == "--" {
             break;
         }
-        anyhow::ensure!(
-            !token.starts_with("-C"),
-            "owned Cargo source validation does not support Cargo -C"
-        );
+        if let Some(selector) = manifest_selector
+            .as_ref()
+            .filter(|selector| selector.option_index == index)
+        {
+            let option = if selector.value_index == index {
+                &token[..selector.value_offset]
+            } else {
+                token.as_str()
+            };
+            if !option.starts_with("--") {
+                // Shared selection spans do not expand the set of other
+                // Cargo options admitted by this source validator.
+                let prefix = option
+                    .strip_suffix('=')
+                    .unwrap_or(option)
+                    .strip_suffix('m')
+                    .and_then(|prefix| prefix.strip_prefix('-'))
+                    .ok_or_else(|| anyhow::anyhow!("invalid owned Cargo manifest selector"))?;
+                anyhow::ensure!(
+                    prefix.chars().all(|flag| matches!(flag, 'q' | 'v' | 'r')),
+                    "unsupported owned Cargo option: {option}"
+                );
+            }
+            let actual = normalize(&cwd.join(&selector.value))?;
+            anyhow::ensure!(
+                actual == selected_local_manifest,
+                "Cargo manifest selector differs from the planned entrypoint"
+            );
+            let selected = validate_selected_cargo_path(&entries, selected_manifest)?;
+            let mapped = container
+                .join(selected)
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("mapped Cargo manifest is not UTF-8"))?
+                .to_owned();
+            tokens[selector.value_index].replace_range(selector.value_offset.., &mapped);
+            index = selector.value_index + 1;
+            continue;
+        }
         let (name, inline) = token
             .split_once('=')
             .map_or((token.as_str(), None), |(name, value)| (name, Some(value)));
@@ -1561,8 +1606,7 @@ pub(super) fn validate_owned_source_content_closure(
         );
         let takes_value = matches!(
             name,
-            "--manifest-path"
-                | "--config"
+            "--config"
                 | "--target"
                 | "--profile"
                 | "--package"
@@ -1590,29 +1634,7 @@ pub(super) fn validate_owned_source_content_closure(
                 !value.is_empty() && value != "--",
                 "missing owned Cargo option value for {name}"
             );
-            if name == "--manifest-path" {
-                manifest_count += 1;
-                anyhow::ensure!(
-                    manifest_count == 1,
-                    "multiple owned Cargo manifest selectors are unsupported"
-                );
-                let actual = normalize(&cwd.join(&value))?;
-                anyhow::ensure!(
-                    actual == selected_local_manifest,
-                    "Cargo manifest selector differs from the planned entrypoint"
-                );
-                let selected = validate_selected_cargo_path(&entries, selected_manifest)?;
-                let mapped = container
-                    .join(selected)
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("mapped Cargo manifest is not UTF-8"))?
-                    .to_owned();
-                tokens[value_index] = if inline.is_some() {
-                    format!("--manifest-path={mapped}")
-                } else {
-                    mapped
-                };
-            } else if name == "--config" {
+            if name == "--config" {
                 let _: toml::Table = toml::from_str(&value).context(
                     "owned Cargo supports inline TOML --config only; config files require a selected mapping",
                 )?;
@@ -1677,7 +1699,7 @@ pub(super) fn validate_owned_source_content_closure(
         index += 1;
     }
     anyhow::ensure!(
-        (manifest_count == 1) == selected_manifest_root.is_some(),
+        manifest_selector.is_some() == selected_manifest_root.is_some(),
         "Cargo manifest selection changed since closure planning"
     );
     Ok(join_exec_command(&tokens))
@@ -3144,7 +3166,7 @@ sys.exit(99)
                 .prefix("rch-owned-closure-")
                 .tempdir_in("/tmp")
                 .unwrap();
-            let local = temp.path().join("local");
+            let local = temp.path().join("local with ' quotes; $cash");
             fs::create_dir_all(&local).unwrap();
             let local = local.canonicalize().unwrap();
             let files = [
@@ -3231,7 +3253,16 @@ sys.exit(99)
             let cwd = policy.canonical_root().join("workspace/apps/app");
             let dependency = policy.canonical_root().join("foreign/crates/member");
             for selected in [&cwd, &dependency] {
-                for equals in [false, true] {
+                for (option, separated) in [
+                    ("--manifest-path", true),
+                    ("--manifest-path=", false),
+                    ("-m", true),
+                    ("-m", false),
+                    ("-m=", false),
+                    ("-qm", true),
+                    ("-qvm", false),
+                    ("-qvm=", false),
+                ] {
                     let manifest = selected.join("Cargo.toml");
                     let mut argv = vec![
                         "env".to_owned(),
@@ -3240,16 +3271,20 @@ sys.exit(99)
                         "test".to_owned(),
                         "--features".to_owned(),
                         "--manifest-path=/opaque-value".to_owned(),
+                        "-F".to_owned(),
+                        "-qm/opaque-value".to_owned(),
                     ];
-                    if equals {
-                        argv.push(format!("--manifest-path={}", manifest.display()));
+                    let selector_index = argv.len();
+                    if separated {
+                        argv.extend([option.to_owned(), manifest.to_str().unwrap().to_owned()]);
                     } else {
-                        argv.extend([
-                            "--manifest-path".to_owned(),
-                            manifest.to_str().unwrap().to_owned(),
-                        ]);
+                        argv.push(format!("{option}{}", manifest.display()));
                     }
-                    argv.extend(["--".to_owned(), "--manifest-path=/test-payload".to_owned()]);
+                    argv.extend([
+                        "--".to_owned(),
+                        "--manifest-path=/test-payload".to_owned(),
+                        "-qm/test-payload".to_owned(),
+                    ]);
                     let command = shell_words::join(&argv);
                     let mapped = validate_owned_source_content_closure(
                         &prepared,
@@ -3266,15 +3301,16 @@ sys.exit(99)
                         .find(|entry| entry.local_root == *selected)
                         .unwrap();
                     let expected = format!("{}/Cargo.toml", remote.remote_root);
-                    if equals {
-                        argv[6] = format!("--manifest-path={expected}");
+                    if separated {
+                        argv[selector_index + 1] = expected;
                     } else {
-                        argv[7] = expected;
+                        argv[selector_index] = format!("{option}{expected}");
                     }
-                    assert_eq!(shell_words::split(&mapped).unwrap(), argv);
+                    assert_eq!(shell_words::split(&mapped).unwrap(), argv, "{command}");
                 }
             }
-            let relative = "cargo check --manifest-path ../../../foreign/crates/member/Cargo.toml --config 'build.jobs=2'";
+            let relative =
+                "cargo check -qm ../../../foreign/crates/member/Cargo.toml --config 'build.jobs=2'";
             let mapped = validate_owned_source_content_closure(
                 &prepared,
                 &layout.source_root,
@@ -3288,15 +3324,24 @@ sys.exit(99)
                 "{}/projects/foreign/crates/member/Cargo.toml",
                 layout.source_root,
             )));
-            validate_owned_source_content_closure(
-                &prepared,
-                &layout.source_root,
-                &cwd,
-                None,
+            for command in [
                 "cargo check --workspace --locked",
-                &policy,
-            )
-            .unwrap();
+                "cargo test --features -mopaque -- -qm/test-payload",
+            ] {
+                let mapped = validate_owned_source_content_closure(
+                    &prepared,
+                    &layout.source_root,
+                    &cwd,
+                    None,
+                    command,
+                    &policy,
+                )
+                .unwrap();
+                assert_eq!(
+                    shell_words::split(&mapped).unwrap(),
+                    shell_words::split(command).unwrap(),
+                );
+            }
         }
 
         #[tokio::test]
@@ -3336,7 +3381,7 @@ sys.exit(99)
                     &layout.source_root,
                     &cwd,
                     Some(selected),
-                    &format!("cargo check --manifest-path {relative}"),
+                    &format!("cargo check -m={relative}"),
                     &policy,
                 )
                 .unwrap_err();
@@ -3360,6 +3405,7 @@ sys.exit(99)
                 "CARGO_HOME=/canonical/home cargo build",
                 "env -C /canonical cargo build",
                 "cargo -C /canonical build",
+                "cargo -qC/canonical build",
                 "cargo build --config /canonical/config.toml",
                 "cargo build --config 'patch.crates-io.member.path=\"/canonical/member\"'",
                 "cargo build --target=/canonical/target.json",
@@ -3372,6 +3418,29 @@ sys.exit(99)
                         &layout.source_root,
                         &cwd,
                         None,
+                        command,
+                        &policy,
+                    )
+                    .is_err(),
+                    "{command}"
+                );
+            }
+            for command in [
+                "cargo build -m Cargo.toml --manifest-path Cargo.toml",
+                "cargo build -mCargo.toml -qvm=Cargo.toml",
+                "cargo build -qm Cargo.toml -qC /canonical",
+                "cargo build -hmCargo.toml",
+                "cargo build -qXmCargo.toml",
+                "cargo build -qm ../../../foreign/crates/member/Cargo.toml",
+                "cargo build -F -mCargo.toml",
+                "cargo build -- -m Cargo.toml",
+            ] {
+                assert!(
+                    validate_owned_source_content_closure(
+                        &prepared,
+                        &layout.source_root,
+                        &cwd,
+                        Some(&cwd),
                         command,
                         &policy,
                     )

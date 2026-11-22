@@ -24,6 +24,7 @@ pub mod binary_hash;
 pub mod bypass_record;
 pub mod bypass_recovery;
 pub mod capability_probe;
+pub mod cargo_args;
 pub mod cargo_path_deps;
 pub mod classifier_drift;
 pub mod closure_explain;

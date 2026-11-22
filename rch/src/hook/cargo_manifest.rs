@@ -9,6 +9,7 @@ use super::super::dependency_closure::{
     SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome, canonicalize_sync_root_for_plan,
     is_within_sync_topology,
 };
+use rch_common::cargo_args::{is_manifest_selector_candidate, parse_manifest_selection};
 use rch_common::path_topology::PathTopologyPolicy;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,87 +26,25 @@ pub(super) fn selected_manifest_root(
     let words = shell_words::split(command)?;
     if !words
         .iter()
-        .any(|word| word == "--manifest-path" || word.starts_with("--manifest-path="))
+        .any(|word| is_manifest_selector_candidate(word))
     {
         return Ok(None);
     }
     let (words, cargo_index) = managed_clean_overlay_cargo_tokens(command)?;
-    let mut selected = None;
-    let mut changes_directory = words[..cargo_index]
-        .iter()
-        .any(|word| matches!(word.as_str(), "-C" | "--chdir") || word.starts_with("--chdir="));
-    let mut args = words[cargo_index + 1..].iter();
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            break;
-        }
-        let manifest = if arg == "--manifest-path" {
-            Some(
-                args.next()
-                    .ok_or_else(|| anyhow::anyhow!("missing --manifest-path value"))?
-                    .as_str(),
-            )
-        } else if let Some(value) = arg.strip_prefix("--manifest-path=") {
-            Some(value)
-        } else {
-            // Never interpret another option's value as a manifest selector.
-            // Changing cwd requires a separate, explicit replay mapping; refuse
-            // that combination instead of discovering the wrong package graph.
-            if arg.starts_with("-C") {
-                changes_directory = true;
-            }
-            if matches!(
-                arg.as_str(),
-                "--config"
-                    | "--target"
-                    | "--target-dir"
-                    | "--profile"
-                    | "--package"
-                    | "-p"
-                    | "--exclude"
-                    | "--features"
-                    | "-F"
-                    | "--bin"
-                    | "--example"
-                    | "--test"
-                    | "--bench"
-                    | "--color"
-                    | "--message-format"
-                    | "--jobs"
-                    | "-j"
-                    | "-Z"
-                    | "-C"
-                    | "--lockfile-path"
-                    | "--artifact-dir"
-                    | "--out-dir"
-            ) {
-                anyhow::ensure!(
-                    args.next().is_some(),
-                    "missing value for Cargo option {arg}"
-                );
-            }
-            None
-        };
-        if let Some(manifest) = manifest {
-            anyhow::ensure!(
-                selected.is_none(),
-                "multiple --manifest-path options are unsupported"
-            );
-            anyhow::ensure!(
-                !manifest.is_empty() && manifest != "--" && !manifest.chars().any(char::is_control),
-                "--manifest-path must name a nonempty Cargo.toml path without control characters"
-            );
-            selected = Some(manifest);
-        }
-    }
-    let Some(selected) = selected else {
+    let selection =
+        parse_manifest_selection(&words[cargo_index + 1..]).map_err(anyhow::Error::msg)?;
+    let changes_directory = selection.changes_directory
+        || words[..cargo_index]
+            .iter()
+            .any(|word| matches!(word.as_str(), "-C" | "--chdir") || word.starts_with("--chdir="));
+    let Some(selected) = selection.manifest else {
         return Ok(None);
     };
     anyhow::ensure!(
         !changes_directory,
-        "--manifest-path with env --chdir/-C or cargo -C requires an explicit working-directory mapping"
+        "Cargo manifest selection with env --chdir/-C or cargo -C requires an explicit working-directory mapping"
     );
-    let manifest = invocation_root.join(selected);
+    let manifest = invocation_root.join(selected.value);
     anyhow::ensure!(
         manifest
             .file_name()
@@ -228,53 +167,59 @@ mod tests {
         let root = base.join("crate with ' quotes; $cash");
         package(&root, "selected", "");
         let path = root.join("Cargo.toml");
-        let value = path.to_str().unwrap();
-        for args in [
-            vec!["cargo", "test", "--manifest-path", value],
-            vec!["cargo", "+nightly", "test", "--manifest-path", value],
-            vec![
-                "env",
-                "--",
-                "KEY=value",
-                "rustup",
-                "run",
-                "nightly",
-                "cargo",
-                "test",
-                "--manifest-path",
-                value,
-            ],
-            vec![
-                "/usr/bin/time",
-                "-f",
-                "cargo",
-                "cargo",
-                "test",
-                "--manifest-path",
-                value,
-            ],
-        ] {
-            assert_eq!(
-                selected_manifest_root(&shell_words::join(args), &base, &policy).unwrap(),
-                Some(root.clone())
-            );
-        }
         let relative = "crate with ' quotes; $cash/Cargo.toml";
-        let equals = format!("--manifest-path={relative}");
-        assert_eq!(
-            selected_manifest_root(
-                &shell_words::join(["cargo", "test", equals.as_str()]),
-                &base,
-                &policy,
-            )
-            .unwrap(),
-            Some(root)
-        );
+        for value in [path.to_str().unwrap(), relative] {
+            for selector in [
+                vec!["--manifest-path".to_owned(), value.to_owned()],
+                vec![format!("--manifest-path={value}")],
+                vec!["-m".to_owned(), value.to_owned()],
+                vec![format!("-m{value}")],
+                vec![format!("-m={value}")],
+                vec!["-qm".to_owned(), value.to_owned()],
+                vec![format!("-qvm{value}")],
+                vec![format!("-qvm={value}")],
+            ] {
+                for prefix in [
+                    vec!["cargo", "test"],
+                    vec!["cargo", "+nightly", "test"],
+                    vec![
+                        "env",
+                        "--",
+                        "KEY=value",
+                        "rustup",
+                        "run",
+                        "nightly",
+                        "cargo",
+                        "test",
+                    ],
+                    vec!["/usr/bin/time", "-f", "cargo", "cargo", "test"],
+                ] {
+                    let command = shell_words::join(
+                        prefix
+                            .into_iter()
+                            .chain(selector.iter().map(String::as_str)),
+                    );
+                    assert_eq!(
+                        selected_manifest_root(&command, &base, &policy).unwrap(),
+                        Some(root.clone()),
+                        "{command}"
+                    );
+                }
+            }
+        }
         for command in [
             "cargo test -- --manifest-path nonexistent/Cargo.toml",
+            "cargo test -- -m nonexistent/Cargo.toml",
             "cargo nextest run -- --manifest-path=nonexistent/Cargo.toml",
             "env -- cargo test -- --manifest-path=nonexistent/Cargo.toml",
+            "env -- cargo test -- -qmnonexistent/Cargo.toml",
             "cargo test --config --manifest-path=not-a-selector",
+            "cargo test --features -mnot-a-selector",
+            "cargo test -F -qmnot-a-selector",
+            "cargo test -p -m=not-a-selector",
+            "cargo test -Z -qmnot-a-selector",
+            "cargo test -F-mnot-a-selector",
+            "cargo test -qF -mnot-a-selector",
             "cargo build",
         ] {
             assert_eq!(
@@ -297,11 +242,24 @@ mod tests {
             "cargo build --manifest-path",
             "cargo build --manifest-path=",
             "cargo build --manifest-path --",
+            "cargo build -m",
+            "cargo build -m=",
+            "cargo build -m --",
+            "cargo build -qm",
+            "cargo build -qvm=",
             "cargo build --manifest-path missing/Cargo.toml",
+            "cargo build -mmissing/Cargo.toml",
             "cargo build --manifest-path ../outside/Cargo.toml",
+            "cargo build -m=../outside/Cargo.toml",
             "cargo build --manifest-path Cargo.toml --manifest-path Cargo.toml",
+            "cargo build -m Cargo.toml --manifest-path Cargo.toml",
+            "cargo build --manifest-path Cargo.toml -qmCargo.toml",
+            "cargo build -mCargo.toml -qvm=Cargo.toml",
             "env -C ignored cargo build --manifest-path Cargo.toml",
             "cargo -C ignored build --manifest-path Cargo.toml",
+            "env -C ignored cargo build -m Cargo.toml",
+            "cargo -qCignored build -m Cargo.toml",
+            "cargo build -mCargo.toml -qC ignored",
         ] {
             assert!(
                 selected_manifest_root(command, &root, &policy).is_err(),
@@ -328,9 +286,10 @@ mod tests {
         package(&dep, "external_dep", "");
         assert_eq!(a.join("../../../dep").canonicalize().unwrap(), dep);
         let reporter = HookReporter::new(OutputVisibility::None);
-        for (name, selected, external) in [("a", &a, true), ("b", &b, false)] {
-            let command =
-                format!("cargo test --manifest-path crates/{name}/Cargo.toml --all-targets");
+        for (name, selected, external, selector) in
+            [("a", &a, true, "-m "), ("b", &b, false, "-qvm=")]
+        {
+            let command = format!("cargo test {selector}crates/{name}/Cargo.toml --all-targets");
             let entry = selected_manifest_root(&command, &repo, &policy)
                 .unwrap()
                 .unwrap();

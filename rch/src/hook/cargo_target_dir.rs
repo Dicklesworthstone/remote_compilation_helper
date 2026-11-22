@@ -238,7 +238,9 @@ pub(super) fn target_triple_for_command(command: &str) -> String {
 /// macros as foreign target output, and also selected the wrong pooled cache.
 pub(super) fn explicit_target_triple_for_command(command: &str) -> Option<String> {
     let (tokens, cargo_index) = cargo_command_tokens(command).ok()?;
-    let mut iter = tokens[cargo_index + 1..].iter();
+    let args =
+        rch_common::cargo_args::normalize_manifest_options(&tokens[cargo_index + 1..]).ok()?;
+    let mut iter = args.iter();
     let mut configured_target = None;
     while let Some(token) = iter.next() {
         if token == "--" {
@@ -256,6 +258,9 @@ pub(super) fn explicit_target_triple_for_command(command: &str) -> Option<String
             let config = if token == "--config" {
                 iter.next().map(String::as_str)
             } else {
+                if rch_common::cargo_args::takes_separate_value(token) {
+                    iter.next()?;
+                }
                 token.strip_prefix("--config=")
             };
             if let Some(config) = config
@@ -1312,10 +1317,22 @@ fn cargo_target_dir_flag_span(tokens: &[String]) -> Option<(std::ops::Range<usiz
         return None;
     }
     let mut index = cargo_index.checked_sub(added)? + 1;
+    // Read original spans: normalizing -qvm here would shift the indices used
+    // to remove only Cargo's actual --target-dir from the caller's argv.
+    let cargo_args_start = index;
+    let manifest = rch_common::cargo_args::parse_manifest_selection(&tokens[index..])
+        .ok()?
+        .manifest;
     let mut selected = None;
     while let Some(token) = tokens.get(index) {
         if token == "--" {
             break;
+        }
+        if let Some(manifest) = &manifest
+            && index == cargo_args_start + manifest.option_index
+        {
+            index = cargo_args_start + manifest.value_index + 1;
+            continue;
         }
         let (end, value) = if token == "--target-dir" {
             let value = tokens.get(index + 1)?;
@@ -1328,32 +1345,7 @@ fn cargo_target_dir_flag_span(tokens: &[String]) -> Option<(std::ops::Range<usiz
         } else {
             // A value can itself spell --target-dir or --. It remains an
             // opaque value, not an option to extract/remove or a separator.
-            let takes_value = matches!(
-                token.as_str(),
-                "--config"
-                    | "--target"
-                    | "--manifest-path"
-                    | "--lockfile-path"
-                    | "--profile"
-                    | "--package"
-                    | "-p"
-                    | "--exclude"
-                    | "--features"
-                    | "-F"
-                    | "--bin"
-                    | "--example"
-                    | "--test"
-                    | "--bench"
-                    | "--color"
-                    | "--message-format"
-                    | "--jobs"
-                    | "-j"
-                    | "-Z"
-                    | "-C"
-                    | "--artifact-dir"
-                    | "--out-dir"
-                    | "--build-dir"
-            );
+            let takes_value = rch_common::cargo_args::takes_separate_value(token);
             if takes_value {
                 tokens.get(index + 1)?;
             }
@@ -3750,6 +3742,9 @@ fn stamp() {
             "--config",
             "--target",
             "--manifest-path",
+            "-m",
+            "-qm",
+            "-vvm",
             "--lockfile-path",
             "--profile",
             "--package",
@@ -3804,6 +3799,69 @@ fn stamp() {
             );
             assert_eq!(
                 super::strip_cargo_target_dir_flags_from_command_tokens(&tokens),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_manifest_operands_preserve_target_and_original_rewrite_spans() {
+        for selector in [
+            vec!["-m", "crates/an app/Cargo.toml"],
+            vec!["-mcrates/an app/Cargo.toml"],
+            vec!["-m=crates/an app/Cargo.toml"],
+            vec!["-qrm", "crates/an app/Cargo.toml"],
+            vec!["-vvm=crates/an app/Cargo.toml"],
+        ] {
+            let mut tokens = vec!["env", "--", "cargo", "build"];
+            tokens.extend(selector);
+            let mut expected: Vec<_> = tokens.iter().map(|word| (*word).to_owned()).collect();
+            expected.extend(["--".into(), "--target-dir=program".into()]);
+            tokens.extend([
+                "--target-dir",
+                "actual outputs",
+                "--",
+                "--target-dir=program",
+            ]);
+            let tokens: Vec<_> = tokens.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                super::extract_cargo_target_dir_from_command_tokens(&tokens).as_deref(),
+                Some("actual outputs")
+            );
+            assert_eq!(
+                super::strip_cargo_target_dir_flags_from_command_tokens(&tokens),
+                Some(expected)
+            );
+        }
+        for selector in [
+            "--manifest-path '--target=x86_64-pc-windows-msvc'",
+            "-m '--target=x86_64-pc-windows-msvc'",
+            "-qm '--target=x86_64-pc-windows-msvc'",
+            "-vvm=--target=x86_64-pc-windows-msvc",
+        ] {
+            let command = format!("cargo build {selector} --target wasm32-unknown-unknown");
+            assert_eq!(
+                super::explicit_target_triple_for_command(&command).as_deref(),
+                Some("wasm32-unknown-unknown"),
+                "{command}"
+            );
+            let command = format!(
+                "cargo build {selector} --config 'build.target=\"aarch64-unknown-linux-gnu\"'"
+            );
+            assert_eq!(
+                super::explicit_target_triple_for_command(&command).as_deref(),
+                Some("aarch64-unknown-linux-gnu"),
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo build -m Cargo.toml --manifest-path other/Cargo.toml --target-dir target",
+            "cargo build --target-dir target -qm=",
+        ] {
+            let tokens = shell_words::split(command).unwrap();
+            assert_eq!(
+                super::cargo_target_dir_flag_span(&tokens),
                 None,
                 "{command}"
             );
