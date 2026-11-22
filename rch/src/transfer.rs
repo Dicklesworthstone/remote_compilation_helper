@@ -25346,6 +25346,209 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cargo_retrieval_exclusions_match_real_rsync_preflight_download_and_staging() {
+        let _guard = test_guard!();
+        let _transport = RealTransport::pin();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let worker = worker_with_os(Some("linux"));
+
+        // Exercise both the target-root pull and the project-root phase, with
+        // cross-target and custom profiles. These are the literal phase rules
+        // persisted after the hook proves required Cargo outputs are safe.
+        for (case, root) in [
+            ("target-root", "debug"),
+            ("cross-target", "aarch64-unknown-linux-gnu/release"),
+            ("project-root", "target/release-perf"),
+        ] {
+            let source = retained.join(case).join("worker");
+            let caller = retained.join(case).join("caller");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir_all(&caller).unwrap();
+            let selected = [
+                format!("{root}/app"),
+                format!("{root}/app.pdb"),
+                format!("{root}/app.dSYM/Contents/Resources/DWARF/app"),
+                format!("{root}/libfixture.so"),
+                format!("{root}/deps/libfixture-0123456789abcdef.rlib"),
+                format!("{root}/build/fixture/0123456789abcdef/out/fixture-0123456789abcdef"),
+                format!("{root}/.wrapper-shims-extra/helper.bin"),
+                format!("{root}/nested/{root}/.wrapper-shims/helper.bin"),
+                format!("{root}/.directory-rule-with-file-name"),
+            ];
+            let excluded = [
+                format!("{root}/.wrapper-shims/helper.bin"),
+                format!("{root}/.kache-build-script-shims/helper.bin"),
+                format!("{root}/incremental/state.bin"),
+                format!("{root}/.fingerprint/state.json"),
+                format!("{root}/build/fixture/0123456789abcdef/out/generated.rs"),
+                format!("{root}/app.d"),
+            ];
+            let mut selected_bytes = 0_u64;
+            for (index, path) in selected.iter().enumerate() {
+                let path = source.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let bytes = format!("required output {case} {index}\n");
+                selected_bytes += bytes.len() as u64;
+                std::fs::write(path, bytes).unwrap();
+            }
+            for path in &excluded {
+                let path = source.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::File::create(path)
+                    .unwrap()
+                    .set_len(4 * 1024 * 1024)
+                    .unwrap();
+            }
+            let patterns = vec![
+                format!("- /{root}/.wrapper-shims/"),
+                format!("- /{root}/.kache-build-script-shims/"),
+                format!("- /{root}/.directory-rule-with-file-name/"),
+                format!("- {root}/incremental/"),
+                format!("- {root}/.fingerprint/"),
+                format!("- {root}/build/"),
+                format!("- {root}/build/**"),
+                "- *.d".to_string(),
+                format!("+ {root}/build/*/*/out/*-????????????????"),
+                format!("{root}/**"),
+            ];
+            let expected: std::collections::BTreeSet<_> = selected.iter().cloned().collect();
+            let paths: Vec<_> = selected
+                .iter()
+                .chain(&excluded)
+                .map(PathBuf::from)
+                .collect();
+
+            for streaming in [false, true] {
+                let stage = retained.join(case).join(if streaming {
+                    "streaming-stage"
+                } else {
+                    "ordinary-stage"
+                });
+                std::fs::create_dir_all(&stage).unwrap();
+                let pipeline = TransferPipeline::new(
+                    caller.clone(),
+                    "cargo-cache-exclusions".into(),
+                    "persisted-policy".into(),
+                    TransferConfig {
+                        // Upload excludes must not leak into this policy: the
+                        // target tree and its required libraries still return.
+                        exclude_patterns: vec!["target/".into(), "deps/".into(), "*.rlib".into()],
+                        ..TransferConfig::default()
+                    },
+                )
+                .with_local_root(stage.clone());
+                let command = || {
+                    let mut command = if streaming {
+                        pipeline.build_retrieve_streaming_command(
+                            &worker,
+                            source.to_str().unwrap(),
+                            &patterns,
+                        )
+                    } else {
+                        pipeline.build_retrieve_command(
+                            &worker,
+                            source.to_str().unwrap(),
+                            &patterns,
+                        )
+                    };
+                    // Real rsync peers over local pipes; only SSH is replaced.
+                    command.args([
+                        "-e",
+                        r#"sh -c 'if [ "$1" = -l ]; then shift 2; fi; shift; exec "$@"' rch-local-peer"#,
+                    ]);
+                    command.env("LC_ALL", "C").current_dir(&source);
+                    command
+                };
+                let mut planning = command();
+                planning.arg("--dry-run");
+                let planned = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    execute_rsync_attempt(planning),
+                )
+                .await
+                .expect("bounded artifact preflight")
+                .expect("start artifact preflight");
+                assert!(
+                    planned.status.success(),
+                    "{case} streaming={streaming}: {}",
+                    String::from_utf8_lossy(&planned.stderr)
+                );
+                let planned_stdout = String::from_utf8_lossy(&planned.stdout);
+                assert_eq!(
+                    parse_rsync_selected_size(&planned_stdout),
+                    Some(selected_bytes)
+                );
+                assert_eq!(
+                    parse_rsync_itemized_regular_files(&planned_stdout)
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    expected,
+                    "preflight must select the complete required output set"
+                );
+                assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 0);
+
+                let copied = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    execute_rsync_attempt(command()),
+                )
+                .await
+                .expect("bounded artifact download")
+                .expect("start artifact download");
+                assert!(
+                    copied.status.success(),
+                    "{case} streaming={streaming}: {}",
+                    String::from_utf8_lossy(&copied.stderr)
+                );
+                let copied_stdout = String::from_utf8_lossy(&copied.stdout);
+                assert_eq!(
+                    parse_rsync_selected_size(&copied_stdout),
+                    Some(selected_bytes)
+                );
+                assert_eq!(
+                    parse_rsync_itemized_regular_files(&copied_stdout)
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    expected
+                );
+                for path in &selected {
+                    assert_eq!(
+                        std::fs::read(stage.join(path)).unwrap(),
+                        std::fs::read(source.join(path)).unwrap(),
+                        "required output {path}"
+                    );
+                }
+                for path in &excluded {
+                    assert!(!stage.join(path).exists(), "worker cache returned: {path}");
+                    assert_eq!(
+                        std::fs::metadata(source.join(path)).unwrap().len(),
+                        4 * 1024 * 1024
+                    );
+                }
+                let (admitted, outside) = pipeline
+                    .partition_staged_artifact_paths(&paths, &patterns)
+                    .unwrap();
+                assert_eq!(
+                    admitted,
+                    selected.iter().map(PathBuf::from).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    outside,
+                    excluded.iter().map(PathBuf::from).collect::<Vec<_>>()
+                );
+                pipeline
+                    .validate_staged_artifact_paths(&admitted, &patterns)
+                    .unwrap();
+                assert!(
+                    pipeline
+                        .validate_staged_artifact_paths(&paths, &patterns)
+                        .is_err()
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_artifact_retry_real_rsync_selected_payload_exceeds_old_budget() {

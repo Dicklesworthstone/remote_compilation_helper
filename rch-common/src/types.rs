@@ -3553,13 +3553,13 @@ pub struct TransferConfig {
     /// zstd compression level (1-19).
     #[serde(default = "default_compression")]
     pub compression_level: u32,
-    /// Patterns to exclude from transfer.
+    /// Patterns to exclude from source upload.
     #[serde(default = "default_excludes")]
     pub exclude_patterns: Vec<String>,
     /// Literal directories relative to the Cargo target root to omit from
     /// artifact return. Additive to built-in cache exclusions; never applied
     /// to source uploads or inherited from their exclude patterns.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub cargo_retrieval_exclude_dirs: Vec<String>,
     /// Built-in default exclude patterns that a custom `exclude_patterns` list
     /// omits on purpose (for example `*.pem` when TLS test fixtures must reach

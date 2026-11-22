@@ -323,13 +323,18 @@ pub(super) fn cargo_retrieval_patterns(
         .map_err(anyhow::Error::msg)?;
     let mut patterns = baseline.to_vec();
     for directory in &transfer.cargo_retrieval_exclude_dirs {
-        for priority in baseline
-            .iter()
-            .filter_map(|pattern| pattern.strip_prefix("+ "))
-        {
+        for pattern in baseline.iter().filter(|pattern| !pattern.starts_with("- ")) {
+            let priority = pattern.strip_prefix("+ ");
+            let output = priority.unwrap_or(pattern);
+            // Whole-profile globs also match private caches. Their required
+            // outputs are established by the complete Cargo receipt. Narrow
+            // outputs and every priority rule already promise deliverables.
+            if priority.is_none() && cargo_profile_tree_pattern(output) {
+                continue;
+            }
             anyhow::ensure!(
-                !priority_may_overlap_directory(priority, directory)?,
-                "Cargo retrieval exclusion {directory:?} overlaps priority output {priority:?}"
+                !priority_may_overlap_directory(output, directory)?,
+                "Cargo retrieval exclusion {directory:?} overlaps required or priority output {pattern:?}"
             );
         }
         if let Some(required) = required_files {
@@ -350,20 +355,38 @@ pub(super) fn cargo_retrieval_patterns(
     Ok(patterns)
 }
 
+fn cargo_profile_tree_pattern(pattern: &str) -> bool {
+    let components: Vec<_> = pattern.split('/').collect();
+    matches!(components.as_slice(), [profile, "**"] if *profile != "doc")
+        || matches!(components.as_slice(), ["*", _, "**"])
+}
+
 /// Decide disjointness component by component. An exhausted prefix or `**`
 /// can overlap the directory's descendants, so uncertainty refuses the rule.
-/// Escaped literal priorities are conservatively protected too.
+/// Convert rsync's literal escapes before using the glob component matcher.
 fn priority_may_overlap_directory(priority: &str, directory: &str) -> anyhow::Result<bool> {
     let mut expected = priority.trim_start_matches('/').split('/');
     let mut actual = directory.split('/');
     loop {
         match (expected.next(), actual.next()) {
             (Some(pattern), Some(component)) => {
-                if pattern == "**" || pattern.contains('\\') {
+                if pattern == "**" {
                     return Ok(true);
                 }
-                let pattern =
-                    glob::Pattern::new(pattern).context("invalid priority output pattern")?;
+                let mut converted = String::new();
+                let mut characters = pattern.chars();
+                while let Some(character) = characters.next() {
+                    if character == '\\' {
+                        let escaped = characters
+                            .next()
+                            .context("incomplete protected artifact pattern escape")?;
+                        converted.push_str(&glob::Pattern::escape(&escaped.to_string()));
+                    } else {
+                        converted.push(character);
+                    }
+                }
+                let pattern = glob::Pattern::new(&converted)
+                    .context("invalid protected artifact output pattern")?;
                 if !pattern.matches_with(
                     component,
                     glob::MatchOptions {
@@ -493,6 +516,50 @@ mod cargo_retrieval_tests {
                 "{directory:?}"
             );
         }
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_protect_narrow_outputs_and_literal_priorities() {
+        let baseline = vec![
+            "debug/**".into(),
+            "debug/app.pdb".into(),
+            "debug/app.dSYM/**".into(),
+            "+ debug/app\\[one\\]".into(),
+        ];
+        for directory in ["debug/app.pdb", "debug/app.dSYM", "debug/app.dSYM/Contents"] {
+            let transfer = TransferConfig {
+                cargo_retrieval_exclude_dirs: vec![directory.into()],
+                ..TransferConfig::default()
+            };
+            assert!(cargo_retrieval_patterns(&baseline, &transfer, None).is_err());
+        }
+        let transfer = TransferConfig {
+            cargo_retrieval_exclude_dirs: vec!["debug/.wrapper-shims".into()],
+            ..TransferConfig::default()
+        };
+        let patterns = cargo_retrieval_patterns(&baseline, &transfer, None).unwrap();
+        assert!(patterns.starts_with(&baseline));
+        assert_eq!(patterns.len(), baseline.len() + 1);
+        assert!(
+            !priority_may_overlap_directory("debug/app\\[one\\]", "debug/.wrapper-shims").unwrap()
+        );
+        assert!(priority_may_overlap_directory("debug/app\\[one\\]", "debug").unwrap());
+        assert!(!priority_may_overlap_directory("debug/app", "debug/app-extra").unwrap());
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_validate_the_whole_policy_without_mutating_baseline() {
+        let baseline = vec!["debug/**".into(), "- debug/incremental/".into()];
+        let before = baseline.clone();
+        let transfer = TransferConfig {
+            cargo_retrieval_exclude_dirs: vec![
+                "debug/.wrapper-shims".into(),
+                "debug/../app".into(),
+            ],
+            ..TransferConfig::default()
+        };
+        assert!(cargo_retrieval_patterns(&baseline, &transfer, None).is_err());
+        assert_eq!(baseline, before);
     }
 }
 

@@ -158,8 +158,9 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-// Version 9 adds opt-in job interception rules. Only on-disk values are
-// cached; runtime overrides and rule validation still run on every load.
+// Version 10 adds Cargo retrieval directory exclusions. Older binaries ignore
+// that key in TOML and cache a config without it, so unchanged source metadata
+// must not let an upgraded reader silently lose the configured policy.
 const CACHE_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,7 +328,14 @@ fn stable_source_fingerprints(
 
 fn try_read_cache() -> Option<RchConfig> {
     let path = cache_file_path()?;
-    let bytes = std::fs::read(&path).ok()?;
+    try_read_cache_at(&path, current_source_fingerprints)
+}
+
+fn try_read_cache_at(
+    path: &Path,
+    fingerprints: impl FnOnce() -> Vec<SourceFingerprint>,
+) -> Option<RchConfig> {
+    let bytes = std::fs::read(path).ok()?;
     let cached: CachedConfig = match serde_json::from_slice(&bytes) {
         Ok(c) => c,
         Err(e) => {
@@ -349,7 +357,7 @@ fn try_read_cache() -> Option<RchConfig> {
         );
         return None;
     }
-    let current = current_source_fingerprints();
+    let current = fingerprints();
     if cached.source_fingerprints != current {
         tracing::debug!(
             target: "rch::hook::config_cache",
@@ -4119,6 +4127,30 @@ identity_file = "/tmp/id_ed25519"
                 .cargo_retrieval_exclude_dirs
                 .is_empty()
         );
+
+        // An unrelated config set rewrites the typed config. Keep [] in that
+        // serialization so the user-level exclusions cannot reappear later.
+        crate::commands::apply_config_set(&project, "transfer.compression_level", "7").unwrap();
+        assert!(
+            std::fs::read_to_string(&project)
+                .unwrap()
+                .contains("cargo_retrieval_exclude_dirs = []")
+        );
+        let rewritten =
+            load_config_with_sources_from_paths(Some(&user), Some(&project), Some(&environment))
+                .unwrap();
+        assert!(
+            rewritten
+                .config
+                .transfer
+                .cargo_retrieval_exclude_dirs
+                .is_empty()
+        );
+        assert_eq!(rewritten.config.transfer.compression_level, 7);
+        assert_eq!(
+            rewritten.sources["transfer.cargo_retrieval_exclude_dirs"],
+            ConfigValueSource::ProjectConfig(project)
+        );
     }
 
     #[test]
@@ -7295,6 +7327,62 @@ confidence_threshold = 0.80
         assert!(
             result.is_err(),
             "corrupt bytes must fail deserialization (caller treats as cache miss)"
+        );
+    }
+
+    #[test]
+    fn cargo_retrieval_exclude_dirs_rejects_legacy_cache_with_unchanged_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("project.toml");
+        let cache_path = directory.path().join("config.cache.json");
+        std::fs::write(
+            &project_path,
+            "[transfer]\ncargo_retrieval_exclude_dirs = [\"debug/.wrapper-shims\"]\n",
+        )
+        .unwrap();
+        let fingerprints = || vec![super::source_fingerprint(project_path.clone())];
+
+        // The previous schema ignored the TOML key, but its cache still
+        // matches this source's metadata. A missing JSON field deserializes
+        // as [], so schema invalidation is what forces the necessary reparse.
+        let mut legacy = serde_json::to_value(CachedConfig {
+            schema_version: 9,
+            source_fingerprints: fingerprints(),
+            socket_path_from_default: false,
+            config: RchConfig::default(),
+        })
+        .unwrap();
+        legacy["config"]["transfer"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cargo_retrieval_exclude_dirs");
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let legacy_config: CachedConfig = serde_json::from_slice(&legacy_bytes).unwrap();
+        assert!(
+            legacy_config
+                .config
+                .transfer
+                .cargo_retrieval_exclude_dirs
+                .is_empty()
+        );
+        assert_eq!(legacy_config.source_fingerprints, fingerprints());
+        std::fs::write(&cache_path, legacy_bytes).unwrap();
+        assert!(super::try_read_cache_at(&cache_path, fingerprints).is_none());
+
+        let parsed = load_config_uncached_from_paths(None, Some(&project_path)).unwrap();
+        write_synthetic_cache(
+            &cache_path,
+            &CachedConfig {
+                schema_version: CACHE_SCHEMA_VERSION,
+                source_fingerprints: fingerprints(),
+                socket_path_from_default: false,
+                config: parsed,
+            },
+        );
+        let restored = super::try_read_cache_at(&cache_path, fingerprints).unwrap();
+        assert_eq!(
+            restored.transfer.cargo_retrieval_exclude_dirs,
+            ["debug/.wrapper-shims"]
         );
     }
 

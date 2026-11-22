@@ -148,6 +148,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 retrieval_min_free_bytes: config.transfer.retrieval_min_free_bytes,
                 compression_level: config.transfer.compression_level,
                 exclude_patterns: config.transfer.exclude_patterns.clone(),
+                cargo_retrieval_exclude_dirs: config.transfer.cargo_retrieval_exclude_dirs.clone(),
                 remote_base: config.transfer.remote_base.clone(),
                 sync_timeout_ms: config.transfer.sync_timeout_ms,
                 // Transfer optimization (bd-3hho)
@@ -412,6 +413,18 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         println!("    {},", style.value(&format!("\"{}\"", pattern)));
     }
     println!("  ]");
+    println!(
+        "  {} = {}",
+        style.key("cargo_retrieval_exclude_dirs"),
+        format_with_source(
+            "transfer.cargo_retrieval_exclude_dirs",
+            &style.value(&format!(
+                "{:?}",
+                config.transfer.cargo_retrieval_exclude_dirs
+            )),
+            &value_sources
+        )
+    );
     if !config.transfer.exclude_defaults_acknowledged.is_empty() {
         println!(
             "  {} = {}",
@@ -1035,6 +1048,12 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "transfer.cargo_retrieval_exclude_dirs",
+        format!("{:?}", config.transfer.cargo_retrieval_exclude_dirs),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "transfer.exclude_defaults_acknowledged",
         format!("{:?}", config.transfer.exclude_defaults_acknowledged),
         sources,
@@ -1616,6 +1635,17 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = parse_string_list(value, key)?;
         }
+        "transfer.cargo_retrieval_exclude_dirs" => {
+            config.transfer.cargo_retrieval_exclude_dirs = parse_string_list(value, key)?;
+            config
+                .transfer
+                .validate_cargo_retrieval_exclude_dirs()
+                .map_err(|reason| ConfigError::InvalidValue {
+                    field: key.to_string(),
+                    reason,
+                    suggestion: "Use literal target-relative directories, such as debug/.wrapper-shims, or [] to clear the policy".to_string(),
+                })?;
+        }
         "transfer.exclude_defaults_acknowledged" => {
             config.transfer.exclude_defaults_acknowledged = parse_string_list(value, key)?;
         }
@@ -1900,6 +1930,11 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = defaults.transfer.exclude_patterns;
             format!("{:?}", config.transfer.exclude_patterns)
+        }
+        "transfer.cargo_retrieval_exclude_dirs" => {
+            config.transfer.cargo_retrieval_exclude_dirs =
+                defaults.transfer.cargo_retrieval_exclude_dirs;
+            format!("{:?}", config.transfer.cargo_retrieval_exclude_dirs)
         }
         "transfer.exclude_defaults_acknowledged" => {
             config.transfer.exclude_defaults_acknowledged =
@@ -2197,6 +2232,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     "transfer": {
                         "compression_level": config.transfer.compression_level,
                         "exclude_patterns": config.transfer.exclude_patterns,
+                        "cargo_retrieval_exclude_dirs": config.transfer.cargo_retrieval_exclude_dirs,
                     },
                     "environment": {
                         "allowlist": config.environment.allowlist,
@@ -2757,6 +2793,21 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
             key: "transfer.exclude_patterns".to_string(),
             current: format!("[{}]", current_excludes),
             default: format!("[{}]", default_excludes),
+            source,
+        });
+    }
+
+    if config.transfer.cargo_retrieval_exclude_dirs
+        != defaults.transfer.cargo_retrieval_exclude_dirs
+    {
+        let source = sources
+            .get("transfer.cargo_retrieval_exclude_dirs")
+            .map(|source| format!("{source:?}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        entries.push(ConfigDiffEntry {
+            key: "transfer.cargo_retrieval_exclude_dirs".to_string(),
+            current: format!("{:?}", config.transfer.cargo_retrieval_exclude_dirs),
+            default: format!("{:?}", defaults.transfer.cargo_retrieval_exclude_dirs),
             source,
         });
     }
@@ -3358,6 +3409,87 @@ mod tests {
         let _guard = test_guard!();
         let result = parse_string_list("  a  ,  b  ", "test_key").unwrap();
         assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn cargo_retrieval_exclude_dirs_set_get_reset_preserves_upload_policy() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let key = "transfer.cargo_retrieval_exclude_dirs";
+        apply_config_set(
+            &path,
+            "transfer.exclude_patterns",
+            "[\"target/\", \".git/\"]",
+        )
+        .unwrap();
+        apply_config_set(
+            &path,
+            key,
+            "[\"debug/.wrapper-shims\", \"debug/cache partagé\"]",
+        )
+        .unwrap();
+        let config: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.transfer.exclude_patterns, ["target/", ".git/"]);
+        assert_eq!(
+            config.transfer.cargo_retrieval_exclude_dirs,
+            ["debug/.wrapper-shims", "debug/cache partagé"]
+        );
+        let source = ConfigValueSource::UserConfig(path.clone());
+        let sources = config::ConfigSourceMap::from([(key.to_string(), source.clone())]);
+        let values = collect_value_sources(&config, &sources);
+        let entry = values.iter().find(|entry| entry.key == key).unwrap();
+        assert_eq!(
+            entry.value,
+            format!("{:?}", config.transfer.cargo_retrieval_exclude_dirs)
+        );
+        assert_eq!(entry.source, source.label());
+
+        config_reset_at(&path, key, &plain_context()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("cargo_retrieval_exclude_dirs = []"));
+        let reset: RchConfig = toml::from_str(&text).unwrap();
+        assert!(reset.transfer.cargo_retrieval_exclude_dirs.is_empty());
+        assert_eq!(reset.transfer.exclude_patterns, ["target/", ".git/"]);
+    }
+
+    #[test]
+    fn cargo_retrieval_exclude_dirs_set_rejects_invalid_policy_without_writing() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let key = "transfer.cargo_retrieval_exclude_dirs";
+        let supported: Vec<_> = (0..128)
+            .map(|index| format!("debug/cache-{index}"))
+            .collect();
+        apply_config_set(&path, key, &serde_json::to_string(&supported).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for invalid in [
+            "",
+            "/debug/cache",
+            "debug/cache/",
+            "debug//cache",
+            "debug/./cache",
+            "debug/../deps",
+            "debug/*",
+            "debug/ca?he",
+            "debug/[cache]",
+            "debug\\cache",
+            "C:/cache",
+            " debug/cache",
+            "debug/cache ",
+            "debug/cache\n",
+        ] {
+            let value = serde_json::to_string(&[invalid]).unwrap();
+            assert!(apply_config_set(&path, key, &value).is_err(), "{invalid:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        for invalid in [vec!["a".repeat(4097)], vec!["debug/cache".to_string(); 129]] {
+            assert!(
+                apply_config_set(&path, key, &serde_json::to_string(&invalid).unwrap()).is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
     }
 
     #[test]

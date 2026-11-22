@@ -37,6 +37,12 @@ selected target-root library and executable is still required. Other library
 outputs outside that root refuse delivery. This also supports ordinary mirror
 builds that retain a configured `build.build-dir`.
 
+The completed receipt must identify every explicitly requested target, including
+examples and mixed named/broad selections. Every relevant returning library
+format and sidecar must survive the original artifact policy. Unknown Cargo
+record reasons or target kinds refuse narrowing rather than establishing an
+incomplete output set from the remaining known records.
+
 Cargo-reported `.dSYM` debug-symbol bundles are required directories. Their
 staged contents must include regular files, and the entire bundle is checked
 for symlinks and other unsupported entries before publication. An exclusion

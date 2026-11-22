@@ -4,8 +4,8 @@
 //! that every requested executable was returned. This contract records Cargo's
 //! actual executable paths and checks them before any staged output publishes,
 //! including explicitly named test/benchmark targets built with `--no-run`.
-//! Commands selecting examples keep the existing artifact policy: their
-//! library metadata can belong to a separately configured Cargo build directory.
+//! Explicit retrieval exclusions also bind selected libraries, examples, and
+//! sidecars while keeping Cargo's separate compiler intermediates private.
 
 use super::artifact_patterns::cargo_bins;
 use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ pub(crate) const MAX_CARGO_OUTPUT_RECEIPT_BYTES: usize = 64 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 enum TargetKind {
     Bin,
+    Example,
     Test,
     Bench,
 }
@@ -31,6 +32,7 @@ impl TargetKind {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Bin => "bin",
+            Self::Example => "example",
             Self::Test => "test",
             Self::Bench => "bench",
         }
@@ -56,6 +58,10 @@ pub(super) struct CargoOutputCapture {
     /// detached collection cannot silently use current configuration instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retrieval_baseline: Option<Vec<String>>,
+    /// Broad selectors combined with a named target still require the other
+    /// selected target-root outputs during detached collection.
+    #[serde(default)]
+    broad_targets: bool,
 }
 
 /// Required executable paths, relative to the project/target output phase.
@@ -112,7 +118,10 @@ impl CargoOutputCapture {
         let Some(first) = self.selected.first() else {
             return false;
         };
-        !self.instrumented && self.selected.iter().all(|target| target.kind == first.kind)
+        !self.instrumented
+            && !self.broad_targets
+            && first.kind != TargetKind::Example
+            && self.selected.iter().all(|target| target.kind == first.kind)
     }
 
     /// Share target/mode validation between pre-publication checks and the
@@ -182,6 +191,7 @@ impl CargoOutputCapture {
             selected,
             instrumented,
             retrieval_baseline: None,
+            broad_targets: false,
         })
     }
 
@@ -194,27 +204,41 @@ impl CargoOutputCapture {
         if directories.is_empty() || baseline.is_empty() {
             return Ok(Self::for_command(kind, command));
         }
-        let formats = cargo_bins::retrieval_capture_formats(kind, command).context(
+        let selection = cargo_bins::retrieval_selection(kind, command).context(
             "transfer.cargo_retrieval_exclude_dirs requires a literal Cargo build or test/bench --no-run command with a complete output receipt",
         )?;
-        let instrumented = match formats.as_slice() {
+        let instrumented = match selection.message_formats.as_slice() {
             [] => true,
             [format] if explicit_json_format(format) => false,
             _ => anyhow::bail!(
                 "transfer.cargo_retrieval_exclude_dirs cannot establish complete outputs with this Cargo --message-format"
             ),
         };
-        let mut capture = Self::for_command(kind, command).unwrap_or(Self {
-            selected: BTreeSet::new(),
-            instrumented,
-            retrieval_baseline: None,
-        });
         anyhow::ensure!(
-            instrumented || capture.caller_json_supported(),
+            instrumented
+                || Self::for_command(kind, command)
+                    .is_some_and(|capture| capture.caller_json_supported()),
             "Cargo retrieval exclusions require human output for a full build; caller JSON projection supports named executables only"
         );
-        capture.retrieval_baseline = Some(baseline.to_vec());
-        Ok(Some(capture))
+        let selected = [
+            (TargetKind::Bin, selection.bins),
+            (TargetKind::Example, selection.examples),
+            (TargetKind::Test, selection.tests),
+            (TargetKind::Bench, selection.benches),
+        ]
+        .into_iter()
+        .flat_map(|(kind, names)| {
+            names
+                .into_iter()
+                .map(move |name| SelectedTarget { kind, name })
+        })
+        .collect();
+        Ok(Some(Self {
+            selected,
+            instrumented,
+            retrieval_baseline: Some(baseline.to_vec()),
+            broad_targets: selection.broad_targets,
+        }))
     }
 
     pub(super) fn retrieval_baseline(&self) -> Option<&[String]> {
@@ -331,7 +355,36 @@ impl CargoOutputCapture {
                         !artifact.target.name.is_empty() && !artifact.target.kind.is_empty(),
                         "Cargo compiler-artifact has no target identity"
                     );
+                    let matched: Vec<_> = self
+                        .selected
+                        .iter()
+                        .filter(|target| {
+                            target.name == artifact.target.name
+                                && artifact
+                                    .target
+                                    .kind
+                                    .iter()
+                                    .any(|kind| kind == target.kind.as_str())
+                        })
+                        .collect();
                     if let Some(filters) = &retrieval_filters {
+                        anyhow::ensure!(
+                            artifact.target.kind.iter().all(|kind| matches!(
+                                kind.as_str(),
+                                "bin"
+                                    | "example"
+                                    | "test"
+                                    | "bench"
+                                    | "lib"
+                                    | "rlib"
+                                    | "dylib"
+                                    | "cdylib"
+                                    | "staticlib"
+                                    | "proc-macro"
+                                    | "custom-build"
+                            )),
+                            "Cargo retrieval exclusions cannot establish an unknown target kind"
+                        );
                         // Build-script executables belong to Cargo's private
                         // cache, not its deliverables. Every other filename
                         // must be understood before an exclusion can be used.
@@ -379,9 +432,17 @@ impl CargoOutputCapture {
                                             | "proc-macro"
                                     )
                                 });
+                            let relevant = artifact.executable.is_some()
+                                || self.broad_targets
+                                || self.selected.is_empty()
+                                || !matched.is_empty();
                             for filename in &artifact.filenames {
                                 let path = Path::new(filename);
                                 validate_absolute_path(path)?;
+                                anyhow::ensure!(
+                                    !filename.chars().any(char::is_control),
+                                    "Cargo output filename contains a control character"
+                                );
                                 let private_intermediate =
                                     path.extension().is_some_and(|extension| {
                                         extension == "rlib"
@@ -415,9 +476,23 @@ impl CargoOutputCapture {
                                 // A sidecar-only glob such as `*.dSYM/**`
                                 // selects the bundle contents without matching
                                 // its bare root, which is what Cargo reports.
-                                if filters.selects(name)
-                                    || (directory && filters.selects(&format!("{name}/")))
-                                {
+                                let admitted = artifact.executable.as_ref() == Some(filename)
+                                    || filters.selects(name)
+                                    || (directory && filters.selects(&format!("{name}/")));
+                                let metadata = path.extension().is_some_and(|extension| {
+                                    matches!(extension.to_str(), Some("rmeta" | "d"))
+                                });
+                                // Private outside-root intermediates above do
+                                // not belong to delivery. For returning targets,
+                                // another crate type or executable must not hide
+                                // a missing library format or required sidecar.
+                                anyhow::ensure!(
+                                    !relevant || metadata || admitted,
+                                    "Cargo artifact policy omits required output {} for target {}; refusing a partial output set",
+                                    relative.display(),
+                                    artifact.target.name
+                                );
+                                if admitted {
                                     if directory {
                                         required_directories.insert(relative);
                                     } else {
@@ -426,19 +501,11 @@ impl CargoOutputCapture {
                                 }
                             }
                         }
+                        for target in matched {
+                            seen.insert(target.clone());
+                        }
+                        continue;
                     }
-                    let matched: Vec<_> = self
-                        .selected
-                        .iter()
-                        .filter(|target| {
-                            target.name == artifact.target.name
-                                && artifact
-                                    .target
-                                    .kind
-                                    .iter()
-                                    .any(|kind| kind == target.kind.as_str())
-                        })
-                        .collect();
                     if matched.is_empty() {
                         // Managed Cargo may place dependency/build-script
                         // intermediates in a separate build.build-dir. They
@@ -476,7 +543,12 @@ impl CargoOutputCapture {
                 "compiler-message" | "build-script-executed" => {
                     anyhow::ensure!(!finished, "Cargo record appeared after build-finished");
                 }
-                _ => {}
+                _ => {
+                    anyhow::ensure!(
+                        retrieval_filters.is_none(),
+                        "Cargo retrieval exclusions cannot establish complete outputs from unknown Cargo record reason {reason:?}"
+                    );
+                }
             }
         }
         anyhow::ensure!(finished, "Cargo output receipt is missing build-finished");
@@ -487,7 +559,7 @@ impl CargoOutputCapture {
             .collect();
         anyhow::ensure!(
             missing.is_empty(),
-            "Cargo output receipt is missing selected executables: {}",
+            "Cargo output receipt is missing selected targets: {}",
             missing.join(", ")
         );
         anyhow::ensure!(
@@ -1026,6 +1098,328 @@ mod tests {
             .collect::<String>();
         text.push_str("{\"reason\":\"build-finished\",\"success\":true}\n");
         text.into_bytes()
+    }
+
+    fn retrieval_capture(command: &str) -> CargoOutputCapture {
+        let kind = rch_common::classify_command(command).kind;
+        let baseline = super::super::artifact_patterns::get_custom_target_artifact_patterns(
+            kind,
+            Some(command),
+        );
+        CargoOutputCapture::for_retrieval_policy(
+            kind,
+            command,
+            &baseline,
+            &["debug/.wrapper-shims".into()],
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn cargo_retrieval_capture_requires_complete_returning_target_outputs() {
+        let full = retrieval_capture("cargo build --workspace");
+        let app = artifact(
+            "bin",
+            "app",
+            &["/target/debug/app"],
+            Some("/target/debug/app"),
+            true,
+        );
+        for incomplete in [
+            artifact(
+                "lib",
+                "core",
+                &["/target/debug/build/libcore.rlib"],
+                None,
+                true,
+            ),
+            artifact(
+                "lib",
+                "core",
+                &[
+                    "/target/debug/deps/libcore.rlib",
+                    "/target/debug/build/libcore.so",
+                ],
+                None,
+                true,
+            ),
+            artifact(
+                "bin",
+                "other",
+                &["/target/debug/build/other", "/target/debug/build/other.pdb"],
+                Some("/target/debug/build/other"),
+                true,
+            ),
+            artifact(
+                "bin",
+                "other",
+                &[
+                    "/target/debug/build/other",
+                    "/target/debug/build/other.dSYM",
+                ],
+                Some("/target/debug/build/other"),
+                true,
+            ),
+        ] {
+            assert!(
+                full.parse_receipt(&receipt(&[app.clone(), incomplete]), Path::new("/target"))
+                    .is_err()
+            );
+        }
+        let named = retrieval_capture("cargo build --bin app");
+        let extra = "/target/debug/build/other";
+        let dependency = artifact(
+            "lib",
+            "dependency",
+            &["/target/debug/build/libdependency.rlib"],
+            None,
+            true,
+        );
+        let outputs = receipt(&[
+            app.clone(),
+            dependency.clone(),
+            artifact("test", "suite", &[extra], Some(extra), true),
+        ]);
+        assert_eq!(
+            named
+                .parse_receipt(&outputs, Path::new("/target"))
+                .unwrap()
+                .required_files,
+            BTreeSet::from([
+                PathBuf::from("debug/app"),
+                PathBuf::from("debug/build/other")
+            ])
+        );
+        for sidecar in [
+            "/target/debug/build/other.pdb",
+            "/target/debug/build/other.dSYM",
+        ] {
+            assert!(
+                named
+                    .parse_receipt(
+                        &receipt(&[
+                            app.clone(),
+                            artifact("bin", "other", &[extra, sidecar], Some(extra), true),
+                        ]),
+                        Path::new("/target")
+                    )
+                    .is_err(),
+                "{sidecar}"
+            );
+        }
+        for flag in [
+            "--lib",
+            "--bins",
+            "--examples",
+            "--tests",
+            "--benches",
+            "--all-targets",
+        ] {
+            let capture = retrieval_capture(&format!("cargo build --bin app {flag}"));
+            let restored: CargoOutputCapture =
+                serde_json::from_slice(&serde_json::to_vec(&capture).unwrap()).unwrap();
+            assert!(restored.broad_targets);
+            assert!(
+                restored
+                    .parse_receipt(
+                        &receipt(&[app.clone(), dependency.clone()]),
+                        Path::new("/target")
+                    )
+                    .is_err(),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_retrieval_capture_preserves_all_explicit_target_obligations() {
+        let app = artifact(
+            "bin",
+            "app",
+            &["/target/debug/app"],
+            Some("/target/debug/app"),
+            true,
+        );
+        for command in [
+            "cargo build --example sample",
+            "cargo build --test suite",
+            "cargo build --bench speed",
+            "cargo build --bin app --example sample",
+            "cargo build --bin app --lib --example sample",
+            "cargo test --no-run --example sample",
+            "cargo bench --no-run --bin other",
+        ] {
+            assert!(
+                retrieval_capture(command)
+                    .parse_receipt(&receipt(std::slice::from_ref(&app)), Path::new("/target"))
+                    .is_err(),
+                "{command}"
+            );
+        }
+        let example = retrieval_capture("cargo build --example sample");
+        let data = receipt(&[artifact(
+            "example",
+            "sample",
+            &["/target/debug/examples/libsample.rlib"],
+            None,
+            true,
+        )]);
+        assert_eq!(
+            example
+                .parse_receipt(&data, Path::new("/target"))
+                .unwrap()
+                .required_files,
+            BTreeSet::from([PathBuf::from("debug/examples/libsample.rlib")])
+        );
+        let named_json = retrieval_capture("cargo build --bin app --message-format=json");
+        assert!(named_json.caller_json_supported());
+        let bundle = receipt(&[artifact(
+            "bin",
+            "app",
+            &["/target/debug/app", "/target/debug/app.dSYM"],
+            Some("/target/debug/app"),
+            true,
+        )]);
+        assert_eq!(
+            named_json
+                .parse_receipt(&bundle, Path::new("/target"))
+                .unwrap()
+                .required_directories,
+            BTreeSet::from([PathBuf::from("debug/app.dSYM")])
+        );
+    }
+
+    #[test]
+    fn cargo_retrieval_capture_keeps_private_intermediates_outside_returning_contract() {
+        let capture = retrieval_capture("cargo build --workspace");
+        let app = artifact(
+            "bin",
+            "app",
+            &["/target/debug/app"],
+            Some("/target/debug/app"),
+            true,
+        );
+        let core = artifact(
+            "lib",
+            "core",
+            &[
+                "/target/debug/libcore.rlib",
+                "/cache/debug/deps/libcore.rlib",
+                "/cache/debug/deps/libcore.rmeta",
+            ],
+            None,
+            true,
+        );
+        let contract = capture
+            .parse_receipt(
+                &receipt(&[
+                    app.clone(),
+                    core.clone(),
+                    artifact(
+                        "lib",
+                        "dependency",
+                        &["/cache/debug/deps/libdependency.rlib"],
+                        None,
+                        true,
+                    ),
+                    artifact(
+                        "proc-macro",
+                        "macro",
+                        &["/cache/debug/deps/libmacro.so"],
+                        None,
+                        true,
+                    ),
+                ]),
+                Path::new("/target"),
+            )
+            .unwrap();
+        assert_eq!(
+            contract.required_files,
+            BTreeSet::from([
+                PathBuf::from("debug/app"),
+                PathBuf::from("debug/libcore.rlib"),
+            ])
+        );
+        for incomplete in [
+            artifact(
+                "lib",
+                "core",
+                &["/target/debug/libcore.rlib", "/cache/debug/libcore.so"],
+                None,
+                true,
+            ),
+            artifact(
+                "bin",
+                "app",
+                &["/target/debug/app", "/cache/debug/app.pdb"],
+                Some("/target/debug/app"),
+                true,
+            ),
+            artifact(
+                "bin",
+                "app",
+                &["/target/debug/app", "/cache/debug/app.dSYM"],
+                Some("/target/debug/app"),
+                true,
+            ),
+            artifact("lib", "core", &["/cache/debug/libcore\t.rlib"], None, true),
+        ] {
+            assert!(
+                capture
+                    .parse_receipt(
+                        &receipt(&[app.clone(), core.clone(), incomplete]),
+                        Path::new("/target")
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_retrieval_capture_refuses_unknown_protocol_records_and_target_kinds() {
+        let full = retrieval_capture("cargo build");
+        let app = artifact(
+            "bin",
+            "app",
+            &["/target/debug/app"],
+            Some("/target/debug/app"),
+            true,
+        );
+        for unknown in [
+            artifact(
+                "future-kind",
+                "future",
+                &["/target/debug/future"],
+                None,
+                true,
+            ),
+            json!({"reason":"future-artifact","filenames":["/target/debug/future"]}),
+        ] {
+            let data = receipt(&[app.clone(), unknown]);
+            assert!(full.parse_receipt(&data, Path::new("/target")).is_err());
+            assert!(
+                capture("cargo build --bin app")
+                    .parse_receipt(&data, Path::new("/target"))
+                    .is_ok()
+            );
+        }
+        let ordinary = [
+            "proc macro diagnostic text",
+            "[macro debug text]",
+            "{\"macro_debug\":\"ordinary JSON\"}",
+        ];
+        let mut data = ordinary.join("\n").into_bytes();
+        data.push(b'\n');
+        data.extend(receipt(&[
+            app,
+            json!({"reason":"compiler-message","message":{"rendered":"diagnostic"}}),
+            json!({"reason":"build-script-executed","out_dir":"/target/debug/build/generated"}),
+        ]));
+        assert!(full.parse_receipt(&data, Path::new("/target")).is_ok());
+        for line in ordinary {
+            assert!(!full.suppress_stdout_line(line));
+        }
     }
 
     #[test]

@@ -916,7 +916,9 @@ Primary files:
 - User config: `~/.config/rch/config.toml`
 - Worker list: `~/.config/rch/workers.toml`
 - Project override: `.rch/config.toml`
-- Optional project excludes: `.rchignore`
+- Optional source-upload excludes: project-root `.rchignore`
+- Additional Cargo artifact exclusions: `[transfer] cargo_retrieval_exclude_dirs`
+  in `.rch/config.toml` (see below)
 
 Precedence (highest first):
 
@@ -1037,6 +1039,8 @@ remote_base = "/data/tmp/rch"
 adaptive_compression = true
 verify_artifacts = false
 max_transfer_mb = 2048
+# Optional worker-private directories, relative to the Cargo target root.
+# cargo_retrieval_exclude_dirs = ["debug/.wrapper-shims", "debug/.kache-build-script-shims"]
 
 [remediation.pooled_target]
 # Where pooled Cargo target stores are PLACED on the worker. Unset (the
@@ -1137,6 +1141,43 @@ the named payloads, not the pooled target's other cached outputs. Anything the
 narrowing cannot parse exactly (unknown flags, shell expansion, other target
 kinds, response files, custom target specs) keeps the broad per-profile filters,
 which can include other cached build outputs in the same profile.
+
+To keep worker-private Cargo caches out of artifact downloads, commit this
+policy in the project's `.rch/config.toml`:
+
+```toml
+[transfer]
+cargo_retrieval_exclude_dirs = [
+    "debug/.wrapper-shims",
+    "debug/.kache-build-script-shims",
+]
+```
+
+Entries are literal directories relative to the **Cargo target root**, including
+custom target directories. Include the actual profile and cross-target prefix,
+such as `aarch64-unknown-linux-gnu/release/.wrapper-shims`. Globs, absolute paths
+and traversal are rejected. The default is `[]`; the list adds to the built-in
+cache exclusions. A project list replaces the user list, and an explicit `[]`
+clears it. Inspect the effective policy with
+`rch config get transfer.cargo_retrieval_exclude_dirs --sources`.
+
+Artifact-returning commands using this policy require durable POSIX execution
+and complete Cargo output evidence. RCH refuses exclusions that could hide
+required executables, libraries, sidecars or priority outputs. The same recorded
+selection governs sizing, download, staged validation and recovery. Full builds
+use normal human output; explicit Cargo JSON remains supported only by the
+existing named-executable contract when its evidence permits. Unsupported command
+and output forms refuse before remote execution. Check, clippy, running tests,
+native outputs and explicit result directories retain their existing policies.
+See [Cargo target exclusions](docs/recovery-artifact-selection.md#cargo-target-exclusions)
+for the supported grammar and output-evidence limits.
+
+`transfer.exclude_patterns` controls source upload. The project-root `.rchignore`
+also supplies guarded project-root retrieval directory rules, but the separate
+Cargo target pull reads `<local Cargo target dir>/.rchignore` instead. That
+target-local file accepts guarded directory rules such as `.wrapper-shims/`,
+and is removed by `cargo clean`. The committed project configuration above
+survives target cleanup and applies across target roots.
 
 For `cmake --build DIR`, Unix Makefiles builds also return the exact executable,
 static-library and unversioned shared-library files declared by CMake's generated

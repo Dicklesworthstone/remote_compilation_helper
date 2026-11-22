@@ -140,6 +140,14 @@ impl<'a> ConfigDisplay<'a> {
             &patterns,
             "transfer.exclude_patterns",
         );
+        let directories = format!("{:?}", self.config.transfer.cargo_retrieval_exclude_dirs);
+        self.push_config_line(
+            &mut lines,
+            "  ",
+            "cargo_retrieval_exclude_dirs",
+            &directories,
+            "transfer.cargo_retrieval_exclude_dirs",
+        );
 
         // Environment section
         lines.push(format!(
@@ -383,6 +391,13 @@ impl<'a> ConfigDisplay<'a> {
             &patterns,
             "transfer.exclude_patterns",
         );
+        let directories = format!("{:?}", self.config.transfer.cargo_retrieval_exclude_dirs);
+        self.print_plain_value(
+            console,
+            "cargo_retrieval_exclude_dirs",
+            &directories,
+            "transfer.cargo_retrieval_exclude_dirs",
+        );
 
         // Environment section
         console.print_plain("");
@@ -538,6 +553,7 @@ mod tests {
                 retrieval_min_free_bytes: 0,
                 compression_level: 6,
                 exclude_patterns: vec!["target".to_string(), "node_modules".to_string()],
+                cargo_retrieval_exclude_dirs: vec!["debug/.wrapper-shims".to_string()],
                 remote_base: "/tmp/rch".to_string(),
                 max_transfer_mb: None,
                 max_transfer_time_ms: None,

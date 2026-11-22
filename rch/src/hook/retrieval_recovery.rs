@@ -11905,15 +11905,18 @@ func TestValue(t *testing.T) {{
                 writer: session.writer.clone(),
             };
             rejected.recipe.transfer.cargo_retrieval_exclude_dirs = vec![excluded.into()];
-            rejected.recipe.phases[0].patterns =
-                cargo_retrieval_patterns(&baseline, &rejected.recipe.transfer, None).unwrap();
+            let before = rejected.writer.snapshot().recovery;
+            let result = cargo_retrieval_patterns(&baseline, &rejected.recipe.transfer, None)
+                .and_then(|patterns| {
+                    rejected.recipe.phases[0].patterns = patterns;
+                    rejected.install_cargo_artifact_evidence(stdout.as_bytes(), remote.path())
+                });
             assert!(
-                rejected
-                    .install_cargo_artifact_evidence(stdout.as_bytes(), remote.path())
-                    .is_err(),
+                result.is_err(),
                 "an exclusion hid required bundle contents: {excluded}"
             );
             assert!(rejected.recipe.phases[0].cargo_outputs.is_none());
+            assert_eq!(rejected.writer.snapshot().recovery, before);
         }
         session
             .install_cargo_artifact_evidence(stdout.as_bytes(), remote.path())
@@ -11948,6 +11951,13 @@ func TestValue(t *testing.T) {{
         for root in [&local, &stage] {
             std::fs::create_dir_all(root.join("debug")).unwrap();
         }
+        // A required bundle must survive as a whole even when an ordinary
+        // target-local ignore rule would otherwise hide some descendants.
+        std::fs::write(
+            local.join(".rchignore"),
+            "debug/app.dSYM/Contents/Resources/\n",
+        )
+        .unwrap();
         std::fs::write(local.join("debug/app"), b"old executable").unwrap();
         std::fs::write(stage.join("debug/app"), b"new executable").unwrap();
         let before = std::fs::read(&session.writer.path).unwrap();

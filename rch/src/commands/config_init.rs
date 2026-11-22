@@ -276,6 +276,8 @@ min_local_time_ms = 2000
 compression_level = 3
 exclude_patterns = [
 {exclude_lines}]
+# Optional worker-private directories, relative to the Cargo target root.
+# cargo_retrieval_exclude_dirs = ["debug/.wrapper-shims", "debug/.kache-build-script-shims"]
 "###
         );
         write_configuration(config_path, &config_content, false)?
@@ -625,6 +627,8 @@ min_local_time_ms = {}
 compression_level = {}
 exclude_patterns = [
 {exclude_lines}]
+# Optional worker-private directories, relative to the Cargo target root.
+# cargo_retrieval_exclude_dirs = ["debug/.wrapper-shims", "debug/.kache-build-script-shims"]
 
 # [remediation]
 # Session-history remediation knobs: temporary bypass, auto-rejoin, proof mode,

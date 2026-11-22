@@ -321,6 +321,7 @@ pub struct ConfigTransferSection {
     pub retrieval_min_free_bytes: u64,
     pub compression_level: u32,
     pub exclude_patterns: Vec<String>,
+    pub cargo_retrieval_exclude_dirs: Vec<String>,
     pub remote_base: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_timeout_ms: Option<u64>,

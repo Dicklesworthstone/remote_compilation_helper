@@ -198,15 +198,27 @@ Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
 - `compression_level` (u32, default `3`) — zstd compression level.
 - `exclude_patterns` (list) — Patterns excluded from source upload. Defaults include:
   `target/`, `.git/`, `node_modules/`, common build caches, and
-  coverage output. Use `rch config show` to see the full effective list.
+  coverage output. Use `rch config show` to see the full effective list. These
+  patterns do not filter artifact downloads.
 - `cargo_retrieval_exclude_dirs` (list, default `[]`) — Literal directories
   relative to the Cargo target root that stay on the worker, for example
   `debug/.wrapper-shims` or `aarch64-unknown-linux-gnu/release/.wrapper-shims`.
   These add to built-in cache exclusions and never inherit upload exclusions.
-  Successful build and `test/bench --no-run` delivery requires a complete Cargo
-  output receipt; rules overlapping required files or priority includes refuse
-  delivery. Unsupported command/format combinations refuse before execution.
-  Streaming check/test/report paths are unaffected. See
+  Use the actual directory name for a custom profile. No globs, absolute paths,
+  empty, `.` or `..` components, trailing slashes, backslashes, colons, control
+  characters or leading/trailing whitespace are accepted. Interior spaces and
+  Unicode are supported. The limit is 128 directories, each at most 4096 bytes.
+  A project list replaces the user list; `[]` clears it. Use `rch config get`,
+  `set`, `reset`, `show --sources`, `diff` or `export --format json` to inspect
+  and manage this setting.
+  Successful build and `test/bench --no-run` delivery requires durable POSIX
+  execution and a complete Cargo output receipt; rules overlapping required
+  executables, libraries, sidecars or priority includes refuse delivery.
+  Full builds use human output; explicit Cargo JSON remains limited to the
+  existing named-executable contract when its evidence permits. Unsupported
+  command/format combinations refuse before remote execution. Streaming check,
+  clippy, running tests, native outputs and explicit result directories are
+  unaffected. See
   [Cargo target exclusions](../recovery-artifact-selection.md#cargo-target-exclusions)
   for the supported command grammar and immutable recovery behavior.
 - `ssh_server_alive_interval_secs` (u64, optional) — Sets `ssh -o ServerAliveInterval`
@@ -281,6 +293,8 @@ remote_speedup_threshold = 1.2
 [transfer]
 compression_level = 3
 exclude_patterns = ["target/", "node_modules/"]
+# Optional worker-private directories relative to the Cargo target root.
+# cargo_retrieval_exclude_dirs = ["debug/.wrapper-shims", "debug/.kache-build-script-shims"]
 ssh_server_alive_interval_secs = 30
 ssh_control_persist_secs = 60
 

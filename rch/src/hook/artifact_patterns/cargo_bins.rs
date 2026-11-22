@@ -20,6 +20,7 @@ pub(in crate::hook) struct NamedCargoSelection {
     pub(in crate::hook) tests: BTreeSet<String>,
     pub(in crate::hook) benches: BTreeSet<String>,
     pub(in crate::hook) message_formats: Vec<String>,
+    pub(in crate::hook) broad_targets: bool,
     targets: BTreeSet<String>,
     profile: String,
 }
@@ -33,11 +34,11 @@ pub(in crate::hook) fn selection(
 
 /// The same literal Cargo grammar, with complete build selections permitted.
 /// This does not narrow transfer globs or opt into caller JSON projection.
-pub(in crate::hook) fn retrieval_capture_formats(
+pub(in crate::hook) fn retrieval_selection(
     kind: Option<CompilationKind>,
     command: &str,
-) -> Option<Vec<String>> {
-    Some(parse_selection(kind, command, false)?.message_formats)
+) -> Option<NamedCargoSelection> {
+    parse_selection(kind, command, false)
 }
 
 fn parse_selection(
@@ -55,6 +56,7 @@ fn parse_selection(
     let mut targets = BTreeSet::new();
     let mut message_formats = Vec::new();
     let mut profile = None;
+    let mut broad_targets = false;
     let mut iter = args.iter().map(String::as_str);
     while let Some(arg) = iter.next() {
         let (flag, inline) = arg
@@ -90,7 +92,10 @@ fn parse_selection(
                 no_run = true;
             }
             "--bins" | "--examples" | "--lib" | "--tests" | "--benches" | "--all-targets"
-                if !require_named && inline.is_none() => {}
+                if !require_named && inline.is_none() =>
+            {
+                broad_targets = true;
+            }
             "--target" => {
                 let target = inline.or_else(|| iter.next())?;
                 // Cargo substitutes host-tuple at runtime; it is not a directory.
@@ -170,6 +175,7 @@ fn parse_selection(
         tests: tests.into_iter().map(str::to_string).collect(),
         benches: benches.into_iter().map(str::to_string).collect(),
         message_formats: message_formats.into_iter().map(str::to_string).collect(),
+        broad_targets,
         targets: targets.into_iter().map(str::to_string).collect(),
         profile: profile.unwrap_or("debug").to_owned(),
     })
