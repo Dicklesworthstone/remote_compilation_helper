@@ -64,6 +64,31 @@ mod native {
     const FRAME_LIMIT: usize = HEADER + RESPONSE_LIMIT + LOG_LIMIT;
     const UNCONFIRMED: i32 = 255;
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct PreparationPolicy {
+        no_start: bool,
+        require_daemon: bool,
+    }
+
+    fn preparation_policy(arguments: &[OsString]) -> Result<(PreparationPolicy, &[OsString])> {
+        let mut policy = PreparationPolicy::default();
+        for (index, argument) in arguments.iter().enumerate() {
+            if argument == "--" {
+                return Ok((policy, &arguments[index + 1..]));
+            }
+            if argument == "--no-start" && !policy.no_start {
+                policy.no_start = true;
+            } else if argument == "--require-daemon" && !policy.require_daemon {
+                policy.require_daemon = true;
+            } else {
+                return Err(invalid(
+                    "unknown or repeated worker-cache preparation option",
+                ));
+            }
+        }
+        Err(invalid("worker-cache requires -- before the command"))
+    }
+
     type Result<T> = io::Result<T>;
 
     fn invalid(message: &'static str) -> io::Error {
@@ -422,23 +447,31 @@ mod native {
         Ok(())
     }
 
-    fn observe(deadline: u64, signals: &Signals) -> Result<(Option<prepare::Prepared>, Vec<u8>)> {
+    fn observe(
+        deadline: u64,
+        signals: &Signals,
+        policy: PreparationPolicy,
+    ) -> Result<(Option<prepare::Prepared>, Vec<u8>)> {
         let (owner, remote) = match UnixStream::pair() {
             Ok(pair) => pair,
-            Err(error) => return Ok((None, fallback_diagnostic(&error.to_string()))),
+            Err(error) => return Ok((None, fallback_diagnostic(&error.to_string(), policy))),
         };
         if let Err(error) = owner.set_nonblocking(true) {
-            return Ok((None, fallback_diagnostic(&error.to_string())));
+            return Ok((None, fallback_diagnostic(&error.to_string(), policy)));
         }
-        let child = match Command::new(native_worker_executable()?)
-            .args(["worker-cache", "--guardian", &deadline.to_string()])
+        let mut command = Command::new(native_worker_executable()?);
+        command.args(["worker-cache", "--guardian", &deadline.to_string()]);
+        if policy.no_start {
+            command.arg("--no-start");
+        }
+        let child = match command
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(remote)))
             .stderr(Stdio::null())
             .spawn()
         {
             Ok(child) => child,
-            Err(error) => return Ok((None, fallback_diagnostic(&error.to_string()))),
+            Err(error) => return Ok((None, fallback_diagnostic(&error.to_string(), policy))),
         };
         let mut guardian = Pinned::new(child);
         let mut bytes = Vec::new();
@@ -479,7 +512,7 @@ mod native {
         }
         let payload = match response {
             Ok(payload) => payload,
-            Err(error) => return Ok((None, fallback_diagnostic(&error.to_string()))),
+            Err(error) => return Ok((None, fallback_diagnostic(&error.to_string(), policy))),
         };
         let mut logs = payload.logs;
         let prepared = if payload.code == 0 {
@@ -496,7 +529,7 @@ mod native {
         match prepared {
             Ok(prepared) => Ok((Some(prepared), logs)),
             Err(error) => {
-                let mut failure = fallback_diagnostic(&error);
+                let mut failure = fallback_diagnostic(&error, policy);
                 failure.append(&mut logs);
                 Ok((None, failure))
             }
@@ -512,10 +545,14 @@ mod native {
             && !prepared.socket.as_os_str().as_bytes().contains(&0)
     }
 
-    fn fallback_diagnostic(error: &str) -> Vec<u8> {
+    fn fallback_diagnostic(error: &str, policy: PreparationPolicy) -> Vec<u8> {
         let error = error.chars().take(4096).collect::<String>();
-        format!("rch: worker-local RABS setup unavailable: {error}; using stock Cargo\n")
-            .into_bytes()
+        let outcome = if policy.require_daemon {
+            "Cargo was not run (--require-daemon)"
+        } else {
+            "using stock Cargo"
+        };
+        format!("rch: worker-local RABS setup unavailable: {error}; {outcome}\n").into_bytes()
     }
 
     struct OwnGroup(Pid);
@@ -536,7 +573,7 @@ mod native {
         }
     }
 
-    fn guardian(deadline: u64) -> Result<()> {
+    fn guardian(deadline: u64, no_start: bool) -> Result<()> {
         // Keep ownership on the main thread too: an error while delivering a
         // response must kill preparation even if the owner watcher has not
         // observed EOF yet and process exit would otherwise stop that thread.
@@ -589,7 +626,7 @@ mod native {
             .recv()
             .map_err(|_| invalid("preparation lifetime watch did not arm"))?;
         close_inherited_descriptors()?;
-        let result = capture_preparer(deadline);
+        let result = capture_preparer(deadline, no_start);
         match result {
             Ok(payload) => send_before(rustix::stdio::stdout(), &payload.encode(), deadline)?,
             Err(_) => send_before(rustix::stdio::stdout(), b"X", deadline)?,
@@ -600,9 +637,13 @@ mod native {
         }
     }
 
-    fn capture_preparer(deadline: u64) -> Result<Payload> {
-        let mut child = Command::new(native_worker_executable()?)
-            .args(["worker-cache", "--prepare", &deadline.to_string()])
+    fn capture_preparer(deadline: u64, no_start: bool) -> Result<Payload> {
+        let mut command = Command::new(native_worker_executable()?);
+        command.args(["worker-cache", "--prepare", &deadline.to_string()]);
+        if no_start {
+            command.arg("--no-start");
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -675,9 +716,9 @@ mod native {
         }
     }
 
-    fn prepare_response(deadline: u64) -> Result<()> {
+    fn prepare_response(deadline: u64, no_start: bool) -> Result<()> {
         close_inherited_descriptors()?;
-        let response = match prepare::run(deadline) {
+        let response = match prepare::run(deadline, no_start) {
             Ok(prepared) => Response {
                 prepared: Some(prepared),
                 error: None,
@@ -773,31 +814,51 @@ mod native {
         }
     }
 
-    fn run(arguments: &[OsString]) -> i32 {
+    fn setup_unavailable(arguments: &[OsString], policy: PreparationPolicy, reason: &str) -> i32 {
+        replay_diagnostics(&fallback_diagnostic(reason, policy));
+        if policy.require_daemon {
+            2
+        } else {
+            exec_command(arguments, None)
+        }
+    }
+
+    fn run(arguments: &[OsString], policy: PreparationPolicy) -> i32 {
         if arguments.is_empty() {
             return 127;
         }
         let budget = preparation_budget();
         if budget == 0 || std::env::var_os(ACTIVE).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            if policy.require_daemon {
+                return setup_unavailable(
+                    arguments,
+                    policy,
+                    "preparation is disabled or already active; daemon readiness cannot be verified",
+                );
+            }
             return exec_command(arguments, None);
         }
         let end = now_ns() + budget * MILLISECOND;
         let Ok(watchdog) = Watchdog::new(end + 1_000 * MILLISECOND) else {
             // No preparation child or daemon exists yet. Failure to acquire
             // supervision resources can still safely preserve stock Cargo.
-            return exec_command(arguments, None);
+            return setup_unavailable(arguments, policy, "preparation watchdog is unavailable");
         };
         // Preserve inherited auto-reap behavior by bypassing setup entirely.
         // No setup child may be started without a waitable identity pin.
         if !matches!(child_is_autoreaped(), Ok(false)) {
             drop(watchdog);
-            return exec_command(arguments, None);
+            return setup_unavailable(arguments, policy, "preparation children cannot be reaped");
         }
         let Ok(mut signals) = Signals::new() else {
             drop(watchdog);
-            return exec_command(arguments, None);
+            return setup_unavailable(
+                arguments,
+                policy,
+                "preparation signal supervision is unavailable",
+            );
         };
-        let observed = observe(end, &signals);
+        let observed = observe(end, &signals, policy);
         let number = signals.number();
         match observed {
             Ok((prepared, logs)) if number == 0 => {
@@ -809,6 +870,9 @@ mod native {
                 let number = signals.number();
                 if number != 0 {
                     return 128 + number as i32;
+                }
+                if prepared.is_none() && policy.require_daemon {
+                    return 2;
                 }
                 exec_command(arguments, prepared)
             }
@@ -831,20 +895,34 @@ mod native {
 
     pub(super) fn main(arguments: &[OsString]) -> i32 {
         match arguments {
-            [role, time] if role == "--guardian" => deadline(time)
-                .and_then(guardian)
-                .map_or(UNCONFIRMED, |()| 0),
-            [role, time] if role == "--prepare" => {
-                deadline(time).and_then(prepare_response).map_or(1, |()| 0)
+            [role, time, options @ ..]
+                if role == "--guardian"
+                    && (options.is_empty() || options == [OsString::from("--no-start")]) =>
+            {
+                deadline(time)
+                    .and_then(|deadline| guardian(deadline, !options.is_empty()))
+                    .map_or(UNCONFIRMED, |()| 0)
+            }
+            [role, time, options @ ..]
+                if role == "--prepare"
+                    && (options.is_empty() || options == [OsString::from("--no-start")]) =>
+            {
+                deadline(time)
+                    .and_then(|deadline| prepare_response(deadline, !options.is_empty()))
+                    .map_or(1, |()| 0)
             }
             [role] if role == "--diagnostics" => diagnostic_relay().map_or(1, |()| 0),
             [role, rest @ ..] if role == "--daemon-exec" => {
                 prepare::daemon_exec(rest).map_or(1, |()| 0)
             }
-            [protocol, version, separator, command @ ..]
-                if protocol == "--protocol" && version == "v1" && separator == "--" =>
-            {
-                run(command)
+            [protocol, version, options @ ..] if protocol == "--protocol" && version == "v1" => {
+                match preparation_policy(options) {
+                    Ok((policy, command)) => run(command, policy),
+                    Err(error) => {
+                        replay_diagnostics(format!("rch: {error}\n").as_bytes());
+                        73
+                    }
+                }
             }
             _ => 73,
         }
@@ -853,6 +931,37 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn preparation_options_end_at_the_command_boundary() {
+            let arguments = [
+                "--no-start",
+                "--require-daemon",
+                "--",
+                "cargo",
+                "--no-start",
+            ]
+            .map(OsString::from);
+            let (policy, command) = preparation_policy(&arguments).unwrap();
+            assert!(policy.no_start);
+            assert!(policy.require_daemon);
+            assert_eq!(command, ["cargo", "--no-start"].map(OsString::from));
+            let ordinary = ["--", "cargo"].map(OsString::from);
+            assert_eq!(
+                preparation_policy(&ordinary).unwrap().0,
+                PreparationPolicy::default()
+            );
+            for invalid in [
+                vec!["--no-start", "--no-start", "--", "cargo"],
+                vec!["--require-daemon", "--require-daemon", "--", "cargo"],
+                vec!["--no-start=yes", "--", "cargo"],
+                vec!["--unknown", "--", "cargo"],
+                vec!["--no-start", "cargo"],
+            ] {
+                let arguments = invalid.iter().map(OsString::from).collect::<Vec<_>>();
+                assert!(preparation_policy(&arguments).is_err(), "{invalid:?}");
+            }
+        }
 
         #[test]
         fn preparation_budget_is_bounded_without_affecting_cargo_arguments() {

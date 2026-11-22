@@ -121,8 +121,13 @@ exit 23
     }
 
     fn command(&self, arguments: &[OsString]) -> Command {
+        self.command_with_policy(arguments, &[])
+    }
+
+    fn command_with_policy(&self, arguments: &[OsString], policy: &[&str]) -> Command {
         let mut command = Command::new(WORKER);
-        command.args(["worker-cache", "--protocol", "v1", "--"]);
+        command.args(["worker-cache", "--protocol", "v1"]);
+        command.args(policy).arg("--");
         command.arg(&self.cargo).args(arguments);
         self.configure(&mut command);
         command
@@ -346,13 +351,115 @@ fn native_prepare_starts_once_preserves_cargo_and_keeps_shared_daemon() {
             Err(Errno::WOULDBLOCK)
         );
     }
-    let output = run(&mut fixture.command(&arguments));
+    let output =
+        run(&mut fixture.command_with_policy(&arguments, &["--no-start", "--require-daemon"]));
     fixture.assert_cargo(&output, &arguments, 2);
+    assert_eq!(output.stderr, b"cargo stderr\n");
+    assert_eq!(fixture.fields()[1], fixture.wrapper.as_os_str().as_bytes());
+    assert_eq!(fixture.fields()[3], b"1");
     assert_eq!(
         fs::read(fixture.root.join("daemon.calls")).unwrap(),
         b"daemon\n"
     );
     assert!(!daemon.dead());
+}
+
+#[test]
+fn attach_only_never_starts_or_recovers_a_missing_or_stale_daemon() {
+    for stale in [false, true] {
+        for required in [false, true] {
+            let fixture = Fixture::new();
+            if stale {
+                let listener = UnixListener::bind(&fixture.socket).unwrap();
+                fs::set_permissions(&fixture.socket, fs::Permissions::from_mode(0o600)).unwrap();
+                drop(listener);
+            }
+            let arguments = opaque_arguments();
+            let mut policy = vec!["--no-start"];
+            if required {
+                policy.push("--require-daemon");
+            }
+            let output = run(&mut fixture.command_with_policy(&arguments, &policy));
+            if required {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                assert!(output.stdout.is_empty());
+                assert!(!fixture.root.join("cargo.calls").exists());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("Cargo was not run"));
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("using stock Cargo"));
+            } else {
+                fixture.assert_cargo(&output, &arguments, 1);
+                fixture.assert_stock();
+                assert!(String::from_utf8_lossy(&output.stderr).contains("using stock Cargo"));
+            }
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--no-start"));
+            assert_eq!(
+                fixture.socket.exists(),
+                stale,
+                "attach-only changed the endpoint"
+            );
+            assert!(
+                !fixture.root.join("state").exists(),
+                "attach-only created startup state"
+            );
+            assert!(!fixture.root.join("daemon.calls").exists());
+        }
+    }
+}
+
+#[test]
+fn required_daemon_never_falls_back_when_preparation_is_unavailable() {
+    for reason in ["wrapper", "daemon", "zero-budget", "active", "opt-out"] {
+        let fixture = Fixture::new();
+        let mut command = fixture.command_with_policy(&opaque_arguments(), &["--require-daemon"]);
+        match reason {
+            "wrapper" => {
+                command.env("CARGO_RABS_WRAP", fixture.root.join("missing"));
+            }
+            "daemon" => {
+                command.env("CARGO_RABS_DAEMON", fixture.root.join("missing"));
+            }
+            "zero-budget" => {
+                command.env("RCH_RABS_PREPARE_TIMEOUT_MS", "0");
+            }
+            "active" => {
+                command.env("RCH_RABS_WORKER_ACTIVE", "1");
+            }
+            "opt-out" => {
+                command.env("RUSTC_WRAPPER", "");
+            }
+            _ => unreachable!(),
+        }
+        let output = run(&mut command);
+        assert_eq!(output.status.code(), Some(2), "{reason}: {output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!fixture.root.join("cargo.calls").exists());
+        assert!(!fixture.root.join("daemon.calls").exists());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("Cargo was not run"),
+            "{reason}: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("using stock Cargo"),
+            "{reason}: {diagnostic}"
+        );
+    }
+}
+
+#[test]
+fn required_daemon_can_start_and_preserves_literal_policy_names_in_cargo_argv() {
+    let fixture = Fixture::new();
+    let arguments = ["test", "--", "--no-start", "--require-daemon"].map(OsString::from);
+    let output = run(&mut fixture.command_with_policy(&arguments, &["--require-daemon"]));
+    fixture.assert_cargo(&output, &arguments, 1);
+    assert_eq!(output.stderr, b"cargo stderr\n");
+    assert_eq!(fixture.fields()[1], fixture.wrapper.as_os_str().as_bytes());
+    assert_eq!(fixture.fields()[3], b"1");
+    assert_eq!(
+        fs::read(fixture.root.join("daemon.calls")).unwrap(),
+        b"daemon\n"
+    );
+    assert!(!fixture.daemon().dead());
 }
 
 #[test]
@@ -452,28 +559,45 @@ fn custom_or_explicitly_disabled_wrappers_are_preserved() {
 
 #[test]
 fn bounded_configuration_failure_reaps_stopped_descendants_before_cargo() {
-    let fixture = Fixture::new();
-    let arguments = opaque_arguments();
-    let mut command = fixture.command(&arguments);
-    command
-        .env("RCH_TEST_CONFIG_MODE", "stopped-tree")
-        .env("RCH_RABS_PREPARE_TIMEOUT_MS", "500")
-        .stderr(Stdio::piped());
-    let running = Running::start(&mut command);
-    let config = Process::from_record(&fixture.root.join("config.pid"));
-    let descendant = Process::from_record(&fixture.root.join("descendant.pid"));
-    let output = running.finish();
-    fixture.assert_cargo(&output, &arguments, 1);
-    fixture.assert_stock();
-    assert!(config.dead(), "configuration survived fallback");
-    assert!(descendant.dead(), "descendant survived fallback");
+    for policy in [&[][..], &["--require-daemon"][..]] {
+        let fixture = Fixture::new();
+        let arguments = opaque_arguments();
+        let mut command = fixture.command_with_policy(&arguments, policy);
+        command
+            .env("RCH_TEST_CONFIG_MODE", "stopped-tree")
+            .env("RCH_RABS_PREPARE_TIMEOUT_MS", "500")
+            .stderr(Stdio::piped());
+        let running = Running::start(&mut command);
+        let config = Process::from_record(&fixture.root.join("config.pid"));
+        let descendant = Process::from_record(&fixture.root.join("descendant.pid"));
+        let output = running.finish();
+        if policy.is_empty() {
+            fixture.assert_cargo(&output, &arguments, 1);
+            fixture.assert_stock();
+        } else {
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(!fixture.root.join("cargo.calls").exists());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Cargo was not run"));
+        }
+        assert!(config.dead(), "configuration survived setup cleanup");
+        assert!(descendant.dead(), "descendant survived setup cleanup");
+    }
 }
 
 #[test]
 fn setup_cancellation_settles_every_descendant_before_reporting_signal() {
-    for signal in [Signal::INT, Signal::TERM, Signal::HUP] {
+    for (signal, required) in [Signal::INT, Signal::TERM, Signal::HUP]
+        .into_iter()
+        .flat_map(|signal| [false, true].map(|required| (signal, required)))
+    {
         let fixture = Fixture::new();
-        let mut command = fixture.command(&opaque_arguments());
+        let policy = if required {
+            &["--require-daemon"][..]
+        } else {
+            &[][..]
+        };
+        let mut command = fixture.command_with_policy(&opaque_arguments(), policy);
         command
             .env("RCH_TEST_CONFIG_MODE", "stopped-tree")
             .stderr(Stdio::piped());

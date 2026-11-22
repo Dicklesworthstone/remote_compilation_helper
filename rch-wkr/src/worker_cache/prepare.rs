@@ -51,11 +51,11 @@ pub(super) struct Prepared {
 
 type Environment = BTreeMap<OsString, OsString>;
 
-pub(super) fn run(deadline_ns: u64) -> std::result::Result<Prepared, String> {
-    prepare(deadline_ns).map_err(|error| format!("{error:#}"))
+pub(super) fn run(deadline_ns: u64, no_start: bool) -> std::result::Result<Prepared, String> {
+    prepare(deadline_ns, no_start).map_err(|error| format!("{error:#}"))
 }
 
-fn prepare(outer_deadline: u64) -> Result<Prepared> {
+fn prepare(outer_deadline: u64, no_start: bool) -> Result<Prepared> {
     let original: Environment = std::env::vars_os().collect();
     let milliseconds = match original.get(OsStr::new("CARGO_RABS_STARTUP_MS")) {
         Some(value) => value
@@ -107,6 +107,7 @@ fn prepare(outer_deadline: u64) -> Result<Prepared> {
         &daemon_env,
         deadline,
         expected_remote.as_ref(),
+        no_start,
     )?;
     Ok(Prepared { wrapper, socket })
 }
@@ -1167,6 +1168,7 @@ fn ensure_daemon(
     env: &Environment,
     deadline: u64,
     expected_remote: Option<&Value>,
+    no_start: bool,
 ) -> Result<()> {
     let stale = match probe(
         socket,
@@ -1178,6 +1180,13 @@ fn ensure_daemon(
         Probe::Stale(identity) => Some(identity),
         Probe::Missing => None,
     };
+    // Attach-only admission never creates startup state, recovers a stale
+    // endpoint, or launches a replacement. The authenticated ready probe
+    // above remains identical to the ordinary startup path.
+    ensure!(
+        !no_start,
+        "no RABS daemon is listening and --no-start was requested"
+    );
     let mut lock = StartupLock::new(state, socket)?;
     if !lock.acquire(socket, deadline)? {
         ensure!(
