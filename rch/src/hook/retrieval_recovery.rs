@@ -725,6 +725,12 @@ impl RecoveryRecipe {
             );
             return Ok(());
         }
+        anyhow::ensure!(
+            self.cargo_output_capture
+                .as_ref()
+                .is_some_and(CargoOutputCapture::supports_retrieval_exclusions),
+            "Cargo retrieval exclusions require a supported complete Cargo output capture"
+        );
         let mut phases = self
             .phases
             .iter()
@@ -12267,6 +12273,56 @@ func TestValue(t *testing.T) {{
                 vec!["debug/.wrapper-shims".into()];
             session.recipe.validate_cargo_retrieval_policy().unwrap();
         }
+    }
+
+    #[test]
+    fn cargo_retrieval_recovery_rejects_incomplete_saved_capture() {
+        let command = "cargo build --workspace";
+        let (_directory, _stage_owner, mut session) = captured_publication_fixture(
+            CompilationKind::CargoBuild,
+            "cargo build --bin app",
+            Path::new("/worker/cargo-output"),
+            true,
+        );
+        let baseline =
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild), Some(command));
+        session.recipe.transfer.cargo_retrieval_exclude_dirs = vec!["debug/.wrapper-shims".into()];
+        session.recipe.cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
+            Some(CompilationKind::CargoBuild),
+            command,
+            &baseline,
+            &session.recipe.transfer.cargo_retrieval_exclude_dirs,
+        )
+        .unwrap();
+        session.recipe.phases[0].patterns =
+            cargo_retrieval_patterns(&baseline, &session.recipe.transfer, None).unwrap();
+        session.persist().unwrap();
+        let session = reload_publication(&session);
+        session.recipe.validate_cargo_retrieval_policy().unwrap();
+        let original =
+            serde_json::to_value(session.recipe.cargo_output_capture.as_ref().unwrap()).unwrap();
+        for patch in [
+            serde_json::json!({"instrumented": false}),
+            serde_json::json!({"retrieval_baseline": []}),
+            serde_json::json!({"retrieval_baseline": ["- /debug/.wrapper-shims/"]}),
+        ] {
+            let mut encoded = original.clone();
+            encoded
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let mut rejected = session.recipe.clone();
+            rejected.cargo_output_capture = Some(serde_json::from_value(encoded).unwrap());
+            let error = rejected.validate_cargo_retrieval_policy().unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "Cargo retrieval exclusions require a supported complete Cargo output capture"
+                ),
+                "{patch}: {error:#}"
+            );
+        }
+        // Valid retained proof is unchanged by a failed restored-state check.
+        session.recipe.validate_cargo_retrieval_policy().unwrap();
     }
 
     pub(super) async fn assert_cargo_fixture_publication(

@@ -47,6 +47,11 @@ fn parse_selection(
     require_named: bool,
 ) -> Option<NamedCargoSelection> {
     let kind = kind?;
+    // Zigbuild receipt capture is opt-in. Ordinary named-output narrowing and
+    // automatic capture retain their existing Cargo build-only behavior.
+    if require_named && kind == CompilationKind::CargoZigbuild {
+        return None;
+    }
     let args = build_arguments(kind, command)?;
     let mut bins = BTreeSet::new();
     let mut examples = BTreeSet::new();
@@ -88,7 +93,12 @@ fn parse_selection(
                 }
                 benches.insert(name);
             }
-            "--no-run" if kind != CompilationKind::CargoBuild && inline.is_none() => {
+            "--no-run"
+                if matches!(
+                    kind,
+                    CompilationKind::CargoTest | CompilationKind::CargoBench
+                ) && inline.is_none() =>
+            {
                 no_run = true;
             }
             "--bins" | "--examples" | "--lib" | "--tests" | "--benches" | "--all-targets"
@@ -99,7 +109,13 @@ fn parse_selection(
             "--target" => {
                 let target = inline.or_else(|| iter.next())?;
                 // Cargo substitutes host-tuple at runtime; it is not a directory.
-                if !component(target) || target == "host-tuple" {
+                if !component(target)
+                    || target == "host-tuple"
+                    // Zigbuild consumes Cargo's JSON while assembling fat
+                    // binaries and emits no complete receipt for this target.
+                    || (kind == CompilationKind::CargoZigbuild
+                        && target == "universal2-apple-darwin")
+                {
                     return None;
                 }
                 targets.insert(target);
@@ -166,7 +182,11 @@ fn parse_selection(
     // Executing tests/benches produces a result stream, not caller-owned
     // executables. Only Cargo's own --no-run can enable output capture; a
     // similarly named test-program argument after `--` never reaches here.
-    if kind != CompilationKind::CargoBuild && !no_run {
+    if matches!(
+        kind,
+        CompilationKind::CargoTest | CompilationKind::CargoBench
+    ) && !no_run
+    {
         return None;
     }
     Some(NamedCargoSelection {
@@ -286,11 +306,20 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
     if tokens.len() > 4096 || tokens.iter().any(|word| word.chars().any(char::is_control)) {
         return None;
     }
+    // The managed lexer accepts more prefixes than command classification.
+    // New plugin capture must stay within the forms RCH actually admits; do
+    // not extend existing command classification through this opt-in parser.
+    if kind == CompilationKind::CargoZigbuild
+        && rch_common::classify_command(command).kind != Some(kind)
+    {
+        return None;
+    }
     // Keep the original wrapper allowlist below: using the shared lexer does
     // not admit chdir, arbitrary wrappers, or a different Cargo subcommand.
     let words: Vec<_> = tokens.iter().map(String::as_str).collect();
     let mut index = 0;
     let mut standalone_xwin = false;
+    let mut standalone_zigbuild = false;
     loop {
         while words.get(index).is_some_and(|word| {
             word.split_once('=')
@@ -303,6 +332,10 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
             "cargo" => break,
             "cargo-xwin" if kind == CompilationKind::CargoBuild => {
                 standalone_xwin = true;
+                break;
+            }
+            "cargo-zigbuild" if kind == CompilationKind::CargoZigbuild => {
+                standalone_zigbuild = true;
                 break;
             }
             "env" => {
@@ -347,6 +380,12 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
     }
     index += 1;
     if !standalone_xwin && words.get(index).is_some_and(|word| word.starts_with('+')) {
+        // Older standalone zigbuild versions pass this form through Cargo
+        // without their linker configuration. Cargo's own +toolchain form
+        // has established plugin semantics.
+        if standalone_zigbuild {
+            return None;
+        }
         index += 1;
     }
     // Keep the plugin invocation intact for execution; only parse the Cargo
@@ -360,10 +399,12 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
         return None;
     }
     if !matches!(
-        (kind, subcommand),
-        (CompilationKind::CargoBuild, "build" | "b")
-            | (CompilationKind::CargoTest, "test" | "t")
-            | (CompilationKind::CargoBench, "bench")
+        (kind, standalone_zigbuild, subcommand),
+        (CompilationKind::CargoBuild, false, "build" | "b")
+            | (CompilationKind::CargoTest, false, "test" | "t")
+            | (CompilationKind::CargoBench, false, "bench")
+            | (CompilationKind::CargoZigbuild, _, "zigbuild")
+            | (CompilationKind::CargoZigbuild, true, "build" | "b")
     ) {
         return None;
     }
@@ -381,6 +422,80 @@ mod tests {
 
     fn select(command: &str) -> Option<Vec<String>> {
         patterns(Some(CompilationKind::CargoBuild), Some(command))
+    }
+
+    #[test]
+    fn zigbuild_retrieval_selection_keeps_literal_plugin_forms_opt_in() {
+        let kind = Some(CompilationKind::CargoZigbuild);
+        for command in [
+            "cargo zigbuild --bin app --profile lean",
+            "cargo +nightly zigbuild '--bin=app' --profile=lean",
+            "cargo-zigbuild zigbuild --bin app --profile lean",
+            "cargo-zigbuild build --bin app --profile lean",
+            "cargo-zigbuild b --bin app --profile lean",
+            "env -u CARGO_TARGET_DIR /opt/bin/cargo-zigbuild build --bin 'app' --profile 'lean'",
+            "env -- cargo-zigbuild b --bin app --profile lean",
+            "MODE=release cargo zigbuild --bin app --profile lean",
+        ] {
+            assert_eq!(
+                rch_common::classify_command(command).kind,
+                kind,
+                "{command}"
+            );
+            let parsed = retrieval_selection(kind, command).unwrap();
+            assert_eq!(parsed.bins, BTreeSet::from(["app".into()]));
+            assert_eq!(parsed.profile, "lean");
+            assert!(!parsed.broad_targets);
+            assert!(parsed.message_formats.is_empty());
+            assert!(selection(kind, command).is_none(), "{command}");
+            assert!(patterns(kind, Some(command)).is_none(), "{command}");
+            assert!(retrieval_selection(Some(CompilationKind::CargoBuild), command).is_none());
+        }
+        let selection = retrieval_selection(
+            kind,
+            "env -- cargo zigbuild --workspace --lib --example sample --target aarch64-unknown-linux-gnu --target=x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
+        assert!(selection.broad_targets);
+        assert_eq!(selection.examples, BTreeSet::from(["sample".into()]));
+        assert_eq!(
+            selection.targets,
+            BTreeSet::from([
+                "aarch64-unknown-linux-gnu".into(),
+                "x86_64-unknown-linux-gnu".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn zigbuild_retrieval_selection_refuses_incomplete_or_ambiguous_forms() {
+        for command in [
+            "cargo build --bin app",
+            "cargo-zigbuild check --bin app",
+            "cargo-zigbuild test --no-run",
+            "cargo-zigbuild zig cc source.c",
+            "cargo zigbuild --no-run",
+            "cargo-zigbuild +nightly build",
+            "cargo-zigbuild +stable zigbuild",
+            "rustup run nightly cargo-zigbuild b --bin app",
+            "rustup run nightly cargo zigbuild --bin app",
+            "cargo zigbuild --target aarch64-unknown-linux-gnu.2.17",
+            "cargo-zigbuild build --target universal2-apple-darwin",
+            "cargo zigbuild --target x86_64-apple-darwin --target=universal2-apple-darwin",
+            "cargo zigbuild --target='universal2-apple-darwin'",
+            "cargo zigbuild --target path/custom.json",
+            "cargo zigbuild --bin app -- --message-format=json",
+            "env --chdir=/tmp cargo zigbuild --bin app",
+            "/usr/bin/time -p cargo zigbuild --bin app",
+            "sh -c 'cargo zigbuild --bin app'",
+            "cargo zigbuild --bin app && echo done",
+            "cargo zigbuild --bin '$OUTPUT'",
+        ] {
+            assert!(
+                retrieval_selection(Some(CompilationKind::CargoZigbuild), command).is_none(),
+                "{command}"
+            );
+        }
     }
 
     #[test]

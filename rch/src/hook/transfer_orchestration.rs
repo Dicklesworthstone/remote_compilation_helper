@@ -1105,21 +1105,24 @@ async fn execute_remote_compilation_inner(
             "Cargo retrieval exclusions require a resolved target directory"
         );
         let baseline = get_custom_target_artifact_patterns(kind, Some(command));
-        if !baseline.is_empty() {
-            anyhow::ensure!(
-                durable_lease.is_some()
-                    && !WorkerPlatform::from_worker(&worker_config).is_windows()
-                    && !super::ssh::should_skip_remote_preflight(&worker_config),
-                "Cargo retrieval exclusions require durable Unix execution and complete output evidence"
-            );
-            super::artifact_patterns::cargo_retrieval_patterns(&baseline, &transfer_config, None)?;
-            CargoOutputCapture::for_retrieval_policy(
-                kind,
-                command,
-                &baseline,
-                &transfer_config.cargo_retrieval_exclude_dirs,
-            )?;
-        }
+        anyhow::ensure!(
+            durable_lease.is_some()
+                && !WorkerPlatform::from_worker(&worker_config).is_windows()
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "Cargo retrieval exclusions require durable Unix execution and complete output evidence"
+        );
+        super::artifact_patterns::cargo_retrieval_patterns(&baseline, &transfer_config, None)?;
+        let capture = CargoOutputCapture::for_retrieval_policy(
+            kind,
+            command,
+            &baseline,
+            &transfer_config.cargo_retrieval_exclude_dirs,
+        )?
+        .context("Cargo retrieval exclusions require complete output capture")?;
+        anyhow::ensure!(
+            capture.supports_retrieval_exclusions(),
+            "Cargo retrieval exclusions require a supported complete Cargo output capture"
+        );
     }
     if let Some(destination) = result_destination {
         anyhow::ensure!(

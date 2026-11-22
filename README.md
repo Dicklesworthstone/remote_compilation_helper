@@ -1168,9 +1168,17 @@ and complete Cargo output evidence. RCH refuses exclusions that could hide
 required executables, libraries, sidecars or priority outputs. The same recorded
 selection governs sizing, download, staged validation and recovery. Full builds
 use normal human output; explicit Cargo JSON remains supported only by the
-existing named-executable contract when its evidence permits. Unsupported command
-and output forms refuse before remote execution. Check, clippy, running tests,
-native outputs and explicit result directories retain their existing policies.
+existing named-executable contract for ordinary Cargo commands when its evidence
+permits. Unsupported command and output forms refuse before remote execution.
+Check, clippy, running tests, native outputs and explicit result directories
+retain their existing policies.
+
+With nonempty exclusions, ordinary `cargo zigbuild` and supported literal
+standalone `cargo-zigbuild` build forms also use complete output capture.
+Zigbuild requires the default message format. An explicit
+`--target universal2-apple-darwin` is refused because that plugin mode does not
+forward complete Cargo JSON evidence. An empty exclusion list leaves existing
+Zigbuild behavior unchanged.
 See [Cargo target exclusions](docs/recovery-artifact-selection.md#cargo-target-exclusions)
 for the supported grammar and output-evidence limits.
 

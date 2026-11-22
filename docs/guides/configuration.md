@@ -211,14 +211,17 @@ Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
   A project list replaces the user list; `[]` clears it. Use `rch config get`,
   `set`, `reset`, `show --sources`, `diff` or `export --format json` to inspect
   and manage this setting.
-  Successful build and `test/bench --no-run` delivery requires durable POSIX
-  execution and a complete Cargo output receipt; rules overlapping required
-  executables, libraries, sidecars or priority includes refuse delivery.
+  Successful `cargo build`, ordinary `cargo zigbuild`, and `test/bench --no-run`
+  delivery requires durable POSIX execution and a complete Cargo output receipt;
+  rules overlapping required executables, libraries, sidecars or priority
+  includes refuse delivery.
   Full builds use human output; explicit Cargo JSON remains limited to the
-  existing named-executable contract when its evidence permits. Unsupported
-  command/format combinations refuse before remote execution. Streaming check,
-  clippy, running tests, native outputs and explicit result directories are
-  unaffected. See
+  existing named-executable contract for ordinary Cargo commands when its
+  evidence permits. Zigbuild requires the default message format. An explicit
+  `--target universal2-apple-darwin` is refused for this opt-in policy.
+  Unsupported command/format combinations refuse before remote execution.
+  Streaming check, clippy, running tests, native outputs and explicit result
+  directories are unaffected. See
   [Cargo target exclusions](../recovery-artifact-selection.md#cargo-target-exclusions)
   for the supported command grammar and immutable recovery behavior.
 - `ssh_server_alive_interval_secs` (u64, optional) — Sets `ssh -o ServerAliveInterval`

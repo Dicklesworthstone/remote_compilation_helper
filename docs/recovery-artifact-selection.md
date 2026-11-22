@@ -23,25 +23,38 @@ accepted. At most 128 directories of 4096 bytes each are supported. Built-in
 `incremental/`, `.fingerprint/`, `build/` and dep-info exclusions remain active.
 An exclusion does not match a same-prefix sibling or a same-named tree elsewhere.
 
-This opt-in applies to artifact-producing Cargo builds and build-only
-`test/bench --no-run`. It supports the bounded literal Cargo build grammar,
-including full workspaces, libraries, multiple binaries, profiles and target
-triples. The Unix durable execution path retains a complete Cargo JSON receipt
-and validates every Cargo-reported selected library, binary and sidecar before
-publishing anything. Required executables and priority includes cannot be
-excluded. Empty, incomplete or malformed output evidence and out-of-root
-executables refuse publication; one remaining file cannot stand in for a
-complete build. Rust `.rlib`/`.rmeta` and procedural-macro intermediates in a
-separate Cargo build directory remain outside target delivery, while every
+This opt-in applies to `cargo build`, ordinary `cargo zigbuild`, and build-only
+`cargo test --no-run` / `cargo bench --no-run`. It supports the bounded literal
+Cargo build grammar, including full workspaces, libraries, multiple binaries,
+profiles and target triples. The Unix durable execution path retains a complete
+Cargo JSON receipt and validates every Cargo-reported selected library, binary
+and sidecar before publishing anything. Required executables and priority
+includes cannot be excluded. Empty, incomplete or malformed output evidence
+and out-of-root executables refuse publication; one remaining file cannot stand
+in for a complete build. Rust `.rlib`/`.rmeta` and procedural-macro intermediates
+in a separate Cargo build directory remain outside target delivery, while every
 selected target-root library and executable is still required. Other library
 outputs outside that root refuse delivery. This also supports ordinary mirror
 builds that retain a configured `build.build-dir`.
 
+For Zigbuild, the accepted forms are `cargo zigbuild`,
+`cargo +toolchain zigbuild`, and the literal standalone invocations
+`cargo-zigbuild zigbuild`, `cargo-zigbuild build` or `cargo-zigbuild b`.
+Zigbuild requires the default message format and literal target triples without
+ABI-version suffixes. Select a toolchain through Cargo; standalone
+`cargo-zigbuild +toolchain ...` and `rustup run` wrappers are unsupported. An explicit
+`--target universal2-apple-darwin` is refused before execution because the
+plugin's universal2 mode does not forward a complete Cargo JSON stream. An empty
+exclusion list leaves existing Zigbuild behavior unchanged.
+
 The completed receipt must identify every explicitly requested target, including
 examples and mixed named/broad selections. Every relevant returning library
-format and sidecar must survive the original artifact policy. Unknown Cargo
-record reasons or target kinds refuse narrowing rather than establishing an
-incomplete output set from the remaining known records.
+format and sidecar must survive the original artifact policy. A named example
+requires a deliverable payload; dep-info (`.d`) and metadata (`.rmeta`) alone do
+not satisfy it, even when the original policy includes them. Malformed emitted
+paths or an invalid saved selection cannot establish a complete receipt. Unknown
+Cargo record reasons or target kinds refuse narrowing rather than establishing
+an incomplete output set from the remaining known records.
 
 Cargo-reported `.dSYM` debug-symbol bundles are required directories. Their
 staged contents must include regular files, and the entire bundle is checked
@@ -52,10 +65,11 @@ Explicit named Cargo JSON retains the bundle directory in `filenames` while
 binding its retained contents to the files published by the completed job.
 
 Full builds use their normal human output; explicit caller JSON remains limited
-to the existing named-executable contract. Unsupported explicit message formats,
-opaque flags, documentation/package commands and transports without durable
-Cargo evidence refuse before execution. Streaming check, clippy, ordinary test
-reports, non-Cargo commands and explicitly declared job results are unaffected.
+to the existing named-executable contract for ordinary Cargo commands.
+Unsupported explicit message formats, opaque flags, documentation/package
+commands and transports without durable Cargo evidence refuse before execution.
+Streaming check, clippy, ordinary test reports, non-Cargo commands and explicitly
+declared job results are unaffected.
 
 Size planning, payload retrieval, staged-file validation and detached recovery
 use the same persisted selection. Recovery retains the original exclusions even

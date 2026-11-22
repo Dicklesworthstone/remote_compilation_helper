@@ -201,11 +201,12 @@ impl CargoOutputCapture {
         baseline: &[String],
         directories: &[String],
     ) -> Result<Option<Self>> {
-        if directories.is_empty() || baseline.is_empty() {
+        if directories.is_empty() {
             return Ok(Self::for_command(kind, command));
         }
+        retrieval_baseline_filters(baseline)?;
         let selection = cargo_bins::retrieval_selection(kind, command).context(
-            "transfer.cargo_retrieval_exclude_dirs requires a literal Cargo build or test/bench --no-run command with a complete output receipt",
+            "transfer.cargo_retrieval_exclude_dirs requires a supported literal Cargo build, zigbuild, or test/bench --no-run command with a complete output receipt",
         )?;
         let instrumented = match selection.message_formats.as_slice() {
             [] => true,
@@ -243,6 +244,24 @@ impl CargoOutputCapture {
 
     pub(super) fn retrieval_baseline(&self) -> Option<&[String]> {
         self.retrieval_baseline.as_deref()
+    }
+
+    /// A restored recipe must retain both its original positive selection and
+    /// a capture mode that can prove every selected output. A baseline alone
+    /// cannot turn an unsupported caller JSON stream into complete evidence.
+    pub(super) fn supports_retrieval_exclusions(&self) -> bool {
+        self.retrieval_exclusion_filters().is_ok()
+    }
+
+    fn retrieval_exclusion_filters(&self) -> Result<crate::transfer::ArtifactFilters> {
+        let baseline = self
+            .retrieval_baseline()
+            .context("Cargo retrieval exclusions lack an original output baseline")?;
+        anyhow::ensure!(
+            self.instrumented || self.caller_json_supported(),
+            "Cargo retrieval exclusions lack a supported complete output capture mode"
+        );
+        retrieval_baseline_filters(baseline)
     }
 
     /// Apply to the managed Cargo command before telemetry/timeout wrappers.
@@ -299,7 +318,7 @@ impl CargoOutputCapture {
         let retrieval_filters = self
             .retrieval_baseline
             .as_ref()
-            .map(|patterns| crate::transfer::ArtifactFilters::from_patterns(patterns))
+            .map(|_| self.retrieval_exclusion_filters())
             .transpose()?;
         anyhow::ensure!(
             !stdout.is_empty() && stdout.len() <= MAX_CARGO_OUTPUT_RECEIPT_BYTES,
@@ -368,6 +387,18 @@ impl CargoOutputCapture {
                         })
                         .collect();
                     if let Some(filters) = &retrieval_filters {
+                        // Private build-script and separate build-directory
+                        // outputs are exceptions to delivery, not to receipt
+                        // validation. Check every declared path before either
+                        // exception can discard an unsafe filename.
+                        for filename in artifact.filenames.iter().chain(artifact.executable.iter())
+                        {
+                            validate_absolute_path(Path::new(filename))?;
+                            anyhow::ensure!(
+                                !filename.chars().any(char::is_control),
+                                "Cargo output filename contains a control character"
+                            );
+                        }
                         anyhow::ensure!(
                             artifact.target.kind.iter().all(|kind| matches!(
                                 kind.as_str(),
@@ -436,13 +467,9 @@ impl CargoOutputCapture {
                                 || self.broad_targets
                                 || self.selected.is_empty()
                                 || !matched.is_empty();
+                            let mut has_deliverable = false;
                             for filename in &artifact.filenames {
                                 let path = Path::new(filename);
-                                validate_absolute_path(path)?;
-                                anyhow::ensure!(
-                                    !filename.chars().any(char::is_control),
-                                    "Cargo output filename contains a control character"
-                                );
                                 let private_intermediate =
                                     path.extension().is_some_and(|extension| {
                                         extension == "rlib"
@@ -493,6 +520,7 @@ impl CargoOutputCapture {
                                     artifact.target.name
                                 );
                                 if admitted {
+                                    has_deliverable |= !metadata;
                                     if directory {
                                         required_directories.insert(relative);
                                     } else {
@@ -500,6 +528,14 @@ impl CargoOutputCapture {
                                     }
                                 }
                             }
+                            anyhow::ensure!(
+                                has_deliverable
+                                    || !matched
+                                        .iter()
+                                        .any(|target| target.kind == TargetKind::Example),
+                                "Cargo selected example {} has no admitted deliverable",
+                                artifact.target.name
+                            );
                         }
                         for target in matched {
                             seen.insert(target.clone());
@@ -922,6 +958,14 @@ fn directory_has_output(root: &Path) -> Result<bool> {
     Ok(has_output)
 }
 
+fn retrieval_baseline_filters(baseline: &[String]) -> Result<crate::transfer::ArtifactFilters> {
+    anyhow::ensure!(
+        baseline.iter().any(|pattern| !pattern.starts_with("- ")),
+        "Cargo retrieval exclusions require a nonempty positive output baseline"
+    );
+    crate::transfer::ArtifactFilters::from_patterns(baseline)
+}
+
 fn explicit_json_format(value: &str) -> bool {
     let mut seen = BTreeSet::new();
     value.split(',').all(|format| {
@@ -1131,6 +1175,369 @@ mod tests {
         )
         .unwrap()
         .unwrap()
+    }
+
+    #[test]
+    fn cargo_retrieval_capture_requires_valid_positive_baselines_and_supported_restored_modes() {
+        let kind = Some(CompilationKind::CargoBuild);
+        let baseline = vec!["debug/**".into(), "- debug/.cache/".into()];
+        let directories = vec!["debug/.wrapper-shims".into()];
+        let make = |command: &str| {
+            CargoOutputCapture::for_retrieval_policy(kind, command, &baseline, &directories)
+                .unwrap()
+                .unwrap()
+        };
+        let stdout = receipt(&[artifact(
+            "bin",
+            "app",
+            &["/target/debug/app"],
+            Some("/target/debug/app"),
+            true,
+        )]);
+        for invalid in [
+            vec![],
+            vec!["- debug/.cache/".into()],
+            vec![String::new()],
+            vec!["debug/[".into()],
+            vec!["+ ".into()],
+        ] {
+            assert!(
+                CargoOutputCapture::for_retrieval_policy(
+                    kind,
+                    "cargo build --workspace",
+                    &invalid,
+                    &directories,
+                )
+                .is_err(),
+                "{invalid:?}"
+            );
+            // Without the setting, capture keeps its original behavior even
+            // when the unused retrieval baseline would not establish outputs.
+            assert_eq!(
+                CargoOutputCapture::for_retrieval_policy(
+                    kind,
+                    "cargo build --bin app",
+                    &invalid,
+                    &[],
+                )
+                .unwrap(),
+                CargoOutputCapture::for_command(kind, "cargo build --bin app")
+            );
+            let mut corrupt = make("cargo build --workspace");
+            corrupt.retrieval_baseline = Some(invalid);
+            let restored: CargoOutputCapture =
+                serde_json::from_slice(&serde_json::to_vec(&corrupt).unwrap()).unwrap();
+            assert!(!restored.supports_retrieval_exclusions());
+            assert!(
+                restored
+                    .parse_receipt(&stdout, Path::new("/target"))
+                    .is_err()
+            );
+        }
+        for command in [
+            "cargo build --workspace",
+            "cargo build --bin app",
+            "cargo build --bin app --message-format=json",
+        ] {
+            let original = make(command);
+            let restored: CargoOutputCapture =
+                serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+            assert!(restored.supports_retrieval_exclusions(), "{command}");
+            restored
+                .parse_receipt(&stdout, Path::new("/target"))
+                .unwrap();
+        }
+        for command in [
+            "cargo build --workspace",
+            "cargo build --bin app --bins",
+            "cargo build --example sample",
+            "cargo build --bin app --test suite",
+        ] {
+            let mut corrupt = make(command);
+            corrupt.instrumented = false;
+            let restored: CargoOutputCapture =
+                serde_json::from_slice(&serde_json::to_vec(&corrupt).unwrap()).unwrap();
+            assert!(!restored.supports_retrieval_exclusions(), "{command}");
+            let error = restored
+                .parse_receipt(&stdout, Path::new("/target"))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("supported complete output capture mode")
+            );
+        }
+        assert!(!capture("cargo build --bin app").supports_retrieval_exclusions());
+    }
+
+    #[test]
+    fn cargo_retrieval_capture_validates_private_artifact_paths_before_skipping() {
+        let capture = CargoOutputCapture::for_retrieval_policy(
+            Some(CompilationKind::CargoBuild),
+            "cargo build --workspace",
+            &["debug/**".into(), "- debug/build/".into()],
+            &["debug/.wrapper-shims".into()],
+        )
+        .unwrap()
+        .unwrap();
+        let app = artifact(
+            "bin",
+            "app",
+            &["/target/debug/app"],
+            Some("/target/debug/app"),
+            true,
+        );
+        let script = "/cache/debug/build/package/build-script-build";
+        let contract = capture
+            .parse_receipt(
+                &receipt(&[
+                    app.clone(),
+                    artifact(
+                        "custom-build",
+                        "build-script-build",
+                        &[script],
+                        Some(script),
+                        true,
+                    ),
+                    artifact(
+                        "lib",
+                        "dependency",
+                        &[
+                            "/cache/debug/deps/libdependency.rlib",
+                            "/cache/debug/deps/libdependency.rmeta",
+                        ],
+                        None,
+                        true,
+                    ),
+                    artifact(
+                        "proc-macro",
+                        "macro",
+                        &["/cache/debug/deps/libmacro.so"],
+                        None,
+                        true,
+                    ),
+                ]),
+                Path::new("/target"),
+            )
+            .unwrap();
+        assert_eq!(contract.required_files, [PathBuf::from("debug/app")].into());
+        assert!(contract.required_directories.is_empty());
+        for invalid in [
+            "relative/libdependency.rlib",
+            "/cache/./libdependency.rlib",
+            "/cache/../libdependency.rlib",
+            "/cache/lib\tdependency.rlib",
+            "/cache/lib\u{7f}dependency.rlib",
+            "/cache/lib\0dependency.rlib",
+        ] {
+            for invalid_record in [
+                artifact(
+                    "custom-build",
+                    "build-script-build",
+                    &[invalid],
+                    Some(script),
+                    true,
+                ),
+                artifact(
+                    "custom-build",
+                    "build-script-build",
+                    &[script],
+                    Some(invalid),
+                    true,
+                ),
+                artifact("lib", "dependency", &[invalid], None, true),
+            ] {
+                assert!(
+                    capture
+                        .parse_receipt(
+                            &receipt(&[app.clone(), invalid_record]),
+                            Path::new("/target")
+                        )
+                        .is_err(),
+                    "{invalid:?}"
+                );
+            }
+        }
+        // This stricter proof belongs only to the opt-in complete receipt.
+        CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), "cargo build --bin app")
+            .unwrap()
+            .parse_receipt(
+                &receipt(&[
+                    app,
+                    artifact(
+                        "custom-build",
+                        "build-script-build",
+                        &["relative"],
+                        Some("relative"),
+                        true,
+                    ),
+                ]),
+                Path::new("/target"),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn cargo_retrieval_capture_requires_each_named_example_to_have_a_deliverable() {
+        let capture = CargoOutputCapture::for_retrieval_policy(
+            Some(CompilationKind::CargoBuild),
+            "cargo build --bin app --example sample",
+            &["debug/**".into(), "- **/*.d".into(), "- **/*.rmeta".into()],
+            &["debug/.wrapper-shims".into()],
+        )
+        .unwrap()
+        .unwrap();
+        let app = artifact(
+            "bin",
+            "app",
+            &["/target/debug/app"],
+            Some("/target/debug/app"),
+            true,
+        );
+        for extension in ["d", "rmeta"] {
+            let relative = format!("debug/examples/sample.{extension}");
+            let output = format!("/target/{relative}");
+            for admitted in [false, true] {
+                let mut selection = capture.clone();
+                if admitted {
+                    selection
+                        .retrieval_baseline
+                        .as_mut()
+                        .unwrap()
+                        .push(format!("+ {relative}"));
+                }
+                let error = selection
+                    .parse_receipt(
+                        &receipt(&[
+                            app.clone(),
+                            artifact("example", "sample", &[output.as_str()], None, true),
+                        ]),
+                        Path::new("/target"),
+                    )
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("selected example sample has no admitted deliverable")
+                );
+            }
+        }
+        for (files, executable, required, bundle) in [
+            (
+                &["/target/debug/examples/libsample.rlib"][..],
+                None,
+                "debug/examples/libsample.rlib",
+                None,
+            ),
+            (
+                &[
+                    "/target/debug/examples/sample",
+                    "/target/debug/examples/sample.dSYM",
+                ][..],
+                Some("/target/debug/examples/sample"),
+                "debug/examples/sample",
+                Some("debug/examples/sample.dSYM"),
+            ),
+        ] {
+            let example = artifact("example", "sample", files, executable, true);
+            // Repeated valid fresh records may name an already-required path.
+            // Deliverability is a property of this record, not set growth.
+            let contract = capture
+                .parse_receipt(
+                    &receipt(&[app.clone(), example.clone(), example]),
+                    Path::new("/target"),
+                )
+                .unwrap();
+            assert_eq!(
+                contract.required_files,
+                [PathBuf::from("debug/app"), PathBuf::from(required)].into()
+            );
+            assert_eq!(
+                contract.required_directories,
+                bundle.into_iter().map(PathBuf::from).collect()
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_retrieval_capture_instruments_supported_zigbuild_commands() {
+        let kind = Some(CompilationKind::CargoZigbuild);
+        let baseline = vec!["*/lean/**".into(), "- **/*.rmeta".into()];
+        let directories = vec!["aarch64-unknown-linux-gnu/lean/.wrapper-shims".into()];
+        let app = "/target/aarch64-unknown-linux-gnu/lean/app";
+        let bundle = "/target/aarch64-unknown-linux-gnu/lean/app.dSYM";
+        let library = "/target/aarch64-unknown-linux-gnu/lean/libsupport.rlib";
+        let stdout = receipt(&[
+            artifact("bin", "app", &[app, bundle], Some(app), true),
+            artifact("lib", "support", &[library], None, true),
+            artifact(
+                "lib",
+                "dependency",
+                &["/cache/debug/deps/libdependency.rlib"],
+                None,
+                true,
+            ),
+        ]);
+        for command in [
+            "cargo zigbuild --profile lean --target aarch64-unknown-linux-gnu --workspace",
+            "cargo +nightly zigbuild --profile=lean --bin app --lib",
+            "env -i /opt/bin/cargo-zigbuild build --profile lean --lib",
+            "env -- cargo-zigbuild b --profile lean --bin app",
+            "cargo-zigbuild zigbuild --profile lean",
+        ] {
+            let capture =
+                CargoOutputCapture::for_retrieval_policy(kind, command, &baseline, &directories)
+                    .unwrap()
+                    .unwrap();
+            assert!(capture.supports_retrieval_exclusions());
+            assert!(!capture.caller_json_supported());
+            assert_eq!(
+                capture.execution_command(command),
+                format!("{command} --message-format=json,json-render-diagnostics")
+            );
+            assert!(CargoOutputCapture::for_command(kind, command).is_none());
+            assert!(
+                CargoOutputCapture::for_retrieval_policy(kind, command, &baseline, &[])
+                    .unwrap()
+                    .is_none()
+            );
+            let restored: CargoOutputCapture =
+                serde_json::from_slice(&serde_json::to_vec(&capture).unwrap()).unwrap();
+            let contract = restored
+                .parse_receipt(&stdout, Path::new("/target"))
+                .unwrap();
+            assert_eq!(
+                contract.required_files,
+                [
+                    PathBuf::from("aarch64-unknown-linux-gnu/lean/app"),
+                    PathBuf::from("aarch64-unknown-linux-gnu/lean/libsupport.rlib")
+                ]
+                .into()
+            );
+            assert_eq!(
+                contract.required_directories,
+                [PathBuf::from("aarch64-unknown-linux-gnu/lean/app.dSYM")].into()
+            );
+        }
+        for command in [
+            "cargo zigbuild --bin app --message-format=json",
+            "cargo-zigbuild build --bin app --message-format=json",
+            "cargo zigbuild --message-format=short",
+            "cargo zigbuild --target universal2-apple-darwin",
+            "cargo-zigbuild build --target x86_64-apple-darwin --target=universal2-apple-darwin",
+            "cargo-zigbuild +nightly build",
+            "rustup run nightly cargo-zigbuild b --profile lean --bin app",
+            "cargo zigbuild --target aarch64-unknown-linux-gnu.2.17",
+            "cargo zigbuild --no-run",
+            "cargo-zigbuild test --no-run",
+            "cargo build",
+        ] {
+            assert!(
+                CargoOutputCapture::for_retrieval_policy(kind, command, &baseline, &directories)
+                    .is_err(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -1584,6 +1991,15 @@ mod tests {
                 "cargo check",
                 &[],
                 &["debug/.wrapper-shims".into()]
+            )
+            .is_err()
+        );
+        assert!(
+            CargoOutputCapture::for_retrieval_policy(
+                Some(CompilationKind::CargoCheck),
+                "cargo check",
+                &[],
+                &[],
             )
             .unwrap()
             .is_none()
