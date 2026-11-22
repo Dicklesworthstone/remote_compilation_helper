@@ -36,7 +36,7 @@ impl RecoveryRecipe {
             .phases
             .get(index)
             .context("missing publication phase")?;
-        let authority = serde_json::json!({
+        let mut authority = serde_json::json!({
             "version": 1,
             "wrapper_id": self.wrapper_id,
             "build_id": self.build_id,
@@ -60,6 +60,11 @@ impl RecoveryRecipe {
             "result_destination": self.result_destination,
             "caller_json_policy": self.caller_json_policy,
         });
+        // Ordinary jobs retain their existing journal binding across upgrades.
+        // New freshness authority is part of the seal only when it exists.
+        if let Some(preparation) = &self.fresh_job_results {
+            authority["fresh_job_results"] = serde_json::to_value(preparation)?;
+        }
         Ok(blake3::hash(&serde_json::to_vec(&authority)?)
             .to_hex()
             .to_string())
@@ -259,6 +264,7 @@ fn decode(
         }
     }
     let mut recipe: RecoveryRecipe = serde_json::from_value(value)?;
+    recipe.validate_fresh_job_results_contract()?;
     for index in 0..recipe.phases.len() {
         let Some(mut journal) = recipe.phases[index].publication_journal.clone() else {
             continue;
@@ -402,6 +408,118 @@ impl RecoverySession {
             owner.verify()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fresh_job_results_tests {
+    use super::*;
+    use rch_common::job_results::{
+        JobResultsPreparationRequest, JobResultsPreparationResponse, JobResultsPreparationResult,
+        PreviousResultDirectory, SCHEMA_VERSION, retention_root_for,
+    };
+
+    // Frozen authority emitted before fresh-result preparation existed. Keep
+    // this wire payload independent of publication_binding's current fields:
+    // adding a null optional field would invalidate already-written journals.
+    const LEGACY_AUTHORITY: &str = r#"{
+        "version": 1,
+        "wrapper_id": "fixture-wrapper",
+        "build_id": 41,
+        "worker": {
+            "id": "fixture-worker", "host": "worker.invalid", "user": "builder",
+            "identity_file": "/unused/key", "total_slots": 1, "priority": 100, "tags": []
+        },
+        "identity": "abc123", "phase_index": 0, "name": "result:reports",
+        "local": "/caller/project", "remote": "/worker/project", "result_dir": "reports",
+        "custom_target": false, "output_gate": false, "patterns": [],
+        "cargo_outputs": null, "native_outputs": null, "kind": "job",
+        "expected_triple": "x86_64-unknown-linux-gnu", "pinned_triple": null,
+        "allow_foreign": false, "package_archive": false,
+        "result_destination": null, "caller_json_policy": null
+    }"#;
+
+    fn legacy_recipe() -> RecoveryRecipe {
+        serde_json::from_str(
+            r#"{
+                "version": 1, "wrapper_id": "fixture-wrapper", "build_id": 41,
+                "worker": {
+                    "id": "fixture-worker", "host": "worker.invalid", "user": "builder",
+                    "identity_file": "/unused/key", "total_slots": 1, "priority": 100, "tags": []
+                },
+                "identity": "abc123", "completion": "/worker/completion",
+                "source_roots": ["/worker/project"], "pair": null, "retire_root": null,
+                "transfer": {}, "project_root": "/caller/project", "kind": "job",
+                "expected_triple": "x86_64-unknown-linux-gnu", "pinned_triple": null,
+                "allow_foreign": false, "package_archive": false,
+                "phases": [{
+                    "name": "result:reports", "local": "/caller/project",
+                    "remote": "/worker/project", "patterns": [], "result_dir": "reports",
+                    "custom_target": false, "output_gate": false,
+                    "baseline": {}, "published": {}, "pending": null, "complete": false
+                }],
+                "exit_code": null, "returned": null
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ordinary_publication_preserves_the_pre_fresh_results_journal_binding() {
+        let recipe = legacy_recipe();
+        assert!(recipe.fresh_job_results.is_none());
+        let legacy_authority: Value = serde_json::from_str(LEGACY_AUTHORITY).unwrap();
+        let legacy_binding = blake3::hash(&serde_json::to_vec(&legacy_authority).unwrap())
+            .to_hex()
+            .to_string();
+        assert_eq!(recipe.publication_binding(0, true).unwrap(), legacy_binding);
+    }
+
+    #[test]
+    fn fresh_publication_binds_preparation_identity_and_exact_receipt() {
+        let mut recipe = legacy_recipe();
+        let ordinary = recipe.publication_binding(0, true).unwrap();
+        let mut request = JobResultsPreparationRequest {
+            schema_version: SCHEMA_VERSION,
+            plan_id: "0123456789abcdef0123456789abcdef".into(),
+            source_root: "/worker/project".into(),
+            retention_root: String::new(),
+            result_dirs: vec!["reports".into()],
+        };
+        request.retention_root =
+            retention_root_for(&request.source_root, &request.plan_id).unwrap();
+        request.validate().unwrap();
+        recipe.fresh_job_results = Some(crate::hook::fresh_job_results::Preparation {
+            request: request.clone(),
+            receipt: None,
+        });
+        let pending = recipe.publication_binding(0, true).unwrap();
+        assert_ne!(pending, ordinary);
+
+        let receipt = JobResultsPreparationResponse {
+            schema_version: SCHEMA_VERSION,
+            request: request.clone(),
+            results: vec![JobResultsPreparationResult {
+                result_dir: "reports".into(),
+                previous: PreviousResultDirectory::Absent,
+                retained_path: None,
+            }],
+        };
+        receipt.validate_for(&request).unwrap();
+        recipe.fresh_job_results.as_mut().unwrap().receipt = Some(receipt);
+        let confirmed = recipe.publication_binding(0, true).unwrap();
+        assert_ne!(confirmed, pending);
+        assert_ne!(confirmed, ordinary);
+
+        request.plan_id = "ffffffffffffffffffffffffffffffff".into();
+        request.retention_root =
+            retention_root_for(&request.source_root, &request.plan_id).unwrap();
+        request.validate().unwrap();
+        recipe.fresh_job_results = Some(crate::hook::fresh_job_results::Preparation {
+            request,
+            receipt: None,
+        });
+        assert_ne!(recipe.publication_binding(0, true).unwrap(), pending);
     }
 }
 

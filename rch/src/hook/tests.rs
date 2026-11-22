@@ -13570,6 +13570,7 @@ async fn native_budget_refusal_precedes_transfer_and_does_not_blame_the_worker()
             false,
             &[],
             None,
+            false,
             &[],
             rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
             None,
@@ -13679,6 +13680,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         true,
         &[],
         None,
+        false,
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
@@ -13810,6 +13812,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         false,
         &[],
         None,
+        false,
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
@@ -13934,6 +13937,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         false,
         &[],
         None,
+        false,
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
@@ -14129,6 +14133,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         false,
         &[],
         None,
+        false,
         &layer0_env,
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
@@ -14239,6 +14244,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         false,
         &[],
         None,
+        false,
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
@@ -14269,6 +14275,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         false,
         &[],
         None,
+        false,
         &[],
         rch_common::remediation_config::DEFAULT_POOLED_REAPER_POOLED_IDLE_HOURS,
         None,
@@ -14397,6 +14404,100 @@ async fn test_hook_leaves_non_allowlisted_tool_local() {
         !matches!(output, HookOutput::AllowWithModifiedCommand(_)),
         "non-allowlisted command must be allowed unchanged, got {output:?}"
     );
+}
+
+fn configured_job_rewrite_fixture() -> rch_common::RchConfig {
+    let mut config = rch_common::RchConfig::default();
+    config.jobs = toml::from_str(
+        r#"
+intercept_enabled = true
+
+[[rules]]
+name = "mutants"
+argv_prefix = ["cargo", "mutants"]
+required_flags = ["--workspace"]
+result_dirs = ["mutants.out"]
+require_tools = ["cargo-mutants"]
+output_flag = "--output"
+"#,
+    )
+    .unwrap();
+    config
+}
+
+#[test]
+fn configured_job_rewrite_carries_fresh_results_without_reinterpreting_payload() {
+    let mut config = configured_job_rewrite_fixture();
+    config.jobs.rules[0].fresh_result_dirs = true;
+    let command = "cargo mutants --workspace --output 'reports/current run' -- --fresh-result-dirs 'literal$HOME' ''";
+    let rewritten = configured_job_command(command, &config)
+        .unwrap()
+        .expect("fresh job rule must delegate");
+    let argv = shell_words::split(&rewritten).unwrap();
+    let separator = argv.iter().position(|word| word == "--").unwrap();
+    assert_eq!(&argv[..3], ["rch", "exec", "--job"]);
+    assert_eq!(
+        argv[..separator]
+            .iter()
+            .filter(|word| word.as_str() == "--fresh-result-dirs")
+            .count(),
+        1,
+        "fresh output policy must reach rch exec exactly once"
+    );
+    assert!(argv[..separator].contains(&"--result-dir=reports/current run".to_string()));
+    assert!(argv[..separator].contains(&"--require-tool=cargo-mutants".to_string()));
+    assert_eq!(
+        &argv[separator + 1..],
+        shell_words::split(command).unwrap(),
+        "literal output override, delimiter and empty/quoted payload must survive"
+    );
+}
+
+#[test]
+fn configured_job_rewrite_keeps_fresh_results_default_off() {
+    let config = configured_job_rewrite_fixture();
+    let command = "cargo mutants --workspace -- --fresh-result-dirs";
+    let rewritten = configured_job_command(command, &config).unwrap().unwrap();
+    let argv = shell_words::split(&rewritten).unwrap();
+    assert_eq!(
+        argv,
+        [
+            "rch",
+            "exec",
+            "--job",
+            "--result-dir=mutants.out",
+            "--require-tool=cargo-mutants",
+            "--",
+            "cargo",
+            "mutants",
+            "--workspace",
+            "--",
+            "--fresh-result-dirs",
+        ],
+        "an argument belonging to the underlying job must not opt into preparation"
+    );
+}
+
+#[test]
+fn configured_job_rewrite_rejects_unsafe_fresh_override_before_broader_rule() {
+    let mut config = configured_job_rewrite_fixture();
+    let mut fallback_rule = config.jobs.rules[0].clone();
+    fallback_rule.name = "broader-mutants".to_string();
+    fallback_rule.required_flags.clear();
+    config.jobs.rules[0].fresh_result_dirs = true;
+    config.jobs.rules.push(fallback_rule);
+    for command in [
+        "cargo mutants --workspace --output=.git",
+        "cargo mutants --workspace --output=reports/.rch-recovery",
+        "cargo mutants --workspace --output=.BeAdS",
+        "cargo mutants --workspace --output=../reports",
+        "cargo mutants --workspace --output=/tmp/results",
+    ] {
+        assert!(
+            configured_job_command(command, &config).is_err(),
+            "unsafe fresh override must not fall through to another rule: {command}"
+        );
+    }
 }
 
 #[test]

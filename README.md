@@ -533,6 +533,43 @@ execution and guarded publication; it never falls back to a local job. An
 interrupted collection uses the same persisted destination with
 `rch jobs recover`.
 
+#### Starting a job with fresh result directories
+
+Add `--fresh-result-dirs` when each run must start with empty reports or
+mutation outputs on the worker. This is off by default; leave it off for
+incremental outputs such as a shared fuzzing corpus.
+
+```bash
+# Choose a new destination for each run to keep local results separate too:
+mkdir -m 700 /var/tmp/verification-run-001
+rch exec --job --fresh-result-dirs --result-dir reports \
+  --result-dest /var/tmp/verification-run-001 -- ./verify.sh
+```
+
+Before launching the payload, an updated Linux worker moves each existing
+declared directory beneath
+`SOURCE_ROOT.rch-job-results-PLAN_ID/old/<source-relative-result-path>` and
+creates fresh empty directories. The retained sibling records the exact
+request and completion receipt; previous output bytes are preserved, not
+deleted. All result paths are checked before preparation starts. A Git working
+tree is required, and paths containing tracked source, submodules, repository
+metadata, symlink ancestors, or overlapping result directories are refused.
+
+The directories already exist, empty, when the command starts. An empty result
+is valid: the job's exit status determines whether its work succeeded, and RCH
+does not infer that a required report was produced. Have the job check its own
+expected outputs before returning success when that matters.
+
+This mode requires remote execution and the native preparation helper.
+Unsupported or older workers, incomplete preparation, or an unconfirmed
+receipt stop the invocation before the payload runs; there is no local
+fallback or automatic second preparation of the same plan. Existing retained
+directories are never overwritten. This prepares the worker's directories;
+local result publication still merges into its destination, so use a unique
+`--result-dest` root when the caller also needs a clean result tree.
+
+#### Native Apple jobs
+
 Native Apple commands can use job mode too: direct `xcodebuild` and `xcrun`
 invocations require a worker declaring `os = "darwin"`. This preserves the OS
 fence: ordinary jobs cannot consume that worker, and Linux workers cannot take
@@ -641,6 +678,7 @@ intercept_enabled = true
 name = "cargo-mutants"
 argv_prefix = ["cargo", "mutants"]
 result_dirs = ["mutants.out"]
+fresh_result_dirs = true
 require_tools = ["cargo-mutants"]
 output_flag = "--output"
 
@@ -671,6 +709,12 @@ result roots decline interception before any worker
 reservation. Options after `--` are payload arguments and do not affect the
 rule. Configure the actual output option used by the tool; RCH does not infer
 arbitrary tools' output conventions.
+
+An intercepted rule with `fresh_result_dirs = true` adds
+`--fresh-result-dirs` to the job invocation, including when `output_flag`
+selects a different directory. It uses the same Linux preparation and retained
+output safeguards described above, and requires remote execution. Omit the
+field, or set it to `false`, to preserve the existing output behavior.
 
 Rule `require_tools` and project `jobs.required_tools` combine and use the
 existing verified worker probes. Declared results are collected on completed

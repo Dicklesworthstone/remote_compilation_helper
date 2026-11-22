@@ -24,6 +24,10 @@ pub struct JobRule {
     pub required_flags: Vec<String>,
     #[serde(default)]
     pub result_dirs: Vec<PathBuf>,
+    /// Retain any previous declared output and create fresh empty directories
+    /// before this job starts. This is opt-in and never deletes prior results.
+    #[serde(default)]
+    pub fresh_result_dirs: bool,
     #[serde(default)]
     pub require_tools: Vec<String>,
     /// An output directory option, such as "--output" or "-o".
@@ -38,6 +42,7 @@ pub struct JobRuleMatch<'a> {
     pub rule: &'a JobRule,
     pub argv: Vec<String>,
     pub result_dirs: Vec<PathBuf>,
+    pub fresh_result_dirs: bool,
 }
 
 /// Validate rule configuration without executing commands or touching paths.
@@ -52,9 +57,10 @@ pub fn validate(jobs: &JobsConfig) -> Result<(), String> {
     for (index, rule) in jobs.rules.iter().enumerate() {
         let prefix = format!("jobs.rules[{index}]");
         if rule.name.is_empty()
-            || !rule.name.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-            })
+            || !rule
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         {
             return Err(format!(
                 "{prefix}.name must use nonempty ASCII letters, digits, - _ ."
@@ -96,7 +102,10 @@ fn validate_rule(rule: &JobRule) -> Result<(), String> {
         crate::tool_requirement::validate(tool)
             .map_err(|reason| format!("invalid require_tools entry {tool:?}: {reason}"))?;
     }
-    normalized_result_dirs(&rule.result_dirs)?;
+    let result_dirs = normalized_result_dirs(&rule.result_dirs)?;
+    if rule.fresh_result_dirs {
+        validate_fresh_result_dirs(&result_dirs)?;
+    }
     if let Some(flag) = &rule.output_flag {
         if !option_name(flag) {
             return Err(
@@ -131,7 +140,10 @@ pub fn match_command<'a>(
     let Some(argv) = literal_argv(command) else {
         return Ok(None);
     };
-    let option_end = argv.iter().position(|word| word == "--").unwrap_or(argv.len());
+    let option_end = argv
+        .iter()
+        .position(|word| word == "--")
+        .unwrap_or(argv.len());
     for rule in &jobs.rules {
         if !argv.starts_with(&rule.argv_prefix)
             || !rule
@@ -143,10 +155,15 @@ pub fn match_command<'a>(
         }
         let result_dirs = resolve_result_dirs(rule, &argv[1..option_end])
             .map_err(|reason| format!("job rule {:?}: {reason}", rule.name))?;
+        if rule.fresh_result_dirs {
+            validate_fresh_result_dirs(&result_dirs)
+                .map_err(|reason| format!("job rule {:?}: {reason}", rule.name))?;
+        }
         return Ok(Some(JobRuleMatch {
             rule,
             argv,
             result_dirs,
+            fresh_result_dirs: rule.fresh_result_dirs,
         }));
     }
     Ok(None)
@@ -155,13 +172,11 @@ pub fn match_command<'a>(
 fn option_name(value: &str) -> bool {
     if let Some(name) = value.strip_prefix("--") {
         !name.is_empty()
-            && name.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
-            })
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     } else {
-        value.len() == 2
-            && value.starts_with('-')
-            && value.as_bytes()[1].is_ascii_alphabetic()
+        value.len() == 2 && value.starts_with('-') && value.as_bytes()[1].is_ascii_alphabetic()
     }
 }
 
@@ -170,7 +185,9 @@ fn literal_executable(value: &str) -> bool {
         || value.starts_with('-')
         || value.ends_with('/')
         || value.contains(['=', '\\'])
-        || value.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
         || value.split('/').any(|part| part == "..")
     {
         return false;
@@ -234,12 +251,13 @@ fn cargo_rabs_invocation(argv: &[String]) -> bool {
     let Some(executable) = argv.first() else {
         return false;
     };
-    let Some(basename) = Path::new(executable).file_name().and_then(|name| name.to_str()) else {
+    let Some(basename) = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
         return false;
     };
-    if !basename.eq_ignore_ascii_case("cargo")
-        && !basename.eq_ignore_ascii_case("cargo.exe")
-    {
+    if !basename.eq_ignore_ascii_case("cargo") && !basename.eq_ignore_ascii_case("cargo.exe") {
         return false;
     }
     let mut args = argv.iter().skip(1);
@@ -313,10 +331,7 @@ fn normalize_result_dir(path: &Path) -> Result<PathBuf, String> {
     let value = path
         .to_str()
         .ok_or("result_dirs must contain only UTF-8 paths")?;
-    if !value.is_ascii()
-        || value.contains(['\\', ':'])
-        || value.chars().any(char::is_control)
-    {
+    if !value.is_ascii() || value.contains(['\\', ':']) || value.chars().any(char::is_control) {
         return Err(
             "result_dirs must be ASCII without backslashes, colons, or control characters"
                 .to_string(),
@@ -329,8 +344,7 @@ fn normalize_result_dir(path: &Path) -> Result<PathBuf, String> {
             Component::Normal(part) => normalized.push(part),
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(
-                    "result_dirs must be repository-relative without parent traversal"
-                        .to_string(),
+                    "result_dirs must be repository-relative without parent traversal".to_string(),
                 );
             }
         }
@@ -349,11 +363,25 @@ fn normalized_result_dirs(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
             .iter()
             .any(|prior| path.starts_with(prior) || prior.starts_with(&path))
         {
-            return Err("result_dirs must not duplicate or overlap another result root".to_string());
+            return Err(
+                "result_dirs must not duplicate or overlap another result root".to_string(),
+            );
         }
         normalized.push(path);
     }
     Ok(normalized)
+}
+
+fn validate_fresh_result_dirs(paths: &[PathBuf]) -> Result<(), String> {
+    let paths = paths
+        .iter()
+        .map(|path| {
+            path.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "fresh result_dirs must contain only UTF-8 paths".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::job_results::validate_result_dirs(&paths)
 }
 
 fn resolve_result_dirs(rule: &JobRule, options: &[String]) -> Result<Vec<PathBuf>, String> {
@@ -368,7 +396,9 @@ fn resolve_result_dirs(rule: &JobRule, options: &[String]) -> Result<Vec<PathBuf
                 .next()
                 .ok_or_else(|| format!("{flag} requires an output directory"))?;
             if value.starts_with('-') {
-                return Err(format!("{flag} requires a directory before the next option"));
+                return Err(format!(
+                    "{flag} requires a directory before the next option"
+                ));
             }
             Some(value.as_str())
         } else if flag.starts_with("--") {
@@ -409,6 +439,7 @@ mod tests {
             argv_prefix: vec!["cargo".to_string(), "mutants".to_string()],
             required_flags: Vec::new(),
             result_dirs: vec![PathBuf::from("mutants.out")],
+            fresh_result_dirs: false,
             require_tools: vec!["cargo-mutants".to_string()],
             output_flag: None,
         }
@@ -441,11 +472,7 @@ mod tests {
             intercept_enabled: true,
             ..JobsConfig::default()
         };
-        assert!(
-            match_command(&no_rules, "cargo mutants")
-                .unwrap()
-                .is_none()
-        );
+        assert!(match_command(&no_rules, "cargo mutants").unwrap().is_none());
     }
 
     #[test]
@@ -459,6 +486,7 @@ name = "gate"
 argv_prefix = ["my-gate", "gate"]
 required_flags = ["--mutation"]
 result_dirs = [".gate-reports"]
+fresh_result_dirs = true
 require_tools = ["my-gate"]
 output_flag = "--output"
 "#;
@@ -467,7 +495,13 @@ output_flag = "--output"
         let back: RchConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(config.jobs.rules, back.jobs.rules);
         assert_eq!(config.jobs.required_tools, ["node@26.7.0"]);
-        for unknown in ["argv_prefx", "required_flag", "output_falg"] {
+        assert!(config.jobs.rules[0].fresh_result_dirs);
+        for unknown in [
+            "argv_prefx",
+            "required_flag",
+            "output_falg",
+            "fresh_result_dir",
+        ] {
             let invalid = format!("{text}\n{unknown} = \"anything\"\n");
             assert!(toml::from_str::<RchConfig>(&invalid).is_err());
         }
@@ -485,6 +519,7 @@ output_flag = "--output"
             assert_eq!(matched.rule.name, "mutants");
             assert_eq!(matched.rule.require_tools, ["cargo-mutants"]);
             assert_eq!(matched.result_dirs, [PathBuf::from("mutants.out")]);
+            assert!(!matched.fresh_result_dirs);
         }
         for command in [
             "cargo mutants-other",
@@ -496,7 +531,10 @@ output_flag = "--output"
             "echo cargo mutants",
             "RUST_LOG=debug cargo mutants",
         ] {
-            assert!(match_command(&config, command).unwrap().is_none(), "{command}");
+            assert!(
+                match_command(&config, command).unwrap().is_none(),
+                "{command}"
+            );
         }
         let mut absolute = rule("absolute");
         absolute.argv_prefix[0] = "/opt/tools/cargo".to_string();
@@ -527,7 +565,10 @@ output_flag = "--output"
             "my-gate gate -v -- --mutation",
             "my-gate gate --mutation -- -v",
         ] {
-            assert!(match_command(&config, command).unwrap().is_none(), "{command}");
+            assert!(
+                match_command(&config, command).unwrap().is_none(),
+                "{command}"
+            );
         }
     }
 
@@ -579,7 +620,10 @@ output_flag = "--output"
             "cargo mutants \"unterminated",
             "cargo mutants \\",
         ] {
-            assert!(match_command(&config, command).unwrap().is_none(), "{command:?}");
+            assert!(
+                match_command(&config, command).unwrap().is_none(),
+                "{command:?}"
+            );
         }
         let matched = match_command(&config, "cargo\tmutants").unwrap().unwrap();
         assert_eq!(matched.argv, ["cargo", "mutants"]);
@@ -635,7 +679,10 @@ output_flag = "--output"
             "cargo -Z script rabs check",
             "cargo -- rabs check",
         ] {
-            assert!(match_command(&config, command).unwrap().is_none(), "{command}");
+            assert!(
+                match_command(&config, command).unwrap().is_none(),
+                "{command}"
+            );
         }
         assert!(
             match_command(&config, "cargo mutants --label rabs")
@@ -673,8 +720,16 @@ output_flag = "--output"
     #[test]
     fn result_roots_reject_escape_and_alias_forms_without_touching_files() {
         for path in [
-            "", ".", "./", "../reports", "reports/../outside", "/tmp/reports",
-            "C:/reports", "reports\\outside", "repórts", "reports\nother",
+            "",
+            ".",
+            "./",
+            "../reports",
+            "reports/../outside",
+            "/tmp/reports",
+            "C:/reports",
+            "reports\\outside",
+            "repórts",
+            "reports\nother",
         ] {
             let mut candidate = rule("root");
             candidate.result_dirs = vec![PathBuf::from(path)];
@@ -699,13 +754,88 @@ output_flag = "--output"
     }
 
     #[test]
+    fn fresh_results_are_explicit_and_follow_the_matched_output_override() {
+        let text = r#"
+[jobs]
+intercept_enabled = true
+[[jobs.rules]]
+name = "gate"
+argv_prefix = ["my-gate"]
+result_dirs = ["reports/default"]
+output_flag = "--output"
+"#;
+        let config: RchConfig = toml::from_str(text).unwrap();
+        let matched = match_command(&config.jobs, "my-gate").unwrap().unwrap();
+        assert!(
+            !matched.fresh_result_dirs,
+            "existing rules keep their output policy"
+        );
+        let config: RchConfig =
+            toml::from_str(&format!("{text}\nfresh_result_dirs = true\n")).unwrap();
+        for (command, expected) in [
+            ("my-gate", "reports/default"),
+            ("my-gate --output './reports//current'", "reports/current"),
+        ] {
+            let matched = match_command(&config.jobs, command).unwrap().unwrap();
+            assert!(matched.fresh_result_dirs);
+            assert_eq!(matched.result_dirs, [PathBuf::from(expected)]);
+            assert_eq!(matched.argv, shell_words::split(command).unwrap());
+        }
+        for command in [
+            "my-gate --output=.git",
+            "my-gate --output=reports/.rch/cache",
+            "my-gate --output=.beads",
+            "my-gate --output=.RCH-target",
+        ] {
+            assert!(match_command(&config.jobs, command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn fresh_result_rules_require_bounded_disjoint_nonmetadata_outputs() {
+        for roots in [
+            vec![],
+            vec!["out", "out/nested"],
+            vec!["out", "OUT"],
+            vec!["out", "Out/nested"],
+            vec![".git"],
+            vec!["reports/.rch"],
+            vec![".beads"],
+            vec![".rch-job-results-old"],
+        ] {
+            let mut candidate = rule("fresh");
+            candidate.fresh_result_dirs = true;
+            candidate.result_dirs = roots.iter().map(PathBuf::from).collect();
+            let mut config = enabled(candidate);
+            assert!(validate(&config).is_err(), "{roots:?}");
+            config.intercept_enabled = false;
+            assert!(
+                validate(&config).is_err(),
+                "disabled rules also validate: {roots:?}"
+            );
+        }
+        let mut candidate = rule("many");
+        candidate.fresh_result_dirs = true;
+        candidate.result_dirs = (0..=crate::job_results::MAX_RESULT_DIRS)
+            .map(|index| PathBuf::from(format!("reports/{index}")))
+            .collect();
+        assert!(validate(&enabled(candidate)).is_err());
+    }
+
+    #[test]
     fn tool_constraints_use_the_existing_verified_tool_contract() {
         for tool in ["cargo-mutants", "g++", "node@26.7.0", "bun@1.3.0"] {
             let mut candidate = rule("tool");
             candidate.require_tools = vec![tool.to_string()];
             validate(&enabled(candidate)).unwrap();
         }
-        for tool in ["", "cargo mutants", "tool/path", "node@latest", "rust@1.80.0"] {
+        for tool in [
+            "",
+            "cargo mutants",
+            "tool/path",
+            "node@latest",
+            "rust@1.80.0",
+        ] {
             let mut candidate = rule("tool");
             candidate.require_tools = vec![tool.to_string()];
             assert!(validate(&enabled(candidate)).is_err(), "{tool:?}");
@@ -735,8 +865,14 @@ output_flag = "--output"
         let config = enabled(candidate);
         for (command, expected) in [
             ("cargo mutants", "mutants.out"),
-            ("cargo mutants --output reports/mutation", "reports/mutation"),
-            ("cargo mutants --output=reports/mutation", "reports/mutation"),
+            (
+                "cargo mutants --output reports/mutation",
+                "reports/mutation",
+            ),
+            (
+                "cargo mutants --output=reports/mutation",
+                "reports/mutation",
+            ),
             ("cargo mutants --output 'reports/a run'", "reports/a run"),
             ("cargo mutants --output=./reports//run", "reports/run"),
             ("cargo mutants --output-extra=elsewhere", "mutants.out"),

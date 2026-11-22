@@ -873,6 +873,7 @@ pub(super) async fn execute_remote_compilation(
     // loudly instead of surfacing the job's bare exit status.
     result_dirs: &[PathBuf],
     result_destination: Option<&recovery::JobResultDestination>,
+    fresh_result_dirs: bool,
     // Resolved Layer 0 pack env pairs (bd-bqu38), forced onto the remote
     // build regardless of the ambient environment.
     layer0_env: &[(String, String)],
@@ -910,6 +911,7 @@ pub(super) async fn execute_remote_compilation(
             source_content_receipt,
             result_dirs,
             result_destination,
+            fresh_result_dirs,
             layer0_env,
             pooled_target_prune_idle_hours,
             pooled_target_store_base,
@@ -1071,11 +1073,27 @@ async fn execute_remote_compilation_inner(
     source_content_receipt: bool,
     result_dirs: &[PathBuf],
     result_destination: Option<&recovery::JobResultDestination>,
+    fresh_result_dirs: bool,
     layer0_env: &[(String, String)],
     pooled_target_prune_idle_hours: u32,
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    if fresh_result_dirs {
+        anyhow::ensure!(
+            kind == Some(CompilationKind::Job)
+                && durable_lease.is_some()
+                && clean_overlay.is_none()
+                && !source_content_receipt
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "fresh result preparation requires a durable working-tree job with source ownership"
+        );
+        anyhow::ensure!(
+            rch_common::declared_os(&worker_config.tags).is_none_or(|os| os == "linux"),
+            "--fresh-result-dirs requires a Linux worker with native no-replace retention"
+        );
+        super::fresh_job_results::validate_directories(result_dirs)?;
+    }
     if !transfer_config.cargo_retrieval_exclude_dirs.is_empty()
         && super::artifact_patterns::cargo_retrieval_exclusions_apply(artifact_delivery_kind(
             kind,
@@ -1596,6 +1614,15 @@ async fn execute_remote_compilation_inner(
         }
     }
     verify_coalesced_source_plan(&sync_plan, &coalesced_source_roots)?;
+    if fresh_result_dirs {
+        for entry in &sync_plan {
+            super::fresh_job_results::protected_upload_dirs(
+                &normalized_invocation_root,
+                result_dirs,
+                &entry.local_root,
+            )?;
+        }
+    }
     if let Some(destination) = result_destination {
         // Recheck the final source closure before any source grant or transfer.
         // Workspace metadata can live outside the command's invocation tree.
@@ -1986,6 +2013,22 @@ async fn execute_remote_compilation_inner(
         source_freshness_control.as_deref(),
         source_target_root.as_deref(),
     );
+    let fresh_results_request = fresh_result_dirs
+        .then(|| {
+            super::fresh_job_results::request(
+                &primary_remote_source_root,
+                &remote_invocation_root,
+                result_dirs,
+            )
+        })
+        .transpose()?;
+    if let Some(request) = &fresh_results_request {
+        // Retention mutates a sibling outside the upload root. It must be in
+        // the immutable source grant before the first receiver can start.
+        mutable_source_authority_roots.push(request.retention_root.clone());
+        mutable_source_authority_roots.sort();
+        mutable_source_authority_roots.dedup();
+    }
     if worker_is_windows {
         mutable_source_authority_roots.clear();
     }
@@ -2213,6 +2256,14 @@ async fn execute_remote_compilation_inner(
                 root_pipeline =
                     root_pipeline.with_remote_cargo_target_dir_override(stable_pool.clone());
             }
+        }
+        if fresh_result_dirs {
+            let protected = super::fresh_job_results::protected_upload_dirs(
+                &normalized_invocation_root,
+                result_dirs,
+                &entry.local_root,
+            )?;
+            root_pipeline = root_pipeline.with_protected_job_result_dirs(&protected)?;
         }
         root_pipeline = apply_source_sync_integrity_policy(
             root_pipeline,
@@ -2696,6 +2747,12 @@ async fn execute_remote_compilation_inner(
             .context("--result-dest requires guarded, recoverable result publication")?
             .set_result_destination(destination)?;
     }
+    if let Some(request) = &fresh_results_request {
+        recovery_session
+            .as_mut()
+            .context("fresh results lost their durable preparation owner")?
+            .require_fresh_job_results(request)?;
+    }
     if let Some(environment) = go_build_environment.as_ref() {
         recovery_session
             .as_mut()
@@ -2971,6 +3028,35 @@ async fn execute_remote_compilation_inner(
     }
     if let Some(lock) = source_pair_lock.as_mut() {
         lock.ensure_held()?;
+    }
+
+    if let Some(request) = &fresh_results_request {
+        source_authority_lock
+            .as_mut()
+            .context("fresh results require an exclusive source-authority grant")?
+            .ensure_held()?;
+        // Recheck the caller's source index after upload: a newly tracked
+        // result subtree cannot become authority to move source on the worker.
+        super::fresh_job_results::validate_local_sources(&normalized_invocation_root, result_dirs)
+            .await?;
+        reporter.verbose(&format!(
+            "[RCH] preparing fresh job outputs; prior directories retained at {}",
+            request.retention_root
+        ));
+        let receipt = super::fresh_job_results::prepare(
+            &worker_config,
+            request,
+            source_identity.context("fresh results have no source activity identity")?,
+        )
+        .await?;
+        recovery_session
+            .as_mut()
+            .context("fresh results lost their durable preparation owner")?
+            .accept_fresh_job_results(&receipt)?;
+        source_authority_lock
+            .as_mut()
+            .context("fresh results lost their source-authority holder")?
+            .ensure_held()?;
     }
 
     let stamped_command = if let Some(before) = build_source_before.as_deref() {

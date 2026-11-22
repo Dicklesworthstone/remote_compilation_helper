@@ -369,7 +369,7 @@ mod tests {
         assert!(validate_result_dirs(&vec!["out".to_string(); MAX_RESULT_DIRS + 1]).is_err());
         assert!(validate_result_dirs(&["x".repeat(MAX_PATH_BYTES + 1)]).is_err());
         let too_deep = vec!["nested"; MAX_PATH_COMPONENTS + 1].join("/");
-        assert!(validate_result_dirs(&[too_deep.clone()]).is_err());
+        assert!(validate_result_dirs(std::slice::from_ref(&too_deep)).is_err());
         assert!(retention_root_for(&format!("/{too_deep}"), &request().plan_id).is_err());
     }
 

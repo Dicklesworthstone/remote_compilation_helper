@@ -478,6 +478,8 @@ pub struct ConfigDiffResponse {
 pub struct ConfiguredJobRule {
     pub name: String,
     pub result_dirs: Vec<std::path::PathBuf>,
+    /// Retain previous worker outputs and create empty replacements before launch.
+    pub fresh_result_dirs: bool,
     /// Effective named-tool requirements, including project-wide job policy.
     pub required_tools: Vec<String>,
 }

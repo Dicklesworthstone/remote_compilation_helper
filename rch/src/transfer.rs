@@ -4,6 +4,9 @@
 //! commands, and retrieving build artifacts.
 
 #[cfg(test)]
+#[path = "transfer/job_results_tests.rs"]
+mod job_results_tests;
+#[cfg(test)]
 #[path = "transfer/node_prepare_tests.rs"]
 mod node_prepare_tests;
 mod prepared_dependencies;
@@ -536,7 +539,7 @@ impl ArtifactFilters {
     }
 
     pub(crate) fn selects(&self, path: &str) -> bool {
-        if is_internal_source_archive(Path::new(path)) {
+        if is_internal_transfer_data(Path::new(path)) {
             return false;
         }
         self.priority
@@ -555,6 +558,17 @@ pub(crate) fn is_internal_source_archive(path: &Path) -> bool {
         part.as_os_str() == ".rch-clean-overlay-base.tar"
             || part.as_os_str() == ".rch-git-archive-cache-v1"
     })
+}
+
+/// Runtime-owned transport and retained-result data never becomes a build
+/// output, including through priority includes or an older recovery recipe.
+pub(crate) fn is_internal_transfer_data(path: &Path) -> bool {
+    is_internal_source_archive(path)
+        || path.components().any(|part| {
+            part.as_os_str()
+                .to_str()
+                .is_some_and(rch_common::job_results::is_retention_basename)
+        })
 }
 
 fn windows_artifact_relative_path(path: &str) -> Result<&str> {
@@ -891,6 +905,10 @@ const PROJECT_HASH_KEY_FILES: &[&str] = &[
     "bunfig.toml",
 ];
 const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
+    // A nested job retains old outputs beside its source root. A later upload
+    // rooted higher in the same checkout must neither upload those private
+    // bytes nor prune the worker's retained sibling with rsync --delete.
+    rch_common::job_results::RETENTION_EXCLUDE_PATTERN,
     ".rch-target/",
     ".rch-target-*/",
     ".rch-tmp/",
@@ -3710,7 +3728,17 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
         self
     }
 
+    fn validate_transfer_roots(&self, remote_path: &str) -> Result<()> {
+        anyhow::ensure!(
+            !is_internal_transfer_data(&self.project_root)
+                && !is_internal_transfer_data(Path::new(remote_path)),
+            "transfer root names reserved source transport data or retained job results"
+        );
+        Ok(())
+    }
+
     fn artifact_retrieval_filters(&self, artifact_patterns: &[String]) -> Result<ArtifactFilters> {
+        self.validate_transfer_roots(&self.remote_path())?;
         let (caller_excludes, includes) = partition_artifact_filters(artifact_patterns);
         let mut excludes = self.get_retrieval_excludes(&includes);
         excludes.extend(caller_excludes);
@@ -4414,6 +4442,39 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
     pub fn with_sync_include_patterns(mut self, patterns: Vec<String>) -> Self {
         self.sync_include_patterns = Some(patterns);
         self
+    }
+
+    /// Preserve declared job outputs until the worker retains them under the
+    /// preparation receipt. Upload must not delete or overwrite the previous
+    /// run before that transaction, even when local output bytes differ.
+    /// Paths are relative to this pipeline's source root, not the job cwd.
+    pub(crate) fn with_protected_job_result_dirs(mut self, dirs: &[PathBuf]) -> Result<Self> {
+        if dirs.is_empty() {
+            return Ok(self);
+        }
+        let names = dirs
+            .iter()
+            .map(|dir| {
+                dir.to_str()
+                    .map(str::to_owned)
+                    .context("protected job output path is not UTF-8")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        rch_common::job_results::validate_result_dirs(&names).map_err(anyhow::Error::msg)?;
+        let mut ordered = dirs.to_vec();
+        ordered.sort();
+        for pattern in clean_overlay_deletion_exclude_patterns(&ordered)? {
+            // Normal uploads and tar consume the effective config exclusions;
+            // include-only metadata uploads use the priority exclusions.
+            // Both precede any include capable of selecting these paths.
+            if !self.transfer_config.exclude_patterns.contains(&pattern) {
+                self.transfer_config.exclude_patterns.push(pattern.clone());
+            }
+            if !self.sync_priority_exclude_patterns.contains(&pattern) {
+                self.sync_priority_exclude_patterns.push(pattern);
+            }
+        }
+        Ok(self)
     }
 
     pub(crate) fn with_clean_overlay_deletions(mut self, deletions: &[PathBuf]) -> Result<Self> {
@@ -5497,6 +5558,7 @@ mkdir -p {source}
         collect_directories: bool,
         namespace_only: bool,
     ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        self.validate_transfer_roots(&self.remote_path())?;
         let effective_excludes = if namespace_only {
             Self::clean_overlay_namespace_excludes()
         } else {
@@ -8034,6 +8096,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
     pub async fn sync_to_remote(&self, worker: &WorkerConfig) -> Result<SyncResult> {
         let remote_path = self.remote_path();
+        self.validate_transfer_roots(&remote_path)?;
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let destination = self.rsync_remote_spec(worker, &remote_path);
 
@@ -8208,6 +8271,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         F: FnMut(&str),
     {
         let remote_path = self.remote_path();
+        self.validate_transfer_roots(&remote_path)?;
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let destination = self.rsync_remote_spec(worker, &remote_path);
 
@@ -8882,7 +8946,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("--exclude")
             .arg(".rch-clean-overlay-base.tar")
             .arg("--exclude")
-            .arg(".rch-git-archive-cache-v1");
+            .arg(".rch-git-archive-cache-v1")
+            .arg("--exclude")
+            .arg(rch_common::job_results::RETENTION_EXCLUDE_PATTERN);
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -8987,7 +9053,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         cmd.arg("--exclude")
             .arg(".rch-clean-overlay-base.tar")
             .arg("--exclude")
-            .arg(".rch-git-archive-cache-v1");
+            .arg(".rch-git-archive-cache-v1")
+            .arg("--exclude")
+            .arg(rch_common::job_results::RETENTION_EXCLUDE_PATTERN);
 
         // Add zstd compression (zlib on a legacy binary; issue #66)
         self.append_compression_args(&mut cmd, &capabilities);
@@ -9212,6 +9280,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         artifact_patterns: &[String],
     ) -> Result<ArtifactRetrieval> {
         let remote_path = self.remote_path();
+        self.validate_transfer_roots(&remote_path)?;
 
         if use_mock_transport(worker) {
             // Mock path also uses retry logic for consistent behavior
@@ -9361,6 +9430,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             .arg("--safe-links")
             .arg("--exclude=.rch-clean-overlay-base.tar")
             .arg("--exclude=.rch-git-archive-cache-v1")
+            .arg("--exclude")
+            .arg(rch_common::job_results::RETENTION_EXCLUDE_PATTERN)
             .arg("-e")
             .arg(ssh_command);
 
@@ -9809,9 +9880,10 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
                 }
             })?;
         anyhow::ensure!(
-            !is_internal_source_archive(rel),
-            "declared result directory names reserved source transport data"
+            !is_internal_transfer_data(rel),
+            "declared result directory names reserved source transport data or retained job results"
         );
+        self.validate_transfer_roots(&self.remote_path())?;
 
         // Materialize only the PARENT tree of the local destination so nested
         // relative paths (`out/shards/a`) work; rsync itself creates the leaf
@@ -9927,6 +9999,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         F: FnMut(&str),
     {
         let remote_path = self.remote_path();
+        self.validate_transfer_roots(&remote_path)?;
 
         if use_mock_transport(worker) {
             let rsync = MockRsync::new(MockRsyncConfig::from_env());

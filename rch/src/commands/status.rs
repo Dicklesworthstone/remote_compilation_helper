@@ -34,9 +34,9 @@ use self::load::run_load_storm;
 use super::config::collect_value_sources;
 use super::helpers::{humanize_duration, runtime_label, urlencoding_encode};
 use super::types::{
-    ConfiguredJobRule, DiagnoseDaemonStatus, DiagnoseDecision, DiagnoseResponse,
-    DiagnoseThreshold, DiagnoseWorkerInventoryEntry, DiagnoseWorkerOutcome,
-    DiagnoseWorkerSelection, DryRunPipelineStep, DryRunSummary,
+    ConfiguredJobRule, DiagnoseDaemonStatus, DiagnoseDecision, DiagnoseResponse, DiagnoseThreshold,
+    DiagnoseWorkerInventoryEntry, DiagnoseWorkerOutcome, DiagnoseWorkerSelection,
+    DryRunPipelineStep, DryRunSummary,
 };
 use super::workers::{
     collect_local_capability_warnings, has_any_capabilities, probe_local_capabilities,
@@ -232,6 +232,7 @@ fn configured_job_rule(
     Ok(Some(ConfiguredJobRule {
         name: matched.rule.name.clone(),
         result_dirs: matched.result_dirs,
+        fresh_result_dirs: matched.fresh_result_dirs,
         required_tools: merge_job_required_tools(
             matched.rule.require_tools.clone(),
             &config.jobs.required_tools,
@@ -266,13 +267,14 @@ fn classify_diagnostic_command(
 /// Match the strictness of the job rail before source-topology admission.
 /// FORCE_REMOTE requests offload but permits fallback; its presence (even
 /// falsy) also overrides the dispatcher's default. Named tool requirements
-/// independently forbid local fallback.
+/// and fresh-result preparation independently forbid local fallback.
 fn configured_job_requires_remote(
     rule: &ConfiguredJobRule,
     role: rch_common::BoxRole,
     environment: impl Fn(&str) -> Option<String>,
 ) -> bool {
-    !rule.required_tools.is_empty()
+    rule.fresh_result_dirs
+        || !rule.required_tools.is_empty()
         || rch_common::placement::resolve_placement_with_role(environment, role)
             .strict_remote_policy
             .fail_closed()
@@ -298,7 +300,10 @@ fn configured_job_topology_decision(
     } else {
         (
             AdmitRecommendation::Local,
-            format!("Would run configured job rule '{}' locally: {reason}", rule.name),
+            format!(
+                "Would run configured job rule '{}' locally: {reason}",
+                rule.name
+            ),
         )
     }
 }
@@ -338,6 +343,15 @@ fn print_configured_job_rule(style: &Theme, rule: &ConfiguredJobRule) {
         })
     );
     let tools = rule.required_tools.join(", ");
+    println!(
+        "  {} {}",
+        style.key("Fresh results:"),
+        style.value(if rule.fresh_result_dirs {
+            "retain previous directories before execution"
+        } else {
+            "disabled"
+        })
+    );
     println!(
         "  {} {}",
         style.key("Required tools:"),
@@ -720,12 +734,10 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         && let Some(reason) = crate::hook::project_topology_local_reason(&topology_policy, &cwd)
     {
         let reason = if let Some(rule) = job_rule.as_ref() {
-            let (recommendation, detail) = configured_job_topology_decision(
-                rule,
-                config.general.role,
-                &reason,
-                |key| std::env::var(key).ok(),
-            );
+            let (recommendation, detail) =
+                configured_job_topology_decision(rule, config.general.role, &reason, |key| {
+                    std::env::var(key).ok()
+                });
             configured_job_refused =
                 recommendation == rch_common::admit_preflight::AdmitRecommendation::Defer;
             detail
@@ -972,7 +984,10 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             summary.reason = if summary.would_offload {
                 format!("configured job rule '{}', worker available", rule.name)
             } else if !daemon_status.reachable {
-                format!("configured job rule '{}', but daemon is not reachable", rule.name)
+                format!(
+                    "configured job rule '{}', but daemon is not reachable",
+                    rule.name
+                )
             } else {
                 format!(
                     "configured job rule '{}', but no worker selected: {}",
@@ -1645,9 +1660,7 @@ fn prepare_admit_preflight(
         _ => None,
     };
     let job = explicit_job || job_rule.is_some();
-    if job
-        && let Some(config) = config
-    {
+    if job && let Some(config) = config {
         require_tool = merge_job_required_tools(require_tool, &config.jobs.required_tools, true);
     }
     if let Some(rule) = job_rule.as_ref() {
@@ -1656,8 +1669,12 @@ fn prepare_admit_preflight(
 
     // An explicit job or configured rule uses the existing job admission rail.
     // Preserve the original classification facts alongside the effective mode.
-    let preflight =
-        rch_common::admit_preflight::preflight(command, proof_policy || !require_tool.is_empty());
+    let preflight = rch_common::admit_preflight::preflight(
+        command,
+        proof_policy
+            || !require_tool.is_empty()
+            || job_rule.as_ref().is_some_and(|rule| rule.fresh_result_dirs),
+    );
     let mut preflight = if job {
         preflight.as_job(require_tool)
     } else {
@@ -1717,12 +1734,10 @@ pub async fn admit(
             && let Some(reason) =
                 crate::hook::project_topology_local_reason(&config.path_topology.to_policy(), &cwd)
         {
-            let (recommendation, detail) = configured_job_topology_decision(
-                rule,
-                config.general.role,
-                &reason,
-                |key| std::env::var(key).ok(),
-            );
+            let (recommendation, detail) =
+                configured_job_topology_decision(rule, config.general.role, &reason, |key| {
+                    std::env::var(key).ok()
+                });
             pf.base_recommendation = recommendation;
             pf.detail = detail;
         }
@@ -5284,7 +5299,6 @@ mod tests {
         .expect("worker status")
     }
 
-
     fn configured_job_fixture() -> rch_common::RchConfig {
         let mut config = rch_common::RchConfig::default();
         config.jobs = toml::from_str(
@@ -5317,6 +5331,7 @@ output_flag = "--output"
         );
         assert_eq!(details.original, command);
         assert_eq!(rule.name, "mutants");
+        assert!(!rule.fresh_result_dirs);
         assert_eq!(
             rule.result_dirs,
             vec![std::path::PathBuf::from("reports/current run")]
@@ -5349,6 +5364,7 @@ output_flag = "--output"
             rch_common::admit_preflight::AdmitRecommendation::Offload
         );
         assert_eq!(admitted.result_dirs, rule.result_dirs);
+        assert!(!admitted.fresh_result_dirs);
         assert_eq!(
             admitted.required_tools,
             vec!["cargo-mutants", "clang", "llvm-cov"]
@@ -5367,6 +5383,7 @@ output_flag = "--output"
         let json = serde_json::to_value(report).unwrap();
         assert_eq!(json["job_rule"]["name"], "mutants");
         assert_eq!(json["job_rule"]["result_dirs"][0], "reports/current run");
+        assert_eq!(json["job_rule"]["fresh_result_dirs"], false);
         assert_eq!(
             json["job_rule"]["required_tools"],
             serde_json::json!(["cargo-mutants", "clang", "llvm-cov"])
@@ -5376,6 +5393,73 @@ output_flag = "--output"
             "a match is not live admission"
         );
         assert!(json.get("selection").is_none());
+    }
+
+    #[test]
+    fn fresh_job_diagnostics_preserve_output_policy_and_require_remote_execution() {
+        use rch_common::BoxRole;
+        use rch_common::admit_preflight::AdmitRecommendation;
+
+        let mut config = configured_job_fixture();
+        config.jobs.required_tools.clear();
+        config.jobs.rules[0].require_tools.clear();
+        config.jobs.rules[0].fresh_result_dirs = true;
+        let command = "cargo mutants --workspace --output reports/current";
+        let (_, rule) = classify_diagnostic_command(command, &config).unwrap();
+        let rule = rule.unwrap();
+        assert!(rule.fresh_result_dirs);
+        assert!(rule.required_tools.is_empty());
+        assert_eq!(
+            rule.result_dirs,
+            [std::path::PathBuf::from("reports/current")]
+        );
+        assert!(configured_job_requires_remote(
+            &rule,
+            BoxRole::Hybrid,
+            |_| None
+        ));
+        // Falsy placement overrides cannot waive explicitly requested worker
+        // preparation or turn it into ordinary local command execution.
+        let (recommendation, detail) = configured_job_topology_decision(
+            &rule,
+            BoxRole::Dispatcher,
+            "source root is unavailable",
+            |_| Some("0".to_string()),
+        );
+        assert_eq!(recommendation, AdmitRecommendation::Defer);
+        assert!(detail.contains("Would refuse"));
+
+        let (preflight, admitted) =
+            prepare_admit_preflight(command, false, Vec::new(), Some(&config), false).unwrap();
+        let admitted = admitted.unwrap();
+        assert!(preflight.proof_policy);
+        assert!(preflight.job_mode);
+        assert!(admitted.fresh_result_dirs);
+        assert_eq!(admitted.result_dirs, rule.result_dirs);
+        let report = AdmitOutput {
+            preflight: &preflight,
+            recommendation: None,
+            observation: "unknown",
+            selection: None,
+            observation_error: None,
+            job_rule: Some(&admitted),
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["job_rule"]["fresh_result_dirs"], true);
+        assert_eq!(json["job_rule"]["result_dirs"][0], "reports/current");
+        assert!(
+            json["recommendation"].is_null(),
+            "static policy is not live admission"
+        );
+        for invalid in [
+            "cargo mutants --workspace --output=.git",
+            "cargo mutants --workspace --output=reports/.rch-cache",
+        ] {
+            assert!(classify_diagnostic_command(invalid, &config).is_err());
+            assert!(
+                prepare_admit_preflight(invalid, false, Vec::new(), Some(&config), false).is_err()
+            );
+        }
     }
 
     #[test]
@@ -5425,14 +5509,9 @@ output_flag = "--output"
             Some(rch_common::CompilationKind::CargoCheck)
         );
         assert!(rule.is_none());
-        let (preflight, rule) = prepare_admit_preflight(
-            "cargo check",
-            false,
-            Vec::new(),
-            Some(&config),
-            false,
-        )
-        .unwrap();
+        let (preflight, rule) =
+            prepare_admit_preflight("cargo check", false, Vec::new(), Some(&config), false)
+                .unwrap();
         assert!(!preflight.job_mode);
         assert!(preflight.required.needs_tools.is_empty());
         assert!(rule.is_none());
@@ -5476,15 +5555,13 @@ output_flag = "--output"
         }
     }
 
-
     #[test]
     fn configured_job_topology_matches_exec_strictness_and_dispatcher_overrides() {
         use rch_common::BoxRole;
         use rch_common::admit_preflight::AdmitRecommendation::{Defer, Local};
 
         let config = configured_job_fixture();
-        let (_, rule) =
-            classify_diagnostic_command("cargo mutants --workspace", &config).unwrap();
+        let (_, rule) = classify_diagnostic_command("cargo mutants --workspace", &config).unwrap();
         let original = rule.unwrap();
         let reason = "project /outside/repo is outside canonical root /projects";
         for (label, tools, role, require, force, expected) in [

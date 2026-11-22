@@ -77,6 +77,10 @@ pub(crate) struct RecoveryRecipe {
     /// may deliver only into that same directory, never a replacement at its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result_destination: Option<JobResultDestination>,
+    /// Declared before worker mutation. A complete, same-plan receipt is
+    /// required before execution; recovery never repeats output preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fresh_job_results: Option<crate::hook::fresh_job_results::Preparation>,
     kind: Option<CompilationKind>,
     expected_triple: String,
     pinned_triple: Option<String>,
@@ -593,6 +597,53 @@ impl HeldRetrievalStage {
 }
 
 impl RecoveryRecipe {
+    pub(super) fn validate_fresh_job_results_contract(&self) -> anyhow::Result<()> {
+        let Some(preparation) = &self.fresh_job_results else {
+            return Ok(());
+        };
+        let request = &preparation.request;
+        request.validate().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            self.prepared
+                && self.kind == Some(CompilationKind::Job)
+                && self.source_authority_namespace == Some(SourceAuthorityNamespace::Current)
+                && self.source_roots.contains(&request.source_root)
+                && self.source_roots.contains(&request.retention_root)
+                && rch_common::declared_os(&self.worker.tags).is_none_or(|os| os == "linux")
+                && self.phases.len() == request.result_dirs.len(),
+            "fresh result preparation contradicts its admitted job and source grant"
+        );
+        for (phase, relative) in self.phases.iter().zip(&request.result_dirs) {
+            let directory = phase
+                .result_dir
+                .as_deref()
+                .context("fresh result preparation cannot replace a compiler artifact phase")?;
+            let normalized =
+                crate::hook::normalize_repository_relative_path("--result-dir", directory)?;
+            anyhow::ensure!(
+                normalized == directory
+                    && phase.name == format!("result:{}", directory.display())
+                    && !crate::transfer::is_internal_transfer_data(directory)
+                    && Path::new(&phase.remote).join(directory)
+                        == Path::new(&request.source_root).join(relative)
+                    && !phase.custom_target
+                    && !phase.output_gate
+                    && phase.patterns.is_empty()
+                    && phase.cargo_outputs.is_none()
+                    && phase.native_outputs.is_none(),
+                "fresh result preparation differs from the admitted result directories"
+            );
+        }
+        if let Some(receipt) = &preparation.receipt {
+            receipt.validate_for(request).map_err(anyhow::Error::msg)?;
+        }
+        anyhow::ensure!(
+            !self.execution_started || preparation.receipt.is_some(),
+            "fresh result execution has no confirmed preparation receipt"
+        );
+        Ok(())
+    }
+
     fn validate_result_destination_contract(&self) -> anyhow::Result<()> {
         let Some(destination) = &self.result_destination else {
             return Ok(());
@@ -615,7 +666,7 @@ impl RecoveryRecipe {
                 crate::hook::normalize_repository_relative_path("--result-dir", directory)?;
             anyhow::ensure!(
                 normalized == directory
-                    && !crate::transfer::is_internal_source_archive(directory)
+                    && !crate::transfer::is_internal_transfer_data(directory)
                     && phase.name == format!("result:{}", directory.display())
                     && phase.local == destination.root
                     && Path::new(&phase.remote).is_absolute()
@@ -1119,7 +1170,7 @@ fn validate_result_member(directory: &Path, relative: &Path) -> anyhow::Result<(
             && relative
                 .components()
                 .all(|part| { matches!(part, std::path::Component::Normal(_)) })
-            && !crate::transfer::is_internal_source_archive(relative),
+            && !crate::transfer::is_internal_transfer_data(relative),
         "mapped result output is outside its declared directory: {}",
         relative.display()
     );
@@ -1712,6 +1763,7 @@ impl RecoverySession {
             staging_released: false,
             project_root,
             result_destination: None,
+            fresh_job_results: None,
             kind: None,
             expected_triple: String::new(),
             pinned_triple: None,
@@ -1927,6 +1979,7 @@ impl RecoverySession {
             staging_released: false,
             project_root,
             result_destination: None,
+            fresh_job_results: None,
             kind: delivery_kind,
             expected_triple: pinned_triple
                 .clone()
@@ -1970,6 +2023,56 @@ impl RecoverySession {
         session.recipe.validate_cargo_retrieval_policy()?;
         session.persist()?;
         Ok(session)
+    }
+
+    pub(crate) fn require_fresh_job_results(
+        &mut self,
+        request: &rch_common::job_results::JobResultsPreparationRequest,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.fresh_job_results.is_none()
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && !self.recipe.sources_released
+                && !self.recipe.retired,
+            "fresh result preparation requires an unconsumed source grant"
+        );
+        let mut next = self.recipe.clone();
+        next.fresh_job_results = Some(crate::hook::fresh_job_results::Preparation {
+            request: request.clone(),
+            receipt: None,
+        });
+        next.validate_fresh_job_results_contract()?;
+        self.persist_next_recipe(next)
+    }
+
+    pub(crate) fn accept_fresh_job_results(
+        &mut self,
+        receipt: &rch_common::job_results::JobResultsPreparationResponse,
+    ) -> anyhow::Result<()> {
+        let pending = self
+            .recipe
+            .fresh_job_results
+            .as_ref()
+            .context("fresh result receipt has no persisted preparation intent")?;
+        anyhow::ensure!(
+            pending.receipt.is_none()
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && !self.recipe.sources_released
+                && !self.recipe.retired,
+            "fresh result receipt cannot replace a prior receipt or execution"
+        );
+        receipt
+            .validate_for(&pending.request)
+            .map_err(anyhow::Error::msg)?;
+        let mut next = self.recipe.clone();
+        next.fresh_job_results
+            .as_mut()
+            .expect("checked pending preparation")
+            .receipt = Some(receipt.clone());
+        next.validate_fresh_job_results_contract()?;
+        self.persist_next_recipe(next)
     }
 
     /// Bind the caller's previously resolved root before execution. The
@@ -3131,11 +3234,17 @@ impl RecoverySession {
 
     pub(crate) fn starting_execution(&mut self) -> anyhow::Result<()> {
         self.verify_result_destination()?;
+        self.recipe.validate_fresh_job_results_contract()?;
         anyhow::ensure!(
             self.recipe.prepared
                 && !self.recipe.execution_started
                 && !self.recipe.preparation_cancelled
                 && !self.recipe.sources_released
+                && self
+                    .recipe
+                    .fresh_job_results
+                    .as_ref()
+                    .is_none_or(|preparation| preparation.receipt.is_some())
                 && self
                     .recipe
                     .prepared_dependencies
@@ -3437,11 +3546,11 @@ impl RecoverySession {
         if let Some(directory) = &phase.result_dir {
             anyhow::ensure!(
                 phase.pending.as_ref().is_none_or(|(relative, _)| {
-                    !crate::transfer::is_internal_source_archive(relative)
+                    !crate::transfer::is_internal_transfer_data(relative)
                 }),
                 "internal source archive has a pending publication; retained evidence requires inspection"
             );
-            files.retain(|relative| !crate::transfer::is_internal_source_archive(relative));
+            files.retain(|relative| !crate::transfer::is_internal_transfer_data(relative));
             for relative in &files {
                 validate_result_member(directory, relative)?;
             }
@@ -4621,6 +4730,7 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     // cancellation or retirement of a job that has not exposed any outputs.
     // Publication rechecks the original physical root before every write.
     recipe.validate_result_destination_contract()?;
+    recipe.validate_fresh_job_results_contract()?;
     recipe.validate_cargo_retrieval_policy()?;
     anyhow::ensure!(
         recipe.source_cancellation_settled != Some(true)
@@ -5857,6 +5967,185 @@ mod tests {
         )
         .unwrap();
         (directory, writer, worker)
+    }
+
+    fn fresh_results_fixture() -> (
+        tempfile::TempDir,
+        RecoverySession,
+        rch_common::job_results::JobResultsPreparationRequest,
+    ) {
+        let (directory, writer, worker) = admitted_preparation_fixture();
+        let remote = "/data/projects/source-recovery";
+        let result_dirs = vec![PathBuf::from("reports"), PathBuf::from("out/shards")];
+        let request =
+            crate::hook::fresh_job_results::request(remote, remote, &result_dirs).unwrap();
+        let roots = vec![remote.to_owned(), request.retention_root.clone()];
+        RecoverySession::begin(
+            &writer,
+            &worker,
+            roots.clone(),
+            None,
+            None,
+            None,
+            TransferConfig::default(),
+            directory.path().to_owned(),
+            "abc123".into(),
+        )
+        .unwrap();
+        let pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "fresh-result-recovery".into(),
+            "fresh-result-recovery".into(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override(remote);
+        let session = RecoverySession::prepare(
+            &writer,
+            &worker,
+            &pipeline,
+            roots,
+            None,
+            None,
+            None,
+            TransferConfig::default(),
+            directory.path().to_owned(),
+            None,
+            Some(CompilationKind::Job),
+            "./run-gate",
+            &result_dirs,
+            "abc123".into(),
+        )
+        .unwrap();
+        (directory, session, request)
+    }
+
+    fn fresh_results_receipt(
+        request: &rch_common::job_results::JobResultsPreparationRequest,
+    ) -> rch_common::job_results::JobResultsPreparationResponse {
+        use rch_common::job_results::{
+            JobResultsPreparationResponse, JobResultsPreparationResult, PreviousResultDirectory,
+            SCHEMA_VERSION,
+        };
+        JobResultsPreparationResponse {
+            schema_version: SCHEMA_VERSION,
+            request: request.clone(),
+            results: request
+                .result_dirs
+                .iter()
+                .map(|directory| JobResultsPreparationResult {
+                    result_dir: directory.clone(),
+                    previous: PreviousResultDirectory::Retained,
+                    retained_path: Some(format!("{}/old/{directory}", request.retention_root)),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn fresh_job_results_require_durable_exact_receipt_before_execution() {
+        let (_directory, mut session, request) = fresh_results_fixture();
+        session.require_fresh_job_results(&request).unwrap();
+        let mut restored = reload_publication(&session);
+        let before = restored.writer.snapshot().recovery;
+        assert!(restored.starting_execution().is_err());
+        assert_eq!(restored.writer.snapshot().recovery, before);
+        assert!(!restored.recipe.execution_started);
+
+        let receipt = fresh_results_receipt(&request);
+        let mut unrelated = receipt.clone();
+        unrelated.results.reverse();
+        assert!(restored.accept_fresh_job_results(&unrelated).is_err());
+        assert_eq!(restored.writer.snapshot().recovery, before);
+        restored.accept_fresh_job_results(&receipt).unwrap();
+        let mut ready = reload_publication(&restored);
+        assert_eq!(
+            ready.recipe.fresh_job_results.as_ref().unwrap().receipt,
+            Some(receipt.clone())
+        );
+        ready.starting_execution().unwrap();
+        let mut started = reload_publication(&ready);
+        assert!(started.recipe.execution_started);
+        let before = started.writer.snapshot().recovery;
+        assert!(started.accept_fresh_job_results(&receipt).is_err());
+        assert!(started.require_fresh_job_results(&request).is_err());
+        assert_eq!(started.writer.snapshot().recovery, before);
+    }
+
+    #[test]
+    fn fresh_job_results_refuse_unbound_grants_outputs_and_platforms() {
+        for invalid in ["grant", "output", "kind", "platform", "namespace"] {
+            let (_directory, mut session, request) = fresh_results_fixture();
+            match invalid {
+                "grant" => session
+                    .recipe
+                    .source_roots
+                    .retain(|root| root != &request.retention_root),
+                "output" => session.recipe.phases[0].result_dir = Some("unrelated".into()),
+                "kind" => session.recipe.kind = Some(CompilationKind::CargoBuild),
+                "platform" => session.recipe.worker.tags.push("os:macos".into()),
+                "namespace" => session.recipe.source_authority_namespace = None,
+                _ => unreachable!(),
+            }
+            let before = session.writer.snapshot().recovery;
+            assert!(
+                session.require_fresh_job_results(&request).is_err(),
+                "{invalid}"
+            );
+            assert!(session.recipe.fresh_job_results.is_none(), "{invalid}");
+            assert_eq!(session.writer.snapshot().recovery, before, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn fresh_job_results_recovery_refuses_missing_or_forged_execution_receipts() {
+        for forge_receipt in [false, true] {
+            let (_directory, mut session, request) = fresh_results_fixture();
+            session.require_fresh_job_results(&request).unwrap();
+            if forge_receipt {
+                let receipt = fresh_results_receipt(&request);
+                session.accept_fresh_job_results(&receipt).unwrap();
+                session
+                    .recipe
+                    .fresh_job_results
+                    .as_mut()
+                    .unwrap()
+                    .receipt
+                    .as_mut()
+                    .unwrap()
+                    .results[0]
+                    .retained_path = Some("/another/job".into());
+            }
+            session.recipe.execution_started = true;
+            // Corrupt on-disk evidence must fail the normal decoder as well as
+            // the full recovery loader; neither may reinterpret this as an
+            // ordinary merge-style job after a client restart.
+            session.persist().unwrap();
+            assert!(load_recipe(&session.writer).is_err());
+            assert!(
+                publication_state::decode_recipe_value(
+                    session.writer.snapshot().recovery.unwrap(),
+                    None,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_job_results_cancelled_preparation_rejects_late_receipt() {
+        let (_directory, mut session, request) = fresh_results_fixture();
+        session.require_fresh_job_results(&request).unwrap();
+        session.recipe.preparation_cancelled = true;
+        session.persist().unwrap();
+        let mut cancelled = reload_publication(&session);
+        let before = cancelled.writer.snapshot().recovery;
+        assert!(
+            cancelled
+                .accept_fresh_job_results(&fresh_results_receipt(&request))
+                .is_err()
+        );
+        assert!(cancelled.starting_execution().is_err());
+        assert_eq!(cancelled.writer.snapshot().recovery, before);
     }
 
     #[test]

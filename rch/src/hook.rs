@@ -75,6 +75,8 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 use which::which;
 
+mod fresh_job_results;
+
 #[cfg(all(feature = "rich-ui", unix))]
 use rich_rust::renderables::Panel;
 
@@ -778,6 +780,9 @@ fn configured_job_command(
             .to_str()
             .ok_or_else(|| "jobs.rules result directory is not UTF-8".to_string())?;
         argv.push(format!("--result-dir={directory}"));
+    }
+    if matched.fresh_result_dirs {
+        argv.push("--fresh-result-dirs".to_string());
     }
     for tool in &matched.rule.require_tools {
         argv.push(format!("--require-tool={tool}"));
@@ -5018,6 +5023,7 @@ pub async fn run_exec(
     job: bool,
     result_dirs: Vec<PathBuf>,
     result_dest: Option<PathBuf>,
+    fresh_result_dirs: bool,
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
     caller_requires_remote: bool,
@@ -5085,6 +5091,7 @@ pub async fn run_exec(
         || cargo_json_stdout
         || exact_worker_requested
         || result_dest.is_some()
+        || fresh_result_dirs
         || !required_tools.is_empty();
 
     // Job admission (`rch exec --job`, bd-bu3fb) bypasses the compilation
@@ -5095,6 +5102,13 @@ pub async fn run_exec(
     // unsafe path fails before any worker selection or transfer happens.
     let (result_dirs, result_destination) = match (|| -> anyhow::Result<_> {
         let dirs = validate_job_result_dirs(result_dirs)?;
+        if fresh_result_dirs {
+            anyhow::ensure!(
+                job && !clean_overlay && !source_content_receipt,
+                "--fresh-result-dirs requires an ordinary working-tree --job"
+            );
+            fresh_job_results::validate_directories(&dirs)?;
+        }
         anyhow::ensure!(
             result_dest.is_none() || (job && !dirs.is_empty()),
             "--result-dest requires --job and at least one --result-dir"
@@ -5122,6 +5136,12 @@ pub async fn run_exec(
             exit_invalid_job_results(&command, exec_start.elapsed().as_millis() as u64, &error)
         }
     };
+    if fresh_result_dirs
+        && let Err(error) =
+            fresh_job_results::validate_local_sources(&std::env::current_dir()?, &result_dirs).await
+    {
+        exit_invalid_job_results(&command, exec_start.elapsed().as_millis() as u64, &error);
+    }
     let classification = if job {
         Classification::compilation(
             CompilationKind::Job,
@@ -5191,6 +5211,7 @@ pub async fn run_exec(
                 || cargo_json_stdout
                 || exact_worker_requested
                 || result_destination.is_some()
+                || fresh_result_dirs
                 || caller_requires_remote
                 || required_tools_requested
         } else {
@@ -5864,6 +5885,7 @@ pub async fn run_exec(
             source_content_receipt,
             &result_dirs,
             result_destination.as_ref(),
+            fresh_result_dirs,
             &layer0_env,
             config.remediation.pooled_target.reaper_pooled_idle_hours,
             config.remediation.pooled_target.store_base.as_deref(),
@@ -7505,6 +7527,7 @@ async fn handle_selection_response(
         false,
         &[],
         None,
+        false,
         &[],
         config.remediation.pooled_target.reaper_pooled_idle_hours,
         config.remediation.pooled_target.store_base.as_deref(),

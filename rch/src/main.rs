@@ -626,6 +626,7 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     rch exec --job -- sharded_tests/run.sh
     rch exec --job --result-dir fuzz/corpus --result-dir crashes -- ./fuzz_target.sh
     rch exec --job --result-dir reports --result-dest /var/tmp/run-output -- ./verify.sh
+    rch exec --job --result-dir reports --fresh-result-dirs -- ./verify.sh
 
 USAGE:
     This command is primarily used internally by the PreToolUse hook.
@@ -694,6 +695,11 @@ USAGE:
         /// the root's identity is retained for safe interrupted-job recovery.
         #[arg(long, value_name = "ROOT", requires_all = ["job", "result_dir"])]
         result_dest: Option<PathBuf>,
+        /// Start each declared result directory empty on the worker, retaining
+        /// previous directories beside the source tree. Requires remote execution
+        /// on Linux; tracked source files and metadata cannot be result roots.
+        #[arg(long, requires_all = ["job", "result_dir"])]
+        fresh_result_dirs: bool,
         /// Require a verified named tool or exact node@VERSION / bun@VERSION.
         /// Plain names refer to operator-declared worker tool probes.
         /// Repeatable for compilation or jobs; all requirements must match.
@@ -2546,6 +2552,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 job,
                 result_dir,
                 result_dest,
+                fresh_result_dirs,
                 require_tool,
                 worker,
                 require_remote,
@@ -2561,6 +2568,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     job,
                     result_dir,
                     result_dest,
+                    fresh_result_dirs,
                     require_tool,
                     worker,
                     require_remote,
@@ -8550,6 +8558,7 @@ mod tests {
                 job,
                 result_dir,
                 result_dest: _,
+                fresh_result_dirs,
                 require_tool: _,
                 worker: _,
                 require_remote: _,
@@ -8565,6 +8574,7 @@ mod tests {
                 assert!(!source_content_receipt);
                 assert!(!job);
                 assert!(result_dir.is_empty());
+                assert!(!fresh_result_dirs);
                 assert_eq!(command, vec!["cargo", "test"]);
             }
             _ => fail_expected("Expected clean-overlay exec command"),
@@ -8599,6 +8609,7 @@ mod tests {
                 job,
                 result_dir,
                 result_dest: _,
+                fresh_result_dirs,
                 require_tool: _,
                 worker: _,
                 require_remote: _,
@@ -8612,6 +8623,7 @@ mod tests {
                 assert!(!source_content_receipt);
                 assert!(!job);
                 assert!(result_dir.is_empty());
+                assert!(!fresh_result_dirs);
                 assert_eq!(command, vec!["cargo", "check"]);
             }
             _ => fail_expected("Expected base-only clean-overlay exec command"),
@@ -9081,6 +9093,89 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
         }
+    }
+
+    #[test]
+    fn cli_parses_fresh_result_directories_with_optional_external_destination() {
+        let _guard = test_guard!();
+        for external_destination in [false, true] {
+            let mut arguments = vec![
+                "rch",
+                "exec",
+                "--job",
+                "--result-dir",
+                "reports/current",
+                "--result-dir",
+                "crashes",
+                "--fresh-result-dirs",
+            ];
+            if external_destination {
+                arguments.extend(["--result-dest", "/var/tmp/current-results"]);
+            }
+            arguments.extend(["--", "./verify.sh"]);
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Some(Commands::Exec {
+                job,
+                result_dir,
+                result_dest,
+                fresh_result_dirs,
+                command,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected fresh-result job execution");
+            };
+            assert!(job && fresh_result_dirs);
+            assert_eq!(
+                result_dir,
+                [PathBuf::from("reports/current"), PathBuf::from("crashes")]
+            );
+            assert_eq!(
+                result_dest,
+                external_destination.then(|| PathBuf::from("/var/tmp/current-results"))
+            );
+            assert_eq!(command, ["./verify.sh"]);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_fresh_result_directories_without_declared_job_outputs() {
+        let _guard = test_guard!();
+        for arguments in [
+            vec!["rch", "exec", "--fresh-result-dirs", "--", "true"],
+            vec!["rch", "exec", "--job", "--fresh-result-dirs", "--", "true"],
+            vec![
+                "rch",
+                "exec",
+                "--result-dir",
+                "reports",
+                "--fresh-result-dirs",
+                "--",
+                "true",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
+        let cli = Cli::try_parse_from([
+            "rch",
+            "exec",
+            "--job",
+            "--result-dir",
+            "reports",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Some(Commands::Exec {
+            fresh_result_dirs, ..
+        }) = cli.command
+        else {
+            panic!("expected ordinary job execution");
+        };
+        assert!(
+            !fresh_result_dirs,
+            "ordinary jobs preserve their output policy"
+        );
     }
 
     #[test]

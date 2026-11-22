@@ -58,6 +58,7 @@ pub async fn run_exec(
     job: bool,
     result_dirs: Vec<PathBuf>,
     result_dest: Option<PathBuf>,
+    fresh_result_dirs: bool,
     required_tools: Vec<String>,
     exact_worker: Option<WorkerId>,
     caller_requires_remote: bool,
@@ -86,6 +87,11 @@ pub async fn run_exec(
     // Job admission (bd-bu3fb) and declared result dirs (bd-p0yoo) ride the
     // Unix rsync/daemon transport; keep the refusal explicit rather than
     // silently running the job locally with different semantics.
+    if fresh_result_dirs {
+        anyhow::bail!(
+            "--fresh-result-dirs requires guarded preparation on a Linux worker through the Unix daemon transport"
+        );
+    }
     if job {
         anyhow::bail!("--job remote admission requires the Unix daemon transport");
     }
