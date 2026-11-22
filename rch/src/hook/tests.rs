@@ -4180,6 +4180,174 @@ fn test_parse_jobs_flag_variants() {
 }
 
 #[test]
+fn cargo_job_flags_belong_to_cargo_not_wrapper_or_program_arguments() {
+    for command in [
+        "cargo build -j '2'",
+        "cargo +nightly build '--jobs=2'",
+        "env -- /usr/bin/cargo build --jobs \"2\"",
+        "/usr/bin/time -f '--jobs=64' -- cargo build -j2",
+        "rustup run --install nightly cargo build -j2",
+        "nice -n 10 env -- cargo build -j2",
+        "timeout --signal TERM --kill-after 5 60 env -- cargo build -j2",
+        "cargo build --config '--jobs=64' -j2",
+        "cargo build --manifest-path 'some --jobs=64/Cargo.toml' -j2",
+        "cargo build --features=-j64 -j2",
+        "cargo run -j2 -- --jobs 64",
+    ] {
+        assert_eq!(parse_jobs_flag(command), Some(2), "{command}");
+    }
+    for command in [
+        "cargo run -- --jobs 64",
+        "cargo test -- --skip --jobs=64",
+        "cargo build --config '--jobs=64'",
+        "cargo build --manifest-path 'some --jobs=64/Cargo.toml'",
+        "/usr/bin/time -f '-j64' cargo build",
+        "env -u --jobs=64 cargo build",
+        "bash scripts/gate.sh cargo test --jobs 64",
+        "sh -c 'cargo build --jobs=64'",
+    ] {
+        assert_eq!(parse_jobs_flag(command), None, "{command}");
+    }
+}
+
+#[test]
+fn cargo_inline_jobs_follow_real_environment_precedence() {
+    for (command, expected) in [
+        ("CARGO_BUILD_JOBS='2' cargo build", Some(2)),
+        ("env -- 'CARGO_BUILD_JOBS=2' cargo build", Some(2)),
+        (
+            "CARGO_BUILD_JOBS=2 CARGO_BUILD_JOBS=64 cargo build",
+            Some(64),
+        ),
+        (
+            "CARGO_BUILD_JOBS=2 env CARGO_BUILD_JOBS=64 cargo build",
+            Some(64),
+        ),
+        (
+            "env CARGO_BUILD_JOBS=64 env CARGO_BUILD_JOBS=2 cargo build",
+            Some(2),
+        ),
+        ("CARGO_BUILD_JOBS=64 cargo build -j2", Some(2)),
+        ("CARGO_BUILD_JOBS=2 env -i cargo build", None),
+        (
+            "CARGO_BUILD_JOBS=2 env --ignore-environment cargo build",
+            None,
+        ),
+        (
+            "CARGO_BUILD_JOBS=2 env -u CARGO_BUILD_JOBS cargo build",
+            None,
+        ),
+        (
+            "CARGO_BUILD_JOBS=2 env --unset=CARGO_BUILD_JOBS cargo build",
+            None,
+        ),
+        (
+            "CARGO_BUILD_JOBS=2 env -uCARGO_BUILD_JOBS cargo build",
+            None,
+        ),
+        ("CARGO_BUILD_JOBS=2 env -u OTHER cargo build", Some(2)),
+        (
+            "CARGO_BUILD_JOBS=2 env -i CARGO_BUILD_JOBS=64 cargo build",
+            Some(64),
+        ),
+        (
+            "CARGO_BUILD_JOBS=2 env -u CARGO_BUILD_JOBS CARGO_BUILD_JOBS=64 cargo build",
+            Some(64),
+        ),
+        (
+            "env CARGO_BUILD_JOBS=2 time -f CARGO_BUILD_JOBS=64 cargo build",
+            Some(2),
+        ),
+        ("time -f CARGO_BUILD_JOBS=64 cargo build", None),
+        (
+            "env CARGO_BUILD_JOBS=2 rustup run nightly cargo build",
+            Some(2),
+        ),
+        (
+            "CARGO_BUILD_JOBS=2 nice -n 10 env CARGO_BUILD_JOBS=64 cargo build",
+            Some(64),
+        ),
+        ("timeout 60 env CARGO_BUILD_JOBS=2 cargo build", Some(2)),
+        ("cargo run -- CARGO_BUILD_JOBS=64", None),
+        ("cargo build --config CARGO_BUILD_JOBS=64", None),
+        (
+            "CARGO_BUILD_JOBS=2 env CARGO_BUILD_JOBS=invalid cargo build",
+            None,
+        ),
+        ("CARGO_BUILD_JOBS=2 cargo build -j0", None),
+        ("CARGO_BUILD_JOBS=2 cargo build --jobs", None),
+        ("env -S 'CARGO_BUILD_JOBS=2 cargo build'", None),
+    ] {
+        assert_eq!(cargo_job_count_for_command(command), expected, "{command}");
+    }
+}
+
+#[test]
+fn cargo_reservations_ignore_payload_controls_and_track_effective_build_jobs() {
+    let config = rch_common::CompilationConfig {
+        build_slots: 12,
+        test_slots: 8,
+        check_slots: 4,
+        ..Default::default()
+    };
+    for (kind, command, expected) in [
+        (CompilationKind::CargoBuild, "cargo run -- --jobs 64", 12),
+        (
+            CompilationKind::CargoBuild,
+            "cargo run -- CARGO_BUILD_JOBS=64",
+            12,
+        ),
+        (
+            CompilationKind::CargoTest,
+            "cargo test -- --test-threads=3 --skip --jobs=64",
+            3,
+        ),
+        (
+            CompilationKind::CargoTest,
+            "cargo test --no-run -- CARGO_BUILD_JOBS=1",
+            12,
+        ),
+        (
+            CompilationKind::CargoTest,
+            "env -u CARGO_BUILD_JOBS cargo test --no-run",
+            12,
+        ),
+        (
+            CompilationKind::CargoTest,
+            "env CARGO_BUILD_JOBS='2' cargo test --no-run",
+            2,
+        ),
+        (
+            CompilationKind::CargoBuild,
+            "CARGO_BUILD_JOBS=2 env CARGO_BUILD_JOBS=64 cargo build",
+            64,
+        ),
+        (CompilationKind::CargoCheck, "cargo check --jobs '2'", 2),
+        (CompilationKind::CargoClippy, "cargo clippy -- -j64", 4),
+        (
+            CompilationKind::Job,
+            "bash gate.sh cargo_test --jobs 64",
+            12,
+        ),
+        (CompilationKind::Gcc, "gcc -c 'CARGO_BUILD_JOBS=64.c'", 12),
+        (CompilationKind::Make, "make -j2", 2),
+        (CompilationKind::Ninja, "ninja -j2", 2),
+        (
+            CompilationKind::CmakeBuild,
+            "cmake --build build --parallel 2",
+            2,
+        ),
+        (CompilationKind::Meson, "meson compile -j2", 2),
+    ] {
+        assert_eq!(
+            estimate_cores_for_command(Some(kind), command, &config),
+            expected,
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn test_parse_test_threads_variants() {
     let _guard = test_guard!();
     assert_eq!(

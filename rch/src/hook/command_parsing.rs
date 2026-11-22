@@ -40,26 +40,66 @@ fn parse_env_u32(command: &str, key: &str) -> Option<u32> {
         .find_map(|token| token.strip_prefix(&needle).and_then(parse_u32))
 }
 
+#[cfg(test)]
 pub(super) fn parse_jobs_flag(command: &str) -> Option<u32> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    for (idx, token) in tokens.iter().enumerate() {
-        if (*token == "-j" || *token == "--jobs")
-            && let Some(next) = tokens.get(idx + 1)
-            && let Some(value) = parse_u32(next)
+    let (tokens, cargo_index, _) = cargo_scheduling_tokens(command)?;
+    cargo_jobs_from_args(&tokens[cargo_index + 1..]).flatten()
+}
+
+/// Only Cargo's arguments describe compiler parallelism. A run/test payload,
+/// another option's value or a wrapper's argv is not a scheduler request.
+/// The outer Option distinguishes an unresolved override from no override:
+/// malformed explicit controls must not reveal an earlier small env value.
+fn cargo_jobs_from_args(tokens: &[String]) -> Option<Option<u32>> {
+    let mut args = tokens.iter();
+    let mut jobs = None;
+    while let Some(token) = args.next() {
+        if token == "--" {
+            break;
+        }
+        if matches!(token.as_str(), "-j" | "--jobs") {
+            jobs = Some(parse_u32(args.next()?)?);
+        } else if let Some(value) = token
+            .strip_prefix("--jobs=")
+            .or_else(|| token.strip_prefix("-j="))
+            .or_else(|| token.strip_prefix("-j"))
         {
-            return Some(value);
-        }
-        if let Some(value) = token.strip_prefix("-j=").and_then(parse_u32) {
-            return Some(value);
-        }
-        if let Some(value) = token.strip_prefix("-j").and_then(parse_u32) {
-            return Some(value);
-        }
-        if let Some(value) = token.strip_prefix("--jobs=").and_then(parse_u32) {
-            return Some(value);
+            jobs = Some(parse_u32(value)?);
+        } else if cargo_option_takes_value(token) {
+            args.next()?;
         }
     }
-    None
+    Some(jobs)
+}
+
+fn cargo_option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "--config"
+            | "--target"
+            | "--target-dir"
+            | "--build-dir"
+            | "--manifest-path"
+            | "--lockfile-path"
+            | "--package"
+            | "-p"
+            | "--exclude"
+            | "--features"
+            | "-F"
+            | "--bin"
+            | "--example"
+            | "--test"
+            | "--bench"
+            | "--profile"
+            | "--color"
+            | "--message-format"
+            | "--jobs"
+            | "-j"
+            | "-Z"
+            | "-C"
+            | "--artifact-dir"
+            | "--out-dir"
+    )
 }
 
 /// The job count the REMOTE build will actually use, when the command says so:
@@ -72,7 +112,8 @@ pub(super) fn parse_jobs_flag(command: &str) -> Option<u32> {
 /// `cargo test` from ts1 at 16 slots: only two workers qualified, and
 /// thousands of builds a day were refused and ran locally.
 pub(crate) fn cargo_job_count_for_command(command: &str) -> Option<u32> {
-    parse_jobs_flag(command).or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
+    let (tokens, cargo_index, inline_jobs) = cargo_scheduling_tokens(command)?;
+    cargo_jobs_from_args(&tokens[cargo_index + 1..])?.or(inline_jobs)
 }
 
 pub(super) fn parse_test_threads(command: &str) -> Option<u32> {
@@ -235,20 +276,32 @@ pub(super) fn has_exact_flag(command: &str) -> bool {
 /// Wrapper `--` belongs to that wrapper, not to Cargo's argument passthrough.
 /// Keep this platform-neutral: both hook backends use the profile analyzer.
 fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
+    let (tokens, index, _) = cargo_scheduling_tokens(command)?;
+    Some((tokens, index))
+}
+
+/// Locate the actual Cargo executable and resolve the command-local scheduler
+/// environment in order. Env clears/unsets and later assignments take effect;
+/// option payloads and command arguments never create environment bindings.
+fn cargo_scheduling_tokens(command: &str) -> Option<(Vec<String>, usize, Option<u32>)> {
     let tokens = shell_words::split(command).ok()?;
     let assignment = |word: &str| {
         word.split_once('=')
             .is_some_and(|(key, _)| rch_common::ssh_utils::is_valid_env_key(key))
     };
     let mut index = 0;
+    let mut inline_jobs = None;
     loop {
         while tokens.get(index).is_some_and(|word| assignment(word)) {
+            if let Some(value) = tokens[index].strip_prefix("CARGO_BUILD_JOBS=") {
+                inline_jobs = parse_u32(value);
+            }
             index += 1;
         }
         let executable = Path::new(tokens.get(index)?).file_name()?.to_str()?;
         match executable {
             "cargo" | "cargo.exe" | "cargo-zigbuild" | "cargo-zigbuild.exe" | "cargo-xwin"
-            | "cargo-xwin.exe" => return Some((tokens, index)),
+            | "cargo-xwin.exe" => return Some((tokens, index, inline_jobs)),
             "env" | "time" => {
                 let is_env = executable == "env";
                 index += 1;
@@ -263,7 +316,13 @@ fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
                         matches!(word.as_str(), "-f" | "--format" | "-o" | "--output")
                     };
                     if takes_value {
-                        tokens.get(index + 1)?;
+                        let value = tokens.get(index + 1)?;
+                        if is_env
+                            && matches!(word.as_str(), "-u" | "--unset")
+                            && value == "CARGO_BUILD_JOBS"
+                        {
+                            inline_jobs = None;
+                        }
                         index += 2;
                         continue;
                     }
@@ -289,6 +348,13 @@ fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
                             || word.starts_with("-o") && word.len() > 2
                     };
                     if flag {
+                        if is_env
+                            && (matches!(word.as_str(), "-i" | "--ignore-environment")
+                                || word == "--unset=CARGO_BUILD_JOBS"
+                                || word == "-uCARGO_BUILD_JOBS")
+                        {
+                            inline_jobs = None;
+                        }
                         index += 1;
                     } else if word.starts_with('-') {
                         // In particular env -S reparses its payload; it is not
@@ -316,9 +382,61 @@ fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
                 }
                 index += 1;
             }
+            "nice" => {
+                index += 1;
+                if let Some(word) = tokens.get(index) {
+                    if matches!(word.as_str(), "-n" | "--adjustment") {
+                        tokens.get(index + 1)?;
+                        index += 2;
+                    } else if word.starts_with("--adjustment=")
+                        || word.starts_with("-n") && word.len() > 2
+                        || word.strip_prefix('-').is_some_and(|value| {
+                            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                    {
+                        index += 1;
+                    }
+                }
+                if tokens.get(index).is_some_and(|word| word == "--") {
+                    index += 1;
+                }
+            }
+            "timeout" => {
+                index += 1;
+                while let Some(word) = tokens.get(index) {
+                    if word == "--" {
+                        index += 1;
+                        break;
+                    }
+                    if matches!(word.as_str(), "-s" | "--signal" | "-k" | "--kill-after") {
+                        tokens.get(index + 1)?;
+                        index += 2;
+                    } else if matches!(
+                        word.as_str(),
+                        "--foreground" | "--preserve-status" | "-v" | "--verbose"
+                    ) || word.starts_with("--signal=")
+                        || word.starts_with("--kill-after=")
+                        || word.starts_with("-s") && word.len() > 2
+                        || word.starts_with("-k") && word.len() > 2
+                    {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let duration = tokens.get(index)?;
+                if !duration
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_digit())
+                {
+                    return None;
+                }
+                index += 1;
+            }
             _ => {
-                // Reuse the classifier for its other wrappers (nice, timeout,
-                // taskset, ...), but only when it identifies an unchanged argv
+                // Reuse the classifier for its other wrappers (taskset,
+                // ionice, ...), but only when it identifies an unchanged argv
                 // suffix. Never search arbitrary argument values for "cargo".
                 let remaining = shell_words::join(&tokens[index..]);
                 let normalized = rch_common::patterns::normalize_command(&remaining);
@@ -327,6 +445,11 @@ fn cargo_profile_tokens(command: &str) -> Option<(Vec<String>, usize)> {
                 if suffix.is_empty() || start <= index || tokens[start + 1..] != suffix[1..] {
                     return None;
                 }
+                // The normalizer establishes an argv suffix, not an env
+                // contract for opaque wrappers such as sudo. Keep explicit
+                // Cargo job flags, but do not carry a small env estimate
+                // across a wrapper whose environment effects are unknown.
+                inline_jobs = None;
                 index = start;
             }
         }
@@ -367,31 +490,7 @@ pub(super) fn cargo_custom_profile_output_dir(command: &str) -> Option<String> {
         } else {
             // These values are opaque even if they look like --profile=P or
             // --. Joined options already keep their value in the same token.
-            if matches!(
-                token.as_str(),
-                "--config"
-                    | "--target"
-                    | "--target-dir"
-                    | "--manifest-path"
-                    | "--lockfile-path"
-                    | "--package"
-                    | "-p"
-                    | "--exclude"
-                    | "--features"
-                    | "-F"
-                    | "--bin"
-                    | "--example"
-                    | "--test"
-                    | "--bench"
-                    | "--color"
-                    | "--message-format"
-                    | "--jobs"
-                    | "-j"
-                    | "-Z"
-                    | "-C"
-                    | "--artifact-dir"
-                    | "--out-dir"
-            ) {
+            if cargo_option_takes_value(token) {
                 iter.next()?;
             }
             continue;
@@ -426,35 +525,7 @@ fn cargo_build_only_test_options(command: &str) -> Option<(CompilationKind, Opti
     if args.peek().is_some_and(|arg| arg.starts_with('+')) && args.next()?.len() == 1 {
         return None;
     }
-    let takes_value = |arg: &str| {
-        matches!(
-            arg,
-            "--config"
-                | "--target"
-                | "--target-dir"
-                | "--build-dir"
-                | "--manifest-path"
-                | "--lockfile-path"
-                | "--package"
-                | "-p"
-                | "--exclude"
-                | "--features"
-                | "-F"
-                | "--bin"
-                | "--example"
-                | "--test"
-                | "--bench"
-                | "--profile"
-                | "--color"
-                | "--message-format"
-                | "--jobs"
-                | "-j"
-                | "-Z"
-                | "-C"
-                | "--artifact-dir"
-                | "--out-dir"
-        )
-    };
+    let takes_value = cargo_option_takes_value;
     let mut kind = None;
     let mut no_run = false;
     let mut jobs = None;
@@ -912,17 +983,15 @@ pub(crate) fn estimate_cores_for_command(
     if matches!(
         kind,
         Some(CompilationKind::CargoTest | CompilationKind::CargoBench)
-    ) && let Some((selected, jobs)) = cargo_build_only_test_options(command)
+    ) && let Some((selected, _)) = cargo_build_only_test_options(command)
         && Some(selected) == kind
     {
         // --no-run starts no test harness. Name filters, --test-threads and
-        // RUST_TEST_THREADS cannot shrink its compiler reservation. The jobs
-        // value above came only from Cargo's argv, before its own -- separator.
+        // RUST_TEST_THREADS cannot shrink its compiler reservation. Job counts
+        // come only from Cargo's argv and its actual inline environment.
         // Ambient CARGO_BUILD_JOBS is ignored for the same reason as in
         // `cargo_job_count_for_command`: it never reaches the worker.
-        return jobs
-            .or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
-            .unwrap_or(build_default);
+        return cargo_job_count_for_command(command).unwrap_or(build_default);
     }
 
     // Slot reduction for filtered tests (fewer tests = fewer slots needed)
