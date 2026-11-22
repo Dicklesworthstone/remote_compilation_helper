@@ -929,7 +929,7 @@ exec "$1/rch-ssh-guard" -c 'printf "resumed\n" > "$1/resumed"' rch-image-resumed
         let root = tempfile::tempdir().unwrap();
         let (directory, mut command) = fixture(root.path());
         let control_path = directory.path().to_owned();
-        let mut process = OwnedSshProcess::spawn(&mut command, Some(directory), None).unwrap();
+        let process = OwnedSshProcess::spawn(&mut command, Some(directory), None).unwrap();
         let pids = started(root.path()).await;
         let retained = root.path().join("retained-original");
         std::fs::rename(&control_path, &retained).unwrap();

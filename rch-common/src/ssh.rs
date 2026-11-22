@@ -64,6 +64,9 @@ struct PoolWorkerControl {
     // Serialize disable/enable while removing the old entry, without holding
     // the pool-wide map lock across a per-worker transition.
     transition: Mutex<()>,
+    // One dispatch can open several simultaneous source/rsync/build channels.
+    // Bound dispatch fanout separately from ordinary pool command activity.
+    external_dispatch: Arc<tokio::sync::Semaphore>,
 }
 
 impl PoolWorkerControl {
@@ -76,6 +79,7 @@ impl PoolWorkerControl {
             policy,
             shutdown,
             transition: Mutex::new(()),
+            external_dispatch: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -785,8 +789,8 @@ impl OutputPreview {
 }
 
 /// Owns a foreground SSH process from spawn through wait/reap. Dropping a
-/// connect future or a client requests termination; the supervisor retains the
-/// child and socket directory until it has reaped the child.
+/// connect future or the last session owner requests termination; the supervisor
+/// retains the child and socket directory until it has reaped the child.
 struct OwnedSshProcess {
     state: watch::Sender<SshProcessState>,
     supervisor: tokio::task::JoinHandle<()>,
@@ -912,11 +916,14 @@ impl OwnedSshProcess {
         self.state.send_modify(|state| state.stopping = true);
     }
 
-    async fn wait_until(&self, deadline: Instant) -> Result<ExitStatus> {
+    async fn wait_outcome_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::result::Result<ExitStatus, String>> {
         let mut changes = self.state.subscribe();
         loop {
             if let Some(outcome) = changes.borrow_and_update().outcome.clone() {
-                return outcome.map_err(anyhow::Error::msg);
+                return Ok(outcome);
             }
             tokio::time::timeout_at(deadline, changes.changed())
                 .await
@@ -927,12 +934,24 @@ impl OwnedSshProcess {
         }
     }
 
-    async fn stop_before(&mut self, deadline: Instant) -> Result<()> {
+    async fn wait_until(&self, deadline: Instant) -> Result<ExitStatus> {
+        self.wait_outcome_until(deadline)
+            .await?
+            .map_err(anyhow::Error::msg)
+    }
+
+    async fn stop_before(&self, deadline: Instant) -> Result<()> {
         self.request_stop();
-        tokio::time::timeout_at(deadline, &mut self.supervisor)
+        // The supervisor publishes outcome only after wait/reap. Waiting on
+        // that shared observation permits external users to retain the exact
+        // process owner while the pool replaces its cached session.
+        // Stopping proves reap, not successful SSH execution or socket
+        // cleanup. The stored outcome remains available to wait_until.
+        let _outcome = self
+            .wait_outcome_until(deadline)
             .await
-            .context("Timed out reaping owned SSH child")?
-            .context("SSH child supervisor failed")
+            .context("Failed to reap owned SSH child")?;
+        Ok(())
     }
 }
 
@@ -983,20 +1002,48 @@ struct OwnedSshSession {
 /// Keep one authenticated SSH master active while external SSH or rsync
 /// subprocesses use its control socket.
 ///
-/// The owning [`SshClient`] must also remain alive. This handle neither starts
-/// subprocesses nor retries commands. Call [`Self::complete`] only after every
-/// channel has completed and been reaped; abandoning the handle retires the
-/// master after its other active users finish, just like a cancelled command.
+/// The handle pins the exact foreground master even when the pool replaces
+/// its cached client session. It neither starts subprocesses nor retries
+/// commands. Call [`Self::complete`] only after every channel has completed
+/// and been reaped; abandoning the handle retires the master after its other
+/// active users finish, just like a cancelled command.
 #[must_use = "hold the transport until its external subprocesses finish"]
 pub struct OwnedSshTransport {
     socket: PathBuf,
     can_disable_background: bool,
     activity: SshProcessUse,
-    _control_dir: Arc<SshControlDir>,
+    _session: Arc<OwnedSshSession>,
     pool_admission: Option<PoolWorkerAdmission>,
+    _exclusive_dispatch: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl OwnedSshTransport {
+    /// Observe actual transport loss or administrative revocation. A sibling
+    /// abandoned use drains the master for new admissions but does not cancel
+    /// this already-admitted user's remaining channels or cleanup.
+    pub async fn closed(&self) {
+        let mut changes = self.activity.state.subscribe();
+        let revoked = pool_admission_revoked(self.pool_admission.clone());
+        tokio::pin!(revoked);
+        loop {
+            let current = changes.borrow_and_update().clone();
+            if current.stopping
+                || current.outcome.is_some()
+                || self._session.process.supervisor.is_finished()
+            {
+                return;
+            }
+            tokio::select! {
+                () = &mut revoked => return,
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Arguments for attaching to this exact ready master, without opening a
     /// replacement network connection if the master disappears.
     ///
@@ -1192,7 +1239,7 @@ pub struct SshClient {
     /// SSH options.
     options: SshOptions,
     /// Active SSH session (if connected).
-    session: Option<OwnedSshSession>,
+    session: Option<Arc<OwnedSshSession>>,
     /// Pool-owned administrative admission. Standalone clients have no pool
     /// policy; callers of those clients remain responsible for admission.
     pool_admission: Option<PoolWorkerAdmission>,
@@ -1226,7 +1273,7 @@ impl SshClient {
     }
 
     /// Borrow this ready master's transport for externally owned subprocesses.
-    /// Keep this client alive until the returned handle is completed or dropped.
+    /// The returned handle retains this exact master until completed or dropped.
     ///
     /// # Errors
     /// Returns an error when disconnected, draining, administratively revoked,
@@ -1242,8 +1289,9 @@ impl SshClient {
             socket: session.session.control_socket().to_path_buf(),
             can_disable_background: session.can_disable_background,
             activity: session.process.begin_use()?,
-            _control_dir: session._control_dir.clone(),
+            _session: Arc::clone(session),
             pool_admission: self.pool_admission.clone(),
+            _exclusive_dispatch: None,
         })
     }
 
@@ -1305,7 +1353,9 @@ impl SshClient {
             debug!("Already connected to {}", self.config.id);
             return Ok(());
         }
-        // A master that exited or expired is no longer a usable session.
+        // A master that exited, expired or began draining cannot accept new
+        // uses. Existing external guards retain its exact owner while a new
+        // session is authenticated; replacement must not stop those users.
         self.session.take();
         let deadline = Instant::now()
             .checked_add(self.options.connect_timeout)
@@ -1336,7 +1386,7 @@ impl SshClient {
         // debug, not info: the telemetry pool connects to every worker each poll
         // cycle, so at info this floods the daemon log (8M+ lines / multi-GB).
         debug!("Connected to {} ({})", self.config.id, self.config.host);
-        self.session = Some(session);
+        self.session = Some(Arc::new(session));
         Ok(())
     }
 
@@ -1391,7 +1441,7 @@ impl SshClient {
             can_disable_background,
         );
         ensure_ssh_deadline(Some(deadline))?;
-        let mut process = OwnedSshProcess::spawn_with_admission(
+        let process = OwnedSshProcess::spawn_with_admission(
             &mut command,
             Some(control_dir.clone()),
             idle_timeout,
@@ -1474,7 +1524,7 @@ impl SshClient {
 
     /// Disconnect from the worker.
     pub async fn disconnect(&mut self) -> Result<()> {
-        if let Some(mut session) = self.session.take() {
+        if let Some(session) = self.session.take() {
             debug!("Disconnecting from {}", self.config.id);
             session
                 .process
@@ -2087,7 +2137,7 @@ async fn wait_for_ssh_master(
                 .arg("-S")
                 .arg(socket)
                 .args(["-o", "BatchMode=yes", "-O", "check", "none"]);
-            let mut probe = OwnedSshProcess::spawn(&mut command, None, None)?;
+            let probe = OwnedSshProcess::spawn(&mut command, None, None)?;
             let checked = probe.wait_until(deadline).await;
             let _ = probe.stop_before(deadline).await;
             if checked?.success() && process.is_running() {
@@ -2532,6 +2582,59 @@ impl SshPool {
             shutdown,
             options,
         }
+    }
+
+    /// A dispatch may borrow this pool only when its configured keepalive and
+    /// idle lifetime are preserved. Project overrides retain the existing
+    /// per-dispatch owner rather than silently inheriting daemon defaults.
+    #[must_use]
+    pub fn matches_transport_policy(
+        &self,
+        server_alive_interval_secs: u64,
+        idle_timeout_secs: u64,
+    ) -> bool {
+        self.options.control_master
+            && self.options.server_alive_interval
+                == Some(Duration::from_secs(server_alive_interval_secs))
+            && matches!(
+                control_persist_mode(true, self.options.control_persist_idle),
+                ControlPersistMode::IdleFor(seconds) if u64::try_from(seconds.get()).ok() == Some(idle_timeout_secs)
+            )
+    }
+
+    /// Borrow one whole-dispatch transport, or return `None` before any SSH
+    /// activity when another dispatch already holds this worker's permit.
+    /// Authentication, lock waits and liveness share the original deadline.
+    /// The returned guard retains both its exact master and this permit.
+    pub async fn try_external_transport_until(
+        &self,
+        config: &WorkerConfig,
+        deadline: Instant,
+    ) -> Result<Option<OwnedSshTransport>> {
+        let deadline = bounded_ssh_deadline(deadline)?;
+        ssh_operation_before(Some(deadline), async {
+            let control = self
+                .worker_control_before(&config.id, Some(deadline))
+                .await?;
+            let admission = control.admission();
+            anyhow::ensure!(
+                admission.is_current(),
+                "SSH worker pool admission was revoked"
+            );
+            let Ok(permit) = Arc::clone(&control.external_dispatch).try_acquire_owned() else {
+                return Ok(None);
+            };
+            let client = self.get_or_connect_until(config, deadline).await?;
+            let mut transport = client.read().await.external_transport()?;
+            ensure_ssh_deadline(Some(deadline))?;
+            anyhow::ensure!(
+                admission.is_current(),
+                "SSH worker pool admission was revoked"
+            );
+            transport._exclusive_dispatch = Some(permit);
+            Ok(Some(transport))
+        })
+        .await
     }
 
     async fn worker_control(&self, worker_id: &WorkerId) -> Arc<PoolWorkerControl> {
@@ -5615,9 +5718,9 @@ exec sleep 30
 
     #[tokio::test]
     async fn external_transport_without_idle_timer_is_reaped_on_dispatch_drop() {
-        // Clients can own a connection without an idle timer. Dropping either
-        // the client or its active-use guard must still stop and reap it;
-        // cleanup cannot depend on a later idle expiration.
+        // Clients can own a connection without an idle timer. A transport
+        // retains that exact owner after the client leaves the pool, and its
+        // eventual drop must reap without depending on an idle expiration.
         for owner_first in [false, true] {
             let fake = FakeSsh::new("ready");
             let mut client = fake.client(Duration::from_secs(3), true);
@@ -5627,7 +5730,7 @@ exec sleep 30
             assert!(transport.arguments().is_ok());
             if owner_first {
                 drop(client);
-                assert!(transport.arguments().is_err());
+                assert!(transport.arguments().is_ok());
                 drop(transport);
             } else {
                 drop(transport);
@@ -5696,6 +5799,145 @@ exec sleep 30
         assert!(!status.success());
         client.disconnect().await.unwrap();
         fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn external_transport_successive_dispatches_share_one_supervised_master() {
+        let fake = FakeSsh::new("ready");
+        let config = fake.client(Duration::from_secs(3), true).config;
+        let pool = SshPool::new(SshOptions {
+            control_master: true,
+            control_persist_idle: Some(Duration::from_secs(60)),
+            server_alive_interval: Some(Duration::from_secs(15)),
+            ..SshOptions::default()
+        });
+        assert!(pool.matches_transport_policy(15, 60));
+        assert!(!pool.matches_transport_policy(15, 30));
+        assert!(!pool.matches_transport_policy(0, 60));
+        assert!(!pool.matches_transport_policy(15, 0));
+        let entry = pool.get_or_create_client_entry(&config).await;
+        let mut previous = None;
+        for _ in 0..2 {
+            fake.connect(&mut *entry.write().await).await.unwrap();
+            let transport = entry.read().await.external_transport().unwrap();
+            let arguments = transport.arguments().unwrap();
+            if let Some(previous) = previous.as_ref() {
+                assert_eq!(&arguments, previous);
+            }
+            previous = Some(arguments);
+            transport.complete();
+        }
+        assert_eq!(fake.pids("master-pids").len(), 1);
+        assert!(entry.read().await.is_connected());
+        pool.close(&config.id).await.unwrap();
+        drop(entry);
+        fake.assert_reaped().await;
+    }
+
+    #[tokio::test]
+    async fn external_transport_busy_dispatch_declines_before_authentication() {
+        let pool = SshPool::new(SshOptions::default());
+        let config = WorkerConfig {
+            host: "must-not-authenticate.invalid".into(),
+            ..WorkerConfig::default()
+        };
+        let control = pool.worker_control(&config.id).await;
+        let permit = Arc::clone(&control.external_dispatch)
+            .try_acquire_owned()
+            .unwrap();
+        let result = pool
+            .try_external_transport_until(&config, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(pool.connections.read().await.is_empty());
+        drop(permit);
+        assert_eq!(control.external_dispatch.available_permits(), 1);
+        pool.set_worker_enabled(&config.id, false).await;
+        assert!(
+            pool.try_external_transport_until(&config, Instant::now() + Duration::from_secs(1),)
+                .await
+                .is_err()
+        );
+        assert!(pool.connections.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_transport_survives_draining_cache_replacement_and_observes_revocation() {
+        for revoke in [None, Some(false), Some(true)] {
+            let fake = FakeSsh::new("ready");
+            let config = fake.client(Duration::from_secs(3), true).config;
+            let pool = SshPool::new(SshOptions {
+                control_master: true,
+                ..SshOptions::default()
+            });
+            let entry = pool.get_or_create_client_entry(&config).await;
+            fake.connect(&mut *entry.write().await).await.unwrap();
+            let abandoned = entry.read().await.external_transport().unwrap();
+            let active = entry.read().await.external_transport().unwrap();
+            let old_arguments = active.arguments().unwrap();
+            let old_socket = active.socket.clone();
+            let mut old_state = active.activity.state.subscribe();
+            drop(abandoned);
+            assert!(!entry.read().await.is_connected());
+
+            // This is the same disconnected/draining branch used by the
+            // pool's next borrower. Replacement must retain B's old owner,
+            // while C obtains a fresh socket without waiting for B's build.
+            fake.connect(&mut *entry.write().await).await.unwrap();
+            let replacement = entry.read().await.external_transport().unwrap();
+            assert_ne!(replacement.socket, old_socket);
+            assert_eq!(fake.pids("master-pids").len(), 2);
+            assert!(old_socket.exists());
+            assert!(old_state.borrow().outcome.is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), active.closed())
+                    .await
+                    .is_err()
+            );
+
+            if let Some(shutdown) = revoke {
+                if shutdown {
+                    pool.shutdown().await.unwrap();
+                } else {
+                    pool.set_worker_enabled(&config.id, false).await;
+                }
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::join!(active.closed(), replacement.closed());
+                })
+                .await
+                .expect("administration must revoke detached and current masters");
+                assert!(active.arguments().is_err());
+                assert!(replacement.arguments().is_err());
+                drop(active);
+                drop(replacement);
+            } else {
+                active.complete();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while old_state.borrow_and_update().outcome.is_none() {
+                        old_state.changed().await.unwrap();
+                    }
+                })
+                .await
+                .expect("the old master must reap after its last existing user");
+                assert!(entry.read().await.is_connected());
+                assert!(replacement.arguments().is_ok());
+                replacement.complete();
+                pool.close(&config.id).await.unwrap();
+            }
+            assert!(
+                old_arguments
+                    .windows(2)
+                    .any(|pair| pair == ["-o", "ProxyCommand=false"])
+            );
+            assert!(
+                old_arguments
+                    .windows(2)
+                    .any(|pair| pair == ["-o", "ControlMaster=no"])
+            );
+            drop(entry);
+            fake.assert_reaped().await;
+        }
     }
 
     #[tokio::test]
