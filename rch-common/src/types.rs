@@ -3553,13 +3553,14 @@ pub struct TransferConfig {
     /// zstd compression level (1-19).
     #[serde(default = "default_compression")]
     pub compression_level: u32,
-    /// Patterns to exclude from transfer.
+    /// Patterns to exclude from source uploads, not artifact retrieval.
     #[serde(default = "default_excludes")]
     pub exclude_patterns: Vec<String>,
-    /// Literal directories relative to the Cargo target root to omit from
-    /// artifact return. Additive to built-in cache exclusions; never applied
-    /// to source uploads or inherited from their exclude patterns.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Literal directories to omit from Cargo target retrieval, relative to
+    /// the target root. Additive to built-in cache exclusions and independent
+    /// of source-upload patterns. Required-output overlap is checked when
+    /// planning retrieval; these paths never authorize omitting an output.
+    #[serde(default)]
     pub cargo_retrieval_exclude_dirs: Vec<String>,
     /// Built-in default exclude patterns that a custom `exclude_patterns` list
     /// omits on purpose (for example `*.pem` when TLS test fixtures must reach
@@ -3739,27 +3740,37 @@ impl Default for TransferConfig {
 }
 
 impl TransferConfig {
-    /// Keep retrieval policy anchored and literal. A wildcard or an aliasing
-    /// spelling cannot establish that every required Cargo output survives.
+    /// Validate the literal syntax and bounds of Cargo retrieval exclusions.
+    ///
+    /// This does not establish that a directory is safe to exclude for a
+    /// particular command. Retrieval planning must also protect that command's
+    /// required outputs and priority includes before emitting any filter rule.
     pub fn validate_cargo_retrieval_exclude_dirs(&self) -> Result<(), String> {
+        const KEY: &str = "transfer.cargo_retrieval_exclude_dirs";
         if self.cargo_retrieval_exclude_dirs.len() > 128 {
-            return Err(
-                "transfer.cargo_retrieval_exclude_dirs accepts at most 128 directories".into(),
-            );
+            return Err(format!("{KEY} accepts at most 128 directories"));
         }
+        let mut seen = std::collections::BTreeSet::new();
         for (index, directory) in self.cargo_retrieval_exclude_dirs.iter().enumerate() {
-            if directory.is_empty()
-                || directory.len() > 4096
+            // Keep rsync and the local artifact matcher on the same literal
+            // spelling. Interior spaces and Unicode are allowed; escapes,
+            // globs, absolute paths and path normalization are not.
+            if directory.len() > 4096
                 || directory.trim() != directory
+                || directory.contains(['\\', '*', '?', '[', ']', ':'])
                 || directory.chars().any(char::is_control)
-                || directory.contains(['\\', ':', '*', '?', '[', ']'])
                 || directory
                     .split('/')
                     .any(|part| matches!(part, "" | "." | ".."))
             {
                 return Err(format!(
-                    "transfer.cargo_retrieval_exclude_dirs[{index}] must be a literal target-relative directory without traversal, glob syntax, or leading/trailing slashes"
+                    "{KEY}[{index}] must be a literal target-relative directory of at most \
+                     4096 bytes, without globs, escapes, control characters, a leading or \
+                     trailing slash, surrounding whitespace, or . / .. components: {directory:?}"
                 ));
+            }
+            if !seen.insert(directory) {
+                return Err(format!("{KEY}[{index}] duplicates directory {directory:?}"));
             }
         }
         Ok(())
@@ -7237,6 +7248,111 @@ retry_max = 2
         let _guard = test_guard!();
         let config = TransferConfig::default();
         assert_eq!(config.remote_base, "/data/tmp/rch");
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_default_and_roundtrip() {
+        let _guard = test_guard!();
+        let legacy: TransferConfig = serde_json::from_str("{}").unwrap();
+        assert!(legacy.cargo_retrieval_exclude_dirs.is_empty());
+        assert_eq!(legacy.exclude_patterns, default_excludes());
+        assert!(legacy.validate_cargo_retrieval_exclude_dirs().is_ok());
+        // Preserve an explicit empty list when a project overrides a user
+        // policy and is later rewritten by another configuration command.
+        let empty = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(empty["cargo_retrieval_exclude_dirs"], serde_json::json!([]));
+
+        let config = TransferConfig {
+            cargo_retrieval_exclude_dirs: vec![
+                "debug/.wrapper-shims".into(),
+                "aarch64-unknown-linux-gnu/release/.kache-build-script-shims".into(),
+                "release-perf/cache with spaces/缓存".into(),
+            ],
+            ..legacy
+        };
+        assert!(config.validate_cargo_retrieval_exclude_dirs().is_ok());
+        let roundtrip: TransferConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.cargo_retrieval_exclude_dirs,
+            config.cargo_retrieval_exclude_dirs
+        );
+        assert_eq!(roundtrip.exclude_patterns, default_excludes());
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_reject_nonliteral_or_ambiguous_paths() {
+        let _guard = test_guard!();
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "/debug/cache",
+            "debug/cache/",
+            " debug/cache",
+            "debug/cache ",
+            "debug//cache",
+            "./debug/cache",
+            "debug/./cache",
+            "debug/../cache",
+            "debug/*",
+            "debug/ca?he",
+            "debug/[cache]",
+            "debug/cache]",
+            "debug\\cache",
+            "C:/cache",
+            "debug/cache\n",
+            "debug/cache\r",
+            "debug/cache\0",
+        ] {
+            let config = TransferConfig {
+                cargo_retrieval_exclude_dirs: vec![invalid.into()],
+                ..TransferConfig::default()
+            };
+            let error = config.validate_cargo_retrieval_exclude_dirs().unwrap_err();
+            assert!(error.contains("transfer.cargo_retrieval_exclude_dirs[0]"));
+        }
+        let duplicate = TransferConfig {
+            cargo_retrieval_exclude_dirs: vec![
+                "debug/.wrapper-shims".into(),
+                "debug/.wrapper-shims".into(),
+            ],
+            ..TransferConfig::default()
+        };
+        assert!(
+            duplicate
+                .validate_cargo_retrieval_exclude_dirs()
+                .unwrap_err()
+                .contains("duplicates")
+        );
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_enforce_count_and_byte_limits() {
+        let _guard = test_guard!();
+        let mut config = TransferConfig {
+            cargo_retrieval_exclude_dirs: (0..128)
+                .map(|index| format!("debug/.cache-{index}"))
+                .collect(),
+            ..TransferConfig::default()
+        };
+        assert!(config.validate_cargo_retrieval_exclude_dirs().is_ok());
+        config
+            .cargo_retrieval_exclude_dirs
+            .push("debug/.extra".into());
+        assert!(
+            config
+                .validate_cargo_retrieval_exclude_dirs()
+                .unwrap_err()
+                .contains("at most 128")
+        );
+        config.cargo_retrieval_exclude_dirs = vec!["a".repeat(4096)];
+        assert!(config.validate_cargo_retrieval_exclude_dirs().is_ok());
+        config.cargo_retrieval_exclude_dirs[0].push('a');
+        assert!(config.validate_cargo_retrieval_exclude_dirs().is_err());
+        // The bound is bytes, not Unicode scalar values.
+        config.cargo_retrieval_exclude_dirs = vec!["é".repeat(2049)];
+        assert!(config.validate_cargo_retrieval_exclude_dirs().is_err());
     }
 
     #[test]

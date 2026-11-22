@@ -31,13 +31,14 @@ pub(in crate::hook) fn selection(
     parse_selection(kind, command, true)
 }
 
-/// The same literal Cargo grammar, with complete build selections permitted.
-/// This does not narrow transfer globs or opt into caller JSON projection.
-pub(in crate::hook) fn retrieval_capture_formats(
+/// Parse the bounded Cargo forms whose complete JSON receipts can protect an
+/// opt-in retrieval exclusion. Broad target selectors are allowed here without
+/// changing the named-output transfer optimization or legacy capture grammar.
+pub(in crate::hook) fn retrieval_selection(
     kind: Option<CompilationKind>,
     command: &str,
-) -> Option<Vec<String>> {
-    Some(parse_selection(kind, command, false)?.message_formats)
+) -> Option<NamedCargoSelection> {
+    parse_selection(kind, command, false)
 }
 
 fn parse_selection(
@@ -86,7 +87,12 @@ fn parse_selection(
                 }
                 benches.insert(name);
             }
-            "--no-run" if kind != CompilationKind::CargoBuild && inline.is_none() => {
+            "--no-run"
+                if matches!(
+                    kind,
+                    CompilationKind::CargoTest | CompilationKind::CargoBench
+                ) && inline.is_none() =>
+            {
                 no_run = true;
             }
             "--bins" | "--examples" | "--lib" | "--tests" | "--benches" | "--all-targets"
@@ -145,8 +151,9 @@ fn parse_selection(
                 && ["-p", "-j", "-F"]
                     .iter()
                     .any(|prefix| arg.starts_with(*prefix) && arg.len() > prefix.len()) => {}
-            // Includes --bins/--examples/--lib/--all-targets and test selectors,
-            // --timings, --config, -Z, output-dir overrides and `--` passthrough.
+            // The named optimization rejects broad selectors. Both modes
+            // reject --timings, --config, -Z, output-dir overrides and `--`
+            // passthrough, whose output contract is not established here.
             _ => return None,
         }
     }
@@ -161,7 +168,11 @@ fn parse_selection(
     // Executing tests/benches produces a result stream, not caller-owned
     // executables. Only Cargo's own --no-run can enable output capture; a
     // similarly named test-program argument after `--` never reaches here.
-    if kind != CompilationKind::CargoBuild && !no_run {
+    if matches!(
+        kind,
+        CompilationKind::CargoTest | CompilationKind::CargoBench
+    ) && !no_run
+    {
         return None;
     }
     Some(NamedCargoSelection {
@@ -358,6 +369,7 @@ fn build_arguments(kind: CompilationKind, command: &str) -> Option<Vec<String>> 
         (CompilationKind::CargoBuild, "build" | "b")
             | (CompilationKind::CargoTest, "test" | "t")
             | (CompilationKind::CargoBench, "bench")
+            | (CompilationKind::CargoZigbuild, "zigbuild")
     ) {
         return None;
     }

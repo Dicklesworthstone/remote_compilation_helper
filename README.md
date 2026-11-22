@@ -872,7 +872,7 @@ Primary files:
 - User config: `~/.config/rch/config.toml`
 - Worker list: `~/.config/rch/workers.toml`
 - Project override: `.rch/config.toml`
-- Optional project excludes: `.rchignore`
+- Optional project excludes: `.rchignore` (see Cargo retrieval exclusions below)
 
 Precedence (highest first):
 
@@ -883,6 +883,39 @@ Precedence (highest first):
 5. Project config
 6. User config
 7. Built-in defaults
+
+### Cargo Retrieval Exclusions
+
+To keep a worker's private wrapper caches out of Cargo artifact downloads,
+add exact target-relative directories to `.rch/config.toml`:
+
+```toml
+[transfer]
+cargo_retrieval_exclude_dirs = [
+  "debug/.wrapper-shims",
+  "debug/.kache-build-script-shims",
+]
+```
+
+This opt-in policy adds to the built-in Cargo cache exclusions and survives
+`cargo clean`. Paths are literal, without `target/`, leading/trailing slashes
+or globs. Include the target triple and profile for cross-compilation or custom
+profiles, such as `aarch64-unknown-linux-gnu/release/.wrapper-shims`. RCH rejects
+rules that could hide required outputs or priority includes, and uses the same
+admitted selection for preflight, transfer, staged validation and recovery.
+Supported commands are exactly parsed `cargo build`, `cargo zigbuild`,
+`cargo test --no-run` and `cargo bench --no-run` with durable POSIX worker
+retrieval. Full builds use the default message format; existing named-executable
+JSON requests remain supported. RCH checks the complete Cargo-reported output
+set before download. Unsupported artifact-producing commands or retrieval paths
+refuse exclusions.
+
+`[transfer] exclude_patterns` affects source uploads only. A project-root
+`.rchignore` is not inherited by the separate Cargo target pull. That pull's
+existing directory-only `.rchignore` rules come from the local target directory,
+where `cargo clean` removes the policy file. See the
+[configuration guide](docs/guides/configuration.md#cargo-retrieval-exclusions)
+for validation and precedence details.
 
 ### Canonical Project Root
 
@@ -973,6 +1006,9 @@ remote_base = "/data/tmp/rch"
 # retrieval_staging_dir = "/mnt/controller-storage/rch-retrieval"
 # Free-space reserve in addition to the selected uncompressed outputs.
 # retrieval_min_free_bytes = 67108864
+# Optional literal worker-private directories relative to the Cargo target root.
+# Adds to built-in cache exclusions; rules that could hide required outputs refuse.
+# cargo_retrieval_exclude_dirs = ["debug/.wrapper-shims"]
 # Optional per-attempt source-sync cap. When unset, the default is payload-aware:
 # 30 seconds plus one second per MiB, capped at one hour.
 # sync_timeout_ms = 120000

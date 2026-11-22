@@ -680,6 +680,7 @@ mod tests {
                 retrieval_min_free_bytes: 0,
                 compression_level: 3,
                 exclude_patterns: vec!["target/".to_string()],
+                cargo_retrieval_exclude_dirs: Vec::new(),
                 remote_base: "/tmp/rch".to_string(),
                 max_transfer_mb: None,
                 max_transfer_time_ms: None,

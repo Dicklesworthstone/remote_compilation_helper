@@ -22,10 +22,10 @@
 //! are private to this module.
 
 use super::artifact_patterns::{
-    artifact_delivery_kind, expected_output_glob_list, get_custom_target_artifact_patterns,
-    get_project_artifact_patterns, kind_has_enumerable_output_contract,
-    kind_produces_transferable_artifacts, sync_back_verified_zero_build_outputs,
-    sync_back_verified_zero_package_archives,
+    artifact_delivery_kind, cargo_capture_for_transfer, cargo_retrieval_patterns,
+    expected_output_glob_list, get_custom_target_artifact_patterns, get_project_artifact_patterns,
+    kind_has_enumerable_output_contract, kind_produces_transferable_artifacts,
+    sync_back_verified_zero_build_outputs, sync_back_verified_zero_package_archives,
 };
 use super::artifact_triple::{describe_findings, foreign_target_artifacts};
 use super::cargo_output_contract::CargoOutputCapture;
@@ -1076,32 +1076,27 @@ async fn execute_remote_compilation_inner(
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
-    if !transfer_config.cargo_retrieval_exclude_dirs.is_empty()
-        && super::artifact_patterns::cargo_retrieval_exclusions_apply(artifact_delivery_kind(
-            kind,
-            Some(command),
-        ))
+    let requested_capture = cargo_capture_for_transfer(kind, command, &transfer_config)?;
+    if requested_capture
+        .as_ref()
+        .is_some_and(CargoOutputCapture::supports_retrieval_exclusions)
     {
+        // The nondurable/Windows paths cannot retain the complete producer
+        // receipt. Refuse before uploading or executing rather than applying
+        // unproven exclusions to their broad artifact selection.
         anyhow::ensure!(
-            forwarded_cargo_target_dir.is_some(),
-            "Cargo retrieval exclusions require a resolved target directory"
+            durable_lease.is_some()
+                && !WorkerPlatform::from_worker(&worker_config).is_windows()
+                && !super::ssh::should_skip_remote_preflight(&worker_config),
+            "Cargo retrieval exclusions require durable POSIX retrieval with a complete Cargo output receipt"
         );
-        let baseline = get_custom_target_artifact_patterns(kind, Some(command));
-        if !baseline.is_empty() {
-            anyhow::ensure!(
-                durable_lease.is_some()
-                    && !WorkerPlatform::from_worker(&worker_config).is_windows()
-                    && !super::ssh::should_skip_remote_preflight(&worker_config),
-                "Cargo retrieval exclusions require durable Unix execution and complete output evidence"
-            );
-            super::artifact_patterns::cargo_retrieval_patterns(&baseline, &transfer_config, None)?;
-            CargoOutputCapture::for_retrieval_policy(
-                kind,
-                command,
-                &baseline,
-                &transfer_config.cargo_retrieval_exclude_dirs,
-            )?;
-        }
+        let custom_target = forwarded_cargo_target_dir.is_some();
+        let patterns = if custom_target {
+            get_custom_target_artifact_patterns(kind, Some(command))
+        } else {
+            get_project_artifact_patterns(kind, Some(command), false)
+        };
+        cargo_retrieval_patterns(&patterns, &transfer_config, custom_target, None)?;
     }
     if let Some(destination) = result_destination {
         anyhow::ensure!(

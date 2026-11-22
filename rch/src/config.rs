@@ -158,8 +158,8 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-// Version 9 adds opt-in job interception rules. Only on-disk values are
-// cached; runtime overrides and rule validation still run on every load.
+// Version 10 adds explicit Cargo retrieval directory exclusions. Only on-disk
+// values are cached; runtime overrides and validation still run on every load.
 const CACHE_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4180,6 +4180,130 @@ identity_file = "/tmp/id_ed25519"
             loaded.sources.get("transfer.exclude_defaults_acknowledged"),
             Some(&ConfigValueSource::UserConfig(user_path.clone()))
         );
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_layer_independently_and_can_be_cleared() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let user_path = dir.join("user.toml");
+        let project_path = dir.join("project.toml");
+        let key = "transfer.cargo_retrieval_exclude_dirs";
+        let env_overrides = HashMap::new();
+        let defaults =
+            load_config_with_sources_from_paths(None, None, Some(&env_overrides)).unwrap();
+        assert!(
+            defaults
+                .config
+                .transfer
+                .cargo_retrieval_exclude_dirs
+                .is_empty()
+        );
+        assert_eq!(defaults.sources.get(key), Some(&ConfigValueSource::Default));
+        std::fs::write(
+            &user_path,
+            "[transfer]\nexclude_patterns = ['target/', '.git/']\n\
+             cargo_retrieval_exclude_dirs = ['debug/.user-cache']\n",
+        )
+        .unwrap();
+        std::fs::write(&project_path, "[transfer]\ncompression_level = 6\n").unwrap();
+        let inherited = load_config_with_sources_from_paths(
+            Some(&user_path),
+            Some(&project_path),
+            Some(&env_overrides),
+        )
+        .unwrap();
+        assert_eq!(
+            inherited.config.transfer.cargo_retrieval_exclude_dirs,
+            ["debug/.user-cache"]
+        );
+        assert_eq!(
+            inherited.sources.get(key),
+            Some(&ConfigValueSource::UserConfig(user_path.clone()))
+        );
+        std::fs::write(
+            &project_path,
+            "[transfer]\ncargo_retrieval_exclude_dirs = ['debug/.wrapper-shims']\n",
+        )
+        .unwrap();
+        let project = load_config_with_sources_from_paths(
+            Some(&user_path),
+            Some(&project_path),
+            Some(&env_overrides),
+        )
+        .unwrap();
+        assert_eq!(
+            project.config.transfer.cargo_retrieval_exclude_dirs,
+            ["debug/.wrapper-shims"]
+        );
+        assert_eq!(
+            project.config.transfer.exclude_patterns,
+            ["target/", ".git/"]
+        );
+        assert_eq!(
+            project.sources.get(key),
+            Some(&ConfigValueSource::ProjectConfig(project_path.clone()))
+        );
+        std::fs::write(
+            &project_path,
+            "[transfer]\ncargo_retrieval_exclude_dirs = []\n",
+        )
+        .unwrap();
+        let cleared = load_config_with_sources_from_paths(
+            Some(&user_path),
+            Some(&project_path),
+            Some(&env_overrides),
+        )
+        .unwrap();
+        assert!(
+            cleared
+                .config
+                .transfer
+                .cargo_retrieval_exclude_dirs
+                .is_empty()
+        );
+        assert_eq!(
+            cleared.config.transfer.exclude_patterns,
+            ["target/", ".git/"]
+        );
+        assert_eq!(
+            cleared.sources.get(key),
+            Some(&ConfigValueSource::ProjectConfig(project_path.clone()))
+        );
+        std::fs::write(&project_path, toml::to_string(&cleared.config).unwrap()).unwrap();
+        let roundtrip =
+            load_config_uncached_from_paths(Some(&user_path), Some(&project_path)).unwrap();
+        assert!(roundtrip.transfer.cargo_retrieval_exclude_dirs.is_empty());
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_reject_invalid_configuration() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("config.toml");
+        for invalid in ["debug/*", "../cache", "debug/.cache/"] {
+            std::fs::write(
+                &path,
+                format!("[transfer]\ncargo_retrieval_exclude_dirs = ['{invalid}']\n"),
+            )
+            .unwrap();
+            let validation = validate_rch_config_file(&path);
+            assert!(
+                validation
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("transfer.cargo_retrieval_exclude_dirs"))
+            );
+            let error = load_config_uncached_from_paths(None, Some(&path)).unwrap_err();
+            assert!(error.to_string().contains("cargo_retrieval_exclude_dirs"));
+        }
+        std::fs::write(
+            &path,
+            "[transfer]\ncargo_retrieval_exclude_dirs = ['debug/.wrapper-shims']\n",
+        )
+        .unwrap();
+        assert!(validate_rch_config_file(&path).errors.is_empty());
+        assert!(load_config_uncached_from_paths(None, Some(&path)).is_ok());
     }
 
     #[test]

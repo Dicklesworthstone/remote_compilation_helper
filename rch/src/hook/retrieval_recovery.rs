@@ -3,7 +3,9 @@ use super::super::artifact_patterns::build_system::{BuildSystemOutputDiscovery, 
 use super::super::artifact_patterns::direct_compiler::{
     NativeOutputContract, NativeOutputPlatform, native_output_contract,
 };
-use super::super::artifact_patterns::{cargo_retrieval_exclusions_apply, cargo_retrieval_patterns};
+use super::super::artifact_patterns::{
+    validate_cargo_retrieval_exclusion_outputs, validate_cargo_retrieval_exclusion_patterns,
+};
 use super::super::cargo_output_contract::{
     CargoCallerPaths, CargoOutputCapture, CargoOutputContract,
 };
@@ -660,7 +662,7 @@ impl RecoveryRecipe {
             .cargo_output_capture
             .as_ref()
             .and_then(CargoOutputCapture::retrieval_baseline);
-        if !cargo_retrieval_exclusions_apply(self.kind) {
+        if !kind_has_enumerable_output_contract(self.kind) {
             anyhow::ensure!(
                 capture_baseline.is_none(),
                 "Cargo retrieval capture belongs to an unrelated command"
@@ -674,18 +676,22 @@ impl RecoveryRecipe {
             );
             return Ok(());
         }
-        let mut phases = self
-            .phases
-            .iter()
-            .filter(|phase| phase.custom_target && !phase.patterns.is_empty());
+        anyhow::ensure!(
+            self.cargo_output_capture
+                .as_ref()
+                .is_some_and(CargoOutputCapture::supports_retrieval_exclusions),
+            "Cargo retrieval exclusions lack complete admitted output evidence"
+        );
+        let mut phases = self.phases.iter().filter(|phase| phase.output_gate);
         let phase = phases
             .next()
-            .context("Cargo retrieval exclusions lost their target phase")?;
+            .context("Cargo retrieval exclusions lost their output phase")?;
         let baseline =
             capture_baseline.context("Cargo retrieval exclusions lack complete output capture")?;
         let expected = cargo_retrieval_patterns(
             baseline,
             &self.transfer,
+            phase.custom_target,
             phase
                 .cargo_outputs
                 .as_ref()
@@ -702,7 +708,11 @@ impl RecoveryRecipe {
         );
         // Once exact priority rules are installed, none may override a
         // configured exclusion. Recovery validates this before any transfer.
-        cargo_retrieval_patterns(&phase.patterns, &self.transfer, None)?;
+        validate_cargo_retrieval_exclusion_patterns(
+            &self.transfer,
+            &phase.patterns,
+            phase.custom_target,
+        )?;
         Ok(())
     }
 
@@ -1765,6 +1775,12 @@ impl RecoverySession {
         // test/bench carve-out, and publication then skipped the very
         // executables the live retrieval fetched (bd-b7lot, seen live).
         let delivery_kind = artifact_delivery_kind(kind, Some(command));
+        let cargo_exclusions = kind_has_enumerable_output_contract(delivery_kind)
+            && !transfer.cargo_retrieval_exclude_dirs.is_empty();
+        anyhow::ensure!(
+            !cargo_exclusions || !WorkerPlatform::from_worker(worker).is_windows(),
+            "Cargo retrieval exclusions require durable POSIX output evidence"
+        );
         let lease = writer.snapshot();
         let intent = decode_recipe_value(
             lease
@@ -1880,27 +1896,34 @@ impl RecoverySession {
         // Observe only the admitted staged set under the publication lock,
         // before its first write. Old journals still resolve pending renames
         // against their original predecessor before any baseline is refreshed.
-        let target_baseline = phases
+        let output_baseline = phases
             .iter()
-            .find(|phase| phase.custom_target)
+            .find(|phase| phase.output_gate)
             .map(|phase| phase.patterns.as_slice())
             .unwrap_or(&[]);
-        let restricted = cargo_retrieval_exclusions_apply(delivery_kind);
         let cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
             kind,
             command,
-            target_baseline,
-            if restricted {
+            output_baseline,
+            if cargo_exclusions {
                 &transfer.cargo_retrieval_exclude_dirs
             } else {
                 &[]
             },
         )?;
+        anyhow::ensure!(
+            !cargo_exclusions
+                || cargo_output_capture
+                    .as_ref()
+                    .is_some_and(CargoOutputCapture::supports_retrieval_exclusions),
+            "Cargo retrieval exclusions require complete admitted output evidence"
+        );
         for phase in phases
             .iter_mut()
-            .filter(|phase| restricted && phase.custom_target)
+            .filter(|phase| cargo_exclusions && phase.output_gate)
         {
-            phase.patterns = cargo_retrieval_patterns(&phase.patterns, &transfer, None)?;
+            phase.patterns =
+                cargo_retrieval_patterns(&phase.patterns, &transfer, phase.custom_target, None)?;
         }
         anyhow::ensure!(
             cargo_output_capture.is_none()
@@ -2320,11 +2343,11 @@ impl RecoverySession {
                 .position(|phase| phase.output_gate)
                 .context("captured Cargo execution has no artifact output root")?;
             let phase = &self.recipe.phases[index];
-            if phase.custom_target {
-                cargo_retrieval_patterns(
-                    &phase.patterns,
+            if capture.supports_retrieval_exclusions() {
+                validate_cargo_retrieval_exclusion_outputs(
                     &self.recipe.transfer,
-                    Some(&contract.required_files),
+                    phase.custom_target,
+                    &contract.required_files,
                 )?;
             }
             if let Some(existing) = &phase.cargo_outputs {
@@ -3106,6 +3129,7 @@ impl RecoverySession {
     }
 
     pub(crate) fn starting_execution(&mut self) -> anyhow::Result<()> {
+        self.recipe.validate_cargo_retrieval_policy()?;
         self.verify_result_destination()?;
         anyhow::ensure!(
             self.recipe.prepared
@@ -3437,6 +3461,19 @@ impl RecoverySession {
             );
             let (admitted, outside) =
                 policy.partition_staged_artifact_paths(&files, &phase.patterns)?;
+            // Presence in staging is not enough: a changed local ignore file
+            // can now reject a required output selected by the saved baseline.
+            // Refuse before any publication instead of silently skipping it.
+            if let Some(contract) = &phase.cargo_outputs
+                && let Some(path) = outside
+                    .iter()
+                    .find(|path| contract.required_files.contains(*path))
+            {
+                anyhow::bail!(
+                    "required Cargo output is outside the effective publication policy: {}",
+                    path.display()
+                );
+            }
             for path in &outside {
                 publication_runtime::checkpoint()?;
                 // Warn: a skip means collector and recipe disagree about the
@@ -5833,6 +5870,60 @@ mod tests {
         )
         .unwrap();
         (directory, writer, worker)
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_reject_complete_capture_for_non_output_kind() {
+        let _guard = test_guard!();
+        let (directory, writer, worker) = preparation_fixture();
+        let remote_source = "/data/projects/source-recovery";
+        let target = directory.path().join("target");
+        let transfer = TransferConfig {
+            cargo_retrieval_exclude_dirs: vec!["debug/.wrapper-shims".into()],
+            ..TransferConfig::default()
+        };
+        let pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "cargo-exclusion-kind".into(),
+            "abc123".into(),
+            transfer.clone(),
+        )
+        .with_remote_path_override(remote_source);
+        let session = RecoverySession::prepare(
+            &writer,
+            &worker,
+            &pipeline,
+            vec![remote_source.into()],
+            None,
+            None,
+            None,
+            transfer,
+            directory.path().to_owned(),
+            Some(&target),
+            Some(CompilationKind::CargoBuild),
+            "cargo build",
+            &[],
+            "abc123".into(),
+        )
+        .unwrap();
+        assert!(session.recipe.validate_cargo_retrieval_policy().is_ok());
+        assert!(
+            session
+                .recipe
+                .cargo_output_capture
+                .as_ref()
+                .unwrap()
+                .supports_retrieval_exclusions()
+        );
+        for kind in [None, Some(CompilationKind::CargoCheck)] {
+            let mut invalid = session.recipe.clone();
+            invalid.kind = kind;
+            writer
+                .set_recovery(invalid.storage_value().unwrap())
+                .unwrap();
+            let error = load_recipe(&writer).unwrap_err();
+            assert!(error.to_string().contains("unrelated command"));
+        }
     }
 
     #[test]
@@ -11413,7 +11504,7 @@ func TestValue(t *testing.T) {{
         )
         .unwrap();
         session.recipe.phases[0].patterns =
-            cargo_retrieval_patterns(&baseline, &session.recipe.transfer, None).unwrap();
+            cargo_retrieval_patterns(&baseline, &session.recipe.transfer, true, None).unwrap();
         session.persist().unwrap();
         let record = |kind: &str, name: &str, relative: &str, executable: bool| {
             let output = remote.path().join(relative);
@@ -11687,6 +11778,380 @@ func TestValue(t *testing.T) {{
         }
         receipt.extend_from_slice(b"{\"reason\":\"build-finished\",\"success\":true}\n");
         receipt
+    }
+
+    fn cargo_retrieval_publication_fixture(
+        remote_root: &Path,
+        custom_target: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, RecoverySession) {
+        let (directory, stage_owner, mut session) = captured_publication_fixture(
+            CompilationKind::CargoBuild,
+            "cargo build --bin app --bin helper --profile lean",
+            remote_root,
+            custom_target,
+        );
+        let kind = Some(CompilationKind::CargoBuild);
+        let command = "cargo build --workspace --profile lean";
+        session.recipe.transfer.cargo_retrieval_exclude_dirs =
+            vec!["lean/.worker-cache".to_owned()];
+        let patterns = if custom_target {
+            get_custom_target_artifact_patterns(kind, Some(command))
+        } else {
+            get_project_artifact_patterns(kind, Some(command), false)
+        };
+        session.recipe.cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
+            kind,
+            command,
+            &patterns,
+            &session.recipe.transfer.cargo_retrieval_exclude_dirs,
+        )
+        .unwrap();
+        session.recipe.phases[0].patterns =
+            cargo_retrieval_patterns(&patterns, &session.recipe.transfer, custom_target, None)
+                .unwrap();
+        session.persist().unwrap();
+        (directory, stage_owner, session)
+    }
+
+    // Filesystem and durable-journal regressions use synthetic producer
+    // receipts; they do not claim worker execution or replay a Cargo command.
+    #[test]
+    fn cargo_retrieval_recovery_keeps_admitted_exclusions_after_config_changes() {
+        for custom_target in [false, true] {
+            let (directory, stage_owner, session) = cargo_retrieval_publication_fixture(
+                Path::new("/worker/cargo-output"),
+                custom_target,
+            );
+            let _directory = directory.keep();
+            let _stage_owner = stage_owner.keep();
+            let original = serde_json::to_value(&session.recipe).unwrap();
+            let original_stage = session.stage(0);
+            let mut recovered = reload_publication(&session);
+            assert!(recovered.needs_cargo_artifact_evidence());
+            let mut current = recovered.recipe.transfer.clone();
+            current.cargo_retrieval_exclude_dirs = vec!["lean/.different-cache".to_owned()];
+            current.exclude_patterns = vec!["target/".to_owned(), "lean/".to_owned()];
+            recovered.apply_retrieval_config(&current).unwrap();
+            let recovered = reload_publication(&recovered);
+            assert_eq!(serde_json::to_value(&recovered.recipe).unwrap(), original);
+            assert_eq!(recovered.stage(0), original_stage);
+            assert!(
+                recovered
+                    .recipe
+                    .cargo_output_capture
+                    .as_ref()
+                    .unwrap()
+                    .supports_retrieval_exclusions()
+            );
+            let prefix = if custom_target { "" } else { "target/" };
+            let excluded = PathBuf::from(format!("{prefix}lean/.worker-cache/helper"));
+            let newly_configured = PathBuf::from(format!("{prefix}lean/.different-cache/helper"));
+            let executable = PathBuf::from(format!("{prefix}lean/app"));
+            let phase = &recovered.recipe.phases[0];
+            let pipeline = TransferPipeline::new(
+                phase.local.clone(),
+                "retained-cargo-policy".into(),
+                recovered.recipe.identity.clone(),
+                recovered.recipe.transfer.clone(),
+            );
+            let (admitted, outside) = pipeline
+                .partition_staged_artifact_paths(
+                    &[
+                        excluded.clone(),
+                        newly_configured.clone(),
+                        executable.clone(),
+                    ],
+                    &phase.patterns,
+                )
+                .unwrap();
+            assert_eq!(outside, vec![excluded]);
+            assert_eq!(admitted, vec![newly_configured, executable]);
+            assert!(!recovered.writer.snapshot().terminal_acknowledged);
+            assert!(!recovered.recipe.sources_released);
+        }
+    }
+
+    #[test]
+    fn cargo_retrieval_recovery_rejects_reported_output_collision_before_policy_mutation() {
+        for custom_target in [false, true] {
+            let remote_root = Path::new("/worker/cargo-output");
+            let (directory, stage_owner, mut session) =
+                cargo_retrieval_publication_fixture(remote_root, custom_target);
+            let _directory = directory.keep();
+            let _stage_owner = stage_owner.keep();
+            let prefix = if custom_target { "lean" } else { "target/lean" };
+            let mut stdout = Vec::new();
+            for (name, relative) in [("app", "app"), ("helper", ".worker-cache/helper")] {
+                let path = remote_root.join(prefix).join(relative);
+                let record = serde_json::json!({
+                    "reason": "compiler-artifact",
+                    "target": {"name": name, "kind": ["bin"]},
+                    "filenames": [path], "executable": path, "fresh": true
+                });
+                stdout.extend(serde_json::to_vec(&record).unwrap());
+                stdout.push(b'\n');
+            }
+            stdout.extend_from_slice(b"{\"reason\":\"build-finished\",\"success\":true}\n");
+            let source_sentinel = session.recipe.project_root.join("source-sentinel");
+            let staged_sentinel = session.stage(0).join("retained-partial-copy");
+            std::fs::write(&source_sentinel, b"original source evidence").unwrap();
+            std::fs::write(&staged_sentinel, b"original staged evidence").unwrap();
+            // Retain the completed producer first, as collection does. A
+            // conflict must preserve those bytes without installing + rules.
+            session
+                .retain_cargo_stdout(&stdout, remote_root, None, 0)
+                .unwrap();
+            let original = serde_json::to_value(&session.recipe).unwrap();
+            let journal = std::fs::read(&session.writer.path).unwrap();
+            let error = session
+                .install_complete_cargo_evidence(&crate::transfer::CargoArtifactEvidence {
+                    stdout: stdout.clone(),
+                    remote_root: remote_root.to_owned(),
+                    remote_project_root: None,
+                })
+                .unwrap_err();
+            assert!(error.is::<CargoOutputContractRejected>(), "{error:#}");
+            assert_eq!(serde_json::to_value(&session.recipe).unwrap(), original);
+            assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
+            assert_eq!(
+                std::fs::read(&source_sentinel).unwrap(),
+                b"original source evidence"
+            );
+            assert_eq!(
+                std::fs::read(&staged_sentinel).unwrap(),
+                b"original staged evidence"
+            );
+            let recovered = reload_publication(&session);
+            assert!(recovered.needs_cargo_artifact_evidence());
+            assert_eq!(
+                recovered
+                    .retained_cargo_artifact_evidence()
+                    .unwrap()
+                    .unwrap()
+                    .stdout,
+                stdout
+            );
+            let phase = &recovered.recipe.phases[0];
+            assert!(phase.cargo_outputs.is_none());
+            assert!(
+                !phase
+                    .patterns
+                    .iter()
+                    .any(|pattern| pattern.starts_with("+ "))
+            );
+            assert!(phase.published.is_empty());
+            assert!(phase.pending.is_none());
+            assert!(!phase.complete);
+            assert!(!recovered.recipe.sources_released);
+            assert!(!recovered.writer.snapshot().terminal_acknowledged);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_retrieval_recovery_refuses_required_files_hidden_by_changed_ignore() {
+        let remote_root = Path::new("/worker/cargo-output");
+        let (directory, stage_owner, mut session) =
+            cargo_retrieval_publication_fixture(remote_root, false);
+        let _directory = directory.keep();
+        let _stage_owner = stage_owner.keep();
+        let app = remote_root.join("target/lean/app");
+        let library = remote_root.join("target/lean/deps/libsupport-123.rlib");
+        let mut stdout = Vec::new();
+        for record in [
+            serde_json::json!({
+                "reason":"compiler-artifact",
+                "target":{"name":"app","kind":["bin"]},
+                "filenames":[app], "executable":app, "fresh":true,
+            }),
+            serde_json::json!({
+                "reason":"compiler-artifact",
+                "target":{"name":"support","kind":["lib"]},
+                "filenames":[library], "executable":null, "fresh":true,
+            }),
+        ] {
+            stdout.extend(serde_json::to_vec(&record).unwrap());
+            stdout.push(b'\n');
+        }
+        stdout.extend_from_slice(b"{\"reason\":\"build-finished\",\"success\":true}\n");
+        session
+            .install_complete_cargo_evidence(&crate::transfer::CargoArtifactEvidence {
+                stdout: stdout.clone(),
+                remote_root: remote_root.to_owned(),
+                remote_project_root: None,
+            })
+            .unwrap();
+        assert!(
+            !session.recipe.phases[0]
+                .patterns
+                .iter()
+                .any(|pattern| pattern.starts_with("+ "))
+        );
+        let local = session.recipe.phases[0].local.clone();
+        let stage = session.stage(0);
+        let required = ["target/lean/app", "target/lean/deps/libsupport-123.rlib"];
+        for relative in required {
+            std::fs::create_dir_all(local.join(relative).parent().unwrap()).unwrap();
+            std::fs::create_dir_all(stage.join(relative).parent().unwrap()).unwrap();
+            std::fs::write(local.join(relative), b"previous local output").unwrap();
+            std::fs::write(stage.join(relative), relative.as_bytes()).unwrap();
+        }
+        let source_sentinel = local.join("source-sentinel");
+        std::fs::write(&source_sentinel, b"original source evidence").unwrap();
+
+        // Model a disconnect after both outputs arrived, followed by a local
+        // ignore change. Every required byte remains in the owned stage, but
+        // the effective publication policy now excludes the library alone.
+        let mut recovered = reload_publication(&session);
+        let ignore = local.join(".rchignore");
+        std::fs::write(&ignore, b"deps/\n").unwrap();
+        recovered.verify_cargo_outputs(0).unwrap();
+        let original = serde_json::to_value(&recovered.recipe).unwrap();
+        let journal = std::fs::read(&recovered.writer.path).unwrap();
+        let error = recovered.publish("project").await.unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "required Cargo output is outside the effective publication policy: target/lean/deps/libsupport-123.rlib"
+        ));
+        assert!(recovered.returned(0).is_err());
+        assert_eq!(serde_json::to_value(&recovered.recipe).unwrap(), original);
+        assert_eq!(std::fs::read(&recovered.writer.path).unwrap(), journal);
+        for relative in required {
+            assert_eq!(
+                std::fs::read(local.join(relative)).unwrap(),
+                b"previous local output"
+            );
+            assert_eq!(
+                std::fs::read(stage.join(relative)).unwrap(),
+                relative.as_bytes()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&source_sentinel).unwrap(),
+            b"original source evidence"
+        );
+        let phase = &recovered.recipe.phases[0];
+        assert!(phase.published.is_empty());
+        assert!(phase.pending.is_none());
+        assert!(phase.publication_journal.is_none());
+        assert!(!phase.complete);
+        assert!(!recovered.recipe.sources_released);
+        assert!(!recovered.writer.snapshot().terminal_acknowledged);
+        assert_eq!(
+            recovered
+                .retained_cargo_artifact_evidence()
+                .unwrap()
+                .unwrap()
+                .stdout,
+            stdout
+        );
+
+        // Clear the conflicting rule without replacing the receipt, phase
+        // policy or staged bytes, then resume the same admitted invocation.
+        std::fs::write(&ignore, b"").unwrap();
+        let mut recovered = reload_publication(&recovered);
+        recovered.publish("project").await.unwrap();
+        for relative in required {
+            assert_eq!(
+                std::fs::read(local.join(relative)).unwrap(),
+                relative.as_bytes()
+            );
+        }
+        recovered.returned(0).unwrap();
+        let recovered = reload_publication(&recovered);
+        assert!(recovered.recipe.phases[0].complete);
+        assert_eq!(recovered.recipe.phases[0].published.len(), required.len());
+        assert_eq!(
+            recovered
+                .retained_cargo_artifact_evidence()
+                .unwrap()
+                .unwrap()
+                .stdout,
+            stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_retrieval_recovery_requires_every_output_before_publishing_nonempty_stage() {
+        let remote_root = Path::new("/worker/cargo-output");
+        let (directory, stage_owner, mut session) =
+            cargo_retrieval_publication_fixture(remote_root, true);
+        let _directory = directory.keep();
+        let _stage_owner = stage_owner.keep();
+        let stdout = cargo_bin_receipt(remote_root, true);
+        session
+            .install_complete_cargo_evidence(&crate::transfer::CargoArtifactEvidence {
+                stdout: stdout.clone(),
+                remote_root: remote_root.to_owned(),
+                remote_project_root: None,
+            })
+            .unwrap();
+        let mut session = reload_publication(&session);
+        let local = session.recipe.phases[0].local.clone();
+        let stage = session.stage(0);
+        std::fs::create_dir_all(local.join("lean")).unwrap();
+        std::fs::create_dir_all(stage.join("lean/deps")).unwrap();
+        std::fs::create_dir_all(stage.join("lean/.worker-cache")).unwrap();
+        for name in ["app", "helper"] {
+            std::fs::write(local.join("lean").join(name), b"previous local output").unwrap();
+        }
+        std::fs::write(stage.join("lean/app"), b"new app").unwrap();
+        std::fs::write(
+            stage.join("lean/deps/libsupport.so"),
+            b"nonempty support output",
+        )
+        .unwrap();
+        std::fs::write(
+            stage.join("lean/.worker-cache/helper"),
+            b"retained private cache",
+        )
+        .unwrap();
+        let journal = std::fs::read(&session.writer.path).unwrap();
+        let error = session.publish("target").await.unwrap_err();
+        assert!(format!("{error:#}").contains("required Cargo output is missing"));
+        assert!(session.returned(0).is_err());
+        assert_eq!(std::fs::read(&session.writer.path).unwrap(), journal);
+        for name in ["app", "helper"] {
+            assert_eq!(
+                std::fs::read(local.join("lean").join(name)).unwrap(),
+                b"previous local output"
+            );
+        }
+        assert!(!local.join("lean/deps/libsupport.so").exists());
+        assert!(!local.join("lean/.worker-cache").exists());
+        assert!(session.recipe.phases[0].published.is_empty());
+        assert!(session.recipe.phases[0].pending.is_none());
+        assert!(!session.recipe.phases[0].complete);
+
+        // Resume the same persisted contract after the missing file arrives;
+        // the retained private cache remains excluded from publication.
+        std::fs::write(stage.join("lean/helper"), b"new helper").unwrap();
+        let mut recovered = reload_publication(&session);
+        recovered.publish("target").await.unwrap();
+        assert_eq!(std::fs::read(local.join("lean/app")).unwrap(), b"new app");
+        assert_eq!(
+            std::fs::read(local.join("lean/helper")).unwrap(),
+            b"new helper"
+        );
+        assert!(!local.join("lean/.worker-cache").exists());
+        assert_eq!(
+            std::fs::read(stage.join("lean/.worker-cache/helper")).unwrap(),
+            b"retained private cache"
+        );
+        let recovered = reload_publication(&recovered);
+        assert!(recovered.recipe.phases[0].complete);
+        assert_eq!(
+            recovered
+                .retained_cargo_artifact_evidence()
+                .unwrap()
+                .unwrap()
+                .stdout,
+            stdout
+        );
+        assert_eq!(
+            recovered.recipe.transfer.cargo_retrieval_exclude_dirs,
+            ["lean/.worker-cache"]
+        );
     }
 
     // These are retained journal/byte-binding regressions, not SSH, compiler,

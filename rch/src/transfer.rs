@@ -23536,6 +23536,127 @@ fn main() {
         assert!(includes.iter().all(|include| !include.starts_with("+ ")));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cargo_retrieval_exclusions_match_preflight_download_and_staged_validation() {
+        let _guard = test_guard!();
+        let owner = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempdir()
+            .unwrap();
+        let source = owner.path().join("worker-target");
+        let selected = [
+            "debug/app",
+            "debug/libapp.rlib",
+            "debug/deps/runtime.so",
+            "debug/.wrapper-shims-extra/keep",
+            "debug/nested/.wrapper-shims/keep",
+            "debug/regular-file",
+        ];
+        let excluded = [
+            "debug/.wrapper-shims/helper.bin",
+            "debug/.kache-build-script-shims/helper.bin",
+            "debug/incremental/cache",
+            "debug/.fingerprint/cache",
+            "debug/build/cache",
+            "debug/app.d",
+        ];
+        for path in selected {
+            let path = source.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"deliverable").unwrap();
+        }
+        for path in excluded {
+            let path = source.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::File::create(path)
+                .unwrap()
+                .set_len(4 * 1024 * 1024)
+                .unwrap();
+        }
+        let patterns = [
+            "- /debug/.wrapper-shims/",
+            "- /debug/.kache-build-script-shims/",
+            "- /debug/regular-file/",
+            "- debug/incremental/",
+            "- debug/.fingerprint/",
+            "- debug/build/",
+            "- *.d",
+            "debug/**",
+        ]
+        .map(String::from);
+        let worker = worker_with_os(None);
+        for streaming in [false, true] {
+            let stage = owner.path().join(format!("stage-{streaming}"));
+            std::fs::create_dir(&stage).unwrap();
+            let pipeline = TransferPipeline::new(
+                stage.clone(),
+                "fixture".into(),
+                "exclusions".into(),
+                TransferConfig {
+                    exclude_patterns: vec!["debug/".into()],
+                    ..Default::default()
+                },
+            );
+            let command = || {
+                let mut command = if streaming {
+                    pipeline.build_retrieve_streaming_command(
+                        &worker,
+                        source.to_str().unwrap(),
+                        &patterns,
+                    )
+                } else {
+                    pipeline.build_retrieve_command(&worker, source.to_str().unwrap(), &patterns)
+                };
+                // Real rsync peers over local pipes, retaining production
+                // filters. This exercises selection, not a worker/SSH fleet.
+                command.args(["-e", r#"sh -c 'if [ "$1" = -l ]; then shift 2; fi; shift; exec "$@"' rch-local-peer"#]);
+                command.env("LC_ALL", "C");
+                command
+            };
+            let mut planning = command();
+            planning.arg("--dry-run");
+            let planned =
+                tokio::time::timeout(Duration::from_secs(15), execute_rsync_attempt(planning))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(planned.status.success(), "{planned:?}");
+            assert_eq!(
+                parse_rsync_selected_size(&String::from_utf8_lossy(&planned.stdout)),
+                Some(selected.len() as u64 * 11)
+            );
+            assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 0);
+            let copied =
+                tokio::time::timeout(Duration::from_secs(15), execute_rsync_attempt(command()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(copied.status.success(), "{copied:?}");
+            for path in selected {
+                assert_eq!(
+                    std::fs::read(stage.join(path)).unwrap(),
+                    b"deliverable",
+                    "{path}"
+                );
+            }
+            for path in excluded {
+                assert!(!stage.join(path).exists(), "worker cache copied: {path}");
+            }
+            let selected_paths = selected.map(PathBuf::from);
+            pipeline
+                .validate_staged_artifact_paths(&selected_paths, &patterns)
+                .unwrap();
+            for path in excluded {
+                assert!(
+                    pipeline
+                        .validate_staged_artifact_paths(&[PathBuf::from(path)], &patterns)
+                        .is_err()
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_priority_include_wins_over_the_cache_exclude_and_nothing_else_does() {
         let pipeline = TransferPipeline::new(

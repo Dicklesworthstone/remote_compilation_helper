@@ -14,29 +14,50 @@ cargo_retrieval_exclude_dirs = [
 ]
 ```
 
-Each entry names an exact directory relative to the resolved Cargo target root,
+Each entry names an exact directory relative to the Cargo target root,
 including custom `CARGO_TARGET_DIR` roots. Cross-compilation and custom profiles
 use their actual directory prefixes, such as
-`aarch64-unknown-linux-gnu/ci-fast/.wrapper-shims`. No globbing, traversal,
-absolute paths, empty components, trailing slashes, backslashes or colons are
-accepted. At most 128 directories of 4096 bytes each are supported. Built-in
-`incremental/`, `.fingerprint/`, `build/` and dep-info exclusions remain active.
-An exclusion does not match a same-prefix sibling or a same-named tree elsewhere.
+`aarch64-unknown-linux-gnu/ci-fast/.wrapper-shims`. Do not add a `target/` prefix:
+a separate target pull anchors rules at its target root, while project-root
+retrieval rebases the same paths under `target/`.
 
-This opt-in applies to artifact-producing Cargo builds and build-only
-`test/bench --no-run`. It supports the bounded literal Cargo build grammar,
-including full workspaces, libraries, multiple binaries, profiles and target
-triples. The Unix durable execution path retains a complete Cargo JSON receipt
-and validates every Cargo-reported selected library, binary and sidecar before
-publishing anything. Required executables and priority includes cannot be
-excluded. Empty, incomplete, malformed or out-of-root output evidence refuses
-publication; one remaining file cannot stand in for a complete build.
+No globbing, traversal, absolute paths, empty components, trailing slashes,
+backslashes, colons, control characters or surrounding whitespace are accepted.
+At most 128 distinct directories of 4096 bytes each are supported. Interior
+spaces and Unicode are allowed. An explicit project list replaces a user list,
+and `cargo_retrieval_exclude_dirs = []` clears it. Built-in `incremental/`,
+`.fingerprint/`, `build/` and dep-info exclusions remain active. An exclusion
+does not match a same-prefix sibling, a same-named tree elsewhere, or a regular
+file with that name. Worker-private directories must be declared; RCH does not
+infer them from names.
 
-Full builds use their normal human output; explicit caller JSON remains limited
-to the existing named-executable contract. Unsupported explicit message formats,
-opaque flags, documentation/package commands and transports without durable
-Cargo evidence refuse before execution. Streaming check, clippy, ordinary test
-reports, non-Cargo commands and explicitly declared job results are unaffected.
+Whole profile or target-triple roots and standard `deps/`, `examples/`, `build/`,
+`doc/`, `package/` and `.dSYM` output subtrees cannot be excluded. Required
+outputs and priority includes remain protected even when built-in cache
+exclusions cover their parent directory.
+
+This opt-in applies to bounded literal `cargo build`, `cargo zigbuild`,
+`cargo test --no-run` and `cargo bench --no-run` invocations, including full
+workspaces, libraries, multiple binaries, profiles and target triples. The
+durable POSIX execution path retains a complete Cargo JSON receipt and validates
+every Cargo-reported selected library, binary and sidecar before publishing
+anything. Empty, incomplete or malformed output evidence refuses publication;
+one remaining file cannot stand in for a complete build.
+
+RCH also refuses publication if an output other than a build script lies outside
+the verified Cargo output roots. Separate build-directory layouts that emit
+libraries or dependencies outside those roots can therefore cause a refusal.
+RCH does not silently discard those outputs. Cargo's `custom-build` records
+describe build scripts, not deliverables; their paths are validated before the
+records are ignored.
+
+Full builds use their default message format and retain normal human output;
+explicit caller JSON remains limited to the existing eligible named-executable
+contract. Unsupported explicit message formats, opaque flags,
+documentation/package commands and transports without durable Cargo evidence,
+including Windows worker retrieval, refuse before execution. Streaming check,
+clippy, ordinary test reports, non-Cargo commands and explicitly declared job
+results are unaffected.
 
 Size planning, payload retrieval, staged-file validation and detached recovery
 use the same persisted selection. Recovery retains the original exclusions even

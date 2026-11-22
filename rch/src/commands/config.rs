@@ -21,6 +21,7 @@ use super::types::{
 
 const SUPPORTED_CONFIG_KEYS: &str = concat!(
     "timeouts.scale, ",
+    "transfer.cargo_retrieval_exclude_dirs, ",
     "general.role, general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.local_slots, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, compilation.allow_local_fallback, compilation.remote_build_jobs, selection.disk_gb_per_slot, selection.weights.disk, transfer.compression_level, transfer.exclude_patterns, transfer.exclude_defaults_acknowledged, environment.allowlist, environment.forward_cargo_profile_settings, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs, path_topology.canonical_root, path_topology.alias_root, layer0.enabled, layer0.release_lto_thin, layer0.release_codegen_units_1, layer0.debug_line_tables_only, api.bind, api.token, api.token_file, api.no_token, api.allow_any_addr, dashboard.url, ",
     "selection.disk_warning_free_ratio, selection.disk_warning_ratio_cap_gb, selection.disk_critical_free_ratio, selection.disk_critical_ratio_cap_gb, ",
     "circuit.failure_threshold, circuit.down_after_failures, circuit.success_threshold, circuit.error_rate_threshold, circuit.window_secs, circuit.open_cooldown_secs, circuit.half_open_max_probes, circuit.command_failure_threshold, circuit.open_cooldown_max_secs, circuit.recovery_probe_interval_secs"
@@ -148,6 +149,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 retrieval_min_free_bytes: config.transfer.retrieval_min_free_bytes,
                 compression_level: config.transfer.compression_level,
                 exclude_patterns: config.transfer.exclude_patterns.clone(),
+                cargo_retrieval_exclude_dirs: config.transfer.cargo_retrieval_exclude_dirs.clone(),
                 remote_base: config.transfer.remote_base.clone(),
                 sync_timeout_ms: config.transfer.sync_timeout_ms,
                 // Transfer optimization (bd-3hho)
@@ -412,6 +414,18 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         println!("    {},", style.value(&format!("\"{}\"", pattern)));
     }
     println!("  ]");
+    println!(
+        "  {} = {}",
+        style.key("cargo_retrieval_exclude_dirs"),
+        format_with_source(
+            "transfer.cargo_retrieval_exclude_dirs",
+            &style.value(&format!(
+                "{:?}",
+                config.transfer.cargo_retrieval_exclude_dirs
+            )),
+            &value_sources
+        )
+    );
     if !config.transfer.exclude_defaults_acknowledged.is_empty() {
         println!(
             "  {} = {}",
@@ -1035,6 +1049,12 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "transfer.cargo_retrieval_exclude_dirs",
+        format!("{:?}", config.transfer.cargo_retrieval_exclude_dirs),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "transfer.exclude_defaults_acknowledged",
         format!("{:?}", config.transfer.exclude_defaults_acknowledged),
         sources,
@@ -1616,6 +1636,13 @@ pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Re
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = parse_string_list(value, key)?;
         }
+        "transfer.cargo_retrieval_exclude_dirs" => {
+            config.transfer.cargo_retrieval_exclude_dirs = parse_string_list(value, key)?;
+            config
+                .transfer
+                .validate_cargo_retrieval_exclude_dirs()
+                .map_err(anyhow::Error::msg)?;
+        }
         "transfer.exclude_defaults_acknowledged" => {
             config.transfer.exclude_defaults_acknowledged = parse_string_list(value, key)?;
         }
@@ -1900,6 +1927,11 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = defaults.transfer.exclude_patterns;
             format!("{:?}", config.transfer.exclude_patterns)
+        }
+        "transfer.cargo_retrieval_exclude_dirs" => {
+            config.transfer.cargo_retrieval_exclude_dirs =
+                defaults.transfer.cargo_retrieval_exclude_dirs;
+            format!("{:?}", config.transfer.cargo_retrieval_exclude_dirs)
         }
         "transfer.exclude_defaults_acknowledged" => {
             config.transfer.exclude_defaults_acknowledged =
@@ -2197,6 +2229,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     "transfer": {
                         "compression_level": config.transfer.compression_level,
                         "exclude_patterns": config.transfer.exclude_patterns,
+                        "cargo_retrieval_exclude_dirs": config.transfer.cargo_retrieval_exclude_dirs,
                     },
                     "environment": {
                         "allowlist": config.environment.allowlist,
@@ -2743,6 +2776,12 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         config.transfer.compression_level,
         defaults.transfer.compression_level,
         "transfer.compression_level"
+    );
+    diff_field!(
+        "transfer.cargo_retrieval_exclude_dirs",
+        format!("{:?}", config.transfer.cargo_retrieval_exclude_dirs),
+        format!("{:?}", defaults.transfer.cargo_retrieval_exclude_dirs),
+        "transfer.cargo_retrieval_exclude_dirs"
     );
 
     // Compare exclude patterns
@@ -3358,6 +3397,62 @@ mod tests {
         let _guard = test_guard!();
         let result = parse_string_list("  a  ,  b  ", "test_key").unwrap();
         assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn cargo_retrieval_exclusions_set_get_reset_and_preserve_rejected_config() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("config.toml");
+        let key = "transfer.cargo_retrieval_exclude_dirs";
+        apply_config_set(&path, "transfer.exclude_patterns", "target/,.git/").unwrap();
+        apply_config_set(
+            &path,
+            key,
+            r#"["debug/.wrapper-shims", "x86_64-unknown-linux-gnu/release/.cache"]"#,
+        )
+        .unwrap();
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        let current: RchConfig = toml::from_str(&bytes).unwrap();
+        assert_eq!(
+            current.transfer.cargo_retrieval_exclude_dirs,
+            [
+                "debug/.wrapper-shims",
+                "x86_64-unknown-linux-gnu/release/.cache"
+            ]
+        );
+        assert_eq!(current.transfer.exclude_patterns, ["target/", ".git/"]);
+        let sources = config::ConfigSourceMap::from([(
+            key.to_string(),
+            ConfigValueSource::UserConfig(path.clone()),
+        )]);
+        let values = collect_value_sources(&current, &sources);
+        let entry = values.iter().find(|entry| entry.key == key).unwrap();
+        assert_eq!(
+            entry.value,
+            format!("{:?}", current.transfer.cargo_retrieval_exclude_dirs)
+        );
+        assert_eq!(
+            entry.source,
+            ConfigValueSource::UserConfig(path.clone()).label()
+        );
+        for invalid in [
+            r#"["debug/*"]"#,
+            r#"["../cache"]"#,
+            r#"["debug/.cache/"]"#,
+            r#"["debug/.cache", "debug/.cache"]"#,
+            r#"[42]"#,
+        ] {
+            assert!(apply_config_set(&path, key, invalid).is_err(), "{invalid}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        }
+        config_reset_at(&path, key, &plain_context()).unwrap();
+        let reset: RchConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(reset.transfer.cargo_retrieval_exclude_dirs.is_empty());
+        assert_eq!(
+            reset.transfer.exclude_patterns,
+            current.transfer.exclude_patterns
+        );
     }
 
     #[test]

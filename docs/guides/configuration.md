@@ -196,19 +196,15 @@ Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
 
 ### `[transfer]`
 - `compression_level` (u32, default `3`) — zstd compression level.
-- `exclude_patterns` (list) — Patterns excluded from source upload. Defaults include:
+- `exclude_patterns` (list) — Patterns excluded from source uploads. Defaults include:
   `target/`, `.git/`, `node_modules/`, common build caches, and
   coverage output. Use `rch config show` to see the full effective list.
-- `cargo_retrieval_exclude_dirs` (list, default `[]`) — Literal directories
-  relative to the Cargo target root that stay on the worker, for example
-  `debug/.wrapper-shims` or `aarch64-unknown-linux-gnu/release/.wrapper-shims`.
-  These add to built-in cache exclusions and never inherit upload exclusions.
-  Successful build and `test/bench --no-run` delivery requires a complete Cargo
-  output receipt; rules overlapping required files or priority includes refuse
-  delivery. Unsupported command/format combinations refuse before execution.
-  Streaming check/test/report paths are unaffected. See
-  [Cargo target exclusions](../recovery-artifact-selection.md#cargo-target-exclusions)
-  for the supported command grammar and immutable recovery behavior.
+- `cargo_retrieval_exclude_dirs` (list, default `[]`) — Literal worker-only
+  directories to omit from Cargo target retrieval, relative to the Cargo target
+  root. Adds to the built-in Cargo cache exclusions and does not inherit or
+  replace source-upload exclusions. See [Cargo retrieval exclusions](#cargo-retrieval-exclusions)
+  and [Artifact selection and recovery](../recovery-artifact-selection.md#cargo-target-exclusions)
+  for the supported commands and immutable recovery behavior.
 - `ssh_server_alive_interval_secs` (u64, optional) — Sets `ssh -o ServerAliveInterval`
   for remote execution and rsync transfers to reduce dropped connections on flaky networks.
 - `ssh_control_persist_secs` (u64, optional) — Positive values opt Unix dispatches
@@ -246,6 +242,75 @@ Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
   detector fails open). `~` is expanded and a bare name is looked up on `PATH`.
   The `RCH_RSYNC_BIN` environment variable overrides this setting. `rch doctor`
   shows the resolved binary and flavour.
+
+#### Cargo retrieval exclusions
+
+Keep worker-private wrapper caches out of downloads with a committed
+`.rch/config.toml` policy:
+
+```toml
+[transfer]
+cargo_retrieval_exclude_dirs = [
+  "debug/.wrapper-shims",
+  "debug/.kache-build-script-shims",
+  "x86_64-unknown-linux-gnu/release/.wrapper-shims",
+]
+```
+
+Each entry is an exact directory path relative to the effective Cargo target
+root, including a profile and target triple where applicable. Do not prefix it
+with `target/` or add a trailing slash. The same paths apply when the target
+directory is relocated with `CARGO_TARGET_DIR`; the policy file remains outside
+that directory and survives `cargo clean`. A separate target pull anchors the
+rules at its target root. Project-root retrieval instead rebases them under
+`target/`; the configured paths are the same in both cases.
+
+Rules are additive to RCH's built-in Cargo cache exclusions. They do not drop
+those defaults, change source uploads, or exclude a regular file merely because
+it has the same name. Worker-private directories are declared by the project;
+RCH does not infer them from names. Whole profile or target-triple roots and
+standard `deps/`, `examples/`, `build/`, `doc/`, `package/` and `.dSYM` output
+subtrees cannot be excluded. Required outputs and priority includes, including
+build-only test executables under `build/`, remain protected.
+
+The durable POSIX worker retrieval path supports exactly parsed `cargo build`,
+`cargo zigbuild`, `cargo test --no-run` and `cargo bench --no-run` invocations.
+Full builds use the default message format; workspace builds, `--target` cross
+builds and custom profiles are supported. Eligible explicitly named executables
+also retain the existing caller-JSON contract. Other explicit message formats,
+unsupported artifact-producing commands and Windows worker retrieval refuse
+exclusions before execution when the required output contract cannot be proven.
+Diagnostic commands and runtime tests without a full Cargo output contract keep
+their existing retrieval behavior.
+
+RCH captures Cargo's completed artifact messages and rejects any rule
+overlapping a reported output before download. RCH also refuses delivery when
+evidence is incomplete or malformed, or libraries or dependencies are emitted
+outside the verified output roots. This includes some separate build-directory
+layouts; those files are never silently dropped. A nonempty transfer does not
+prove that every required output was delivered.
+
+The admitted selection is shared by retrieval preflight, download, staged
+validation and collection recovery. Recovery uses the original job's admitted
+rules; changing this setting later does not rewrite an unfinished job's policy.
+
+Paths must be literal: absolute paths, glob or escape syntax, control
+characters, colons, surrounding whitespace, empty path components, `.` and `..`
+components are invalid. At most 128 distinct paths of at most 4096 bytes each are
+accepted. Interior spaces and Unicode are supported. Project configuration
+replaces a user-configured list; an explicit `cargo_retrieval_exclude_dirs = []`
+clears it while retaining the built-in cache exclusions. Inspect the effective
+setting with `rch config get transfer.cargo_retrieval_exclude_dirs` or
+`rch config show --sources`.
+
+Existing exclusion surfaces have different roots:
+
+| Policy | Scope |
+|--------|-------|
+| `[transfer] exclude_patterns` | Source upload only; never inherited by artifact retrieval. |
+| Project-root `.rchignore` | Source upload, plus guarded directory rules for the project-root retrieval phase. Not inherited by the separate Cargo target pull. |
+| `<local Cargo target dir>/.rchignore` | Guarded directory rules for the Cargo target pull; file-pattern rules are not used for retrieval. This file is removed by `cargo clean`. |
+| `[transfer] cargo_retrieval_exclude_dirs` | Validated exact Cargo target-relative directories for retrieval, stored outside the target tree. |
 
 ### `[circuit]`
 
