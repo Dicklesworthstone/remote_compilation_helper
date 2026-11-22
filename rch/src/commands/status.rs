@@ -229,6 +229,13 @@ fn configured_job_rule(
     else {
         return Ok(None);
     };
+    if matched.fresh_result_dirs
+        && crate::hook::config_local_policy(config, Some(rch_common::CompilationKind::Job))
+            .is_none()
+    {
+        rch_common::admit_preflight::validate_fresh_result_command(command)
+            .map_err(anyhow::Error::msg)?;
+    }
     Ok(Some(ConfiguredJobRule {
         name: matched.rule.name.clone(),
         result_dirs: matched.result_dirs,
@@ -5458,6 +5465,58 @@ output_flag = "--output"
             assert!(classify_diagnostic_command(invalid, &config).is_err());
             assert!(
                 prepare_admit_preflight(invalid, false, Vec::new(), Some(&config), false).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_job_diagnostics_refuse_impossible_hosts_before_live_admission() {
+        for executable in ["xcodebuild", "xcrun"] {
+            let mut config = configured_job_fixture();
+            let rule = &mut config.jobs.rules[0];
+            rule.argv_prefix = vec![executable.to_string()];
+            rule.required_flags.clear();
+            rule.require_tools.clear();
+            rule.fresh_result_dirs = true;
+            let command = format!("{executable} build");
+
+            let diagnostic = classify_diagnostic_command(&command, &config)
+                .unwrap_err()
+                .to_string();
+            assert!(diagnostic.contains("Linux worker"));
+            assert!(diagnostic.contains("darwin"));
+            let admission =
+                prepare_admit_preflight(&command, false, Vec::new(), Some(&config), false)
+                    .unwrap_err()
+                    .to_string();
+            assert_eq!(admission, diagnostic);
+
+            // Matching must still rewrite the passive hook to explicit exec,
+            // whose early refusal preserves the requested remote-only policy.
+            assert!(
+                rch_common::job_rules::match_command(&config.jobs, &command)
+                    .unwrap()
+                    .unwrap()
+                    .fresh_result_dirs
+            );
+            // A config-local rule is never rewritten by the hook, so its
+            // dormant remote preparation policy cannot reject a local command.
+            config.general.force_local = true;
+            let (local, _) =
+                prepare_admit_preflight(&command, false, Vec::new(), Some(&config), false).unwrap();
+            assert_eq!(
+                local.base_recommendation,
+                rch_common::admit_preflight::AdmitRecommendation::Local
+            );
+            config.general.force_local = false;
+            config.jobs.rules[0].fresh_result_dirs = false;
+            let (preflight, matched) =
+                prepare_admit_preflight(&command, false, Vec::new(), Some(&config), false).unwrap();
+            assert!(matched.is_some());
+            assert_eq!(preflight.required.needs_os.as_deref(), Some("darwin"));
+            assert_eq!(
+                preflight.base_recommendation,
+                rch_common::admit_preflight::AdmitRecommendation::Offload
             );
         }
     }

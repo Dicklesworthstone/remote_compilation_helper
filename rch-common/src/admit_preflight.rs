@@ -643,6 +643,40 @@ pub fn required_os_for_command(command: &str) -> Option<String> {
     os_from_command_and_targets(command, &triples)
 }
 
+/// Refuse a fresh-output job whose payload requires a non-Linux host before
+/// the client reserves a worker. The preparation helper needs Linux no-replace
+/// directory renames; a native Apple or MSVC command cannot satisfy both sides
+/// of that contract. Cross-compilation keeps its existing host exemptions.
+///
+/// # Errors
+/// Returns the conflicting host requirement. Opaque scripts and ordinary jobs
+/// retain their existing routing; mentioning a platform in an argument does
+/// not establish that the worker must run it.
+pub fn validate_fresh_result_command(command: &str) -> Result<(), String> {
+    for part in split_shell_commands(command) {
+        let detail = classify_command_detailed(part);
+        let targets = if detail.classification.is_compilation {
+            derive_capabilities(part, detail.classification.kind).host_targets
+        } else {
+            Vec::new()
+        };
+        let native_host = os_from_command_and_targets(part, &[]);
+        // Check every host separately: mixed Apple/MSVC targets produce no
+        // single ordinary OS preference, but neither is a valid Linux job.
+        if let Some(host) = targets
+            .iter()
+            .filter_map(|target| target_host_os(target))
+            .chain(native_host.as_deref())
+            .find(|host| *host != "linux")
+        {
+            return Err(format!(
+                "fresh result directories require a Linux worker, but the command requires {host}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Native Apple tools need a Darwin host even in explicit job mode, where the
 /// compilation classifier deliberately does not recognize them. Only inspect
 /// the invoked command word, never an argument mentioning a tool. Opaque shell
@@ -904,7 +938,10 @@ mod tests {
             preflight("cc -c source.c", false).with_required_tools(vec!["approved-sdk".into()]);
         assert_eq!(compile.required.needs_native_tools, ["cc"]);
         assert_eq!(compile.required.needs_tools, ["approved-sdk"]);
-        assert_eq!(compile.required.to_requirement(1).needs_native_tools, ["cc"]);
+        assert_eq!(
+            compile.required.to_requirement(1).needs_native_tools,
+            ["cc"]
+        );
         let job = compile.as_job(vec!["custom-toolchain".into()]);
         assert_eq!(job.required.needs_native_tools, ["cc"]);
         assert_eq!(job.required.needs_tools, ["custom-toolchain"]);
@@ -1206,6 +1243,67 @@ mod tests {
         );
         assert_eq!(required_os_for_command("cargo check --workspace"), None);
         assert_eq!(required_os_for_command("cargo test"), None);
+    }
+
+    #[test]
+    fn fresh_result_command_preserves_linux_jobs_and_cross_compilation() {
+        for command in [
+            "./verify.sh",
+            "cargo mutants --workspace",
+            "cargo test --workspace",
+            "cargo build --target x86_64-pc-windows-gnu",
+            "cargo build --target wasm32-unknown-unknown",
+            "cargo xwin build --target x86_64-pc-windows-msvc",
+            "cargo +nightly zigbuild --target aarch64-apple-darwin",
+            "./verify.sh xcodebuild x86_64-pc-windows-msvc",
+            "./verify.sh --target aarch64-apple-darwin",
+        ] {
+            assert!(validate_fresh_result_command(command).is_ok(), "{command}");
+        }
+    }
+
+    #[test]
+    fn fresh_result_command_rejects_incompatible_native_hosts() {
+        for (command, host) in [
+            (
+                "xcodebuild -project App.xcodeproj -scheme App build",
+                "darwin",
+            ),
+            ("/usr/bin/xcrun swift test", "darwin"),
+            (
+                "env DEVELOPER_DIR=/Applications/Xcode.app xcodebuild test",
+                "darwin",
+            ),
+            ("cargo build --target aarch64-apple-darwin", "darwin"),
+            ("cargo build --target x86_64-pc-windows-msvc", "windows"),
+            ("cargo xwin build --target aarch64-apple-ios", "darwin"),
+            ("cargo zigbuild --target x86_64-pc-windows-msvc", "windows"),
+            (
+                "cargo xwin build --target x86_64-pc-windows-msvc && cargo build --target aarch64-apple-darwin",
+                "darwin",
+            ),
+            (
+                "cargo build --target aarch64-apple-darwin --target x86_64-pc-windows-msvc",
+                "darwin",
+            ),
+            (
+                "xcodebuild build && cargo build --target x86_64-pc-windows-msvc",
+                "darwin",
+            ),
+        ] {
+            let error = validate_fresh_result_command(command).unwrap_err();
+            assert!(error.contains("Linux worker"), "{command}: {error}");
+            assert!(error.contains(host), "{command}: {error}");
+        }
+        // The new constraint is opt-in; native-host routing itself is intact.
+        assert_eq!(
+            required_os_for_command("xcodebuild build").as_deref(),
+            Some("darwin")
+        );
+        assert_eq!(
+            required_os_for_command("cargo build --target x86_64-pc-windows-msvc").as_deref(),
+            Some("windows")
+        );
     }
 
     #[test]

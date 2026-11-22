@@ -5108,6 +5108,8 @@ pub async fn run_exec(
                 "--fresh-result-dirs requires an ordinary working-tree --job"
             );
             fresh_job_results::validate_directories(&dirs)?;
+            rch_common::admit_preflight::validate_fresh_result_command(&command)
+                .map_err(anyhow::Error::msg)?;
         }
         anyhow::ensure!(
             result_dest.is_none() || (job && !dirs.is_empty()),

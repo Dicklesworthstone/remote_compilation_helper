@@ -561,6 +561,8 @@ does not infer that a required report was produced. Have the job check its own
 expected outputs before returning success when that matters.
 
 This mode requires remote execution and the native preparation helper.
+Commands that explicitly require Darwin or Windows are refused before reserving
+a worker; configured-rule admission and diagnostic previews apply the same check.
 Unsupported or older workers, incomplete preparation, or an unconfirmed
 receipt stop the invocation before the payload runs; there is no local
 fallback or automatic second preparation of the same plan. Existing retained
