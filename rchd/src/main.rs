@@ -1408,16 +1408,30 @@ async fn async_main() -> Result<()> {
     // flag so it can be turned off if a site hits mux trouble; when `None` each
     // subsystem falls back to its legacy throwaway path.
     //
-    // The pool keeps a BOUNDED-idle master (ControlPersist=IdleFor(60)); the
+    // The pool keeps a bounded-idle master (60 seconds unless configured); the
     // openssh crate's Forever default is deliberately avoided (see
     // `control_persist_mode` — that default is exactly what leaked masters).
+    // Matching transfer settings also let one admitted foreground dispatch
+    // borrow this supervised connection without changing its transport policy.
     let ssh_pool: Option<Arc<rch_common::SshPool>> = if daemon_config.connection_pooling {
         let pool_options = rch_common::SshOptions {
             connect_timeout: rch_common::timing::scale_duration(
                 rch_common::SshOptions::default().connect_timeout,
             ),
             control_master: true,
-            control_persist_idle: Some(Duration::from_secs(60)),
+            control_persist_idle: Some(Duration::from_secs(
+                rch_config
+                    .transfer
+                    .ssh_control_persist_secs
+                    .filter(|seconds| *seconds > 0)
+                    .unwrap_or(60),
+            )),
+            server_alive_interval: Some(Duration::from_secs(
+                rch_config
+                    .transfer
+                    .ssh_server_alive_interval_secs
+                    .unwrap_or(15),
+            )),
             ..Default::default()
         };
         info!("SSH connection pooling enabled (warm ControlMaster reuse)");

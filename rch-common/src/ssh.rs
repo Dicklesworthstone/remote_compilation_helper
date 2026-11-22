@@ -1557,6 +1557,43 @@ impl SshClient {
             .await
     }
 
+    /// Replace a pool entry whose liveness channel failed, without treating
+    /// that channel's nonzero exit as permission to kill an existing dispatch.
+    /// The pool holds the client write lock here, so remaining active uses are
+    /// externally owned; ordinary pool commands retain their read lock.
+    async fn replace_failed_probe_using_before(
+        &mut self,
+        ssh_program: &Path,
+        control_directory: Option<&Path>,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        ensure_ssh_deadline(deadline)?;
+        if let Some(session) = self.session.take() {
+            let retained = session.process.state.send_if_modified(|state| {
+                if state.active_commands == 0 {
+                    return false;
+                }
+                state.draining = true;
+                true
+            });
+            if !retained {
+                let cleanup = Instant::now() + SSH_CLEANUP_TIMEOUT;
+                let cleanup = deadline.map_or(cleanup, |deadline| deadline.min(cleanup));
+                if let Err(error) = session.process.stop_before(cleanup).await {
+                    debug!(
+                        "Failed to reap stale pooled SSH master for {}: {error}",
+                        self.config.id
+                    );
+                }
+            }
+            // Existing external guards pin this exact draining master. If
+            // there are none, its stopped owner is dropped before reconnect.
+        }
+        ensure_ssh_deadline(deadline)?;
+        self.connect_using_before(ssh_program, control_directory, deadline)
+            .await
+    }
+
     /// Execute a command on the remote worker using this client's configured
     /// command timeout.
     pub async fn execute(&self, command: &str) -> Result<CommandResult> {
@@ -2802,7 +2839,9 @@ impl SshPool {
                     "Pooled SSH connection to {} failed liveness probe; reconnecting",
                     config.id
                 );
-                client_guard.reconnect_before(deadline).await?;
+                client_guard
+                    .replace_failed_probe_using_before(Path::new("ssh"), None, deadline)
+                    .await?;
             }
         }
         ensure_ssh_deadline(deadline)?;
@@ -5935,6 +5974,90 @@ exec sleep 30
                     .windows(2)
                     .any(|pair| pair == ["-o", "ControlMaster=no"])
             );
+            drop(entry);
+            fake.assert_reaped().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn external_transport_survives_completed_failed_probe_replacement() {
+        for close_pool in [false, true] {
+            let fake = FakeSsh::new("ready");
+            let config = fake.client(Duration::from_secs(3), true).config;
+            let pool = SshPool::new(SshOptions {
+                control_master: true,
+                ..SshOptions::default()
+            });
+            let entry = pool.get_or_create_client_entry(&config).await;
+            fake.connect(&mut *entry.write().await).await.unwrap();
+            let active = entry.read().await.external_transport().unwrap();
+            let old_socket = active.socket.clone();
+            let mut old_state = active.activity.state.subscribe();
+            {
+                let mut client = entry.write().await;
+                // An observed SSH channel exit completes its use even when
+                // it refuses a session. Unlike a dropped/timed-out probe, it
+                // leaves is_connected true and enters the failed-probe branch.
+                let probe = client
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .process
+                    .begin_use()
+                    .unwrap();
+                let status = tokio::process::Command::new("sh")
+                    .args(["-c", "exit 255"])
+                    .status()
+                    .await
+                    .unwrap();
+                assert_eq!(status.code(), Some(255));
+                probe.complete();
+                assert!(client.is_connected());
+                assert!(!old_state.borrow().draining);
+                client
+                    .replace_failed_probe_using_before(
+                        &fake.program,
+                        Some(fake.directory.path()),
+                        Some(Instant::now() + Duration::from_secs(3)),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let replacement = entry.read().await.external_transport().unwrap();
+            assert_ne!(replacement.socket, old_socket);
+            assert_eq!(fake.pids("master-pids").len(), 2);
+            assert!(old_state.borrow().draining);
+            assert!(old_state.borrow().outcome.is_none());
+            assert!(old_socket.exists());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), active.closed())
+                    .await
+                    .is_err()
+            );
+            if close_pool {
+                pool.close(&config.id).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::join!(active.closed(), replacement.closed());
+                })
+                .await
+                .unwrap();
+                assert!(active.arguments().is_err());
+                assert!(replacement.arguments().is_err());
+                drop(active);
+                drop(replacement);
+            } else {
+                assert!(replacement.arguments().is_ok());
+                replacement.complete();
+                active.complete();
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while old_state.borrow_and_update().outcome.is_none() {
+                    old_state.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("failed-probe replacement must reap its old owner after completion");
+            pool.close(&config.id).await.unwrap();
             drop(entry);
             fake.assert_reaped().await;
         }

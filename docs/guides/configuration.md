@@ -228,9 +228,17 @@ Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
   for remote execution and rsync transfers to reduce dropped connections on flaky networks.
 - `ssh_control_persist_secs` (u64, optional) — Positive values opt Unix dispatches
   into one supervised foreground SSH connection, shared by preparation, transfers,
-  execution and cleanup. The active dispatch pins the connection until cleanup;
-  a completed dispatch reaps it instead of leaving a background ControlPersist
-  process. Unset or `0` keeps one-shot transports. Windows workers and automatic
+  execution and cleanup. When daemon connection pooling is enabled and its
+  keepalive and idle settings match, the dispatch borrows the daemon's connection
+  under its admitted build and wrapper identity. The open local lease pins that
+  connection through cleanup, then leaves it warm for the next dispatch. Only
+  one external dispatch borrows a master at a time; a busy pool, an older daemon,
+  or different project settings use the existing dedicated per-dispatch connection.
+  That dedicated connection is reaped after cleanup. Both paths keep the SSH
+  process supervised, without a detached background ControlPersist process.
+  Loss of a granted lease stops new channels and retains unconfirmed work for
+  recovery; it never redials or replays an admitted command. Unset or `0` keeps
+  one-shot transports. Windows workers and automatic
   recovery also retain their one-shot transports. Enable it for high-latency
   workers. A dispatch makes many short SSH requests, and without it each one
   pays a fresh handshake: several seconds per request on an intercontinental

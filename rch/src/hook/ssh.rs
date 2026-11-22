@@ -32,6 +32,7 @@
 //! submodules (`transfer_orchestration`, `repo_updater`) can call them; the two
 //! shell-script builders stay private to this module.
 
+use super::daemon_ipc::ssh_transport::{DaemonSshLease, LeaseWatch};
 use super::*;
 use crate::transfer::WorkerPlatform;
 
@@ -41,6 +42,7 @@ struct OffloadSshTransport {
     worker: WorkerConfig,
     arguments: Vec<std::ffi::OsString>,
     shell_arguments: String,
+    lease: Option<LeaseWatch>,
 }
 
 impl OffloadSshTransport {
@@ -49,8 +51,52 @@ impl OffloadSshTransport {
             && self.worker.host == worker.host
             && self.worker.user == worker.user
             && self.worker.identity_file == worker.identity_file
+            && rch_common::declared_os(&self.worker.tags) == rch_common::declared_os(&worker.tags)
             && !WorkerPlatform::from_worker(worker).is_windows()
     }
+
+    fn revoked(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.lost_reason().is_some())
+    }
+}
+
+/// Revocation is different from opting out. Keep an explicit transport that
+/// cannot attach or dial, including from infallible rsync command builders.
+/// These options precede every configured proxy and multiplexing option.
+fn revoked_transport_arguments() -> Vec<std::ffi::OsString> {
+    [
+        "-S",
+        "none",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ProxyCommand=false",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "BatchMode=yes",
+        "-T",
+    ]
+    .map(std::ffi::OsString::from)
+    .to_vec()
+}
+
+fn transport_shell_arguments(arguments: &[std::ffi::OsString]) -> anyhow::Result<String> {
+    arguments
+        .iter()
+        .map(|argument| {
+            let value = argument
+                .to_str()
+                .context("SSH transport argument is not UTF-8")?;
+            rch_common::ssh_utils::shell_escape_value(value)
+                .context("SSH transport argument is not shell-safe")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(|arguments| arguments.join(" "))
 }
 
 tokio::task_local! {
@@ -59,7 +105,7 @@ tokio::task_local! {
     static OFFLOAD_SSH_TRANSPORT: Option<OffloadSshTransport>;
 }
 
-/// Configure explicitly requested connection reuse within one dispatch.
+/// Configure explicitly requested connection reuse for a Unix dispatch.
 /// Unset and zero retain the one-shot transport; only a positive idle window
 /// opts into the existing owned foreground connection on Unix workers.
 fn owned_offload_ssh_options(
@@ -85,13 +131,16 @@ fn owned_offload_ssh_options(
     })
 }
 
-/// Reuse one supervised foreground connection for an explicitly opted-in Unix
-/// dispatch. The client and active-use guard outlive every control/transfer/build
-/// channel and the dispatch's cancellation cleanup. No persistent background
-/// master is created, and a lost socket cannot silently redial or replay work.
+/// Prefer a matching daemon-owned connection for an explicitly opted-in Unix
+/// dispatch, keeping its lease through cancellation cleanup. Before receiving
+/// a grant, unavailable pooling falls back to the dedicated foreground owner.
+/// Neither path creates a background master or redials a lost capability.
 pub(super) async fn with_owned_offload_ssh<T>(
     worker: WorkerConfig,
     transfer: &TransferConfig,
+    socket_path: &str,
+    build_id: Option<u64>,
+    local_wrapper_id: Option<&str>,
     operation: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
     let options = if crate::transfer::use_mock_transport(&worker)
@@ -104,6 +153,34 @@ pub(super) async fn with_owned_offload_ssh<T>(
     let Some(options) = options else {
         return OFFLOAD_SSH_TRANSPORT.scope(None, operation).await;
     };
+    if let (Some(build_id), Some(local_wrapper_id)) = (build_id, local_wrapper_id) {
+        use rch_common::ssh_transport_lease::{
+            SSH_TRANSPORT_LEASE_ACQUIRE_TIMEOUT_MS, SSH_TRANSPORT_LEASE_VERSION,
+            SshTransportEndpoint, SshTransportLeaseRequest,
+        };
+        let request = SshTransportLeaseRequest {
+            version: SSH_TRANSPORT_LEASE_VERSION,
+            build_id,
+            local_wrapper_id: local_wrapper_id.to_owned(),
+            endpoint: SshTransportEndpoint::from_worker(&worker),
+            server_alive_interval_secs: transfer.ssh_server_alive_interval_secs.unwrap_or(15),
+            idle_timeout_secs: transfer.ssh_control_persist_secs.unwrap_or_default(),
+        };
+        let budget = rch_common::timing::scale_duration(Duration::from_millis(
+            SSH_TRANSPORT_LEASE_ACQUIRE_TIMEOUT_MS,
+        ));
+        if let Some(lease) = super::daemon_ipc::ssh_transport::acquire(socket_path, request, budget)
+            .await
+            .map_err(|error| {
+                // A rejected or malformed grant cannot validate this admitted
+                // owner. Preserve its reservation for exact-identity recovery;
+                // the ordinary retry/fail-open path must not bypass rejection.
+                error.context(crate::transfer::RemoteExecutionUnconfirmed)
+            })?
+        {
+            return with_daemon_offload_ssh(worker, lease, operation).await;
+        }
+    }
     let mut client = rch_common::ssh::SshClient::new(worker.clone(), options);
     client
         .connect()
@@ -114,6 +191,7 @@ pub(super) async fn with_owned_offload_ssh<T>(
         worker,
         arguments: transport.arguments()?,
         shell_arguments: transport.shell_args()?,
+        lease: None,
     };
     let outcome = OFFLOAD_SSH_TRANSPORT.scope(Some(context), operation).await;
     if outcome.is_ok() {
@@ -129,6 +207,68 @@ pub(super) async fn with_owned_offload_ssh<T>(
     outcome
 }
 
+/// Keep the IPC lease and its monitor alive through preparation, execution,
+/// publication, and settlement. The daemon owns the pooled SSH child; a normal
+/// finish releases only our active-use guard and leaves that child reusable.
+pub(in crate::hook) async fn with_daemon_offload_ssh<T>(
+    worker: WorkerConfig,
+    lease: DaemonSshLease,
+    operation: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let arguments = lease
+        .arguments()
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    let context = OffloadSshTransport {
+        worker,
+        shell_arguments: transport_shell_arguments(&arguments)?,
+        arguments,
+        lease: Some(lease.watch()),
+    };
+    let outcome = OFFLOAD_SSH_TRANSPORT.scope(Some(context), operation).await;
+    if outcome.is_ok()
+        && let Err(error) = lease.complete().await
+    {
+        // The verified payload/result is independent of whether the
+        // daemon received our permission to reuse its transport.
+        warn!("Could not confirm daemon SSH transport release: {error:#}");
+    }
+    outcome
+}
+
+/// Cancel only the inner pipeline on lease loss. The caller's preparation
+/// settlement remains outside this future, so loss cannot skip durable cleanup.
+/// A ready verified result wins a simultaneous disconnect; an error never
+/// gains retry or local-fallback authority from that race.
+pub(in crate::hook) async fn guard_offload_ssh_operation<T>(
+    operation: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let lease = OFFLOAD_SSH_TRANSPORT
+        .try_with(|context| context.as_ref().and_then(|context| context.lease.clone()))
+        .ok()
+        .flatten();
+    let Some(lease) = lease else {
+        return operation.await;
+    };
+    if let Some(reason) = lease.lost_reason() {
+        return Err(anyhow::anyhow!(reason).context(crate::transfer::RemoteExecutionUnconfirmed));
+    }
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        outcome = &mut operation => {
+            match (outcome, lease.lost_reason()) {
+                (Err(error), Some(reason)) => Err(error.context(reason).context(crate::transfer::RemoteExecutionUnconfirmed)),
+                (outcome, _) => outcome,
+            }
+        }
+        reason = lease.lost() => {
+            Err(anyhow::anyhow!(reason).context(crate::transfer::RemoteExecutionUnconfirmed))
+        }
+    }
+}
+
 pub(crate) fn offload_ssh_transport_arguments(
     worker: &WorkerConfig,
 ) -> Option<Vec<std::ffi::OsString>> {
@@ -142,7 +282,13 @@ pub(crate) fn offload_ssh_transport_arguments(
             context
                 .as_ref()
                 .filter(|context| context.matches(worker))
-                .map(|context| context.arguments.clone())
+                .map(|context| {
+                    if context.revoked() {
+                        revoked_transport_arguments()
+                    } else {
+                        context.arguments.clone()
+                    }
+                })
         })
         .ok()
         .flatten()
@@ -166,7 +312,14 @@ pub(crate) fn offload_ssh_transport_shell_arguments(worker: &WorkerConfig) -> Op
             context
                 .as_ref()
                 .filter(|context| context.matches(worker))
-                .map(|context| context.shell_arguments.clone())
+                .map(|context| {
+                    if context.revoked() {
+                        // Every argument is a fixed ASCII literal.
+                        "-S none -o ControlMaster=no -o ControlPersist=no -o ProxyCommand=false -o ConnectionAttempts=1 -o BatchMode=yes -T".to_owned()
+                    } else {
+                        context.shell_arguments.clone()
+                    }
+                })
         })
         .ok()
         .flatten()
@@ -197,6 +350,7 @@ pub(crate) async fn with_offload_ssh_arguments_for_test<F: std::future::Future>(
                 worker,
                 arguments,
                 shell_arguments,
+                lease: None,
             }),
             operation,
         )
@@ -3246,10 +3400,17 @@ mod tests {
                                 ssh_control_persist_secs: setting,
                                 ..TransferConfig::default()
                             };
-                            with_owned_offload_ssh(worker.clone(), &transfer, async {
-                                assert!(offload_ssh_transport_arguments(&worker).is_none());
-                                Ok(())
-                            })
+                            with_owned_offload_ssh(
+                                worker.clone(),
+                                &transfer,
+                                "",
+                                None,
+                                None,
+                                async {
+                                    assert!(offload_ssh_transport_arguments(&worker).is_none());
+                                    Ok(())
+                                },
+                            )
                             .await
                             .expect("automatic recovery must not create a reusable connection");
                         }
@@ -3314,7 +3475,7 @@ mod tests {
                 ssh_control_persist_secs: setting,
                 ..TransferConfig::default()
             };
-            let value = with_owned_offload_ssh(worker.clone(), &transfer, async {
+            let value = with_owned_offload_ssh(worker.clone(), &transfer, "", None, None, async {
                 assert!(offload_ssh_transport_arguments(&worker).is_none());
                 Ok(42)
             })
@@ -3332,7 +3493,7 @@ mod tests {
                     ssh_control_persist_secs: setting,
                     ..TransferConfig::default()
                 };
-                with_owned_offload_ssh(excluded.clone(), &transfer, async {
+                with_owned_offload_ssh(excluded.clone(), &transfer, "", None, None, async {
                     assert!(offload_ssh_transport_arguments(&excluded).is_none());
                     Ok(())
                 })

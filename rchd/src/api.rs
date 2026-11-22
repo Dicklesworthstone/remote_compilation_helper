@@ -42,6 +42,9 @@ use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+#[path = "ssh_transport_lease.rs"]
+mod ssh_transport_lease;
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -815,6 +818,20 @@ async fn handle_connection_with_metrics(
     let n = read_line_with_limit(&mut reader, &mut line, MAX_LINE_SIZE).await?;
     if n == 0 {
         return Ok(()); // Connection closed
+    }
+
+    // This route lends transport until its socket closes; its lifetime is not
+    // finite API request latency. Capture peer birth above, before any await.
+    if ssh_transport_lease::is_request(&line) {
+        metrics::inc_requests("ssh-transport-v1");
+        return ssh_transport_lease::handle(
+            &line,
+            &ctx,
+            maintenance_peer.as_ref(),
+            &mut reader,
+            &mut writer,
+        )
+        .await;
     }
 
     let line = line.trim();

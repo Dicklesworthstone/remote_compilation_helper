@@ -10,6 +10,9 @@
 use super::*;
 use serde::Deserialize;
 
+#[path = "daemon_ipc/ssh_transport.rs"]
+pub(super) mod ssh_transport;
+
 const MAX_DAEMON_HEADER_BYTES: usize = 16 * 1024;
 const MAX_DAEMON_BODY_BYTES: usize = 64 * 1024;
 const MAX_DAEMON_STATUS_BYTES: usize = 1024;

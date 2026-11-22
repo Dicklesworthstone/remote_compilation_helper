@@ -3574,11 +3574,13 @@ pub struct TransferConfig {
     pub ssh_server_alive_interval_secs: Option<u64>,
     /// Optional SSH connection-reuse idle window in seconds.
     ///
-    /// Positive values also enable one owned foreground connection across a
-    /// Unix exec dispatch's control, transfer and execution channels. The active
-    /// dispatch pins that connection until cleanup, then reaps it; no detached
-    /// ControlPersist process is left behind. Windows and automatic recovery
-    /// retain their one-shot transports.
+    /// Positive values enable one supervised foreground connection across a
+    /// Unix dispatch's control, transfer and execution channels. A matching
+    /// daemon pool lends its connection under an open build-bound lease and
+    /// retains it for later dispatches; unavailable or busy pools use a
+    /// dedicated connection reaped after cleanup. No detached ControlPersist
+    /// process is left behind. Windows and automatic recovery retain their
+    /// one-shot transports.
     /// - Unset does not request connection reuse.
     /// - `0` disables persistence (`ControlPersist=no`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -97,6 +97,7 @@ pub mod source_namespace_paths;
 pub mod ssh;
 #[cfg(all(test, unix))]
 mod ssh_timeout_test;
+pub mod ssh_transport_lease;
 pub mod ssh_utils;
 pub mod stale_target_reap;
 pub mod storm_control;
