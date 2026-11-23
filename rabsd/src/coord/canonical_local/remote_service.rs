@@ -223,6 +223,19 @@ impl ServiceProfile {
         // reconnects. Headroom grants no extra operation or input permits.
         2 * self.max_roots + self.max_queued_roots
     }
+
+    fn max_queued_per_peer(&self) -> usize {
+        // Validated enrollment fixes each peer's backlog share. Round down:
+        // rounding up lets early peers consume later peers' reserved space.
+        // A single edge keeps the whole backlog. A queue smaller than the
+        // enrollment still permits one ticket per peer, subject to the global
+        // bound; that configuration cannot reserve room for every peer.
+        if self.max_queued_roots == 0 {
+            0
+        } else {
+            (self.max_queued_roots / self.allowed_edge_pins.len()).max(1)
+        }
+    }
 }
 
 /// Reuse budgets belong to the service, not to individual connections or peers.
@@ -376,7 +389,11 @@ pub fn run_service_profile(
         config.max_roots,
         config.jobs_per_root,
     )?;
-    let admissions = OperationAdmissions::new_peer_fair(config.max_roots, config.max_queued_roots);
+    let admissions = OperationAdmissions::new_peer_fair(
+        config.max_roots,
+        config.max_queued_roots,
+        config.max_queued_per_peer(),
+    );
     let operations = match runtime
         .coord
         .authority()
@@ -404,6 +421,7 @@ pub fn run_service_profile(
         &json!({"kind":"canonical-remote-service-listening", "version":SERVICE_VERSION,
         "address":listener.local_addr()?.to_string(), "max_roots":config.max_roots,
         "max_queued_roots":config.max_queued_roots,
+        "max_queued_roots_per_peer":config.max_queued_per_peer(),
         "queue_timeout_seconds":config.queue_timeout_seconds,
         "source_cache_bytes":config.source_cache_bytes,
         "toolchain_cache_bytes":config.toolchain_cache_bytes,
@@ -1896,6 +1914,7 @@ mod tests {
     fn remote_queue_defaults_and_capacity_are_bounded() {
         let (_owner, mut profile) = service_profile();
         assert_eq!(profile.max_queued_roots, 0);
+        assert_eq!(profile.max_queued_per_peer(), 0);
         assert_eq!(profile.queue_timeout_seconds, 300);
         assert_eq!(profile.source_cache_bytes, 0);
         assert_eq!(profile.toolchain_cache_bytes, 0);
@@ -1909,6 +1928,7 @@ mod tests {
         profile.queue_timeout_seconds = 1800;
         profile.validate().unwrap();
         assert_eq!(profile.max_sessions(), 192);
+        assert_eq!(profile.max_queued_per_peer(), 128);
         profile.max_queued_roots = 129;
         assert!(profile.validate().is_err());
         profile.max_queued_roots = 128;
@@ -3494,7 +3514,7 @@ mod tests {
 
     #[test]
     fn immediate_remote_admission_holds_capacity_until_owner_drop() {
-        let admissions = OperationAdmissions::new_peer_fair(1, 0);
+        let admissions = OperationAdmissions::new_peer_fair(1, 0, 0);
         let peer = AdmissionPeer::new(Vec::new());
         let output = Arc::clone(&peer.output);
         let mut wire = Wire::new(peer);
@@ -3525,8 +3545,140 @@ mod tests {
     }
 
     #[test]
+    fn remote_enrollment_divides_backlog_without_disabling_small_queues() {
+        let (_owner, mut profile) = service_profile();
+        profile.max_roots = 1;
+        profile.max_queued_roots = 4;
+        profile.validate().unwrap();
+        assert_eq!(profile.max_queued_per_peer(), 4);
+        profile.allowed_edge_pins.push("cd".repeat(32));
+        profile.validate().unwrap();
+        assert_eq!(profile.max_queued_per_peer(), 2);
+        profile.allowed_edge_pins.push("ef".repeat(32));
+        profile.validate().unwrap();
+        assert_eq!(profile.max_queued_per_peer(), 1);
+
+        let admissions = OperationAdmissions::new_peer_fair(
+            profile.max_roots,
+            profile.max_queued_roots,
+            profile.max_queued_per_peer(),
+        );
+        let active = admissions
+            .enqueue_for_peer([0xab; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let first = admissions.enqueue_for_peer([0xab; 32]).unwrap();
+        let second = admissions.enqueue_for_peer([0xcd; 32]).unwrap();
+        for peer in [[0xab; 32], [0xcd; 32]] {
+            assert!(matches!(
+                admissions.enqueue_for_peer(peer),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ));
+        }
+        // Rounding up gives each early peer two tickets and excludes this
+        // third enrolled peer. Keep the remainder slot unassigned instead.
+        let third = admissions.enqueue_for_peer([0xef; 32]).unwrap();
+        drop((first, second, third, active));
+
+        profile.max_queued_roots = 1;
+        profile.validate().unwrap();
+        assert_eq!(profile.max_queued_per_peer(), 1);
+        let admissions = OperationAdmissions::new_peer_fair(
+            profile.max_roots,
+            profile.max_queued_roots,
+            profile.max_queued_per_peer(),
+        );
+        let active = admissions
+            .enqueue_for_peer([0xab; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let queued = admissions.enqueue_for_peer([0xab; 32]).unwrap();
+        assert!(matches!(
+            admissions.enqueue_for_peer([0xcd; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(queued);
+        let mut newcomer = admissions.enqueue_for_peer([0xcd; 32]).unwrap();
+        assert!(newcomer.try_start().unwrap().is_none());
+        drop(active);
+        drop(newcomer.try_start().unwrap().unwrap());
+        profile.max_queued_roots = 0;
+        assert_eq!(profile.max_queued_per_peer(), 0);
+    }
+
+    #[test]
+    fn remote_peer_burst_cannot_exclude_a_new_peer_from_bounded_admission() {
+        let (_owner, mut profile) = service_profile();
+        profile.max_roots = 1;
+        profile.max_queued_roots = 4;
+        profile.allowed_edge_pins.push("cd".repeat(32));
+        profile.validate().unwrap();
+        let admissions = OperationAdmissions::new_peer_fair(
+            profile.max_roots,
+            profile.max_queued_roots,
+            profile.max_queued_per_peer(),
+        );
+        let active = admissions
+            .enqueue_for_peer([0xab; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let mut first = admissions.enqueue_for_peer([0xab; 32]).unwrap();
+        let tail = admissions.enqueue_for_peer([0xab; 32]).unwrap();
+        let mut excess = AdmissionPeer::new(record(&Message::InputsDone {}));
+        excess.before_read = Some(Box::new(|| {
+            panic!("peer backlog refusal consumed input or polled an unadmitted request");
+        }));
+        let excess_output = Arc::clone(&excess.output);
+        let error = ready(acquire_operation(
+            &mut Wire::new(excess),
+            &admissions,
+            [0xab; 32],
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(1),
+            || true,
+        ))
+        .err()
+        .expect("one peer exceeded its backlog share");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("queued-root share"));
+        assert!(messages(&excess_output).is_empty());
+
+        let mut newcomer = AdmissionPeer::new(record(&Message::Poll {}));
+        let newcomer_output = Arc::clone(&newcomer.output);
+        newcomer.before_read = Some(Box::new(move || {
+            drop(active);
+            drop(first.try_start().unwrap().unwrap());
+        }));
+        let admitted = ready(acquire_operation(
+            &mut Wire::new(newcomer),
+            &admissions,
+            [0xcd; 32],
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(1),
+            || true,
+        ))
+        .unwrap();
+        assert_eq!(messages(&newcomer_output), vec![json!({"kind":"queued"})]);
+        drop((tail, admitted));
+        drop(
+            admissions
+                .enqueue_for_peer([0xab; 32])
+                .unwrap()
+                .try_start()
+                .unwrap()
+                .unwrap(),
+        );
+    }
+
+    #[test]
     fn remote_poll_admission_preserves_fifo_and_cannot_be_barged() {
-        let admissions = OperationAdmissions::new_peer_fair(1, 2);
+        let admissions = OperationAdmissions::new_peer_fair(1, 2, 2);
         let active = admissions
             .enqueue_for_peer([1; 32])
             .unwrap()
@@ -3564,7 +3716,7 @@ mod tests {
 
     #[test]
     fn authenticated_remote_peer_gets_a_turn_before_an_earlier_peers_burst_drains() {
-        let admissions = OperationAdmissions::new_peer_fair(1, 4);
+        let admissions = OperationAdmissions::new_peer_fair(1, 4, 4);
         let active = admissions
             .enqueue_for_peer([1; 32])
             .unwrap()
@@ -3631,7 +3783,7 @@ mod tests {
             ),
             (b"not-json\n".to_vec(), io::ErrorKind::InvalidData),
         ] {
-            let admissions = OperationAdmissions::new_peer_fair(1, 1);
+            let admissions = OperationAdmissions::new_peer_fair(1, 1, 1);
             let active = admissions
                 .enqueue_for_peer([1; 32])
                 .unwrap()
@@ -3662,7 +3814,7 @@ mod tests {
 
     #[test]
     fn remote_queue_refuses_overflow_expiry_and_unhealthy_runtime_before_grant() {
-        let admissions = OperationAdmissions::new_peer_fair(1, 1);
+        let admissions = OperationAdmissions::new_peer_fair(1, 1, 1);
         let active = admissions
             .enqueue_for_peer([1; 32])
             .unwrap()
@@ -3726,7 +3878,7 @@ mod tests {
 
     #[test]
     fn queued_remote_runtime_failure_cannot_take_a_newly_freed_slot() {
-        let admissions = OperationAdmissions::new_peer_fair(1, 1);
+        let admissions = OperationAdmissions::new_peer_fair(1, 1, 1);
         let active = admissions
             .enqueue_for_peer([1; 32])
             .unwrap()
@@ -3772,7 +3924,7 @@ mod tests {
             block_on_top_level(&runtime, async move {
                 handle
                     .spawn(async move {
-                        let admissions = OperationAdmissions::new_peer_fair(1, 1);
+                        let admissions = OperationAdmissions::new_peer_fair(1, 1, 1);
                         let active = admissions
                             .enqueue_for_peer([1; 32])
                             .unwrap()

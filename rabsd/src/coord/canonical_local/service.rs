@@ -272,16 +272,23 @@ struct AdmissionState {
 struct PeerAdmissions {
     turns: FairQueue,
     waiting: BTreeMap<String, VecDeque<u64>>,
+    /// Fixed by the validated enrollment, not by the current set of callers.
+    queued_share: usize,
 }
 
 impl PeerAdmissions {
-    fn new() -> Self {
+    fn new(queued_share: usize) -> Self {
         Self {
             // Equal one-root turns need no estimated-cost or deadline override.
             // Operation deadlines remain enforced by each waiting connection.
             turns: FairQueue::new(u64::MAX, 0),
             waiting: BTreeMap::new(),
+            queued_share,
         }
+    }
+
+    fn can_enqueue(&self, peer: &str) -> bool {
+        self.waiting.get(peer).map_or(0, VecDeque::len) < self.queued_share
     }
 
     fn tenant(peer: &str) -> TenantKey {
@@ -339,8 +346,13 @@ impl OperationAdmissions {
         Self::with_peers(maximum, queued, None)
     }
 
-    pub(super) fn new_peer_fair(maximum: usize, queued: usize) -> Arc<Self> {
-        Self::with_peers(maximum, queued, Some(PeerAdmissions::new()))
+    pub(super) fn new_peer_fair(
+        maximum: usize,
+        queued: usize,
+        queued_per_peer: usize,
+    ) -> Arc<Self> {
+        debug_assert!(queued_per_peer <= queued);
+        Self::with_peers(maximum, queued, Some(PeerAdmissions::new(queued_per_peer)))
     }
 
     fn with_peers(maximum: usize, queued: usize, peers: Option<PeerAdmissions>) -> Arc<Self> {
@@ -380,6 +392,24 @@ impl OperationAdmissions {
                 "canonical service is busy; no build was admitted",
             ));
         }
+        // Idle capacity is granted atomically, never borrowed by a waiting
+        // ticket. Enqueue and try_start have separate locks: an idle allowance
+        // in the queue limit could otherwise be spent by several callers.
+        // Existing queued work must still win its ordinary fair turn.
+        let immediate = state.peers.is_some()
+            && state.waiting.is_empty()
+            && state.active < self.maximum;
+        if !immediate
+            && let (Some(peers), Some(peer)) = (&state.peers, &peer)
+            && !peers.can_enqueue(peer)
+        {
+            // Refuse excess backlog before assigning a ticket, charging a fair
+            // turn, or retaining any input. Global capacity remains unchanged.
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "canonical peer has reached its queued-root share; no build was admitted",
+            ));
+        }
         state.next_ticket = state
             .next_ticket
             .checked_add(1)
@@ -389,11 +419,22 @@ impl OperationAdmissions {
             peers.enqueue(peer, ticket);
         }
         state.waiting.push_back(ticket);
+        let admitted = if immediate {
+            state.waiting.pop_front();
+            if let (Some(peers), Some(peer)) = (&mut state.peers, &peer) {
+                peers.start(peer, ticket, ticket);
+            }
+            state.active += 1;
+            Some(AdmittedOperation(Arc::clone(self)))
+        } else {
+            None
+        };
         Ok(WaitingOperation {
             admissions: Arc::clone(self),
             ticket,
             peer,
-            queued: true,
+            queued: admitted.is_none(),
+            admitted,
         })
     }
 
@@ -454,10 +495,16 @@ pub(super) struct WaitingOperation {
     ticket: u64,
     peer: Option<String>,
     queued: bool,
+    /// An idle root already granted under the enqueue lock. Dropping this
+    /// owner before try_start releases it just like any other active admission.
+    admitted: Option<AdmittedOperation>,
 }
 
 impl WaitingOperation {
     pub(super) fn try_start(&mut self) -> io::Result<Option<AdmittedOperation>> {
+        if let Some(admitted) = self.admitted.take() {
+            return Ok(Some(admitted));
+        }
         let mut state = self
             .admissions
             .state
@@ -2045,7 +2092,7 @@ mod tests {
     fn admission_mode_rejects_missing_or_unexpected_peer_identity_without_taking_capacity() {
         for peer_fair in [false, true] {
             let admissions = if peer_fair {
-                OperationAdmissions::new_peer_fair(1, 0)
+                OperationAdmissions::new_peer_fair(1, 0, 0)
             } else {
                 OperationAdmissions::new(1, 0)
             };
@@ -2081,8 +2128,224 @@ mod tests {
     }
 
     #[test]
+    fn peer_backlog_share_leaves_room_for_newcomers_before_fair_scheduling() {
+        let admissions = OperationAdmissions::new_peer_fair(1, 4, 2);
+        let active = admissions
+            .enqueue_for_peer([1; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let mut first = admissions.enqueue_for_peer([1; 32]).unwrap();
+        let tail = admissions.enqueue_for_peer([1; 32]).unwrap();
+        let (ticket, turns) = {
+            let state = admissions.state.lock().unwrap();
+            (state.next_ticket, state.peers.as_ref().unwrap().turns.clone())
+        };
+        for _ in 0..64 {
+            assert!(matches!(
+                admissions.enqueue_for_peer([1; 32]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+                    && error.to_string().contains("queued-root share")
+            ));
+        }
+        {
+            let state = admissions.state.lock().unwrap();
+            assert_eq!(state.next_ticket, ticket, "refusals consumed ticket IDs");
+            assert_eq!(state.peers.as_ref().unwrap().turns, turns);
+            assert_eq!(state.active, 1);
+            assert_eq!(state.waiting.len(), 2);
+        }
+        let mut newcomer = admissions.enqueue_for_peer([2; 32]).unwrap();
+        let newcomer_tail = admissions.enqueue_for_peer([2; 32]).unwrap();
+        assert!(matches!(
+            admissions.enqueue_for_peer([3; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(active);
+        assert!(newcomer.try_start().unwrap().is_none());
+        drop(first.try_start().unwrap().unwrap());
+        let newcomer_active = newcomer.try_start().unwrap().unwrap();
+        drop((tail, newcomer_tail, newcomer_active));
+        let state = admissions.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert!(state.waiting.is_empty());
+        assert!(state.peers.as_ref().unwrap().waiting.is_empty());
+    }
+
+    #[test]
+    fn accepted_but_unclaimed_roots_cannot_be_spent_twice_or_fill_peer_backlogs() {
+        let admissions = OperationAdmissions::new_peer_fair(3, 3, 1);
+        let mut burst: VecDeque<_> = (0..4)
+            .map(|_| admissions.enqueue_for_peer([1; 32]).unwrap())
+            .collect();
+        let mut second = admissions.enqueue_for_peer([2; 32]).unwrap();
+        assert!(matches!(
+            admissions.enqueue_for_peer([2; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        // No caller has polled try_start. The first three admissions already
+        // own distinct roots; only the fourth A request consumes its backlog.
+        let mut third = admissions.enqueue_for_peer([3; 32]).unwrap();
+        {
+            let state = admissions.state.lock().unwrap();
+            assert_eq!(state.active, 3);
+            assert_eq!(state.waiting.len(), 3);
+            assert_eq!(state.next_ticket, 6);
+        }
+        assert!(second.try_start().unwrap().is_none());
+        assert!(third.try_start().unwrap().is_none());
+        let mut claimed = Vec::new();
+        for _ in 0..3 {
+            let mut reserved = burst.pop_front().unwrap();
+            claimed.push(reserved.try_start().unwrap().unwrap());
+            drop(reserved);
+            assert_eq!(admissions.state.lock().unwrap().active, 3);
+        }
+        drop(claimed);
+        let first = burst.pop_front().unwrap().try_start().unwrap().unwrap();
+        let second_active = second.try_start().unwrap().unwrap();
+        let third_active = third.try_start().unwrap().unwrap();
+        // All three peers can queue again while their earlier roots remain
+        // active. The original burst cannot own the whole physical backlog.
+        let waiting = [
+            admissions.enqueue_for_peer([1; 32]).unwrap(),
+            admissions.enqueue_for_peer([2; 32]).unwrap(),
+            admissions.enqueue_for_peer([3; 32]).unwrap(),
+        ];
+        drop((waiting, first, second_active, third_active));
+        let state = admissions.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert!(state.waiting.is_empty());
+        assert!(state.peers.as_ref().unwrap().waiting.is_empty());
+    }
+
+    #[test]
+    fn unclaimed_root_drop_and_claim_transfer_release_exactly_once() {
+        let admissions = OperationAdmissions::new_peer_fair(1, 0, 0);
+        let reserved = admissions.enqueue_for_peer([1; 32]).unwrap();
+        assert_eq!(admissions.state.lock().unwrap().active, 1);
+        assert!(admissions.state.lock().unwrap().waiting.is_empty());
+        assert!(matches!(
+            admissions.enqueue_for_peer([2; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(reserved);
+        assert_eq!(admissions.state.lock().unwrap().active, 0);
+        let mut reserved = admissions.enqueue_for_peer([2; 32]).unwrap();
+        let active = reserved.try_start().unwrap().unwrap();
+        assert!(reserved.try_start().unwrap().is_none());
+        drop(reserved);
+        assert_eq!(admissions.state.lock().unwrap().active, 1);
+        assert!(matches!(
+            admissions.enqueue_for_peer([1; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(active);
+        assert_eq!(admissions.state.lock().unwrap().active, 0);
+    }
+
+    #[test]
+    fn peer_backlog_quota_never_reserves_idle_execution_slots() {
+        let admissions = OperationAdmissions::new_peer_fair(3, 2, 1);
+        let mut active = Vec::new();
+        for _ in 0..3 {
+            active.push(
+                admissions
+                    .enqueue_for_peer([1; 32])
+                    .unwrap()
+                    .try_start()
+                    .unwrap()
+                    .expect("idle execution capacity was reserved for absent peers"),
+            );
+        }
+        let mut first = admissions.enqueue_for_peer([1; 32]).unwrap();
+        assert!(matches!(
+            admissions.enqueue_for_peer([1; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        let mut other = admissions.enqueue_for_peer([2; 32]).unwrap();
+        assert_eq!(admissions.state.lock().unwrap().waiting.len(), 2);
+        assert!(first.try_start().unwrap().is_none());
+        assert!(other.try_start().unwrap().is_none());
+        drop(active);
+        let first_active = first.try_start().unwrap().unwrap();
+        let other_active = other.try_start().unwrap().unwrap();
+        let additional = admissions
+            .enqueue_for_peer([1; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        drop((first_active, other_active, additional));
+        assert_eq!(admissions.state.lock().unwrap().active, 0);
+    }
+
+    #[test]
+    fn single_peer_and_zero_queue_keep_their_full_global_capacity() {
+        for queued in [0, 4] {
+            let admissions = OperationAdmissions::new_peer_fair(2, queued, queued);
+            let mut waiting = VecDeque::new();
+            for _ in 0..2 + queued {
+                waiting.push_back(admissions.enqueue_for_peer([1; 32]).unwrap());
+            }
+            assert!(matches!(
+                admissions.enqueue_for_peer([1; 32]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ));
+            let first = waiting.pop_front().unwrap().try_start().unwrap().unwrap();
+            let second = waiting.pop_front().unwrap().try_start().unwrap().unwrap();
+            if let Some(head) = waiting.front_mut() {
+                assert!(head.try_start().unwrap().is_none());
+            }
+            drop((first, second));
+            while let Some(mut head) = waiting.pop_front() {
+                drop(head.try_start().unwrap().unwrap());
+            }
+            let state = admissions.state.lock().unwrap();
+            assert_eq!(state.active, 0);
+            assert!(state.waiting.is_empty());
+            assert!(state.peers.as_ref().unwrap().waiting.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancelling_or_starting_waiters_releases_the_same_peers_backlog_share() {
+        let admissions = OperationAdmissions::new_peer_fair(1, 4, 2);
+        let active = admissions
+            .enqueue_for_peer([1; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let cancelled = admissions.enqueue_for_peer([1; 32]).unwrap();
+        let mut successor = admissions.enqueue_for_peer([1; 32]).unwrap();
+        assert!(matches!(
+            admissions.enqueue_for_peer([1; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(cancelled);
+        let replacement = admissions.enqueue_for_peer([1; 32]).unwrap();
+        let other = admissions.enqueue_for_peer([2; 32]).unwrap();
+        drop(active);
+        let successor_active = successor.try_start().unwrap().unwrap();
+        let next = admissions.enqueue_for_peer([1; 32]).unwrap();
+        assert!(matches!(
+            admissions.enqueue_for_peer([1; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop((replacement, other, next, successor_active));
+        let state = admissions.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert!(state.waiting.is_empty());
+        let peers = state.peers.as_ref().unwrap();
+        assert!(peers.waiting.is_empty());
+        assert!(peers.turns.peek(state.next_ticket).is_none());
+    }
+
+    #[test]
     fn peer_fair_admission_interleaves_bursts_with_bounded_capacity_and_peer_fifo() {
-        let admissions = OperationAdmissions::new_peer_fair(1, 12);
+        let admissions = OperationAdmissions::new_peer_fair(1, 12, 12);
         let blocker = admissions
             .enqueue_for_peer([0; 32])
             .unwrap()
@@ -2142,7 +2405,7 @@ mod tests {
 
     #[test]
     fn cancelled_peer_heads_and_empty_turns_preserve_other_demand_without_virtual_debt() {
-        let admissions = OperationAdmissions::new_peer_fair(1, 4);
+        let admissions = OperationAdmissions::new_peer_fair(1, 4, 4);
         let active = admissions
             .enqueue_for_peer([1; 32])
             .unwrap()

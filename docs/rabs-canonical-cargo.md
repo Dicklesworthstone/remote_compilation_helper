@@ -3023,13 +3023,39 @@ operation holds its root slot across input transfer, execution and final
 delivery, bounding simultaneous work even while inputs are uploading.
 
 `max_queued_roots` accepts 0–128 and defaults to 0. Set it above zero to let
-authenticated clients wait in FIFO order when the active roots are occupied.
-The example admits four operations and allows sixteen additional sessions.
-Total connections, including TLS handshakes, are bounded by the sum of those
-limits. At the coordinator, a request waiting for an operation slot retains only
-its connection and bounded declaration. It receives no input tree or compiler
-tokens and cannot start uploading or execute Cargo until a slot becomes
-available. The client keeps its already captured inputs while waiting.
+authenticated clients wait when the active roots are occupied. Requests keep
+FIFO order within each authenticated client key; the coordinator schedules fair
+turns between keys. The example admits four operations and bounds additional
+waiting requests at sixteen.
+
+Each enrolled client also has a fixed waiting allowance: divide
+`max_queued_roots` by the number of `allowed_edge_pins`, round down, and use at
+least one slot when queuing is enabled. With four waiting slots and three
+clients, each client can retain one waiting request. The remaining slot stays
+unassigned so earlier clients cannot consume a later client's share. A single
+enrolled client retains the entire configured queue. The existing service-ready
+event reports the computed `max_queued_roots_per_peer`.
+
+Available active-root capacity remains usable by any client. When there is no
+backlog, enqueue grants that capacity atomically; concurrent callers cannot
+claim the same idle slot. An unclaimed grant releases its capacity when its
+owner is dropped. Once work is queued, new arrivals cannot bypass its existing
+fair turn. Cancelling a waiting request removes only that request and frees
+its peer's allowance; starting it moves the capacity into the active-root bound.
+
+When the queue can hold at least one request per enrolled client, one peer
+cannot exhaust another peer's waiting allowance. Rounding down leaves at most
+`enrolled_clients - 1` waiting slots unassigned; active-root capacity remains
+available.
+If the configured queue is smaller than the enrollment, the global queue bound
+still applies and all clients cannot hold waiting requests simultaneously.
+These quotas apply after authentication and request validation; they do not
+reserve listener connections or TLS-handshake capacity.
+
+At the coordinator, a queued request retains only its connection and bounded
+declaration. It receives no input tree or compiler tokens and cannot start
+uploading or execute Cargo until admitted. The client keeps its already
+captured inputs while waiting.
 
 `queue_timeout_seconds` accepts 1–1800 and defaults to 300. The queue deadline
 is fixed when a validated request enters admission; progress polls do not renew
