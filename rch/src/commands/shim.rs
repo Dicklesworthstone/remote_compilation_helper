@@ -90,7 +90,7 @@ use crate::ui::theme::StatusIndicator;
 ///
 /// `11` also recognizes the short manifest selector (`-m`), including attached
 /// paths and grouped short options, before sending a build to RCH.
-const SHIM_VERSION: &str = "11";
+const SHIM_VERSION: &str = "12";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -505,12 +505,36 @@ find_subcommand() {{
       fi ;;
   esac
 }}
+# A build that names no manifest, run where neither the working directory nor
+# any ancestor holds a Cargo.toml, can only end in cargo's "could not find
+# `Cargo.toml`". Let the real cargo say that at once, instead of reserving a
+# worker for a retryable RCH-E415 about a manifest that does not exist
+# (bd-y6jtw). Anything that can point cargo elsewhere (a manifest path, -C, any
+# -Z flag) keeps the RCH route, and argv after `--` belongs to the program.
+manifest_unreachable() {{
+  for a in "$@"; do
+    case "$a" in
+      --) break ;;
+      --manifest-path|--manifest-path=*|-m|-m?*|-C|-C?*|-Z|-Z?*) return 1 ;;
+    esac
+  done
+  rch_manifest_dir=$(pwd -P 2>/dev/null) || return 1
+  while [ -n "$rch_manifest_dir" ]; do
+    [ -e "$rch_manifest_dir/Cargo.toml" ] && return 1
+    [ "$rch_manifest_dir" = / ] && return 0
+    rch_manifest_dir=${{rch_manifest_dir%/*}}
+    [ -n "$rch_manifest_dir" ] || rch_manifest_dir=/
+  done
+  return 1
+}}
 find_subcommand "$@"
 case "$rch_subcommand" in
   build|b|test|t|check|c|clippy|bench|doc|nextest|run|r|zigbuild|xwin)
+    manifest_unreachable "$@" && exec_local "$@"
     {offload} ;;
   package|publish)
     [ "$rch_packaging" = 1 ] || exec_local "$@"
+    manifest_unreachable "$@" && exec_local "$@"
     {offload} ;;
   *)
     exec_local "$@" ;;
@@ -1405,6 +1429,9 @@ mod tests {
         rch_available: bool,
     ) -> std::process::Output {
         let root = tempfile::tempdir().unwrap();
+        // A reachable manifest, so these argv-routing cases are not decided by
+        // the no-manifest check (bd-y6jtw).
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         let tools = root.path().join("tools with ' quotes");
         std::fs::create_dir(&tools).unwrap();
         let shim = root.path().join("cargo");
@@ -1773,7 +1800,24 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
         env: &[(&str, &str)],
         home: Option<&Path>,
     ) -> std::process::Output {
+        exec_shim_from(dir, name, args, env, home, None)
+    }
+
+    /// [`exec_shim`] from an explicit working directory (the shim's manifest
+    /// reachability check reads the cwd and its ancestors).
+    #[cfg(unix)]
+    fn exec_shim_from(
+        dir: &Path,
+        name: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        home: Option<&Path>,
+        cwd: Option<&Path>,
+    ) -> std::process::Output {
         let mut cmd = std::process::Command::new(dir.join(name));
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.args(args)
             .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
             .env_remove("RCH_CARGO_WRAPPER_BYPASS")
@@ -1818,6 +1862,105 @@ exit "${RCH_SHIM_TEST_STATUS:-0}"
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Run the standard sandboxed cargo shim from `cwd`; assert success and
+    /// return the stub's trimmed stdout ("OFFLOAD ..." or "LOCAL ...").
+    #[cfg(unix)]
+    fn run_shim_from(body: &str, args: &[&str], cwd: &Path) -> String {
+        let dir = shim_sandbox(body, "cargo", args);
+        let real = dir.join("real-cargo");
+        let env = [
+            ("RCH_SHIM_REAL_CARGO", real.to_str().unwrap()),
+            ("RCH_SHIM_REAL_CARGO_CLIPPY", real.to_str().unwrap()),
+        ];
+        let out = exec_shim_from(&dir, "cargo", args, &env, None, Some(cwd));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "shim exited {:?}; stderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A fresh directory under /tmp whose physical path has no `Cargo.toml` in
+    /// it or any ancestor, or None if this host cannot provide one.
+    #[cfg(unix)]
+    fn manifestless_dir(tag: &str) -> Option<PathBuf> {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = Path::new("/tmp").join(format!(
+            "rch-shim-nomanifest-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).ok()?;
+        let physical = dir.join("sub").canonicalize().ok()?;
+        if physical.ancestors().any(|a| a.join("Cargo.toml").exists()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+        Some(dir)
+    }
+
+    /// bd-y6jtw: `cargo run -p x` typed in a directory with no Cargo.toml up to
+    /// `/` reserved a worker and came back 30-90 s later as a retryable
+    /// RCH-E415. The shim now hands it to the real cargo, which fails at once
+    /// with its own "could not find `Cargo.toml`", for every offload route.
+    #[cfg(unix)]
+    #[test]
+    fn build_with_no_reachable_manifest_runs_real_cargo() {
+        let Some(root) = manifestless_dir("local") else {
+            eprintln!("skipped: /tmp has a Cargo.toml ancestor on this host");
+            return;
+        };
+        let cwd = root.join("sub");
+        let body = cargo_shim_body(true);
+        for args in [
+            &["run", "--release", "-p", "flife-studio"][..],
+            &["build"][..],
+            &["test", "--workspace"][..],
+            &["check", "--message-format=json"][..],
+            // Arguments after `--` belong to the program, not to cargo.
+            &["test", "--", "--manifest-path", "x/Cargo.toml"][..],
+            &["package"][..],
+        ] {
+            let out = run_shim_from(&body, args, &cwd);
+            assert!(out.starts_with("LOCAL"), "{args:?} from {cwd:?}: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The manifest check must never keep a build local that cargo could run:
+    /// an explicit manifest, `-C`, any `-Z` flag, or a Cargo.toml in an
+    /// ancestor all keep the RCH route.
+    #[cfg(unix)]
+    #[test]
+    fn manifest_hints_and_ancestor_manifests_still_offload() {
+        let Some(root) = manifestless_dir("offload") else {
+            eprintln!("skipped: /tmp has a Cargo.toml ancestor on this host");
+            return;
+        };
+        let cwd = root.join("sub");
+        let body = cargo_shim_body(true);
+        for args in [
+            &["build", "--manifest-path", "/elsewhere/Cargo.toml"][..],
+            &["build", "--manifest-path=/elsewhere/Cargo.toml"][..],
+            &["-C", "/elsewhere", "build"][..],
+            &["-Zunstable-options", "build"][..],
+            &["build", "-Z", "build-std"][..],
+        ] {
+            let out = run_shim_from(&body, args, &cwd);
+            assert!(out.starts_with("OFFLOAD"), "{args:?} from {cwd:?}: {out}");
+        }
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let nested = root.join("sub/crates/a");
+        std::fs::create_dir_all(&nested).unwrap();
+        let out = run_shim_from(&body, &["build"], &nested);
+        assert!(out.starts_with("OFFLOAD"), "ancestor manifest: {out}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The regression this whole change exists for: a plain
