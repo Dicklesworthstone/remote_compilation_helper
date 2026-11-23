@@ -109,7 +109,7 @@ fn negotiated_previews_and_renewals_share_the_native_stream_without_changing_exe
         RecordPeer::new(&runtime, PreviewingWire { wire, queries: 0 }, &request()),
         trigger,
     )
-    .with_preview_observer(Some(observer.clone()));
+    .with_preview_observer(Some(observer.clone().into()));
     let original = request();
     peer.send(&selection(1000)).unwrap();
     assert!(peer.preview.as_ref().unwrap().wake_at().is_none());
@@ -159,7 +159,8 @@ fn pending_lease_ack_defers_due_preview_in_both_tick_and_receive_paths() {
     let runtime = runtime();
     let trigger = Trigger::default();
     let observer = observer();
-    let mut peer = peer(&runtime, &trigger, &[]).with_preview_observer(Some(observer.clone()));
+    let mut peer =
+        peer(&runtime, &trigger, &[]).with_preview_observer(Some(observer.clone().into()));
     peer.send(&selection(3000)).unwrap();
     peer.send(&request()).unwrap();
     peer.lease
@@ -208,7 +209,8 @@ fn terminal_result_drains_one_late_preview_without_cache_exposure_or_deadline_ex
     let trigger = Trigger::default();
     let observer = observer();
     let before = observer.snapshot(0, 0).unwrap();
-    let mut peer = peer(&runtime, &trigger, &[]).with_preview_observer(Some(observer.clone()));
+    let mut peer =
+        peer(&runtime, &trigger, &[]).with_preview_observer(Some(observer.clone().into()));
     peer.send(&selection(30000)).unwrap();
     peer.send(&request()).unwrap();
     peer.preview_tick().unwrap();
@@ -340,7 +342,7 @@ fn cancelled_partial_preview_write_poisons_without_appending_cancel_renewal_or_r
         RecordPeer::new(&runtime, stream, &request()),
         OperationInterrupts::new(cancellation),
     )
-    .with_preview_observer(Some(observer.clone()));
+    .with_preview_observer(Some(observer.clone().into()));
     peer.send(&selection(1000)).unwrap();
     peer.send(&request()).unwrap();
     let mut expected = peer.inner.stream.wire.sent.clone();

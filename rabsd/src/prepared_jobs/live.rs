@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 /// ends live presentation; the verified result later supplies that entire
 /// unseen suffix. A partial console write poisons this invocation instead.
 #[derive(Default)]
-struct StderrPrefix {
+pub(crate) struct StderrPrefix {
     bytes: u64,
     digest: Sha256,
     gap: bool,
@@ -30,7 +30,7 @@ struct StderrPrefix {
 }
 
 impl StderrPrefix {
-    fn append(
+    pub(crate) fn append(
         &mut self,
         offset: u64,
         skipped: u64,
@@ -112,7 +112,7 @@ impl StderrPrefix {
         Ok(())
     }
 
-    fn descriptor(&self) -> io::Result<DiagnosticStream> {
+    pub(crate) fn descriptor(&self) -> io::Result<DiagnosticStream> {
         if self.poisoned {
             return Err(invalid("partial live stderr cannot be replayed"));
         }
@@ -120,6 +120,10 @@ impl StderrPrefix {
             bytes: self.bytes,
             sha256: rabs_protocol::raw_bytes::encode_hex(&self.digest.clone().finalize()),
         })
+    }
+
+    pub(crate) fn exposed(&self) -> bool {
+        self.exposed
     }
 }
 

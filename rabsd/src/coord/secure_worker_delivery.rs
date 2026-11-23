@@ -52,6 +52,7 @@ mod preview;
 use admission::AdmittedWorkerSession;
 pub use admission::PinnedWorkerAdmission;
 pub use cancellation::OperationCancellation;
+pub use preview::WorkerOutputObserver;
 
 /// A caller may bind an authenticated worker to its own live coordinator before
 /// any source bytes or execution request leave this process. The durable pin
@@ -1637,7 +1638,7 @@ pub fn receive_authenticated_controlled(
     )
 }
 
-/// The daemon's optional observer receives bounded live tails. It has no access
+/// The optional observer receives bounded live tails. It has no access
 /// to the transport, cancellation, result retention or verified delivery state.
 #[allow(clippy::too_many_arguments)]
 pub fn receive_authenticated_observed(
@@ -1650,7 +1651,7 @@ pub fn receive_authenticated_observed(
     upload: Option<&SourceUpload>,
     resume_source: Option<&ResumeSource>,
     cancellation: OperationCancellation,
-    observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+    observer: Option<WorkerOutputObserver>,
 ) -> Result<Delivery, DeliveryFailure> {
     receive_authenticated_with_admission(
         runtime,
@@ -1681,7 +1682,7 @@ pub fn receive_authenticated_with_admission(
     upload: Option<&SourceUpload>,
     resume_source: Option<&ResumeSource>,
     cancellation: OperationCancellation,
-    observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+    observer: Option<WorkerOutputObserver>,
     on_admitted: Option<WorkerAdmissionHook>,
 ) -> Result<Delivery, DeliveryFailure> {
     receive_authenticated_inner(
@@ -1762,7 +1763,7 @@ fn receive_authenticated_inner(
     upload: Option<&SourceUpload>,
     resume_source: Option<&ResumeSource>,
     cancellation: OperationCancellation,
-    observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+    observer: Option<WorkerOutputObserver>,
     on_admitted: Option<WorkerAdmissionHook>,
     live_continuation: Option<SealedResult>,
     initial_record: Option<(Value, Vec<u8>)>,

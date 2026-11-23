@@ -673,7 +673,7 @@ fn worker_admission_state() -> PathBuf {
 
 struct TlsOperationControl<'a> {
     cancellation: OperationCancellation,
-    preview: Option<rabsd::coord::prepared_operation::PreviewObserver>,
+    preview: Option<rabsd::coord::secure_worker_delivery::WorkerOutputObserver>,
     on_listening: &'a mut dyn FnMut(SocketAddr) -> io::Result<()>,
 }
 

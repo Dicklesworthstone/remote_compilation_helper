@@ -241,6 +241,42 @@ impl Receiver {
             stderr,
         }
     }
+    #[cfg(target_os = "linux")]
+    fn spawn_live_build(
+        root: &Path,
+        certificates: &Certificates,
+        bundle: &Path,
+        destination: &Path,
+        outputs: &Path,
+    ) -> Self {
+        let stdout = root.join("live-build.stdout");
+        let stderr = root.join("live-build.stderr");
+        let child = Command::new(env!("CARGO_BIN_EXE_rabsd"))
+            .args([
+                "--worker-build-tls",
+                "--replay-diagnostics",
+                "--live-stderr",
+                "127.0.0.1:0",
+                "worker",
+                &certificates.pin(),
+            ])
+            .arg(bundle)
+            .arg(destination)
+            .arg(outputs)
+            .env("RABS_STATE_DIR", root.join("state"))
+            .env("RABS_COORD_TLS_CA", &certificates.server.ca)
+            .env("RABS_COORD_TLS_CERT", &certificates.server.certificate)
+            .env("RABS_COORD_TLS_KEY", &certificates.server.private_key)
+            .stdout(File::create(&stdout).unwrap())
+            .stderr(File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            stdout,
+            stderr,
+        }
+    }
     fn listening(&mut self) -> String {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -1463,6 +1499,255 @@ fn prepared_build_bundle(root: &Path) -> (PathBuf, Value, Vec<u8>) {
     )
     .unwrap();
     (bundle, request, source)
+}
+
+#[cfg(target_os = "linux")]
+fn prepared_live_cargo_bundle(root: &Path) -> (PathBuf, Value) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+    let checkout = root.join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("Cargo.toml"),
+        b"[package]\nname = 'live-stderr-fixture'\nversion = '0.1.0'\n[lib]\npath = 'lib.rs'\n",
+    )
+    .unwrap();
+    // Keep the existing source-transfer helper's multi-range assertion active.
+    let source = [
+        b"// ".to_vec(),
+        vec![b'x'; MAX_SOURCE_CHUNK + 17],
+        b"\npub fn answer() -> u32 { 42 }\n".to_vec(),
+    ]
+    .concat();
+    fs::write(checkout.join("lib.rs"), source).unwrap();
+    let specification = json!({
+        "kind":"canonical-exec", "request_id":7,
+        "program":"/__rabs/toolchain/bin/cargo", "toolchain_backing":"/tc",
+        "args":["check", "--message-format=json", "--target-dir=/__rabs/out/cargo"],
+        "source_files":["Cargo.toml", "lib.rs"], "timeout_ms":10000,
+        "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1", "cargo":"cargo-json-v1"},
+    });
+    let bundle = root.join("bundle");
+    prepare_source_bundle(&checkout, &specification, &bundle).unwrap();
+    let request = serde_json::from_slice(&fs::read(bundle.join("request.json")).unwrap()).unwrap();
+    (bundle, request)
+}
+
+/// The scripted worker constructs its own wire manifest. The production
+/// receiver must independently validate it and all transferred object bytes.
+#[cfg(target_os = "linux")]
+fn live_cargo_artifact_manifest() -> Value {
+    let mut digest = Sha256::new();
+    let field = |digest: &mut Sha256, bytes: &[u8]| {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    };
+    field(&mut digest, b"rabs.worker-artifact-manifest.v1");
+    field(&mut digest, b"cargo");
+    digest.update(1_u64.to_be_bytes());
+    field(&mut digest, b"a");
+    digest.update([0]);
+    digest.update((ARTIFACT.len() as u64).to_be_bytes());
+    field(&mut digest, hash(ARTIFACT).as_bytes());
+    json!({"unit":"cargo", "files":[{
+        "name":"a", "bytes":ARTIFACT.len(), "sha256":hash(ARTIFACT), "executable":false,
+    }], "total_bytes":ARTIFACT.len(), "manifest_sha256":hex(&digest.finalize())})
+}
+
+/// Real native CLI, TLS, bounded worker-preview polling, source capture,
+/// verified delivery and console replay. The worker is scripted and does not
+/// run Cargo; this is not a compilation, cache or fleet performance claim.
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_live_stderr_precedes_completion_and_replays_exactly_once() {
+    direct_live_stderr_case(0, false);
+    direct_live_stderr_case(101, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_live_stderr_rejects_changed_final_prefix_before_stdout_replay() {
+    direct_live_stderr_case(0, true);
+}
+
+#[cfg(target_os = "linux")]
+fn direct_live_stderr_case(exit_code: i32, changed_prefix: bool) {
+    const PREFIX: &[u8] = b"live Cargo progress before completion\n";
+    const SUFFIX: &[u8] = b"final Cargo diagnostic after completion\n";
+    let certificates = Certificates::new();
+    let owner = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(owner.path()).unwrap();
+    let (bundle, request) = prepared_live_cargo_bundle(&root);
+    let delivery = root.join("delivery");
+    let outputs = root.join("outputs");
+    let pin = certificates.pin();
+    let mut receiver =
+        Receiver::spawn_live_build(&root, &certificates, &bundle, &delivery, &outputs);
+    let address = receiver.listening();
+    let stdout = if exit_code == 0 {
+        concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"kind\":[\"lib\"]},",
+            "\"filenames\":[\"/__rabs/out/cargo/a\"],\"executable\":null}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n"
+        )
+        .as_bytes()
+    } else {
+        b"{\"reason\":\"build-finished\",\"success\":false}\n"
+    };
+    let mut stderr = [PREFIX, SUFFIX].concat();
+    if changed_prefix {
+        stderr[0] ^= 1;
+    }
+    let manifest = live_cargo_artifact_manifest();
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    runtime.block_on(async {
+        asupersync::time::timeout(asupersync::time::wall_now(), Duration::from_secs(15), async {
+            let mut peer = connect_peer(&address, "localhost", &certificates.worker).await.unwrap();
+            let mut offered = hello(&pin);
+            offered["source_transfers"] = json!([SOURCE_TRANSFER]);
+            offered["output_previews"] = json!(["tail-v1"]);
+            let (_, grant) = authenticate_grant(&mut peer.stream, &pin, &offered).await;
+            assert_eq!(grant["output_preview"], "tail-v1");
+            receive_prepared_source(&mut peer.stream, &request, &root.join("worker-source")).await;
+            assert_eq!(receive(&mut peer.stream).await.unwrap(), request);
+            assert_eq!(receive(&mut peer.stream).await.unwrap(),
+                json!({"kind":"output-preview", "request_id":7}));
+            send(&mut peer.stream, &json!({
+                "kind":"output-preview", "version":"tail-v1", "request_id":7,
+                "active":true, "complete":false, "publication_authorized":false,
+                "segments":[
+                    {"stream":"stdout", "offset":0, "data_hex":hex(stdout),
+                        "skipped_bytes":0, "observed_bytes":stdout.len()},
+                    {"stream":"stderr", "offset":0, "data_hex":hex(PREFIX),
+                        "skipped_bytes":0, "observed_bytes":PREFIX.len()},
+                ],
+            })).await.unwrap();
+
+            // Observe the actual process output before allowing the peer to
+            // send its terminal result. Sleeping after completion would not
+            // establish that the feature delivers progress during execution.
+            let until = Instant::now() + Duration::from_secs(5);
+            while !fs::read(&receiver.stderr).unwrap().windows(PREFIX.len()).any(|bytes| bytes == PREFIX) {
+                assert!(Instant::now() < until, "live prefix was withheld: {}", receiver.logs());
+                assert!(receiver.child.try_wait().unwrap().is_none(), "live client exited early");
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+            }
+            assert!(fs::read(&receiver.stdout).unwrap().is_empty(), "Cargo readiness stdout escaped early");
+            assert!(!outputs.exists(), "an uncompleted worker exposed outputs");
+            let mut result = json!({
+                "kind":"exec-result", "request_id":7, "executed":true, "exit_code":exit_code,
+                "residual_group_members":0, "stop_reason":null,
+                "output_transfer":"ranges-v1", "output_ack_required":true,
+                "stdout_bytes":stdout.len(), "stdout_sha256":hash(stdout),
+                "stderr_bytes":stderr.len(), "stderr_sha256":hash(&stderr),
+                "artifact_ack_required":false, "artifact_manifest":null,
+            });
+            if exit_code == 0 {
+                result["artifact_transfer"] = json!("files-v1");
+                result["artifact_ack_required"] = json!(true);
+                result["artifact_manifest"] = manifest.clone();
+            }
+            send(&mut peer.stream, &result).await.unwrap();
+            let mut acknowledgments = 0;
+            loop {
+                let query = receive(&mut peer.stream).await.unwrap();
+                assert_eq!(query["request_id"], 7);
+                match query["kind"].as_str().unwrap() {
+                    "output-preview" => {
+                        // The completion may overtake one already-issued
+                        // observation. Settle only that correlated query.
+                        send(&mut peer.stream, &json!({
+                            "kind":"output-preview", "version":"tail-v1", "request_id":7,
+                            "active":false, "complete":false, "publication_authorized":false,
+                            "segments":[],
+                        })).await.unwrap();
+                    }
+                    "output-read" | "artifact-read" => {
+                        let artifact = query["kind"] == "artifact-read";
+                        let name = query[if artifact { "name" } else { "stream" }].as_str().unwrap();
+                        let bytes = match (artifact, name) {
+                            (false, "stdout") => stdout,
+                            (false, "stderr") => stderr.as_slice(),
+                            (true, "a") if exit_code == 0 => ARTIFACT,
+                            other => panic!("unexpected retrieval {other:?}"),
+                        };
+                        assert_eq!(query["offset"], 0);
+                        let mut chunk = json!({
+                            "kind":if artifact { "artifact-chunk" } else { "output-chunk" },
+                            "request_id":7, "offset":0, "next_offset":bytes.len(),
+                            "total_bytes":bytes.len(), "eof":true, "data_hex":hex(bytes),
+                            "chunk_sha256":hash(bytes), "sha256":hash(bytes),
+                        });
+                        chunk[if artifact { "name" } else { "stream" }] = json!(name);
+                        if artifact {
+                            chunk["executable"] = json!(false);
+                            chunk["manifest_sha256"] = manifest["manifest_sha256"].clone();
+                        }
+                        send(&mut peer.stream, &chunk).await.unwrap();
+                    }
+                    "output-ack" | "artifact-ack" => {
+                        // Final bytes are retained before releasing the worker,
+                        // even if the caller later refuses the preview prefix.
+                        assert_eq!(fs::read(delivery.join("diagnostics/stderr")).unwrap(), stderr);
+                        let output = query["kind"] == "output-ack";
+                        send(&mut peer.stream, &json!({
+                            "kind":if output { "output-acknowledged" } else { "artifact-acknowledged" },
+                            "request_id":7, "already_released":false,
+                        })).await.unwrap();
+                        acknowledgments += 1;
+                        if acknowledgments == if exit_code == 0 { 2 } else { 1 } {
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected command; no reexecution permitted: {other}"),
+                }
+            }
+        }).await.expect("direct live-stderr TLS exchange timed out");
+    });
+    let status = receiver.wait();
+    let console_stderr = fs::read(&receiver.stderr).unwrap();
+    assert_eq!(
+        console_stderr
+            .windows(PREFIX.len())
+            .filter(|bytes| *bytes == PREFIX)
+            .count(),
+        1
+    );
+    if changed_prefix {
+        assert!(!status.success(), "a changed final transcript was accepted");
+        assert!(fs::read(&receiver.stdout).unwrap().is_empty());
+        assert!(
+            !console_stderr
+                .windows(SUFFIX.len())
+                .any(|bytes| bytes == SUFFIX)
+        );
+        assert!(
+            receiver
+                .logs()
+                .contains("\"diagnostics_may_have_been_exposed\":true")
+        );
+    } else {
+        assert_eq!(status.code(), Some(exit_code), "{}", receiver.logs());
+        assert_eq!(fs::read(&receiver.stdout).unwrap(), stdout);
+        assert_eq!(
+            console_stderr
+                .windows(SUFFIX.len())
+                .filter(|bytes| *bytes == SUFFIX)
+                .count(),
+            1
+        );
+        assert!(
+            console_stderr
+                .windows(stderr.len())
+                .any(|bytes| bytes == stderr)
+        );
+    }
+    if exit_code == 0 {
+        assert_eq!(fs::read(outputs.join("a")).unwrap(), ARTIFACT);
+    } else {
+        assert!(!outputs.exists());
+    }
 }
 
 /// The original compiler installation is moved and changed before the operator

@@ -192,7 +192,7 @@ impl<'a, S, I: Interrupts> OperatorPeer<'a, S, I> {
 
     pub(super) fn with_preview_observer(
         mut self,
-        observer: Option<crate::coord::prepared_operation::PreviewObserver>,
+        observer: Option<super::WorkerOutputObserver>,
     ) -> Self {
         self.preview = observer.map(PreviewSession::new);
         self

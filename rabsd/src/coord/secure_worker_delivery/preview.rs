@@ -4,13 +4,46 @@
 
 use super::{invalid, require};
 use crate::coord::prepared_operation::PreviewObserver;
-use rabs_asupersync::stream_drain::preview::{MAX_PREVIEW_BYTES, OutputPreview, PreviewStream};
+use rabs_asupersync::stream_drain::preview::{
+    LiveOutputPreview, MAX_PREVIEW_BYTES, OutputPreview, PreviewStream,
+};
 use serde_json::{Value, json};
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "tail-v1";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Optional, fixed-size observations of one authenticated execution. Neither
+/// variant invokes caller code or waits for a console on the transport owner.
+/// Direct clients have no durable daemon job identity and create no such claim.
+#[derive(Clone, Debug)]
+pub enum WorkerOutputObserver {
+    Prepared(PreviewObserver),
+    Direct(Arc<LiveOutputPreview>),
+}
+
+impl From<PreviewObserver> for WorkerOutputObserver {
+    fn from(observer: PreviewObserver) -> Self {
+        Self::Prepared(observer)
+    }
+}
+
+impl WorkerOutputObserver {
+    fn observe(&self, active: bool, segments: &[OutputPreview]) {
+        match self {
+            Self::Prepared(observer) => {
+                let _ = observer.observe(active, segments);
+            }
+            Self::Direct(observer) => {
+                for segment in segments {
+                    observer.record(segment.stream, segment.offset, &segment.bytes);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct Cursors {
@@ -112,7 +145,7 @@ impl Cursors {
 }
 
 pub(super) struct PreviewSession {
-    observer: PreviewObserver,
+    observer: WorkerOutputObserver,
     selected: bool,
     request: Option<u64>,
     next_poll: Option<Instant>,
@@ -122,7 +155,7 @@ pub(super) struct PreviewSession {
 }
 
 impl PreviewSession {
-    pub(super) fn new(observer: PreviewObserver) -> Self {
+    pub(super) fn new(observer: WorkerOutputObserver) -> Self {
         Self {
             observer,
             selected: false,
@@ -189,7 +222,7 @@ impl PreviewSession {
         }
         // This fixed implementation only touches its separate bounded in-memory
         // cache using try_lock; it cannot wait on disk, a CLI, or the job store.
-        let _ = self.observer.observe(active, &segments);
+        self.observer.observe(active, &segments);
         if active {
             self.next_poll = Some(Instant::now() + POLL_INTERVAL);
         } else {

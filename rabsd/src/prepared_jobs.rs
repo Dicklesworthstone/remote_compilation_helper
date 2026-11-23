@@ -4,7 +4,7 @@
 
 mod build;
 mod follow;
-mod live;
+pub(crate) mod live;
 mod wait;
 
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,14 +32,14 @@ const ERROR_REPORT_BUDGET: Duration = Duration::from_millis(100);
 /// A waiting client's own deadline, separate from the durable job's lifetime.
 /// Completion shortens both subsequent verification and already-open writers;
 /// neither a slow console nor a final replay starts a fresh wait budget.
-struct ClientDeadline {
+pub(crate) struct ClientDeadline {
     until: Cell<Instant>,
     #[cfg(target_os = "linux")]
-    output: rabsd::OutputDeadline,
+    pub(crate) output: rabsd::OutputDeadline,
 }
 
 impl ClientDeadline {
-    fn new(until: Instant) -> Self {
+    pub(crate) fn new(until: Instant) -> Self {
         Self {
             until: Cell::new(until),
             #[cfg(target_os = "linux")]
@@ -47,8 +47,11 @@ impl ClientDeadline {
         }
     }
 
-    fn get(&self) -> Instant {
-        self.until.get()
+    pub(crate) fn get(&self) -> Instant {
+        let until = self.until.get();
+        #[cfg(target_os = "linux")]
+        let until = until.min(self.output.get());
+        until
     }
 
     fn limit(&self, until: Instant) {
@@ -58,7 +61,7 @@ impl ClientDeadline {
         self.output.limit(until);
     }
 
-    fn complete(&self) -> Instant {
+    pub(crate) fn complete(&self) -> Instant {
         self.limit(Instant::now() + COMPLETION_BUDGET);
         self.get()
     }
@@ -71,12 +74,28 @@ fn with_client_console<T>(
     deadline: &ClientDeadline,
     work: impl FnOnce(&mut dyn Write, &mut dyn Write) -> io::Result<T>,
 ) -> io::Result<T> {
+    with_stopped_client_console(deadline, &AtomicBool::new(false), work)
+}
+
+/// Direct clients share the same bounded console path while their operation's
+/// signal bridge may revoke a stalled write. This flag never proves completion.
+pub(crate) fn with_stopped_client_console<T>(
+    deadline: &ClientDeadline,
+    stopped: &AtomicBool,
+    work: impl FnOnce(&mut dyn Write, &mut dyn Write) -> io::Result<T>,
+) -> io::Result<T> {
     #[cfg(target_os = "linux")]
     {
-        client_console_to(&io::stdout(), &io::stderr(), deadline, work)
+        client_console_to(&io::stdout(), &io::stderr(), deadline, stopped, work)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        if stopped.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "console cancelled",
+            ));
+        }
         remaining(deadline.get())?;
         work(&mut io::stdout().lock(), &mut io::stderr().lock())
     }
@@ -105,7 +124,7 @@ fn with_client_stdout<T>(
     }
 }
 
-fn write_client_status(message: impl Display) -> io::Result<()> {
+pub(crate) fn write_client_status(message: impl Display) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         write_client_record_to(&io::stderr(), message, CLIENT_BUDGET)
@@ -148,13 +167,13 @@ fn client_console_to<T>(
     stdout: &impl std::os::fd::AsFd,
     stderr: &impl std::os::fd::AsFd,
     deadline: &ClientDeadline,
+    stopped: &AtomicBool,
     work: impl FnOnce(&mut dyn Write, &mut dyn Write) -> io::Result<T>,
 ) -> io::Result<T> {
-    let stopped = AtomicBool::new(false);
     let mut stdout =
-        rabsd::ControlledOutput::with_deadline(stdout, &stopped, deadline.output.clone())?;
+        rabsd::ControlledOutput::with_deadline(stdout, stopped, deadline.output.clone())?;
     let mut stderr =
-        rabsd::ControlledOutput::with_deadline(stderr, &stopped, deadline.output.clone())?;
+        rabsd::ControlledOutput::with_deadline(stderr, stopped, deadline.output.clone())?;
     work(&mut stdout, &mut stderr)
 }
 
@@ -631,21 +650,27 @@ mod tests {
                 } else {
                     (&ordinary, &pipe)
                 };
-                let error = client_console_to(stdout, stderr, &deadline, |stdout, stderr| {
-                    deadline.limit(Instant::now() + Duration::from_millis(50));
-                    let retained = deadline.get();
-                    deadline.complete();
-                    assert_eq!(
-                        deadline.get(),
-                        retained,
-                        "completion must never renew a bound"
-                    );
-                    if stdout_stalls {
-                        stdout.write_all(b"verified final stdout")
-                    } else {
-                        stderr.write_all(b"live stderr")
-                    }
-                })
+                let error = client_console_to(
+                    stdout,
+                    stderr,
+                    &deadline,
+                    &AtomicBool::new(false),
+                    |stdout, stderr| {
+                        deadline.limit(Instant::now() + Duration::from_millis(50));
+                        let retained = deadline.get();
+                        deadline.complete();
+                        assert_eq!(
+                            deadline.get(),
+                            retained,
+                            "completion must never renew a bound"
+                        );
+                        if stdout_stalls {
+                            stdout.write_all(b"verified final stdout")
+                        } else {
+                            stderr.write_all(b"live stderr")
+                        }
+                    },
+                )
                 .unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::TimedOut);
                 assert_eq!(ordinary.metadata().unwrap().len(), 0);

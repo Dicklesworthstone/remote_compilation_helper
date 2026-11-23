@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 const DIAGNOSTIC_REPLAY_BUDGET: Duration = Duration::from_secs(300);
 
+mod live;
+
 /// Carries the original exclusive worker admission from allocation to transport.
 /// Allocation is not authentication or execution authority. Only the normal
 /// pinned TLS/challenge path can grant those. The prepared request is bound
@@ -228,6 +230,7 @@ impl PreparedBuild<'_> {
         source: &str,
         specification: &str,
         state: &Path,
+        live_stderr: bool,
     ) -> io::Result<Option<ReservedWorkerAdmission>> {
         self.validate_preparation(source)?;
         let mut reserved = None;
@@ -244,6 +247,9 @@ impl PreparedBuild<'_> {
                     .to_owned(),
             ],
             |specification| {
+                if live_stderr {
+                    live::validate_request(specification)?;
+                }
                 if specification["request_id"].as_str() != Some("allocate") {
                     return Ok(());
                 }
@@ -267,9 +273,7 @@ impl PreparedBuild<'_> {
         // The normal build path reopens and validates that exact retained
         // request and its source bytes before any execution write. It does not
         // recapture the original checkout or trust this informational event.
-        writeln!(
-            io::stderr().lock(),
-            "{}",
+        crate::prepared_jobs::write_client_status(
             json!({"kind":"worker-build-prepared", "bundle":self.bundle,
                 "request_id":report["request_id"],
                 "execution_may_have_run":false, "publication_authorized":false}),
@@ -541,15 +545,12 @@ impl PreparedBuild<'_> {
         match result {
             Ok(code) => code,
             Err(error) => {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "kind":"worker-build-error", "directory":error.directory,
-                        "output_directory":self.output, "detail":error.detail,
-                        "execution_may_have_run":error.execution_may_have_run, "reexecute":false,
-                        "diagnostics_may_have_been_exposed":diagnostics_may_have_been_exposed,
-                    })
-                );
+                crate::prepared_jobs::report_client_error(json!({
+                    "kind":"worker-build-error", "directory":error.directory,
+                    "output_directory":self.output, "detail":error.detail,
+                    "execution_may_have_run":error.execution_may_have_run, "reexecute":false,
+                    "diagnostics_may_have_been_exposed":diagnostics_may_have_been_exposed,
+                }));
                 1
             }
         }
@@ -589,6 +590,22 @@ fn run(args: &[String], tls: bool) -> i32 {
         [flag, rest @ ..] if flag == "--replay-diagnostics" => (rest, true),
         _ => (args, false),
     };
+    let (args, live_stderr) = match args {
+        [flag, rest @ ..] if flag == "--live-stderr" => (rest, true),
+        _ => (args, false),
+    };
+    if live_stderr && (!tls || !replay_diagnostics) {
+        crate::prepared_jobs::report_client_error(
+            "--live-stderr requires --worker-build-tls --replay-diagnostics",
+        );
+        return 2;
+    }
+    if live_stderr && !cfg!(target_os = "linux") {
+        crate::prepared_jobs::report_client_error(
+            "direct --live-stderr requires Linux bounded console support",
+        );
+        return 2;
+    }
     let (args, preparation) = match args {
         [flag, source, specification, rest @ ..] if flag == "--prepare-from" => {
             (rest, Some((source.as_str(), specification.as_str())))
@@ -605,7 +622,7 @@ fn run(args: &[String], tls: bool) -> i32 {
         })
     else {
         eprintln!(
-            "usage: rabsd --worker-build-{} [--replay-diagnostics] [--prepare-from <absolute-source-root> <spec.json> | --resume | --resume-from <absolute-old-delivery>] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
+            "usage: rabsd --worker-build-{} [--replay-diagnostics [--live-stderr]] [--prepare-from <absolute-source-root> <spec.json> | --resume | --resume-from <absolute-old-delivery>] <IP:port> <worker> {}<absolute-bundle-directory> <absolute-delivery-directory> <absolute-output-directory>",
             if tls { "tls" } else { "loopback" },
             if tls { "<worker-spki-sha256> " } else { "" }
         );
@@ -626,11 +643,15 @@ fn run(args: &[String], tls: bool) -> i32 {
         resume_from,
     };
     let reserved = if let Some((source, specification)) = preparation {
-        match build.prepare_from(source, specification, &super::worker_admission_state()) {
+        match build.prepare_from(
+            source,
+            specification,
+            &super::worker_admission_state(),
+            live_stderr,
+        ) {
             Ok(reserved) => reserved,
             Err(error) => {
-                eprintln!(
-                    "{}",
+                crate::prepared_jobs::report_client_error(
                     json!({"kind":"worker-build-prepare-error", "bundle":build.bundle,
                         "directory":build.directory, "output_directory":build.output,
                         "detail":error.to_string(), "execution_may_have_run":false,
@@ -642,7 +663,11 @@ fn run(args: &[String], tls: bool) -> i32 {
     } else {
         None
     };
-    build.report(replay_diagnostics, reserved)
+    if live_stderr {
+        build.report_live(reserved)
+    } else {
+        build.report(replay_diagnostics, reserved)
+    }
 }
 
 pub fn run_build(args: &[String]) -> i32 {
@@ -758,7 +783,7 @@ pub fn execute_prepared_operation(
     let mut on_listening = |address| claim.listening(address);
     let control = TlsOperationControl {
         cancellation: claim.cancellation(),
-        preview: claim.preview_observer(),
+        preview: claim.preview_observer().map(Into::into),
         on_listening: &mut on_listening,
     };
     let acknowledgment_only = claim.acknowledgment_only();
@@ -805,7 +830,7 @@ pub fn execute_prepared_operation(
 mod tests {
     use super::*;
 
-    fn diagnostic_snapshot(stdout: &[u8], stderr: &[u8]) -> DiagnosticSnapshot {
+    pub(super) fn diagnostic_snapshot(stdout: &[u8], stderr: &[u8]) -> DiagnosticSnapshot {
         use sha2::{Digest, Sha256};
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().canonicalize().unwrap();
@@ -990,6 +1015,61 @@ mod tests {
     }
 
     #[test]
+    fn direct_live_stderr_refuses_non_cargo_before_allocating_or_capturing_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (source, specification) = preparation_fixture(&root);
+        let mut request: Value =
+            serde_json::from_slice(&fs::read(&specification).unwrap()).unwrap();
+        request["request_id"] = json!("allocate");
+        fs::write(&specification, serde_json::to_vec(&request).unwrap()).unwrap();
+        let (bundle, delivery, output, state) = (
+            root.join("bundle"),
+            root.join("delivery"),
+            root.join("output"),
+            root.join("state"),
+        );
+        let pin = "01".repeat(32);
+        let build = PreparedBuild {
+            pin: Some(&pin),
+            bundle: &bundle,
+            directory: &delivery,
+            output: &output,
+            ..preparation_build(&root)
+        };
+        let error = build
+            .prepare_from(
+                source.to_str().unwrap(),
+                specification.to_str().unwrap(),
+                &state,
+                true,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("whole-Cargo"));
+        assert!(
+            [bundle, delivery, output, state]
+                .iter()
+                .all(|path| !path.exists())
+        );
+        assert_eq!(
+            fs::read(source.join("lib.rs")).unwrap(),
+            b"pub fn value() -> u32 { 42 }\n"
+        );
+    }
+
+    #[test]
+    fn direct_live_stderr_requires_tls_and_exact_replay_flag_order_before_io() {
+        for (arguments, tls) in [
+            (vec!["--live-stderr"], true),
+            (vec!["--replay-diagnostics", "--live-stderr"], false),
+            (vec!["--live-stderr", "--replay-diagnostics"], true),
+        ] {
+            let arguments: Vec<String> = arguments.into_iter().map(str::to_owned).collect();
+            assert_eq!(run(&arguments, tls), 2);
+        }
+    }
+
+    #[test]
     fn prepare_from_captures_once_and_keeps_original_checkout_out_of_execution() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();
@@ -1009,6 +1089,7 @@ mod tests {
                     source.to_str().unwrap(),
                     specification.to_str().unwrap(),
                     &root.join("state"),
+                    false,
                 )
                 .unwrap()
                 .is_none()
@@ -1031,6 +1112,7 @@ mod tests {
                     source.to_str().unwrap(),
                     specification.to_str().unwrap(),
                     &root.join("state"),
+                    false,
                 )
                 .is_err()
         );
@@ -1059,6 +1141,7 @@ mod tests {
                     source.to_str().unwrap(),
                     specification.to_str().unwrap(),
                     &root.join("state"),
+                    false,
                 )
                 .unwrap_err();
             assert!(error.to_string().contains("requires new"));
@@ -1093,6 +1176,7 @@ mod tests {
                         missing.to_str().unwrap(),
                         "not-read.json",
                         &root.join("state"),
+                        false,
                     )
                     .is_err()
             );
@@ -1119,6 +1203,7 @@ mod tests {
                 source.to_str().unwrap(),
                 specification.to_str().unwrap(),
                 &root.join("state"),
+                false,
             )
             .unwrap_err();
         assert!(error.to_string().contains("overlap the source"));
@@ -1146,6 +1231,7 @@ mod tests {
                     source.to_str().unwrap(),
                     specification.to_str().unwrap(),
                     &root.join("state"),
+                    false,
                 )
                 .is_err()
         );
@@ -1424,7 +1510,12 @@ mod tests {
             ..preparation_build(&root)
         };
         let reservation = build
-            .prepare_from(source.to_str().unwrap(), spec.to_str().unwrap(), &state)
+            .prepare_from(
+                source.to_str().unwrap(),
+                spec.to_str().unwrap(),
+                &state,
+                false,
+            )
             .unwrap()
             .unwrap();
         let request = build.request().unwrap();
@@ -1468,7 +1559,12 @@ mod tests {
                 ..preparation_build(&root)
             };
             let reserved = build
-                .prepare_from(source.to_str().unwrap(), spec.to_str().unwrap(), &state)
+                .prepare_from(
+                    source.to_str().unwrap(),
+                    spec.to_str().unwrap(),
+                    &state,
+                    false,
+                )
                 .unwrap()
                 .unwrap();
             let request = build.request().unwrap();
@@ -1502,7 +1598,12 @@ mod tests {
             ..preparation_build(&root)
         };
         let reserved = build
-            .prepare_from(source.to_str().unwrap(), spec.to_str().unwrap(), &state)
+            .prepare_from(
+                source.to_str().unwrap(),
+                spec.to_str().unwrap(),
+                &state,
+                false,
+            )
             .unwrap()
             .unwrap();
         let request = build.request().unwrap();
@@ -1554,7 +1655,12 @@ mod tests {
         };
         assert!(
             build
-                .prepare_from(source.to_str().unwrap(), spec.to_str().unwrap(), &state)
+                .prepare_from(
+                    source.to_str().unwrap(),
+                    spec.to_str().unwrap(),
+                    &state,
+                    false
+                )
                 .is_err()
         );
         // Inspect the production allocator's durable receipt count: merely
@@ -1614,7 +1720,12 @@ mod tests {
         };
         assert!(
             build
-                .prepare_from(source.to_str().unwrap(), spec.to_str().unwrap(), &state)
+                .prepare_from(
+                    source.to_str().unwrap(),
+                    spec.to_str().unwrap(),
+                    &state,
+                    false
+                )
                 .is_err()
         );
         assert!(!state.exists());
@@ -1650,7 +1761,12 @@ mod tests {
         };
         assert!(
             build
-                .prepare_from(source.to_str().unwrap(), spec.to_str().unwrap(), &state)
+                .prepare_from(
+                    source.to_str().unwrap(),
+                    spec.to_str().unwrap(),
+                    &state,
+                    false
+                )
                 .unwrap()
                 .is_none()
         );
@@ -1715,7 +1831,12 @@ mod tests {
         ] {
             assert!(
                 build
-                    .prepare_from(source.to_str().unwrap(), spec.to_str().unwrap(), &state)
+                    .prepare_from(
+                        source.to_str().unwrap(),
+                        spec.to_str().unwrap(),
+                        &state,
+                        false
+                    )
                     .is_err()
             );
             assert!(!bundle.exists());
@@ -1729,7 +1850,12 @@ mod tests {
             std::os::unix::fs::symlink(&source, &alias).unwrap();
             assert!(
                 build
-                    .prepare_from(source.to_str().unwrap(), spec.to_str().unwrap(), &alias)
+                    .prepare_from(
+                        source.to_str().unwrap(),
+                        spec.to_str().unwrap(),
+                        &alias,
+                        false
+                    )
                     .is_err()
             );
             assert!(!source.join("worker-admission").exists());
