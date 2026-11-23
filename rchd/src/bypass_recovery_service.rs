@@ -1057,9 +1057,9 @@ pub(crate) async fn record_process_observation_failure(
         .details
         .insert(RECOVERY_ENDPOINT.into(), recovery_endpoint(&config));
     // Keep bounded retry deduplication without refusing fresh failures.
-    // A long-lived retained owner may produce many distinct cancellation
-    // attempts. An ancient duplicate may conservatively count again once
-    // evicted; a new failure must always interrupt a pending canary.
+    // Each retained build contributes one cancellation incident, regardless
+    // of how often cleanup retries. An ancient duplicate may conservatively
+    // count again once evicted; a new failure must always interrupt a canary.
     if incidents.len() >= 4096 {
         drop(incidents.drain(..incidents.len() - 4095));
     }

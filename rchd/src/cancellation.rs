@@ -1475,13 +1475,13 @@ impl CancellationOrchestrator {
             store,
             &worker,
             endpoint,
-            // Retransmitting this attempt's cleanup is idempotent. A fresh
-            // cancellation attempt is new observation evidence, even when it
-            // targets the same retained build that caused the first bypass.
-            &format!(
-                "cancel:{}:{}:{:?}",
-                owner.id, owner.started_at, record.requested_at
-            ),
+            // A retry still describes the same unresolved build, not a new
+            // worker incident. Use durable ownership rather than this
+            // attempt's Instant so retries and daemon restarts cannot keep
+            // extending quarantine or erase successful recovery probes.
+            // The admission timestamp distinguishes a new build incarnation
+            // even if an imported history reuses its numeric ID.
+            &format!("cancel:{}:{}", owner.id, owner.started_at),
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         )
         .await
@@ -4015,12 +4015,114 @@ wait
                         .get(config.id.as_str())
                         .unwrap()
                         .consecutive_failures,
-                    2,
-                    "a fresh failed cancellation attempt is new health evidence"
+                    1,
+                    "retrying the same retained build is not a new health incident"
                 );
                 assert_eq!(worker.used_slots(), 3);
             } else if !matches!(case, "retarget" | "aba") {
                 assert!(worker.reserve_slots(1).await, "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_incidents_survive_restart_and_interleaved_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let bypass_path = directory.path().join("bypass.json");
+        let pool = WorkerPool::new();
+        let config = rch_common::WorkerConfig {
+            id: WorkerId::new("retry-worker"),
+            total_slots: 8,
+            ..Default::default()
+        };
+        pool.add_worker(config.clone()).await;
+        let worker = pool.get(&config.id).await.unwrap();
+        let history = Arc::new(BuildHistory::new(100).with_persistence(history_path.clone()));
+        let mut owners = Vec::new();
+        for project in ["first-project", "second-project"] {
+            let owner = history
+                .try_start_active_build_with_waiter(
+                    project.into(),
+                    config.id.to_string(),
+                    "cargo test".into(),
+                    0,
+                    None,
+                    2,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(worker.endpoint_snapshot().await),
+                )
+                .unwrap()
+                .unwrap();
+            history
+                .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                    build_id: owner.id,
+                    worker_id: config.id.clone(),
+                    hook_pid: None,
+                    local_wrapper_id: None,
+                    remote_pgid_file: Some(format!("/admitted/{}.pgid", owner.id)),
+                    phase: rch_common::BuildHeartbeatPhase::Execute,
+                    detail: None,
+                    progress_counter: Some(1),
+                    progress_percent: None,
+                })
+                .unwrap();
+            owners.push(history.active_build(owner.id).unwrap());
+        }
+        assert!(worker.reserve_slots(4).await);
+        let mut ctx = make_test_context(pool, history);
+        ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
+            rch_common::BypassRecordStore::with_path(&bypass_path),
+        )));
+        let mut orch = CancellationOrchestrator::new(test_config(), test_events());
+        let first_attempt = Instant::now() - Duration::from_secs(1_000);
+        let mut expected = None;
+
+        // Retry the same build before and after another owner fails. Reload
+        // both durable stores in between: no process-local retry ID or recent
+        // incident alone is sufficient to keep this sequence idempotent.
+        for (attempt, owner_index) in [0, 0, 1, 0, 1].into_iter().enumerate() {
+            if attempt == 1 {
+                ctx.history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
+                    rch_common::BypassRecordStore::load(&bypass_path),
+                )));
+                orch = CancellationOrchestrator::new(test_config(), test_events());
+            }
+            let owner = ctx.history.active_build(owners[owner_index].id).unwrap();
+            let mut record = test_record(CancellationState::Failed, 1, true);
+            record.build_id = owner.id;
+            record.worker_id.clone_from(&owner.worker_id);
+            record.worker_endpoint = owner.worker_endpoint.clone();
+            record.remote_pgid_file = owner.remote_pgid_file.clone();
+            record.slots = owner.slots;
+            record.slots_released = 0;
+            record.requested_at = first_attempt + Duration::from_secs(30 * attempt as u64);
+            orch.run_cleanup(&ctx, &mut record).await;
+
+            let current = rch_common::BypassRecordStore::load(&bypass_path)
+                .get(config.id.as_str())
+                .cloned()
+                .unwrap();
+            if matches!(attempt, 0 | 2) {
+                assert_eq!(current.consecutive_failures, if attempt == 0 { 1 } else { 2 });
+                expected = Some(current);
+            } else {
+                assert_eq!(
+                    Some(current),
+                    expected,
+                    "a retry must preserve the recovery deadline, backoff and evidence"
+                );
+            }
+            assert_eq!(record.state, CancellationState::Failed);
+            assert_eq!(record.slots_released, 0);
+            assert_eq!(worker.used_slots(), 4);
+            assert!(!worker.reserve_slots(1).await);
+            for owner in &owners {
+                assert!(ctx.history.active_build(owner.id).is_some());
+                assert!(!ctx.history.has_terminal_build(owner.id));
             }
         }
     }
