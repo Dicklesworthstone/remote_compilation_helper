@@ -75,6 +75,11 @@ fn vanished(error: rustix::io::Errno) -> bool {
     )
 }
 
+fn can_skip_entry_error(error: rustix::io::Errno, is_output_root: bool) -> bool {
+    vanished(error)
+        || (!is_output_root && matches!(error, rustix::io::Errno::ACCESS | rustix::io::Errno::PERM))
+}
+
 pub(super) fn growth_buffer(budget: u64) -> u64 {
     (budget / 16).clamp(1, 256 * 1024 * 1024)
 }
@@ -321,7 +326,14 @@ fn verify_cargo_cache_bindings(aliases: &Aliases) -> Result<()> {
     Ok(())
 }
 
-fn cache_walk_is_bounded(roots: &[PathBuf], limit: usize) -> Result<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheWalk {
+    Bounded,
+    TooLarge,
+    Inaccessible,
+}
+
+fn cache_walk_status(roots: &[PathBuf], limit: usize) -> Result<CacheWalk> {
     let mut entries = 0usize;
     let mut visited = BTreeSet::new();
     let mut pending = roots.to_vec();
@@ -331,6 +343,11 @@ fn cache_walk_is_bounded(roots: &[PathBuf], limit: usize) -> Result<bool> {
         }
         let listing = match fs::read_dir(&path) {
             Ok(listing) => listing,
+            // An inaccessible subtree cannot prove that this shared cache is
+            // small enough to walk. Keep its existing filesystem floor probes.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(CacheWalk::Inaccessible);
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -344,6 +361,9 @@ fn cache_walk_is_bounded(roots: &[PathBuf], limit: usize) -> Result<bool> {
         for entry in listing {
             let entry = match entry {
                 Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Ok(CacheWalk::Inaccessible);
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -356,11 +376,14 @@ fn cache_walk_is_bounded(roots: &[PathBuf], limit: usize) -> Result<bool> {
             };
             entries += 1;
             if entries > limit {
-                return Ok(false);
+                return Ok(CacheWalk::TooLarge);
             }
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => pending.push(entry.path()),
                 Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Ok(CacheWalk::Inaccessible);
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -373,7 +396,7 @@ fn cache_walk_is_bounded(roots: &[PathBuf], limit: usize) -> Result<bool> {
             }
         }
     }
-    Ok(true)
+    Ok(CacheWalk::Bounded)
 }
 
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -538,6 +561,7 @@ fn pool_fingerprint(mut entries: Vec<PoolEntry>) -> [u8; 32] {
 #[derive(Clone, Debug)]
 pub(super) struct OutputScan {
     total: u64,
+    output_complete: bool,
     records: Option<Arc<Records>>,
     pool_state: Option<[u8; 32]>,
     pool_bytes: u64,
@@ -549,14 +573,17 @@ struct DirectoryScan {
     entries: Dir,
     signature: Signature,
     relative: Option<Vec<u32>>,
+    is_output_root: bool,
 }
 
 struct Walker<'a> {
     total: u64,
+    output_complete: bool,
     added: Option<u64>,
     pool_bytes: u64,
     seen: BTreeSet<Identity>,
     devices: BTreeSet<u64>,
+    output_roots: BTreeSet<Identity>,
     baseline: Option<&'a Records>,
     records: Option<Records>,
     pool_entries: Option<Vec<PoolEntry>>,
@@ -569,22 +596,37 @@ impl Walker<'_> {
         self.pool_entries = None;
     }
 
+    fn skip_entry_error(&mut self, error: rustix::io::Errno, is_output_root: bool) -> bool {
+        if !can_skip_entry_error(error, is_output_root) {
+            return false;
+        }
+        self.incomplete();
+        if matches!(error, rustix::io::Errno::ACCESS | rustix::io::Errno::PERM) {
+            // Unlike bounded learning metadata or vanished entries, inaccessible
+            // descendants leave allocated bytes unknown. Keep the measured lower
+            // bound for enforcement without learning a smaller disk requirement.
+            self.output_complete = false;
+        }
+        true
+    }
+
     fn enter(
         &mut self,
         parent: BorrowedFd<'_>,
         name: &OsStr,
         relative: Option<Vec<u32>>,
+        is_output_root: bool,
         observe_directory: &mut impl FnMut(),
     ) -> Result<Option<DirectoryScan>> {
         let info = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(info) => info,
-            Err(error) if vanished(error) => {
-                self.incomplete();
-                return Ok(None);
-            }
+            Err(error) if self.skip_entry_error(error, is_output_root) => return Ok(None),
             Err(error) => return Err(std::io::Error::from(error).into()),
         };
         let identity = identity(&info);
+        // An explicit root may also be nested below an earlier root. Its first
+        // visit must retain root checks before inode deduplication can skip it.
+        let is_output_root = is_output_root || self.output_roots.contains(&identity);
         let signature = Signature::of(&info)?;
         if let (Some(relative), Some(entries)) = (&relative, &mut self.pool_entries) {
             if entries.len() >= self.limit {
@@ -635,8 +677,11 @@ impl Walker<'_> {
         }
         let descriptor = match rustix::fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty()) {
             Ok(descriptor) => descriptor,
-            Err(error) if vanished(error) => {
-                self.incomplete();
+            Err(error) if self.skip_entry_error(error, is_output_root) => {
+                // Tests may deliberately remove all permissions from their
+                // temporary directories. Keep any blocks already measured,
+                // but never certify a partial tree for pool learning. Output
+                // roots and filesystem capacity probes remain mandatory.
                 return Ok(None);
             }
             Err(error) => return Err(std::io::Error::from(error).into()),
@@ -652,10 +697,7 @@ impl Walker<'_> {
         observe_directory();
         let entries = match Dir::read_from(&file) {
             Ok(entries) => entries,
-            Err(error) if vanished(error) => {
-                self.incomplete();
-                return Ok(None);
-            }
+            Err(error) if self.skip_entry_error(error, is_output_root) => return Ok(None),
             Err(error) => return Err(std::io::Error::from(error).into()),
         };
         Ok(Some(DirectoryScan {
@@ -663,6 +705,7 @@ impl Walker<'_> {
             entries,
             signature,
             relative,
+            is_output_root,
         }))
     }
 }
@@ -674,16 +717,16 @@ fn measure_outputs(
     limit: usize,
     mut observe_directory: impl FnMut(),
 ) -> Result<OutputScan> {
-    let devices = output_bindings(paths)?
-        .values()
-        .map(|identity| identity.0)
-        .collect();
+    let bindings = output_bindings(paths)?;
+    let devices = bindings.values().map(|identity| identity.0).collect();
     let mut walker = Walker {
         total: 0,
+        output_complete: true,
         added: baseline.map(|_| 0),
         pool_bytes: 0,
         seen: BTreeSet::new(),
         devices,
+        output_roots: bindings.into_values().collect(),
         baseline,
         records: Some(BTreeMap::new()),
         pool_entries: Some(Vec::new()),
@@ -699,6 +742,7 @@ fn measure_outputs(
             rustix::fs::CWD,
             path.as_os_str(),
             relative,
+            true,
             &mut observe_directory,
         )?;
         let mut pending: Vec<DirectoryScan> = first.into_iter().collect();
@@ -719,13 +763,13 @@ fn measure_outputs(
                         directory.file.as_fd(),
                         OsStr::from_bytes(name),
                         relative,
+                        false,
                         &mut observe_directory,
                     )? {
                         pending.push(child);
                     }
                 }
-                Some(Err(error)) if vanished(error) => {
-                    walker.incomplete();
+                Some(Err(error)) if walker.skip_entry_error(error, directory.is_output_root) => {
                     pending.pop();
                 }
                 Some(Err(error)) => return Err(std::io::Error::from(error).into()),
@@ -742,6 +786,7 @@ fn measure_outputs(
     }
     Ok(OutputScan {
         total: walker.total,
+        output_complete: walker.output_complete,
         records: walker.records.map(Arc::new),
         pool_state: walker.pool_entries.map(pool_fingerprint),
         pool_bytes: walker.pool_bytes,
@@ -803,7 +848,8 @@ impl Scanner {
         for path in outputs {
             push_unique(&mut selected_outputs, path.clone());
         }
-        if cache_walk_is_bounded(&cache_outputs, cache_limit)? {
+        let cache_walk = cache_walk_status(&cache_outputs, cache_limit)?;
+        if cache_walk == CacheWalk::Bounded {
             for path in &cache_outputs {
                 push_unique(&mut selected_outputs, path.clone());
             }
@@ -823,6 +869,7 @@ impl Scanner {
             pool_identity,
             initial: OutputScan {
                 total: 0,
+                output_complete: false,
                 records: None,
                 pool_state: None,
                 pool_bytes: 0,
@@ -830,10 +877,25 @@ impl Scanner {
             },
             devices: BTreeSet::new(),
         };
-        scanner.devices = scanner.sample()?.0.into_keys().collect();
-        scanner.verify_bindings()?;
-        scanner.initial = measure_outputs(&scanner.outputs, target, None, record_limit, || {})?;
-        scanner.verify_bindings()?;
+        let samples = scanner.sample()?.0;
+        let free = samples.values().copied().min().unwrap_or(0);
+        scanner.devices = samples.into_keys().collect();
+        scanner.initial = (|| {
+            scanner.verify_bindings()?;
+            let initial = measure_outputs(&scanner.outputs, target, None, record_limit, || {})?;
+            scanner.verify_bindings()?;
+            Ok(initial)
+        })()
+        .map_err(|mut failure: Failure| {
+            failure.free = free;
+            failure
+        })?;
+        if cache_walk == CacheWalk::Inaccessible {
+            scanner.initial.output_complete = false;
+            // The unreadable cache baseline cannot support warm admission.
+            // Keep visible-root records for streaming growth enforcement.
+            scanner.initial.pool_state = None;
+        }
         Ok(scanner)
     }
 
@@ -881,6 +943,7 @@ pub(super) struct Accounting {
     baseline_pool: Option<Pool>,
     final_pool: Option<Pool>,
     admitted_pool: Option<Pool>,
+    output_complete: bool,
     incremental_reliable: bool,
     strict_tracking: bool,
     peak_added: u64,
@@ -916,6 +979,7 @@ impl Accounting {
             pool_identity: scanner.pool_identity,
             final_pool: baseline_pool.clone(),
             admitted_pool: None,
+            output_complete: scanner.initial.output_complete,
             incremental_reliable: scanner.initial.records.is_some() && baseline_pool.is_some(),
             baseline_pool,
             strict_tracking: false,
@@ -1037,6 +1101,7 @@ impl Accounting {
 
     pub(super) fn observe_output(&mut self, scan: OutputScan) -> Result<()> {
         self.peak_output = self.peak_output.max(scan.total);
+        self.output_complete &= scan.output_complete;
         let net_growth = scan.total.saturating_sub(self.baseline);
         self.final_pool = scan.pool_state.map(|state| Pool {
             identity: self.pool_identity,
@@ -1082,6 +1147,10 @@ impl Accounting {
         Ok(())
     }
 
+    pub(super) fn last_free_bytes(&self) -> Option<u64> {
+        self.free.values().copied().min()
+    }
+
     pub(super) fn usage(&self, complete: bool, exit_code: Option<i32>) -> Value {
         let incremental = self.incremental_reliable.then(|| {
             json!({
@@ -1098,6 +1167,7 @@ impl Accounting {
         json!({
             "max_growth_bytes": self.budget, "min_free_bytes": self.floor,
             "peak_output_bytes": self.peak_output, "peak_growth_bytes": self.peak_growth,
+            "output_complete": self.output_complete,
             "incremental": incremental, "admitted_pool": self.admitted_pool,
             "complete": complete, "exit_code": exit_code,
         })
@@ -1108,7 +1178,7 @@ impl Accounting {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::{MetadataExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
@@ -1156,6 +1226,110 @@ mod tests {
         assert_eq!(failure.reason, "cold_required");
         assert_eq!(failure.required_growth_bytes, Some(required));
         assert_eq!(failure.growth, 0);
+    }
+
+    struct RestorePermissions {
+        path: PathBuf,
+        permissions: fs::Permissions,
+    }
+
+    impl RestorePermissions {
+        fn restrict(path: &Path, mode: u32) -> Self {
+            let permissions = fs::metadata(path).unwrap().permissions();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            Self {
+                path: path.to_owned(),
+                permissions,
+            }
+        }
+    }
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            fs::set_permissions(&self.path, self.permissions.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn only_descendant_permission_errors_are_skippable() {
+        use rustix::io::Errno;
+        for error in [Errno::ACCESS, Errno::PERM] {
+            assert!(can_skip_entry_error(error, false));
+            assert!(!can_skip_entry_error(error, true));
+        }
+        for error in [Errno::IO, Errno::BADF, Errno::NOMEM] {
+            assert!(!can_skip_entry_error(error, false));
+            assert!(!can_skip_entry_error(error, true));
+        }
+    }
+
+    #[test]
+    fn inaccessible_descendants_keep_samples_and_growth_but_never_learn_partial_output() {
+        for mode in [0o000, 0o400] {
+            let (_root, target) = tree();
+            let directory = target.join("permission-fixture");
+            fs::create_dir(&directory).unwrap();
+            write_output(&directory.join("hidden"), 128 * 1024);
+            let value = scanner(&target, &[]);
+            let added = write_output(&target.join("visible"), 64 * 1024);
+            let restore = RestorePermissions::restrict(&directory, mode);
+            let access = if mode == 0 {
+                fs::read_dir(&directory).map(|_| ())
+            } else {
+                fs::symlink_metadata(directory.join("hidden")).map(|_| ())
+            };
+            let Err(error) = access else {
+                eprintln!(
+                    "permission regression requires an unprivileged user; mode {mode:o} is accessible"
+                );
+                return;
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+            let scan = value.scan().unwrap();
+            assert!(!scan.output_complete);
+            assert!(scan.records.is_none());
+            assert!(scan.pool_state.is_none());
+            assert!(scan.added.unwrap() >= added);
+            assert!(scan.total >= added);
+            let (samples, at) = value.sample().unwrap();
+            assert!(samples.values().all(|free| *free > 0));
+            let mut accounting = Accounting::new(MIB, 0, &value, None, false).unwrap();
+            accounting.admit(
+                samples.clone(),
+                samples.keys().map(|device| (*device, 0)).collect(),
+                at,
+            );
+            accounting.observe_output(scan).unwrap();
+            assert!(accounting.peak_growth >= added);
+            assert_eq!(
+                accounting.last_free_bytes(),
+                samples.values().copied().min()
+            );
+
+            // Stale permission fixtures must also permit the next cold job.
+            let next = scanner(&target, &[]);
+            let mut cold = Accounting::new(MIB, 0, &next, None, false).unwrap();
+            cold.admit(samples.clone(), samples.clone(), at);
+            assert_eq!(
+                cold.observe_free(samples, at + Duration::from_secs(1))
+                    .unwrap_err()
+                    .reason,
+                "free_floor",
+                "unknown descendant sizes never disable filesystem floors"
+            );
+
+            // Becoming readable again cannot retroactively certify the peak.
+            drop(restore);
+            let recovered = value.scan().unwrap();
+            assert!(recovered.output_complete);
+            accounting.observe_output(recovered).unwrap();
+            let usage = accounting.usage(true, Some(37));
+            assert_eq!(usage["complete"], true);
+            assert_eq!(usage["exit_code"], 37);
+            assert_eq!(usage["output_complete"], false);
+            assert!(usage["incremental"].is_null());
+        }
     }
 
     #[test]
@@ -1266,6 +1440,23 @@ mod tests {
         fs::create_dir(&target).unwrap();
         assert_eq!(value.sample().unwrap_err().reason, "monitor_unavailable");
         assert_eq!(value.scan().unwrap_err().reason, "monitor_unavailable");
+    }
+
+    #[test]
+    fn nested_output_roots_keep_root_permission_checks_before_deduplication() {
+        let (root, target) = tree();
+        let source = root.path().join("source");
+        let nested = source.join("output");
+        fs::create_dir_all(&nested).unwrap();
+        let value = scanner(&target, &[source, nested.clone()]);
+        let _restore = RestorePermissions::restrict(&nested, 0o000);
+        let Err(error) = fs::read_dir(&nested) else {
+            eprintln!("permission regression requires an unprivileged user");
+            return;
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(value.scan().unwrap_err().reason, "monitor_unavailable");
+        assert_eq!(value.sample().unwrap_err().reason, "monitor_unavailable");
     }
 
     #[test]
@@ -1422,6 +1613,7 @@ mod tests {
         accounting
             .observe_output(OutputScan {
                 total: MIB / 2,
+                output_complete: true,
                 records: None,
                 pool_state: None,
                 pool_bytes: 0,
@@ -1437,6 +1629,7 @@ mod tests {
         let failure = accounting
             .observe_output(OutputScan {
                 total: 2 * MIB,
+                output_complete: true,
                 records: None,
                 pool_state: None,
                 pool_bytes: 0,
@@ -1672,8 +1865,8 @@ mod tests {
         for index in 0..3 {
             write_output(&registry.join(index.to_string()), 4096);
         }
-        assert!(cache_walk_is_bounded(&roots, 5).unwrap());
-        assert!(!cache_walk_is_bounded(&roots, 4).unwrap());
+        assert_eq!(cache_walk_status(&roots, 5).unwrap(), CacheWalk::Bounded);
+        assert_eq!(cache_walk_status(&roots, 4).unwrap(), CacheWalk::TooLarge);
         let bounded = Scanner::with_limits(
             &target,
             &[target.clone()],
@@ -1700,6 +1893,62 @@ mod tests {
         .unwrap();
         assert!(roots.iter().all(|path| walked.outputs.contains(path)));
         assert!(walked.initial.total > bounded.initial.total);
+    }
+
+    #[test]
+    fn inaccessible_cache_subtree_retains_floor_probes_without_claiming_a_bounded_walk() {
+        let (root, target) = tree();
+        let (base, plan, roots, _aliases) = cache_roots(root.path());
+        let registry = base.join("rch-cargo-cache-worker/registry");
+        let directory = registry.join("private");
+        fs::create_dir(&directory).unwrap();
+        write_output(&directory.join("hidden"), 4096);
+        let _restore = RestorePermissions::restrict(&directory, 0o000);
+        let Err(error) = fs::read_dir(&directory) else {
+            eprintln!("permission regression requires an unprivileged user");
+            return;
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            cache_walk_status(&roots, 100).unwrap(),
+            CacheWalk::Inaccessible
+        );
+        let value = Scanner::with_limits(
+            &target,
+            std::slice::from_ref(&target),
+            &[],
+            Some(&plan),
+            "boot",
+            Some(base.as_os_str()),
+            100,
+            100,
+        )
+        .unwrap();
+        assert_eq!(value.outputs.as_slice(), std::slice::from_ref(&target));
+        assert!(roots.iter().all(|path| value.paths.contains(path)));
+        assert!(value.sample().unwrap().0.values().all(|free| *free > 0));
+        let accounting = Accounting::new(MIB, 0, &value, None, false).unwrap();
+        let usage = accounting.usage(true, Some(0));
+        assert_eq!(usage["output_complete"], false);
+        assert!(usage["incremental"].is_null());
+        assert!(value.initial.pool_state.is_none());
+        assert!(value.initial.records.is_some());
+
+        let _root_restore = RestorePermissions::restrict(&registry, 0o000);
+        assert!(
+            Scanner::with_limits(
+                &target,
+                std::slice::from_ref(&target),
+                &[],
+                Some(&plan),
+                "boot",
+                Some(base.as_os_str()),
+                100,
+                100,
+            )
+            .is_err(),
+            "managed cache roots still require a real filesystem probe"
+        );
     }
 
     #[test]

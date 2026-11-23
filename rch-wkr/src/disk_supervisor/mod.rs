@@ -944,8 +944,17 @@ mod unix {
         let mut receipts = if failure.reason == "deadline" {
             vec![(invocation.prefix().to_owned(), None)]
         } else {
+            // A failed output walk says nothing about filesystem capacity.
+            // Preserve the last independent statvfs sample when available.
+            let free = if failure.reason == "monitor_unavailable" {
+                accounting
+                    .and_then(scan::Accounting::last_free_bytes)
+                    .unwrap_or(failure.free)
+            } else {
+                failure.free
+            };
             let mut value = json!({
-                "reason": failure.reason, "free_bytes": failure.free, "growth_bytes": failure.growth,
+                "reason": failure.reason, "free_bytes": free, "growth_bytes": failure.growth,
                 "max_growth_bytes": invocation.budget, "min_free_bytes": invocation.floor,
                 "started": started, "detail": failure.detail.chars().take(240).collect::<String>(),
                 "peak_output_bytes": accounting.map(|accounting| accounting.peak_output).or(peak),
@@ -1269,6 +1278,34 @@ mod unix {
         }
 
         #[test]
+        fn monitor_failure_receipt_uses_capacity_sample_without_replacing_measured_refusals() {
+            let fixture = tempfile::tempdir().unwrap();
+            let target = fixture.path().canonicalize().unwrap();
+            let scanner =
+                scan::Scanner::new(&target, std::slice::from_ref(&target), &[], None, "boot")
+                    .unwrap();
+            let mut accounting = scan::Accounting::new(1 << 20, 0, &scanner, None, false).unwrap();
+            let invocation = Invocation::parse(&arguments(plan())).unwrap();
+            let unknown = Failure::unavailable("output scan failed");
+            let receipts = failure_receipts(&invocation, &unknown, true, Some(&accounting), None);
+            assert_eq!(receipts[0].1.as_ref().unwrap()["free_bytes"], 0);
+
+            let (samples, at) = scanner.sample().unwrap();
+            let free = *samples.values().min().unwrap();
+            assert!(free > 0);
+            let floors = samples.keys().map(|device| (*device, 0)).collect();
+            accounting.admit(samples, floors, at);
+            let receipts = failure_receipts(&invocation, &unknown, true, Some(&accounting), None);
+            assert_eq!(receipts[0].1.as_ref().unwrap()["free_bytes"], free);
+            assert_eq!(receipts[1].1.as_ref().unwrap()["complete"], false);
+
+            let measured = Failure::new("free_floor", 7, 19, "measured floor reached");
+            let receipts = failure_receipts(&invocation, &measured, true, Some(&accounting), None);
+            assert_eq!(receipts[0].1.as_ref().unwrap()["free_bytes"], 7);
+            assert_eq!(receipts[0].1.as_ref().unwrap()["growth_bytes"], 19);
+        }
+
+        #[test]
         fn receipt_publication_waits_for_directory_durability() {
             let fixture = tempfile::tempdir().unwrap().keep();
             let receipt = fixture.join("receipt");
@@ -1283,10 +1320,8 @@ mod unix {
             let (finished, completion) = mpsc::sync_channel(1);
             let published = receipt.clone();
             let publisher = thread::spawn(move || {
-                let result = persist_receipt_with_directory_sync(
-                    &published,
-                    &receipts,
-                    |directory| {
+                let result =
+                    persist_receipt_with_directory_sync(&published, &receipts, |directory| {
                         let observed = (
                             std::fs::read(&published)?,
                             std::fs::metadata(&published)?.mode() & 0o777,
@@ -1297,8 +1332,7 @@ mod unix {
                             .recv_timeout(Duration::from_secs(5))
                             .map_err(|_| io::Error::other("test directory barrier timed out"))?;
                         directory.sync_all()
-                    },
-                );
+                    });
                 finished.send(result).unwrap();
             });
             let observed = entry.recv_timeout(Duration::from_secs(5)).unwrap();

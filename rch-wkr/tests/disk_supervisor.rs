@@ -6,6 +6,7 @@
 use std::cell::Cell;
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -155,6 +156,36 @@ fn receipt(path: &Path, prefix: &str) -> Value {
     serde_json::from_str(value).unwrap()
 }
 
+/// Restore only this test's permission fixtures, including after a failed
+/// assertion. Leaving mode-000 descendants behind can poison a surrounding
+/// remote test job's own temporary directory.
+struct RestorePermissions(Vec<(PathBuf, u32)>);
+
+impl Drop for RestorePermissions {
+    fn drop(&mut self) {
+        for (path, mode) in &self.0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(*mode));
+        }
+    }
+}
+
+fn permission_checks_apply(fixture: &Fixture) -> bool {
+    let directory = fixture.root.join("permission-probe");
+    fs::create_dir(&directory).unwrap();
+    let _restore = RestorePermissions(vec![(directory.clone(), 0o700)]);
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o000)).unwrap();
+    match fs::read_dir(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => true,
+        Ok(_) => {
+            eprintln!(
+                "skipping permission regression: mode-000 directories are readable; run as an unprivileged user"
+            );
+            false
+        }
+        Err(error) => panic!("probe directory permissions: {error}"),
+    }
+}
+
 #[test]
 fn native_probe_and_invalid_input_never_launch_a_payload() {
     let output = Command::new(WORKER)
@@ -199,11 +230,212 @@ fn completed_commands_preserve_bytes_status_and_bound_receipts() {
         assert!(output.stderr.starts_with(b"unterminated-error"));
         let usage = receipt(&path, USAGE);
         assert_eq!(usage["complete"], true);
+        assert_eq!(usage["output_complete"], true);
         assert_eq!(usage["exit_code"], status);
         assert!(usage["peak_output_bytes"].as_u64().unwrap() >= 4096);
         assert_eq!(fs::read(fixture.target.join("artifact")).unwrap(), b"small");
         assert!(fs::metadata(path).unwrap().len() <= 8192);
     }
+}
+
+#[test]
+fn stale_unreadable_descendants_allow_later_jobs_without_learning_a_partial_pool() {
+    let fixture = Fixture::new();
+    if !permission_checks_apply(&fixture) {
+        return;
+    }
+    let temporary = fixture.target.join(".rch-tmp");
+    let unreadable = temporary.join("unreadable");
+    let unsearchable = temporary.join("unsearchable");
+    let file = temporary.join("mode-000.txt");
+    fs::create_dir_all(&unreadable).unwrap();
+    fs::create_dir(&unsearchable).unwrap();
+    fs::write(unreadable.join("hidden"), b"retained output").unwrap();
+    fs::write(unsearchable.join("hidden"), b"retained output").unwrap();
+    fs::write(&file, b"unreadable file").unwrap();
+    let _restore = RestorePermissions(vec![
+        (unreadable.clone(), 0o700),
+        (unsearchable.clone(), 0o700),
+        (file.clone(), 0o600),
+    ]);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        fs::read_dir(&unreadable).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        fs::symlink_metadata(unsearchable.join("hidden"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        fs::read(&file).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+
+    // Repeat against the same stale tree: one successful job must not merely
+    // defer the refusal to the next admission or final scan.
+    for status in [0, 37] {
+        let (path, child) = fixture.shell(
+            8 * MIB,
+            0,
+            &format!("printf ran; printf visible > artifact; exit {status}"),
+        );
+        let output = child.finish();
+        assert_eq!(output.status.code(), Some(status), "{output:?}");
+        assert_eq!(output.stdout, b"ran");
+        let usage = receipt(&path, USAGE);
+        assert_eq!(usage["complete"], true);
+        assert_eq!(usage["output_complete"], false);
+        assert_eq!(usage["exit_code"], status);
+        assert!(usage["incremental"].is_null());
+        assert!(!fs::read_to_string(&path).unwrap().contains(MARKER));
+    }
+}
+
+#[test]
+fn runtime_unreadable_descendants_preserve_test_status_through_periodic_and_final_scans() {
+    for status in [0, 37] {
+        let fixture = Fixture::new();
+        if !permission_checks_apply(&fixture) {
+            return;
+        }
+        let temporary = fixture.target.join(".rch-tmp");
+        let _restore = RestorePermissions(vec![
+            (temporary.join("unreadable"), 0o700),
+            (temporary.join("unsearchable"), 0o700),
+            (temporary.join("mode-000.txt"), 0o600),
+        ]);
+        let body = format!(
+            "set -e; mkdir -p .rch-tmp/unreadable .rch-tmp/unsearchable; \
+             printf hidden > .rch-tmp/unreadable/hidden; \
+             printf hidden > .rch-tmp/unsearchable/hidden; \
+             printf unreadable > .rch-tmp/mode-000.txt; \
+             chmod 000 .rch-tmp/unreadable .rch-tmp/mode-000.txt; \
+             chmod 400 .rch-tmp/unsearchable; printf ready > ready; \
+             sleep 3; printf survived; exit {status}"
+        );
+        let (path, child) = fixture.shell(8 * MIB, 0, &body);
+        child.ready(&fixture.target.join("ready"));
+        assert_eq!(
+            fs::read_dir(temporary.join("unreadable"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let output = child.finish();
+        assert_eq!(output.status.code(), Some(status), "{output:?}");
+        assert_eq!(output.stdout, b"survived");
+        let usage = receipt(&path, USAGE);
+        assert_eq!(usage["complete"], true);
+        assert_eq!(usage["output_complete"], false);
+        assert_eq!(usage["exit_code"], status);
+        assert!(usage["incremental"].is_null());
+        assert!(!fs::read_to_string(&path).unwrap().contains(MARKER));
+        assert_eq!(
+            fs::metadata(temporary.join("unreadable"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0,
+            "the monitor must not change workload permissions"
+        );
+    }
+}
+
+#[test]
+fn unreadable_descendants_do_not_hide_excess_visible_growth() {
+    let fixture = Fixture::new();
+    if !permission_checks_apply(&fixture) {
+        return;
+    }
+    let unreadable = fixture.target.join(".rch-tmp/unreadable");
+    fs::create_dir_all(&unreadable).unwrap();
+    let _restore = RestorePermissions(vec![(unreadable.clone(), 0o700)]);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let (path, child) = fixture.shell(
+        MIB,
+        0,
+        "head -c 4194304 /dev/urandom > large-output; printf ready > ready; sleep 30",
+    );
+    child.ready(&fixture.target.join("ready"));
+    let output = child.finish();
+    assert!(!output.status.success(), "{output:?}");
+    let failure = receipt(&path, MARKER);
+    assert_eq!(failure["reason"], "growth");
+    assert_eq!(failure["started"], true);
+    assert!(failure["growth_bytes"].as_u64().unwrap() >= 4 * MIB);
+    assert!(failure["free_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn unreadable_output_root_still_refuses_before_launch() {
+    let fixture = Fixture::new();
+    if !permission_checks_apply(&fixture) {
+        return;
+    }
+    let _restore = RestorePermissions(vec![(fixture.target.clone(), 0o700)]);
+    fs::set_permissions(&fixture.target, fs::Permissions::from_mode(0o000)).unwrap();
+    let (path, plan, mut command) = fixture.invocation(8 * MIB, 0);
+    command
+        .current_dir(&fixture.root)
+        .arg(plan.to_string())
+        .args(["tracked", "/bin/sh", "-c", "touch payload-started"]);
+    let output = OwnedGroup::spawn(command, None).finish();
+    assert_eq!(output.status.code(), Some(120), "{output:?}");
+    let failure = receipt(&path, MARKER);
+    assert_eq!(failure["reason"], "monitor_unavailable");
+    assert_eq!(failure["started"], false);
+    assert!(!fixture.root.join("payload-started").exists());
+}
+
+#[test]
+fn runtime_unreadable_output_root_stays_fatal_with_last_known_free_space() {
+    let fixture = Fixture::new();
+    if !permission_checks_apply(&fixture) {
+        return;
+    }
+    let _restore = RestorePermissions(vec![(fixture.target.clone(), 0o700)]);
+    let (path, child) = fixture.shell(8 * MIB, 0, "printf started; chmod 000 .; sleep 30");
+    let output = child.finish();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"started");
+    let failure = receipt(&path, MARKER);
+    assert_eq!(failure["reason"], "monitor_unavailable");
+    assert_eq!(failure["started"], true);
+    assert!(failure["free_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(receipt(&path, USAGE)["complete"], false);
+}
+
+#[test]
+fn unreadable_regular_file_is_fully_counted_without_reading_contents() {
+    let fixture = Fixture::new();
+    if !permission_checks_apply(&fixture) {
+        return;
+    }
+    let file = fixture.target.join(".rch-tmp/mode-000.txt");
+    let _restore = RestorePermissions(vec![(file.clone(), 0o600)]);
+    let (path, child) = fixture.shell(
+        8 * MIB,
+        0,
+        "set -e; mkdir .rch-tmp; head -c 1048576 /dev/urandom > .rch-tmp/mode-000.txt; chmod 000 .rch-tmp/mode-000.txt",
+    );
+    let output = child.finish();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read(&file).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let usage = receipt(&path, USAGE);
+    assert_eq!(usage["complete"], true);
+    assert_eq!(usage["output_complete"], true);
+    assert_eq!(usage["exit_code"], 0);
+    assert!(usage["peak_output_bytes"].as_u64().unwrap() >= MIB);
+    assert!(!fs::read_to_string(&path).unwrap().contains(MARKER));
 }
 
 #[test]
@@ -243,7 +475,6 @@ fn admission_refuses_before_start_and_receipt_ownership_cannot_be_reused() {
     let (path, mut plan, mut command) = fixture.invocation(8 * MIB, 0);
     let original = format!("{MARKER}{{\"reason\":\"growth\",\"started\":true}}\n");
     fs::write(&path, &original).unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     plan["receipt_initialized"] = true.into();
     command

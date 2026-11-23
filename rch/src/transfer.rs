@@ -1159,6 +1159,11 @@ struct RemoteBuildDiskUsage {
     min_free_bytes: u64,
     peak_output_bytes: u64,
     peak_growth_bytes: u64,
+    // Command completion remains valid after a descendant permission error,
+    // but a partial scan cannot establish a smaller learned disk allowance.
+    // Older receipts do not attest complete output coverage.
+    #[serde(default)]
+    output_complete: bool,
     complete: bool,
     exit_code: Option<i32>,
     #[serde(default)]
@@ -6348,6 +6353,11 @@ exit \"$__rch_disk_status\"; }}"
     pub(crate) fn parse_disk_usage_marker(&self, line: &str) -> Option<u64> {
         self.parse_complete_disk_usage(line)
             .map(|usage| usage.peak_output_bytes)
+    }
+
+    pub(crate) fn parse_disk_output_complete(&self, line: &str) -> Option<bool> {
+        self.parse_complete_disk_usage(line)
+            .map(|usage| usage.output_complete)
     }
 
     pub(crate) fn parse_disk_observation_marker(

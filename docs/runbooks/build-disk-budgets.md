@@ -238,6 +238,21 @@ symlink output roots, replacement roots, scan failures, and unaccounted
 filesystem changes cannot silently become zero usage. Hard links and nested
 output roots are deduplicated within a scan.
 
+Tests may deliberately create unreadable files or directories. Regular files
+are counted from metadata without opening their contents. Permission-denied
+descendants are skipped when their metadata or directory entries cannot be
+read; any allocation already measured still counts, as does other visible
+output. Required output roots, filesystem probes, and other I/O failures remain
+mandatory checks. The independent filesystem capacity samples continue to
+enforce the free-space floor, and a later monitor failure reports the last
+available sample instead of replacing it with zero.
+
+A permission-incomplete scan reports `output_complete: false` for the entire
+job. It can still confirm command completion and preserve the command's exit
+status, but its partial byte count cannot teach a smaller disk requirement or
+establish a reusable target-pool fingerprint. Restoring permissions later in
+the same job does not retroactively certify its earlier peak.
+
 Dispatcher-managed Cargo execution also includes the worker's durable
 `rch-cargo-cache-<worker>` home, an explicit literal absolute `CARGO_HOME`
 override, and physical destinations of their `registry` and `git` redirects.
@@ -476,5 +491,5 @@ before choosing an explicit retry.
 - [Footprint provenance and retention](../../rchd/src/headroom.rs)
 - [Ownership and admission accounting](../../rchd/src/history.rs)
 - [Capacity freshness and pressure policy](../../rchd/src/disk_pressure.rs)
-- [Worker disk supervisor](../../rch-common/build_disk_monitor.py)
+- [Worker disk supervisor](../../rch-wkr/src/disk_supervisor/mod.rs)
 - [SSH supervision and receipts](../../rch/src/transfer.rs)

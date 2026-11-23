@@ -216,6 +216,57 @@ pub(super) fn capture_disk_budget_diagnostic(
     Some(failure)
 }
 
+/// Keep completion evidence separate from the measurements eligible for
+/// learning. Both streamed diagnostics and the durable receipt use this path.
+#[derive(Default)]
+struct DiskUsageCapture {
+    peak_output_bytes: Option<u64>,
+    observation: Option<rch_common::BuildDiskObservation>,
+    exit_code: Option<i32>,
+    output_complete: Option<bool>,
+    conflict: bool,
+}
+
+impl DiskUsageCapture {
+    fn capture(&mut self, pipeline: &TransferPipeline, line: &str) -> bool {
+        let Some(peak) = pipeline.parse_disk_usage_marker(line) else {
+            return false;
+        };
+        let status = pipeline.parse_disk_usage_exit_code(line);
+        let observation = pipeline.parse_disk_observation_marker(line);
+        let output_complete = pipeline.parse_disk_output_complete(line);
+        if (self.exit_code.is_some() && self.exit_code != status)
+            || (self.peak_output_bytes.is_some()
+                && (self.peak_output_bytes != Some(peak)
+                    || self.observation != observation
+                    || self.output_complete != output_complete))
+        {
+            self.conflict = true;
+        }
+        self.observation = observation;
+        self.exit_code = status;
+        self.output_complete = output_complete;
+        self.peak_output_bytes = Some(self.peak_output_bytes.unwrap_or(0).max(peak));
+        true
+    }
+
+    fn is_missing(&self) -> bool {
+        self.peak_output_bytes.is_none()
+    }
+
+    fn matches_exit(&self, exit_code: i32) -> bool {
+        !self.conflict && (self.is_missing() || self.exit_code == Some(exit_code))
+    }
+
+    fn learning_measurements(&self) -> (Option<u64>, Option<rch_common::BuildDiskObservation>) {
+        if !self.conflict && self.output_complete == Some(true) {
+            (self.peak_output_bytes, self.observation)
+        } else {
+            (None, None)
+        }
+    }
+}
+
 /// A holder can disappear while durable completion is being read. Recheck the
 /// actual guard before turning a setup refusal into permission to fail over.
 pub(super) fn ensure_remote_process_setup_after_completion(
@@ -3212,10 +3263,7 @@ async fn execute_remote_compilation_inner(
     let stderr_capture_cell = Rc::new(RefCell::new(String::new()));
     let deadline_triggered = Rc::new(Cell::new(false));
     let disk_failure = Rc::new(RefCell::new(None));
-    let disk_peak_output_bytes = Rc::new(Cell::new(None::<u64>));
-    let disk_observation = Rc::new(Cell::new(None::<rch_common::BuildDiskObservation>));
-    let disk_usage_exit_code = Rc::new(Cell::new(None::<i32>));
-    let disk_usage_conflict = Rc::new(Cell::new(false));
+    let disk_usage = Rc::new(RefCell::new(DiskUsageCapture::default()));
 
     let use_compile_progress = progress_enabled
         && matches!(
@@ -3271,10 +3319,7 @@ async fn execute_remote_compilation_inner(
     let stderr_capture_stderr = Rc::clone(&stderr_capture_cell);
     let deadline_triggered_stderr = Rc::clone(&deadline_triggered);
     let disk_failure_stderr = Rc::clone(&disk_failure);
-    let disk_peak_output_stderr = Rc::clone(&disk_peak_output_bytes);
-    let disk_observation_stderr = Rc::clone(&disk_observation);
-    let disk_usage_exit_stderr = Rc::clone(&disk_usage_exit_code);
-    let disk_usage_conflict_stderr = Rc::clone(&disk_usage_conflict);
+    let disk_usage_stderr = Rc::clone(&disk_usage);
     let deadline_pipeline = pipeline.clone();
     let process_setup_marker = pipeline.remote_process_setup_marker();
     let heartbeat_state_stdout = heartbeat_loop
@@ -3349,24 +3394,10 @@ async fn execute_remote_compilation_inner(
                 *disk_failure_stderr.borrow_mut() = Some(failure);
                 return;
             }
-            if let Some(peak) = deadline_pipeline.parse_disk_usage_marker(line) {
-                let status = deadline_pipeline.parse_disk_usage_exit_code(line);
-                let observation = deadline_pipeline.parse_disk_observation_marker(line);
-                // ubs:ignore[rust.security.constant-time-compare] — public Option<i32> exit-status conflict check, not secret equality.
-                if disk_usage_exit_stderr.get().is_some() && disk_usage_exit_stderr.get() != status
-                {
-                    disk_usage_conflict_stderr.set(true);
-                }
-                if disk_peak_output_stderr.get().is_some()
-                    && (disk_peak_output_stderr.get() != Some(peak)
-                        || disk_observation_stderr.get() != observation)
-                {
-                    disk_usage_conflict_stderr.set(true);
-                }
-                disk_observation_stderr.set(observation);
-                disk_usage_exit_stderr.set(status);
-                disk_peak_output_stderr
-                    .set(Some(disk_peak_output_stderr.get().unwrap_or(0).max(peak)));
+            if disk_usage_stderr
+                .borrow_mut()
+                .capture(&deadline_pipeline, line)
+            {
                 return;
             }
             if deadline_pipeline.is_deadline_marker(line) {
@@ -3418,8 +3449,7 @@ async fn execute_remote_compilation_inner(
     // Mock transport never runs the remote disk supervisor, so it has neither
     // a receipt to read nor usage to certify (as in `execute_remote`).
     let disk_supervised = !crate::transfer::use_mock_transport(&worker_config);
-    if disk_supervised && captured_disk_failure.is_none() && disk_peak_output_bytes.get().is_none()
-    {
+    if disk_supervised && captured_disk_failure.is_none() && disk_usage.borrow().is_missing() {
         // A full stderr pipe may drop control output. The immutable receipt
         // remains available after confirmed completion and is attempt-bound.
         if let Some(receipt) = pipeline
@@ -3434,32 +3464,12 @@ async fn execute_remote_compilation_inner(
                 if let Some(failure) = pipeline.parse_disk_budget_marker(line) {
                     captured_disk_failure = Some(failure);
                 }
-                if let Some(peak) = pipeline.parse_disk_usage_marker(line) {
-                    let status = pipeline.parse_disk_usage_exit_code(line);
-                    let observation = pipeline.parse_disk_observation_marker(line);
-                    // ubs:ignore[rust.security.constant-time-compare] — public Option<i32> exit-status conflict check, not secret equality.
-                    if disk_usage_exit_code.get().is_some() && disk_usage_exit_code.get() != status
-                    {
-                        disk_usage_conflict.set(true);
-                    }
-                    if disk_peak_output_bytes.get().is_some()
-                        && (disk_peak_output_bytes.get() != Some(peak)
-                            || disk_observation.get() != observation)
-                    {
-                        disk_usage_conflict.set(true);
-                    }
-                    disk_observation.set(observation);
-                    disk_usage_exit_code.set(status);
-                    disk_peak_output_bytes
-                        .set(Some(disk_peak_output_bytes.get().unwrap_or(0).max(peak)));
-                }
+                disk_usage.borrow_mut().capture(&pipeline, line);
             }
         }
     }
     anyhow::ensure!(
-        !disk_usage_conflict.get()
-            && (disk_peak_output_bytes.get().is_none()
-                || disk_usage_exit_code.get() == Some(result.exit_code)), // ubs:ignore[rust.security.constant-time-compare] — compares public disk and SSH exit statuses; mismatch fails closed.
+        disk_usage.borrow().matches_exit(result.exit_code),
         crate::transfer::RemoteExecutionUnconfirmed
     );
     if let Some(mut failure) = captured_disk_failure {
@@ -3488,7 +3498,7 @@ async fn execute_remote_compilation_inner(
         return Err(failure.into());
     }
     if disk_supervised
-        && disk_peak_output_bytes.get().is_none()
+        && disk_usage.borrow().is_missing()
         && !(result.exit_code == 137 && deadline_triggered.get())
     {
         pipeline.ensure_remote_disk_budget(&result)?;
@@ -4551,6 +4561,7 @@ async fn execute_remote_compilation_inner(
     disk_roots.push(pipeline.remote_cargo_target_dir());
     disk_roots.sort();
     disk_roots.dedup();
+    let (disk_peak_output_bytes, disk_observation) = disk_usage.borrow().learning_measurements();
     Ok(RemoteExecutionResult {
         deadline_triggered: exit_code == 137 && deadline_triggered.get(),
         exit_code,
@@ -4559,14 +4570,172 @@ async fn execute_remote_compilation_inner(
         timing,
         result_dirs: exec_dir_stats,
         disk_roots,
-        disk_peak_output_bytes: disk_peak_output_bytes.get(),
-        disk_observation: disk_observation.get(),
+        disk_peak_output_bytes,
+        disk_observation,
         cargo_stdout,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    fn disk_usage_capture_fixture() -> (super::TransferPipeline, serde_json::Value) {
+        use super::*;
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/disk-usage-capture"),
+            "disk-usage-capture".into(),
+            "abc123".into(),
+            TransferConfig::default(),
+        )
+        .with_disk_budget(Some(rch_common::BuildDiskBudget {
+            max_growth_bytes: 8 << 20,
+            min_free_bytes: 1 << 20,
+            warm_policy: None,
+        }));
+        let pool = rch_common::BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 10 << 20,
+        };
+        let usage = serde_json::json!({
+            "max_growth_bytes": 8 << 20, "min_free_bytes": 1 << 20,
+            "peak_output_bytes": 30 << 20, "peak_growth_bytes": 1 << 20,
+            "output_complete": true, "complete": true, "exit_code": 0,
+            "incremental": rch_common::BuildDiskObservation {
+                version: rch_common::BuildDiskObservation::VERSION,
+                baseline_output_bytes: 10 << 20,
+                peak_added_output_bytes: 1 << 20,
+                peak_free_drop_bytes: 1 << 20,
+                baseline_pool: pool,
+                final_pool: rch_common::BuildDiskPool {
+                    state: [3; 32],
+                    retained_bytes: 11 << 20,
+                    ..pool
+                },
+            },
+        });
+        (pipeline, usage)
+    }
+
+    fn disk_usage_capture_line(
+        pipeline: &super::TransferPipeline,
+        usage: &serde_json::Value,
+    ) -> String {
+        let setup_marker = pipeline.remote_process_setup_marker();
+        let deadline = setup_marker.strip_suffix("_IDENTITY_UNAVAILABLE").unwrap();
+        format!("{deadline}_DISK_USAGE:{usage}\n")
+    }
+
+    #[test]
+    fn partial_disk_scans_confirm_completion_without_teaching_smaller_budgets() {
+        use super::*;
+
+        for output_complete in [Some(true), Some(false), None] {
+            for status in [0, 37] {
+                let (pipeline, mut usage) = disk_usage_capture_fixture();
+                usage["exit_code"] = status.into();
+                match output_complete {
+                    Some(complete) => usage["output_complete"] = complete.into(),
+                    None => {
+                        usage.as_object_mut().unwrap().remove("output_complete");
+                    }
+                }
+                if output_complete == Some(false) {
+                    usage["incremental"] = serde_json::Value::Null;
+                }
+                let line = disk_usage_capture_line(&pipeline, &usage);
+                let mut captured = DiskUsageCapture::default();
+                assert!(captured.capture(&pipeline, &line));
+                // Re-reading an identical durable receipt preserves the
+                // same completion as the streamed receipt.
+                assert!(captured.capture(&pipeline, &line));
+                assert!(!captured.is_missing());
+                assert!(captured.matches_exit(status));
+                assert!(!captured.matches_exit(137));
+                assert_eq!(captured.peak_output_bytes, Some(30 << 20));
+                let expected = if output_complete == Some(true) {
+                    (
+                        Some(30 << 20),
+                        Some(serde_json::from_value(usage["incremental"].clone()).unwrap()),
+                    )
+                } else {
+                    (None, None)
+                };
+                assert_eq!(captured.learning_measurements(), expected);
+                assert!(
+                    pipeline
+                        .ensure_remote_disk_budget(&rch_common::CommandResult {
+                            exit_code: status,
+                            stderr: line,
+                            stdout: String::new(),
+                            duration_ms: 0,
+                        })
+                        .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disk_usage_capture_rejects_conflicting_raw_measurements_and_coverage() {
+        use super::*;
+
+        let (pipeline, usage) = disk_usage_capture_fixture();
+        for (field, replacement) in [
+            ("peak_output_bytes", serde_json::json!(31 << 20)),
+            ("exit_code", serde_json::json!(37)),
+            ("output_complete", serde_json::json!(false)),
+            ("incremental", serde_json::Value::Null),
+        ] {
+            let mut captured = DiskUsageCapture::default();
+            assert!(captured.capture(&pipeline, &disk_usage_capture_line(&pipeline, &usage)));
+            let mut changed = usage.clone();
+            changed[field] = replacement;
+            assert!(captured.capture(&pipeline, &disk_usage_capture_line(&pipeline, &changed)));
+            assert!(captured.conflict, "{field} conflict was lost");
+            assert!(!captured.matches_exit(0));
+            assert_eq!(captured.learning_measurements(), (None, None));
+        }
+
+        // Partial scans are still compared using their real measured peaks,
+        // even though neither receipt is eligible for footprint learning.
+        let mut partial = usage;
+        partial["output_complete"] = false.into();
+        partial["incremental"] = serde_json::Value::Null;
+        let mut captured = DiskUsageCapture::default();
+        assert!(captured.capture(&pipeline, &disk_usage_capture_line(&pipeline, &partial)));
+        partial["peak_output_bytes"] = (31 << 20).into();
+        assert!(captured.capture(&pipeline, &disk_usage_capture_line(&pipeline, &partial)));
+        assert!(!captured.matches_exit(0));
+        assert_eq!(captured.peak_output_bytes, Some(31 << 20));
+        assert_eq!(captured.learning_measurements(), (None, None));
+    }
+
+    #[test]
+    fn disk_usage_capture_requires_boolean_coverage_and_valid_completion() {
+        use super::*;
+
+        let (pipeline, usage) = disk_usage_capture_fixture();
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!("true"),
+        ] {
+            let mut changed = usage.clone();
+            changed["output_complete"] = invalid;
+            let mut captured = DiskUsageCapture::default();
+            assert!(!captured.capture(&pipeline, &disk_usage_capture_line(&pipeline, &changed)));
+            assert!(captured.is_missing());
+        }
+        let mut unfinished = usage.clone();
+        unfinished["complete"] = false.into();
+        let mut captured = DiskUsageCapture::default();
+        assert!(!captured.capture(&pipeline, &disk_usage_capture_line(&pipeline, &unfinished)));
+        assert!(captured.is_missing());
+        let (other, _) = disk_usage_capture_fixture();
+        assert!(!captured.capture(&other, &disk_usage_capture_line(&pipeline, &usage)));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn go_clean_overlay_selection_includes_pinned_controls_without_receipt() {
