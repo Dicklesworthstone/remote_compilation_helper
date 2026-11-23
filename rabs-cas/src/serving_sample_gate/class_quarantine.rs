@@ -40,6 +40,8 @@ const NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str =
     "rustc-workspace-native-generated-dag-rlib-v1";
 const NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
     "rustc-workspace-native-generated-dag-metadata-v1";
+const PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS: &str =
+    "rustc-workspace-propagated-native-dag-metadata-v1";
 const WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str = "rustc-workspace-terminal-leaf-metadata-v2";
 const WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
 const GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
@@ -160,6 +162,9 @@ pub(super) fn refusal(
             }
             [SqlValue::Text(class)] if class == NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => {
                 NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS => {
+                PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS
             }
             [SqlValue::Text(class)] if class == WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
@@ -731,6 +736,10 @@ mod tests {
                 ActionClassRisk::NativeGeneratedWorkspaceDagMetadata,
             ),
             (
+                PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS,
+                ActionClassRisk::PropagatedNativeWorkspaceDagMetadata,
+            ),
+            (
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
                 ActionClassRisk::WorkspaceTerminalLeafMetadata,
             ),
@@ -773,6 +782,7 @@ mod tests {
                 GENERATED_WORKSPACE_DAG_METADATA_CLASS,
                 NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS,
                 NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS,
+                PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS,
                 WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
                 WORKSPACE_TERMINAL_METADATA_CLASS,
                 GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,

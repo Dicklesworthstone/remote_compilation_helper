@@ -61,7 +61,8 @@ impl ProducerPolicy {
             }
             CommittedDependencyPolicy::WorkspaceDagMetadata
             | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
-            | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata => {
+            | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
+            | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata => {
                 (true, ProducerDomain::WorkspaceDag)
             }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
@@ -106,6 +107,9 @@ impl ProducerPolicy {
             }
             ActionClassRisk::NativeGeneratedWorkspaceDagMetadata => {
                 CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
+            }
+            ActionClassRisk::PropagatedNativeWorkspaceDagMetadata => {
+                CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
             }
             ActionClassRisk::WorkspaceTerminalMetadata => {
                 CommittedDependencyPolicy::WorkspaceTerminalMetadata
@@ -152,7 +156,8 @@ impl ProducerPolicy {
             }
             ActionClassRisk::WorkspaceDagMetadata
             | ActionClassRisk::GeneratedWorkspaceDagMetadata
-            | ActionClassRisk::NativeGeneratedWorkspaceDagMetadata => {
+            | ActionClassRisk::NativeGeneratedWorkspaceDagMetadata
+            | ActionClassRisk::PropagatedNativeWorkspaceDagMetadata => {
                 self.domain == ProducerDomain::WorkspaceDag && self.metadata_allowed
             }
             // A successful terminal check never supplies a Rust dependency,
@@ -790,6 +795,7 @@ fn verify_graph(
                 | ActionClassRisk::WorkspaceDagMetadata
                 | ActionClassRisk::GeneratedWorkspaceDagMetadata
                 | ActionClassRisk::NativeGeneratedWorkspaceDagMetadata
+                | ActionClassRisk::PropagatedNativeWorkspaceDagMetadata
         ) || immutable_leaf == Some(RemoteDependencyOutputClass::Metadata);
         if !(policy.admits_class(risk)
             || immutable_leaf.is_some_and(|class| {
@@ -877,6 +883,7 @@ fn verify_graph(
                     | ActionClassRisk::GeneratedWorkspaceDagMetadata
                     | ActionClassRisk::NativeGeneratedWorkspaceDagRlib
                     | ActionClassRisk::NativeGeneratedWorkspaceDagMetadata
+                    | ActionClassRisk::PropagatedNativeWorkspaceDagMetadata
             ) && ancestors.is_empty())
         {
             return Err(format!(
@@ -1141,6 +1148,9 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata => {
                     LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
                 }
+                CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata => {
+                    LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS
+                }
                 _ => panic!("DAG fixture requires an independently keyed DAG policy"),
             };
             self.prepare_class(tag, parents, outputs, class)
@@ -1229,6 +1239,7 @@ pub(crate) mod tests {
                 LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS => 31,
                 LIVE_NATIVE_GENERATED_WORKSPACE_METADATA_CLASS => 32,
                 LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => 33,
+                LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS => 36,
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 24,
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
                 LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 34,
@@ -1728,6 +1739,12 @@ pub(crate) mod tests {
                 vec![consumes(&upstream)],
                 33,
             ),
+            (
+                133,
+                LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS,
+                vec![consumes(&upstream)],
+                36,
+            ),
         ] {
             // Deliberately enroll an archive in this synthetic metadata-class
             // publication. Exact manifest/object agreement must not let that
@@ -1752,13 +1769,15 @@ pub(crate) mod tests {
             assert_eq!(producer.manifest.key_epoch, epoch);
             fixture.commit(&producer);
             let mut input = witness(&producer);
-            fixture
-                .coord
-                .verify_committed_dependencies(
-                    std::slice::from_ref(&input),
-                    CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
-                )
-                .unwrap();
+            for policy in [
+                CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
+                CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata,
+            ] {
+                fixture
+                    .coord
+                    .verify_committed_dependencies(std::slice::from_ref(&input), policy)
+                    .unwrap();
+            }
             for policy in [
                 CommittedDependencyPolicy::WorkspaceDagRlib,
                 CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,

@@ -3361,6 +3361,123 @@ mod tests {
     }
 
     #[test]
+    fn propagated_native_workspace_metadata_keeps_driver_bound_complete_capture() {
+        use crate::edge::live_facts::LiveFacts;
+        use rabs_key::live_dependency::workspace_dependency_cache::plan_propagated_native_workspace_dag_metadata;
+        use rabs_key::live_dependency::{LiveRustcRequest, plan_canonical_workspace_execution};
+        use rabs_protocol::input_evidence::ActionInputManifest;
+
+        for own_generated in [false, true] {
+            let fixture = GeneratedFixture::new(true, false).workspace(false, true, false);
+            let logical = "/__rabs/out/cargo/debug/build/provider/out";
+            let backing = fixture.paths.physical(Path::new(logical)).unwrap();
+            std::fs::create_dir_all(backing.join("native")).unwrap();
+            std::fs::create_dir_all(backing.join("empty")).unwrap();
+            std::fs::write(
+                backing.join("native/libprovider.a"),
+                b"retained native input",
+            )
+            .unwrap();
+            let unit = backing.parent().unwrap();
+            std::fs::write(unit.join("root-output"), logical).unwrap();
+            std::fs::write(
+                unit.join("output"),
+                format!("cargo::rustc-link-search=native={logical}/native\n"),
+            )
+            .unwrap();
+            if !own_generated {
+                std::fs::write(
+                    fixture
+                        .paths
+                        .physical(Path::new("/__rabs/workspace/app/lib.rs"))
+                        .unwrap(),
+                    b"pub const VALUE: u32 = upstream::VALUE;\n",
+                )
+                .unwrap();
+            }
+            let mut env = fixture.plan.execution_env.clone();
+            env.retain(|(name, _)| own_generated || name != "OUT_DIR");
+            let argv = vec![
+                fixture.plan.compiler.clone(),
+                "--crate-name=generated".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--error-format=json".into(),
+                "--json=artifacts".into(),
+                format!("--out-dir={}", fixture.plan.out_dir),
+                format!(
+                    "--extern=upstream={}/libupstream.rmeta",
+                    fixture.plan.out_dir
+                ),
+                format!("-Lnative={logical}/native"),
+                "app/lib.rs".into(),
+            ];
+            let fresh = plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &argv,
+                    cwd: "/__rabs/workspace",
+                    env: &env,
+                },
+                "x86_64-unknown-linux-gnu",
+            )
+            .unwrap();
+            let plan = plan_propagated_native_workspace_dag_metadata(&fresh).unwrap();
+            fixture
+                .paths
+                .require_committed_dependency_library(
+                    &plan,
+                    CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata,
+                )
+                .unwrap();
+            assert!(
+                fixture
+                    .paths
+                    .require_workspace_closed_library(&plan)
+                    .is_err()
+            );
+            assert!(fixture.paths.require_local_capture().is_err());
+            let physical = fixture.paths.project_plan(&plan).unwrap();
+            let generated = fixture.paths.generated_root(&plan, &physical).unwrap();
+            assert_eq!(generated.is_some(), own_generated);
+            let native = fixture.paths.native_roots(&plan, &physical).unwrap();
+            let facts = LiveFacts::new();
+            assert!(
+                facts
+                    .package_canonical(&physical, generated.as_ref(), &[])
+                    .is_err()
+            );
+            let captured = facts
+                .package_canonical(&physical, generated.as_ref(), &native)
+                .unwrap();
+            captured
+                .verify_unchanged(Path::new(&physical.source_root))
+                .unwrap();
+            captured.verify_generated_disjoint(&physical).unwrap();
+            assert_eq!(captured.build_script_output.is_some(), own_generated);
+            let mut inputs = ActionInputManifest::default();
+            captured.append_native_inputs(&plan, &mut inputs).unwrap();
+            assert_eq!(
+                rabs_key::live_dependency::native_input_directories(&plan, &inputs, 0).unwrap(),
+                vec!["empty", "native"]
+            );
+            assert!(inputs.inputs.iter().any(|input| {
+                input.virtual_path.as_bytes() == plan.native_record_virtual_path(0).as_bytes()
+            }));
+            std::fs::write(unit.join("root-output"), "/another/operation/out").unwrap();
+            assert!(
+                captured
+                    .verify_unchanged(Path::new(&physical.source_root))
+                    .is_err()
+            );
+            assert!(
+                facts
+                    .package_canonical(&physical, generated.as_ref(), &native)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn native_mapping_and_capture_refuse_unbound_or_output_aliasing_roots() {
         use crate::edge::live_facts::LiveFacts;
         let mut fixture = GeneratedFixture::new(false, false);

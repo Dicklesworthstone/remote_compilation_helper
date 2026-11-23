@@ -121,6 +121,10 @@ pub enum ActionClassRisk {
     /// Native-generated closed metadata with committed Rust ancestry, requiring
     /// independent samples from native leaves and all archive DAG classes.
     NativeGeneratedWorkspaceDagMetadata,
+    /// Closed workspace metadata with driver-bound inherited static native
+    /// trees and committed Rust ancestry. Its samples cannot be borrowed from
+    /// own-OUT_DIR native metadata, pure DAGs, or archive classes.
+    PropagatedNativeWorkspaceDagMetadata,
     /// Exact selected binary/example or harness metadata checks with a proven
     /// empty candidate inventory. Terminal outputs never authorize consumers.
     WorkspaceTerminalLeafMetadata,

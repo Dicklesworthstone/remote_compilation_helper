@@ -499,6 +499,8 @@ const LIVE_NATIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str =
     "rustc-workspace-native-generated-dag-rlib-v1";
 const LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
     "rustc-workspace-native-generated-dag-metadata-v1";
+const LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS: &str =
+    "rustc-workspace-propagated-native-dag-metadata-v1";
 const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
     "rustc-workspace-terminal-leaf-metadata-v2";
 const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
@@ -561,6 +563,9 @@ fn record_descriptor_class(
             }
             CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata => {
                 LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS
+            }
+            CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata => {
+                LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS
             }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
@@ -681,6 +686,11 @@ fn recorded_action_risk(
                 if class == LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS =>
             {
                 Ok(ActionClassRisk::NativeGeneratedWorkspaceDagMetadata)
+            }
+            [SqlValue::Text(class)]
+                if class == LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS =>
+            {
+                Ok(ActionClassRisk::PropagatedNativeWorkspaceDagMetadata)
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceTerminalLeafMetadata)
@@ -5664,9 +5674,9 @@ mod tests {
             CommittedDependencyPolicy, CommittedWorkspaceDependency,
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
             plan_generated_terminal_workspace_metadata, plan_generated_workspace_dag_library,
-            plan_mixed_workspace_library, plan_terminal_workspace_metadata,
-            remote_committed_dependency_key, remote_committed_workspace_metadata_key,
-            remote_committed_workspace_rlib_key,
+            plan_mixed_workspace_library, plan_propagated_native_workspace_dag_metadata,
+            plan_terminal_workspace_metadata, remote_committed_dependency_key,
+            remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
         };
         use rabs_key::live_dependency::{
             DependencyDirectoryFact, DependencySourceKind, ExternFact, LiveRustcRequest,
@@ -5681,7 +5691,9 @@ mod tests {
                                          policy: Option<CommittedDependencyPolicy>,
                                          generated: bool,
                                          native: bool| {
-            assert!(!native || generated);
+            let propagated =
+                policy == Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata);
+            assert!(!native || generated || propagated);
             assert!(
                 !generated
                     || policy.is_none()
@@ -5692,6 +5704,7 @@ mod tests {
                                 | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
+                                | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
                                 | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
                                 | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
                         )
@@ -5762,10 +5775,12 @@ mod tests {
                 ));
             }
             if native {
-                argv.extend([
-                    "-Lnative=/__rabs/out/cargo/debug/build/leaf-generated/out".into(),
-                    "-lstatic=leaf_native".into(),
-                ]);
+                let root = if propagated {
+                    "/__rabs/out/cargo/debug/build/provider/out"
+                } else {
+                    "/__rabs/out/cargo/debug/build/leaf-generated/out"
+                };
+                argv.extend([format!("-Lnative={root}"), "-lstatic=leaf_native".into()]);
             }
             let request = LiveRustcRequest {
                 argv: &argv,
@@ -5792,6 +5807,9 @@ mod tests {
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
                 ) => plan_generated_workspace_dag_library(&execution),
+                Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata) => {
+                    plan_propagated_native_workspace_dag_metadata(&execution)
+                }
                 Some(
                     CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
                     | CommittedDependencyPolicy::WorkspaceTerminalMetadata,
@@ -5848,7 +5866,24 @@ mod tests {
                     entries: vec![RawBytes::from("config.rs")],
                 });
             }
-            if native {
+            if native && propagated {
+                for path in [
+                    plan.native_input_virtual_path(0, "libleaf_native.a"),
+                    plan.native_record_virtual_path(0),
+                ] {
+                    inputs.inputs.push(PositiveInput {
+                        virtual_path: RawBytes::new(path.into_bytes()),
+                        object: ObjectId(identity.clone()),
+                        file_type: InputFileType::Regular,
+                        executable: false,
+                        symlink_resolution: Vec::new(),
+                    });
+                }
+                inputs.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.native_input_virtual_root(0).into_bytes()),
+                    entries: vec![RawBytes::from("libleaf_native.a")],
+                });
+            } else if native {
                 inputs.inputs.push(PositiveInput {
                     virtual_path: RawBytes::new(
                         plan.generated_input_virtual_path("libleaf_native.a")
@@ -6088,6 +6123,24 @@ mod tests {
                 ActionClassRisk::NativeGeneratedWorkspaceDagMetadata,
             ),
             (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata),
+                    false,
+                    true,
+                ),
+                ActionClassRisk::PropagatedNativeWorkspaceDagMetadata,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata),
+                    true,
+                    true,
+                ),
+                ActionClassRisk::PropagatedNativeWorkspaceDagMetadata,
+            ),
+            (
                 descriptor(
                     "--emit=dep-info,metadata",
                     Some(CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata),
@@ -6121,7 +6174,8 @@ mod tests {
             ),
         ];
         let expected_epochs = [
-            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 30, 32, 31, 33, 24, 25, 34, 35,
+            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 30, 32, 31, 33, 36, 36, 24, 25,
+            34, 35,
         ];
         assert_eq!(descriptors.len(), expected_epochs.len());
         for ((descriptor, _), expected_epoch) in descriptors.iter().zip(expected_epochs) {

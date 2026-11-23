@@ -12,13 +12,18 @@
 //! claims remain untrusted; immutable dependency DAG contracts are unchanged.
 //! Separately versioned generated workspace DAG classes additionally retain
 //! the complete own OUT_DIR and exact completed Cargo build-script record.
+//! Propagated-native metadata has its own class retaining every foreign
+//! OUT_DIR and completed producer record, with an optional own generated tree.
 
 mod generated;
 
-pub use generated::plan_generated_workspace_dag_library;
 pub(super) use generated::{
     GENERATED_DAG_METADATA_ISOLATION_PROFILE, GENERATED_DAG_RLIB_ISOLATION_PROFILE,
     NATIVE_GENERATED_DAG_METADATA_ISOLATION_PROFILE, NATIVE_GENERATED_DAG_RLIB_ISOLATION_PROFILE,
+    PROPAGATED_NATIVE_DAG_METADATA_ISOLATION_PROFILE,
+};
+pub use generated::{
+    plan_generated_workspace_dag_library, plan_propagated_native_workspace_dag_metadata,
 };
 
 use super::remote::{self, RemoteDependencyOutputClass, RemoteDependencyRefusal};
@@ -270,6 +275,9 @@ pub enum CommittedDependencyPolicy {
     /// Closed metadata with complete own-OUT_DIR static native inputs and
     /// exact committed Rust producer ancestry, independently qualified, epoch 33.
     NativeGeneratedWorkspaceDagMetadata,
+    /// Closed library metadata with complete propagated native OUT_DIR trees,
+    /// exact Cargo records and committed Rust producer ancestry, epoch 36.
+    PropagatedNativeWorkspaceDagMetadata,
     /// Selected terminal check with complete own generated inputs and an empty
     /// Rust candidate inventory; never a dependency producer, epoch 34.
     GeneratedWorkspaceTerminalLeafMetadata,
@@ -312,6 +320,9 @@ impl CommittedDependencyPolicy {
             DependencySourceKind::WorkspaceNativeGeneratedDagMetadata => {
                 Some(Self::NativeGeneratedWorkspaceDagMetadata)
             }
+            DependencySourceKind::WorkspacePropagatedNativeDagMetadata => {
+                Some(Self::PropagatedNativeWorkspaceDagMetadata)
+            }
             // The source kind requires a retained policy capability. Only that
             // capability may select the separately qualified empty-input class.
             DependencySourceKind::WorkspaceTerminalMetadata => {
@@ -340,6 +351,7 @@ impl CommittedDependencyPolicy {
             | Self::WorkspaceTerminalMetadata
             | Self::GeneratedWorkspaceDagMetadata
             | Self::NativeGeneratedWorkspaceDagMetadata
+            | Self::PropagatedNativeWorkspaceDagMetadata
             | Self::GeneratedWorkspaceTerminalLeafMetadata
             | Self::GeneratedWorkspaceTerminalMetadata => RemoteDependencyOutputClass::Metadata,
         }
@@ -355,7 +367,8 @@ impl CommittedDependencyPolicy {
             Self::GeneratedWorkspaceDagRlib
             | Self::GeneratedWorkspaceDagMetadata
             | Self::NativeGeneratedWorkspaceDagRlib
-            | Self::NativeGeneratedWorkspaceDagMetadata => generated::validate_plan(plan, self),
+            | Self::NativeGeneratedWorkspaceDagMetadata
+            | Self::PropagatedNativeWorkspaceDagMetadata => generated::validate_plan(plan, self),
             Self::WorkspaceRlib => validate_committed_workspace_rlib_plan(plan),
             Self::WorkspaceMetadata => validate_committed_workspace_metadata_plan(plan),
             Self::WorkspaceTerminalLeafMetadata | Self::WorkspaceTerminalMetadata => {
@@ -511,6 +524,9 @@ fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContrac
         CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => Some(&generated::NATIVE_RLIB),
         CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata => {
             Some(&generated::NATIVE_METADATA)
+        }
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata => {
+            Some(&generated::PROPAGATED_NATIVE_METADATA)
         }
         _ => None,
     }
@@ -912,7 +928,8 @@ pub fn remote_committed_dependency_shape(
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
         | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
         | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
-        | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata => {
+        | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
+        | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata => {
             generated::shape(plan, policy, directories, dependencies, toolchain_root)
         }
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
@@ -1154,6 +1171,7 @@ pub fn committed_dependency_descriptor_policy(
         CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
         CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
         CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata,
     ] {
         let contract = dag_contract(policy).expect("DAG policy has a contract");
         if descriptor.action_class == contract.class
@@ -1182,7 +1200,7 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
     (10..=15).contains(&descriptor.key_epoch)
         || (18..=25).contains(&descriptor.key_epoch)
         || (28..=29).contains(&descriptor.key_epoch)
-        || matches!(descriptor.key_epoch, 31 | 33 | 34 | 35)
+        || matches!(descriptor.key_epoch, 31 | 33 | 34 | 35 | 36)
         || [
             descriptor.sandbox_semantic_policy.domain,
             descriptor.execution_semantics.domain,
@@ -1204,6 +1222,7 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
                 "rabs.canonical-workspace-generated-dag-rlib.",
                 "rabs.canonical-workspace-native-generated-dag-rlib.",
                 "rabs.canonical-workspace-native-generated-dag-metadata.",
+                "rabs.canonical-workspace-propagated-native-dag-metadata.",
                 "rabs.canonical-workspace-generated-dag-metadata.",
             ]
             .into_iter()
@@ -1367,6 +1386,7 @@ pub fn remote_committed_dependency_key(
             | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
             | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
             | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
+            | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
     ) {
         return generated::key(
             plan,

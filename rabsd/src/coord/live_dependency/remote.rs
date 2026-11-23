@@ -1067,6 +1067,7 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
             | DependencySourceKind::WorkspaceGeneratedDagMetadata
             | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
             | DependencySourceKind::WorkspaceNativeGeneratedDagMetadata
+            | DependencySourceKind::WorkspacePropagatedNativeDagMetadata
     ) {
         let policy = CommittedDependencyPolicy::from_source_kind(plan.source_kind)
             .ok_or("generated workspace DAG lost its committed-input policy")?;
@@ -5397,6 +5398,217 @@ mod execution_resource_tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn propagated_native_metadata_dispatch_requires_exact_roots_closed_mode_and_ancestry() {
+        use rabs_key::live_dependency::workspace_dependency_cache::{
+            CommittedWorkspaceDependency, plan_propagated_native_workspace_dag_metadata,
+        };
+        use rabs_key::live_dependency::{ExternFact, plan_canonical_workspace_execution};
+        use rabs_protocol::input_evidence::{DirectoryEnumeration, InputFileType, PositiveInput};
+        use rabs_protocol::raw_bytes::RawBytes;
+        use rabs_protocol::result_identity::ObjectId;
+
+        // Real planner, key and wire assemblers with explicit inventory facts;
+        // physical capture and installed producer authority have separate tests.
+        for (own_generated, static_flag) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let native = "/__rabs/out/cargo/debug/build/provider/out";
+            let own = "/__rabs/out/cargo/debug/build/workspace_app/out";
+            let mut fixture = Fixture::workspace_metadata(Some("lib"), false);
+            let dependency_path = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
+            fixture.argv.extend([
+                format!("--extern=upstream={dependency_path}"),
+                format!("-Lnative={native}/native"),
+            ]);
+            if static_flag {
+                fixture.argv.push("-lstatic=provider".into());
+            }
+            let mut env = fixture.plan.execution_env.clone();
+            if own_generated {
+                env.push(("OUT_DIR".into(), own.into()));
+            }
+            let fresh = plan_canonical_workspace_execution(
+                LiveRustcRequest {
+                    argv: &fixture.argv,
+                    cwd: &fixture.plan.cwd,
+                    env: &env,
+                },
+                &fixture.plan.host_triple,
+            )
+            .unwrap();
+            fixture.plan = plan_propagated_native_workspace_dag_metadata(&fresh).unwrap();
+            let plan = &fixture.plan;
+            let policy = CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata;
+            assert_eq!(
+                execution_mode(plan).unwrap(),
+                DependencyExecutionMode::ClosedMetadata
+            );
+            fixture.context = DependencyExecContext::new_canonical_workspace_execution(
+                DependencyExecutionMode::ClosedMetadata,
+                plan.cwd.clone(),
+                plan.out_dir.clone(),
+                plan.dependency_dirs.clone(),
+                Vec::new(),
+                vec![DependencyArtifactRoot {
+                    path: plan.out_dir.clone(),
+                    prefix: "dependencies/0000".into(),
+                }],
+                plan.generated_root.clone(),
+                fixture.context.source_directories().to_vec(),
+                Vec::new(),
+                plan.execution_env.clone(),
+                [0x11; 32],
+            )
+            .unwrap();
+            assert!(
+                fixture.request().is_err(),
+                "the native input mount cannot be omitted"
+            );
+            fixture.context = fixture
+                .context
+                .with_native_roots(vec![DependencyNativeRoot {
+                    path: native.into(),
+                    prefix: "native/0000".into(),
+                    directories: vec!["empty".into(), "native".into()],
+                }])
+                .unwrap();
+            let request = fixture.request().unwrap();
+            assert_eq!(request["args"], json!(fixture.argv[1..]));
+            assert_eq!(
+                request["dependency_context"]["execution_mode"],
+                "closed-metadata"
+            );
+            assert_eq!(
+                request["dependency_context"]["native_roots"],
+                json!([{
+                    "path":native, "prefix":"native/0000", "directories":["empty","native"]
+                }])
+            );
+            assert_eq!(
+                request["dependency_context"]["generated_root"],
+                json!(plan.generated_root)
+            );
+            assert_eq!(request["artifacts"]["files"], json!(plan.output_names()));
+            let (mut inputs, toolchain) = workspace_metadata_key_facts(plan);
+            let digest = |bytes: &[u8]| compute("rabs.test.propagated-native.v1", bytes);
+            for (path, bytes) in [
+                (
+                    plan.native_input_virtual_path(0, "native/libprovider.a"),
+                    b"static input".as_slice(),
+                ),
+                (
+                    plan.native_record_virtual_path(0),
+                    b"completed Cargo native record".as_slice(),
+                ),
+            ] {
+                inputs.inputs.push(PositiveInput {
+                    virtual_path: RawBytes::new(path.into_bytes()),
+                    object: ObjectId(digest(bytes)),
+                    file_type: InputFileType::Regular,
+                    executable: false,
+                    symlink_resolution: Vec::new(),
+                });
+            }
+            for (path, entries) in [
+                (plan.native_input_virtual_root(0), vec!["empty", "native"]),
+                (plan.native_input_virtual_path(0, "empty"), Vec::new()),
+                (
+                    plan.native_input_virtual_path(0, "native"),
+                    vec!["libprovider.a"],
+                ),
+            ] {
+                inputs.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::new(path.into_bytes()),
+                    entries: entries.into_iter().map(RawBytes::from).collect(),
+                });
+            }
+            if own_generated {
+                inputs.directory_enumerations.push(DirectoryEnumeration {
+                    virtual_path: RawBytes::new(plan.generated_virtual_root().into_bytes()),
+                    entries: Vec::new(),
+                });
+            }
+            let dependency = CommittedWorkspaceDependency {
+                path: dependency_path,
+                producer_action: digest(b"action"),
+                producer_descriptor: digest(b"descriptor"),
+                producer_manifest: digest(b"manifest"),
+                role: OutputRole::ProvisionalMetadata,
+                virtual_path: RawBytes::from("libupstream.rmeta"),
+                object: ObjectId(digest(b"exact committed metadata")),
+            };
+            let directories = vec![DependencyDirectoryFact {
+                path: plan.out_dir.clone(),
+                artifacts: vec![ExternFact {
+                    path: dependency.path.clone(),
+                    content_digest: dependency.object.0.clone(),
+                }],
+            }];
+            let runtime = compute(
+                rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
+                b"runtime",
+            );
+            let key_for =
+                |inputs: &ActionInputManifest, dependencies: &[CommittedWorkspaceDependency]| {
+                    remote_committed_dependency_key(
+                        plan,
+                        policy,
+                        &toolchain,
+                        &directories,
+                        dependencies,
+                        inputs,
+                        own_generated.then_some(b"".as_slice()),
+                        "/__rabs/toolchain",
+                        &fixture.toolchain.sha256,
+                        &runtime,
+                    )
+                };
+            let dependencies = vec![dependency];
+            let key = key_for(&inputs, &dependencies).unwrap();
+            assert_eq!(key.descriptor.key_epoch, 36);
+            verify_execution_policy(
+                plan,
+                &key,
+                DependencyExecutionMode::ClosedMetadata,
+                Some(policy),
+            )
+            .unwrap();
+            assert!(
+                key_for(&inputs, &[]).is_err(),
+                "captured bytes cannot supply producer authority"
+            );
+            let mut missing_record = inputs.clone();
+            missing_record.inputs.retain(|input| {
+                input.virtual_path.as_bytes() != plan.native_record_virtual_path(0).as_bytes()
+            });
+            assert!(key_for(&missing_record, &dependencies).is_err());
+            for other in [
+                None,
+                Some(CommittedDependencyPolicy::WorkspaceDagMetadata),
+                Some(CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata),
+            ] {
+                assert!(
+                    verify_execution_policy(
+                        plan,
+                        &key,
+                        DependencyExecutionMode::ClosedMetadata,
+                        other
+                    )
+                    .is_err()
+                );
+            }
+            for mode in [
+                DependencyExecutionMode::Metadata,
+                DependencyExecutionMode::Rlib,
+            ] {
+                assert!(verify_execution_policy(plan, &key, mode, Some(policy)).is_err());
+                fixture.context = fixture.context.clone().with_execution_mode(mode);
+                assert!(fixture.request().is_err());
+            }
         }
     }
 

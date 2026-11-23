@@ -2003,11 +2003,26 @@ Workspace units can also receive native search paths propagated through dependen
 libraries. They use the same completed-record capture and
 `canonical-generated-native-roots-v1` capability described above, including
 consumers with no own `OUT_DIR`. The root's full retained files and directory
-listings remain part of each fresh workspace execution identity. This scope
-still excludes dynamic/system libraries and native library modifiers.
+listings remain part of each workspace execution identity. Only supported static
+native options and retained Cargo paths are eligible; dynamic, system and
+framework inputs remain excluded.
 Inputs cannot be acquired by spelling an unretained host path in rustc argv.
-Workspace native results remain request-owned and are never published or
-replayed through the dependency action cache.
+
+Ordinary workspace library metadata checks with propagated native inputs can
+also earn action-cache reuse through the distinct
+`canonical-workspace-propagated-native-dag-metadata-v1` class (key epoch 36).
+Every loadable Rust dependency must have an operation-owned installation backed
+by an exact committed producer and complete transitive ancestry. Every foreign
+native tree, its directory listings and completed Cargo records remain keyed;
+an optional own `OUT_DIR` is retained in full as well. The coordinator checks
+these generations again before publication and delivery. The class requires
+its own successful verification samples and quarantine checks, so earlier
+pure-Rust or own-`OUT_DIR` metadata evidence cannot enable its replay.
+
+This path uses the closed metadata sandbox and publishes only metadata,
+dep-info and diagnostics. It supplies no archive, final-link, harness or
+build-script execution authority. Unsupported or unqualified requests retain
+the existing fresh execution path; build scripts still execute under Cargo.
 
 The general workspace execution profile executes each accepted request afresh.
 Its identity binds the entire

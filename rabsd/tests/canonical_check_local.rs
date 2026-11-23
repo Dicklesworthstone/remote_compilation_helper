@@ -9530,6 +9530,132 @@ fn canonical_cargo_check_caches_own_native_workspace_leaf_metadata() {
     remote_native_workspace("check", true);
 }
 
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual committed native workspace producer, downstream metadata samples and relocated cache replay"]
+fn canonical_cargo_check_replays_propagated_native_workspace_metadata() {
+    use rabs_cas::metadata_store::RabsMetadataStore;
+    use rabs_protocol::result_identity::OutputRole;
+
+    let (owner, mut profile) = native_fixture();
+    let first = owner.path().join("source-a");
+    let relocated = owner.path().join("source-b");
+    for source in [&first, &relocated] {
+        generated_native_workspace(source, true);
+        write(
+            source,
+            "Cargo.toml",
+            "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\n[workspace]\nmembers=['consumer']\nresolver='2'\n[features]\nremote_workspace=[]\n",
+        );
+        write(
+            source,
+            "Cargo.lock",
+            "version=4\n\n[[package]]\nname='canonical_app'\nversion='0.1.0'\n\n[[package]]\nname='propagated_consumer'\nversion='0.1.0'\ndependencies=['canonical_app']\n",
+        );
+        write(
+            source,
+            "consumer/Cargo.toml",
+            "[package]\nname='propagated_consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ncanonical_app={path='..',features=['remote_workspace']}\n",
+        );
+        write(
+            source,
+            "consumer/src/lib.rs",
+            "pub fn answer() -> u32 { canonical_app::answer() }\npub const BINDING: &str = canonical_app::NATIVE_BINDING;\n",
+        );
+    }
+    profile["command"] = json!("check");
+    profile["selection"] = json!({"workspace":true,"lib":true,"features":["remote_workspace"]});
+    let names = ["canonical_app", "propagated_consumer"];
+    let stock = stock_native_workspace_metadata(owner.path(), 0, &profile, &names);
+    let (mut worker, environment) = NativeWorker::start(owner.path());
+    let mut targets = BTreeSet::new();
+    let mut original_keys = None;
+    for number in 1..=4 {
+        // Each request gets a new cold private target. The fourth also uses a
+        // relocated checkout, so Cargo freshness cannot impersonate a cache hit.
+        profile["target_cache"] = json!({
+            "runtime_epoch":format!("propagated-native-metadata-{number}-v1"),
+            "max_bytes":268435456,
+        });
+        if number == 4 {
+            profile["source_root"] = json!(relocated);
+        }
+        let before = (number == 4).then(|| read_bounded(&worker.state.join("requests.json")));
+        let (code, events, output) =
+            run_with_environment(owner.path(), 600 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        let actual =
+            native_workspace_metadata_outputs(owner.path(), &events, &output, &names, &mut targets);
+        assert_eq!(actual, stock, "stock and executed/replayed metadata differ");
+        let offers = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        let keys = if number == 4 {
+            assert!(
+                offers.is_empty(),
+                "qualified replay dispatched another compiler: {output}"
+            );
+            assert_eq!(
+                before.unwrap(),
+                read_bounded(&worker.state.join("requests.json"))
+            );
+            &hits
+        } else {
+            assert!(
+                hits.is_empty(),
+                "unsampled native metadata replayed: {output}"
+            );
+            &offers
+        };
+        assert_eq!(
+            keys.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(names)
+        );
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        if let Some(original) = &original_keys {
+            assert_eq!(
+                keys, original,
+                "relocation or sampling split the native dependency key"
+            );
+        } else {
+            original_keys = Some(keys.clone());
+        }
+        for (name, class) in [
+            (
+                "canonical_app",
+                "rustc-workspace-native-generated-metadata-v1",
+            ),
+            (
+                "propagated_consumer",
+                "rustc-workspace-propagated-native-dag-metadata-v1",
+            ),
+        ] {
+            assert_closed_workspace_leaf_evidence(
+                owner.path(),
+                &keys[name],
+                number.min(3) as usize,
+                class,
+            );
+        }
+        assert_workspace_dag_ancestry(owner.path(), keys, &actual.0, &names);
+        let cas = rabsd::janitor::store::mount_and_reconcile(
+            &owner.path().join("state/canonical-compile-v1/cas"),
+        )
+        .unwrap();
+        let mut store = cas.store().lock().unwrap();
+        let manifest_key = store
+            .published_manifest_key_str(&keys["propagated_consumer"])
+            .unwrap()
+            .unwrap();
+        let manifest = rabsd::coord::live::load_manifest(&mut *store, &manifest_key).unwrap();
+        assert_eq!(manifest.key_epoch, 36);
+        assert_eq!(manifest.logical_outputs.len(), 2);
+        assert!(manifest.logical_outputs.iter().all(|output| matches!(
+            output.role,
+            OutputRole::ProvisionalMetadata | OutputRole::DepInfo,
+        )));
+    }
+    worker.finish();
+}
+
 fn native_workspace_metadata_outputs(
     root: &Path,
     events: &[Value],

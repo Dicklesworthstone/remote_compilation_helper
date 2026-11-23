@@ -1127,6 +1127,7 @@ impl CanonicalPaths {
             | DependencySourceKind::WorkspaceGeneratedDagMetadata
             | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
             | DependencySourceKind::WorkspaceNativeGeneratedDagMetadata
+            | DependencySourceKind::WorkspacePropagatedNativeDagMetadata
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
             | DependencySourceKind::WorkspaceMixedMetadata => None,
@@ -2602,6 +2603,7 @@ mod tests {
             CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
             CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
             CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
+            CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let archive = matches!(
@@ -2619,6 +2621,7 @@ mod tests {
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
             );
             let mut parent_outputs =
                 vec![("libparent.rmeta", OutputRole::ProvisionalMetadata, METADATA)];
@@ -2708,6 +2711,7 @@ mod tests {
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
             ) {
                 let ordinary = if archive {
                     CommittedDependencyPolicy::WorkspaceDagRlib
