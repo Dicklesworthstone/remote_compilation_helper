@@ -192,6 +192,81 @@ pub(super) fn receive(
     Ok((header, bytes))
 }
 
+/// A cancellation can interrupt either a header or a payload. Retain both
+/// cursors so the same connection can finish that frame while draining; a
+/// diagnostic payload must never be mistaken for a cancellation receipt.
+#[derive(Default)]
+pub(super) struct FrameReader {
+    header_bytes: [u8; HEADER_BYTES],
+    header_offset: usize,
+    header: Option<Header>,
+    payload: Vec<u8>,
+    payload_offset: usize,
+}
+
+impl FrameReader {
+    pub(super) fn receive(
+        &mut self,
+        stream: &mut UnixStream,
+        deadline: Instant,
+        stopped: &AtomicBool,
+    ) -> io::Result<(Header, Vec<u8>)> {
+        fn fill(
+            stream: &mut UnixStream,
+            bytes: &mut [u8],
+            offset: &mut usize,
+            deadline: Instant,
+            stopped: &AtomicBool,
+        ) -> io::Result<()> {
+            while *offset < bytes.len() {
+                checkpoint(deadline, stopped)?;
+                match stream.read(&mut bytes[*offset..]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "canonical service frame was truncated during cancellation",
+                        ));
+                    }
+                    Ok(count) => *offset += count,
+                    Err(error) if retryable(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+        fill(
+            stream,
+            &mut self.header_bytes,
+            &mut self.header_offset,
+            deadline,
+            stopped,
+        )?;
+        let header = match self.header {
+            Some(header) => header,
+            None => {
+                let header = Header::decode(self.header_bytes).map_err(io::Error::other)?;
+                self.payload.resize(header.length(), 0);
+                self.header = Some(header);
+                header
+            }
+        };
+        fill(
+            stream,
+            &mut self.payload,
+            &mut self.payload_offset,
+            deadline,
+            stopped,
+        )?;
+        header
+            .validate_payload(&self.payload)
+            .map_err(io::Error::other)?;
+        self.header_offset = 0;
+        self.header = None;
+        self.payload_offset = 0;
+        Ok((header, std::mem::take(&mut self.payload)))
+    }
+}
+
 pub(super) fn send(
     stream: &mut UnixStream,
     kind: Kind,
@@ -352,10 +427,76 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_preserves_every_partial_frame_cursor() {
+        // Receipt-shaped diagnostic bytes must remain part of their original
+        // payload when cancellation interrupts either a header or its body.
+        let receipt = Header::new(Kind::Cancelled, 0).unwrap().encode();
+        let payload = [b"diagnostic".as_slice(), &receipt].concat();
+        let frame = [
+            Header::new(Kind::Stdout, payload.len())
+                .unwrap()
+                .encode()
+                .as_slice(),
+            &payload,
+        ]
+        .concat();
+        for split in [
+            1,
+            HEADER_BYTES - 1,
+            HEADER_BYTES,
+            HEADER_BYTES + 3,
+            frame.len() - 1,
+        ] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            configure(&client).unwrap();
+            configure(&server).unwrap();
+            server.write_all(&frame[..split]).unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let child_stopped = Arc::clone(&stopped);
+            let cancel = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                child_stopped.store(true, Ordering::Release);
+            });
+            let mut reader = FrameReader::default();
+            assert_eq!(
+                reader
+                    .receive(
+                        &mut client,
+                        Instant::now() + Duration::from_secs(5),
+                        &stopped
+                    )
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Interrupted
+            );
+            cancel.join().unwrap();
+            server.write_all(&frame[split..]).unwrap();
+            server.write_all(&receipt).unwrap();
+            drop(server);
+            let mut state = ResponseState::default();
+            state
+                .observe(Header::new(Kind::Accepted, 0).unwrap(), &[])
+                .unwrap();
+            let draining = AtomicBool::new(false);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (header, actual) = reader.receive(&mut client, deadline, &draining).unwrap();
+            assert_eq!(header.kind(), Kind::Stdout);
+            assert_eq!(actual, payload);
+            state.observe(header, &actual).unwrap();
+            assert!(!state.cleanup_confirmed());
+            let (header, bytes) = reader.receive(&mut client, deadline, &draining).unwrap();
+            assert_eq!(header.kind(), Kind::Cancelled);
+            state.observe(header, &bytes).unwrap();
+            assert!(state.cleanup_confirmed());
+            expect_eof(&mut client, deadline, &draining).unwrap();
+        }
+    }
+
+    #[test]
     fn oversized_header_and_truncation_fail_without_waiting_for_claimed_body() {
         for bytes in [
-            vec![1, Kind::Stdout as u8, 255, 255, 255, 255],
-            vec![1, 3, 0, 0, 0, 4, 1],
+            vec![2, Kind::Stdout as u8, 255, 255, 255, 255],
+            vec![2, 3, 0, 0, 0, 4, 1],
         ] {
             let (mut client, mut server) = UnixStream::pair().unwrap();
             configure(&client).unwrap();

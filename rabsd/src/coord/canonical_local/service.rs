@@ -8,8 +8,7 @@
 mod wire;
 
 use super::{
-    OperationCancellation, Profile, SharedRuntime, ordinary_directory, overlap, plain_absolute,
-    private_directory,
+    Profile, SharedRuntime, ordinary_directory, overlap, plain_absolute, private_directory,
 };
 use crate::controlled_output::ControlledOutput;
 use crate::edge::live_facts::read_stable;
@@ -17,9 +16,11 @@ use crate::edge::server::report_log_line;
 use asupersync::signal::ShutdownController;
 use rabs_protocol::canonical_service::{
     Header, Kind, MAX_CHUNK_BYTES, MAX_FAILURE_BYTES, MAX_PROFILE_BYTES, ResponseState,
+    decode_termination, encode_termination,
 };
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
+use rabs_protocol::subscriber_interest::ChildTermination;
 use rabs_sandbox::socket_endpoint::EndpointLease;
 use rabs_scheduler::fairness::{FairQueue, TenantKey};
 use serde::Deserialize;
@@ -513,7 +514,43 @@ impl Drop for AdmittedOperation {
 
 struct OperationOwner {
     stopped: Arc<AtomicBool>,
-    thread: Option<JoinHandle<io::Result<i32>>>,
+    thread: Option<JoinHandle<io::Result<ChildTermination>>>,
+}
+
+#[derive(Debug)]
+struct ClientDrained;
+
+impl std::fmt::Display for ClientDrained {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("canonical client disconnected; its operation was drained")
+    }
+}
+
+impl std::error::Error for ClientDrained {}
+
+fn report_session_result(stream: &mut UnixStream, result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<ClientDrained>()) =>
+        {
+            // Only the owner can produce this acknowledgment, after join.
+            // A partial write, crash or unresolved cleanup cannot produce it.
+            wire::send(
+                stream,
+                Kind::Cancelled,
+                &[],
+                Instant::now() + HANDSHAKE_BUDGET,
+                &AtomicBool::new(false),
+            )
+        }
+        Err(error) => {
+            failed(stream, &error.to_string());
+            Err(error)
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 impl OperationOwner {
@@ -521,7 +558,7 @@ impl OperationOwner {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    fn join(&mut self) -> io::Result<i32> {
+    fn join(&mut self) -> io::Result<ChildTermination> {
         self.thread
             .take()
             .ok_or_else(|| io::Error::other("canonical operation already joined"))?
@@ -541,11 +578,18 @@ impl OperationOwner {
             if error.kind() == io::ErrorKind::ConnectionAborted {
                 // The wire is also checked before admission, when no
                 // operation exists. Only its owner can confirm this drain.
-                self.stop_and_join();
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "canonical client disconnected; its operation was drained",
-                )
+                self.stopped.store(true, Ordering::Release);
+                match self.join() {
+                    Err(error)
+                        if error.kind() != io::ErrorKind::Interrupted
+                            || error
+                                .get_ref()
+                                .is_some_and(|inner| inner.is::<super::UnconfirmedCleanup>()) =>
+                    {
+                        error
+                    }
+                    _ => io::Error::new(io::ErrorKind::ConnectionAborted, ClientDrained),
+                }
             } else {
                 error
             }
@@ -770,18 +814,23 @@ fn relay_operation(
     // Join all writers before sending the last tail or a terminal result. The
     // same cursors continue; bytes already streamed are never replayed here.
     let outcome = operation.join();
-    operation.check_client(stream)?;
+    // The client may have half-closed while the last writer finished. Deliver
+    // the native completion (which also confirms cleanup) rather than trying
+    // to join an already joined owner a second time.
     let deadline = Instant::now() + DELIVERY_BUDGET;
     while output.send_available(stream, deadline, &operation.stopped)? {}
     match outcome {
-        Ok(code) => send_response(
-            stream,
-            &mut output.state,
-            Kind::Completed,
-            &code.to_be_bytes(),
-            deadline,
-            &operation.stopped,
-        ),
+        Ok(termination) => {
+            let (kind, bytes) = encode_termination(termination).map_err(io::Error::other)?;
+            send_response(
+                stream,
+                &mut output.state,
+                kind,
+                &bytes,
+                deadline,
+                &operation.stopped,
+            )
+        }
         Err(error) => Err(error),
     }
 }
@@ -825,12 +874,21 @@ fn handle_session(
         profile_bytes.len() <= MAX_PROFILE_BYTES,
         "canonical profile exceeds the native byte bound",
     )?;
-    let _admission = admissions.acquire(
-        stream,
-        &runtime,
-        &stopped,
-        Duration::from_secs(profile.timeout_seconds),
-    )?;
+    let _admission = admissions
+        .acquire(
+            stream,
+            &runtime,
+            &stopped,
+            Duration::from_secs(profile.timeout_seconds),
+        )
+        .map_err(|error| {
+            // No operation has been created while this request waits for admission.
+            if error.kind() == io::ErrorKind::ConnectionAborted {
+                io::Error::new(io::ErrorKind::ConnectionAborted, ClientDrained)
+            } else {
+                error
+            }
+        })?;
     let owner = tempfile::Builder::new()
         .prefix("canonical-service-output-")
         .permissions(fs::Permissions::from_mode(0o700))
@@ -958,10 +1016,7 @@ pub fn run_service_profile(
                             &identity,
                             child_stop,
                         );
-                        if let Err(error) = &result {
-                            failed(&mut stream, &error.to_string());
-                        }
-                        result
+                        report_session_result(&mut stream, result)
                     })?;
                 sessions.0.push(Session {
                     stopped,
@@ -985,11 +1040,13 @@ pub fn run_service_profile(
 
 /// Attach one existing profile to its explicitly selected running service.
 /// Failure is terminal: this path never starts a daemon or falls back locally.
-pub fn run_client_profile(
+pub(super) fn run_client_profile(
     path: &Path,
     release_mode: ReleaseAuthorizationMode,
     build_identity: String,
-) -> io::Result<i32> {
+    stopped: &AtomicBool,
+    cleanup_confirmed: &mut bool,
+) -> io::Result<ChildTermination> {
     let (_, bytes) = read_stable(path, MAX_PROFILE_BYTES as u64)?;
     let profile: Profile =
         serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
@@ -1009,8 +1066,6 @@ pub fn run_client_profile(
         )
     };
     let identity = socket_identity(socket).map_err(endpoint_error)?;
-    let cancellation = OperationCancellation::start()?;
-    let stopped = &cancellation.stopped;
     let deadline = profile.client_deadline()?;
     // Validate and retain the caller's sinks before submitting a request that
     // can start Cargo. Backpressure uses the same stop flag and fixed deadline
@@ -1019,47 +1074,101 @@ pub fn run_client_profile(
     let mut stderr = ControlledOutput::new(&io::stderr(), stopped, deadline)?;
     let mut stream = wire::connect(socket, Instant::now() + HANDSHAKE_BUDGET, stopped)
         .map_err(endpoint_error)?;
-    require(
-        socket_identity(socket).map_err(endpoint_error)? == identity,
-        "canonical service endpoint changed while connecting",
-    )?;
-    let request = json!({
-        "version":REQUEST_VERSION, "build_identity":build_identity,
-        "require_release":release_mode == ReleaseAuthorizationMode::Required,
-        "profile":serde_json::from_slice::<Value>(&bytes)?
-    });
-    let early_refusal = wire::submit(
-        &mut stream,
-        &serde_json::to_vec(&request)?,
-        Instant::now() + HANDSHAKE_BUDGET,
-        stopped,
-    )?;
-    receive_result(
-        stream,
-        early_refusal,
-        deadline,
-        stopped,
-        &mut stdout,
-        &mut stderr,
-    )
+    // Keep the connection through cancellation. A write-side EOF tells the
+    // service to stop and join this operation while its read side confirms
+    // the drain; re-signalling immediately after close would race cleanup.
+    let mut reader = wire::FrameReader::default();
+    let mut response = ResponseState::default();
+    let mut request_submitted = false;
+    let result = (|| {
+        require(
+            socket_identity(socket).map_err(endpoint_error)? == identity,
+            "canonical service endpoint changed while connecting",
+        )?;
+        let request = json!({
+            "version":REQUEST_VERSION, "build_identity":build_identity,
+            "require_release":release_mode == ReleaseAuthorizationMode::Required,
+            "profile":serde_json::from_slice::<Value>(&bytes)?
+        });
+        *cleanup_confirmed = false;
+        let early_refusal = wire::submit(
+            &mut stream,
+            &serde_json::to_vec(&request)?,
+            Instant::now() + HANDSHAKE_BUDGET,
+            stopped,
+        )?;
+        request_submitted = true;
+        receive_result(
+            &mut stream,
+            &mut reader,
+            &mut response,
+            early_refusal,
+            deadline,
+            stopped,
+            &mut stdout,
+            &mut stderr,
+        )
+    })();
+    if result.is_ok() {
+        *cleanup_confirmed = true;
+    } else if stopped.load(Ordering::Acquire) && request_submitted {
+        *cleanup_confirmed = false;
+        cancel_and_drain(
+            &mut stream,
+            &mut reader,
+            &mut response,
+            Instant::now() + DELIVERY_BUDGET,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("canonical service cancellation cleanup is unconfirmed: {error}"),
+            )
+        })?;
+        *cleanup_confirmed = true;
+    }
+    result
 }
 
-/// Own the connection through presentation so any failed/cancelled sink closes
-/// it immediately. The service then cancels and joins only this operation.
+/// Resume the exact partial frame before reading a post-cleanup receipt.
+/// Bare EOF, a failed write, or a diagnostic containing receipt-shaped bytes
+/// cannot prove cleanup. The cancelled console never participates in draining.
+fn cancel_and_drain(
+    stream: &mut UnixStream,
+    reader: &mut wire::FrameReader,
+    state: &mut ResponseState,
+    deadline: Instant,
+) -> io::Result<()> {
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let draining = AtomicBool::new(false);
+    while !state.is_finished() {
+        let (header, payload) = reader.receive(stream, deadline, &draining)?;
+        state.observe(header, &payload).map_err(io::Error::other)?;
+    }
+    require(
+        state.cleanup_confirmed(),
+        "service did not confirm its operation drain",
+    )?;
+    wire::expect_eof(stream, deadline, &draining)
+}
+
+/// Present the original output exactly once. The caller owns this connection
+/// until either terminal EOF or its explicit cancellation drain completes.
 fn receive_result(
-    mut stream: UnixStream,
+    stream: &mut UnixStream,
+    reader: &mut wire::FrameReader,
+    state: &mut ResponseState,
     mut early_refusal: Option<(Header, Vec<u8>)>,
     deadline: Instant,
     stopped: &AtomicBool,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
-) -> io::Result<i32> {
-    let mut state = ResponseState::default();
+) -> io::Result<ChildTermination> {
     let mut result = None;
     while !state.is_finished() {
         let (header, payload) = match early_refusal.take() {
             Some(frame) => frame,
-            None => wire::receive(&mut stream, deadline, stopped)?,
+            None => reader.receive(stream, deadline, stopped)?,
         };
         state.observe(header, &payload).map_err(io::Error::other)?;
         match header.kind() {
@@ -1072,12 +1181,15 @@ fn receive_result(
                 stderr.write_all(&payload)?;
                 stderr.flush()?;
             }
-            Kind::Completed => {
-                let bytes: [u8; 4] = payload
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| invalid("invalid native exit code"))?;
-                result = Some(Ok(i32::from_be_bytes(bytes)));
+            Kind::Completed | Kind::Signaled => {
+                result =
+                    Some(decode_termination(header.kind(), &payload).map_err(io::Error::other));
+            }
+            Kind::Cancelled => {
+                result = Some(Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "canonical service confirmed cancellation cleanup",
+                )));
             }
             Kind::Failed => {
                 result = Some(Err(io::Error::other(
@@ -1088,7 +1200,7 @@ fn receive_result(
         }
     }
     if let Err(error) = wire::expect_eof(
-        &mut stream,
+        stream,
         deadline.min(Instant::now() + HANDSHAKE_BUDGET),
         stopped,
     ) {
@@ -1202,7 +1314,7 @@ mod tests {
                 }
                 child_stdout.write_all(b"tail")?;
                 child_stderr.write_all(b"end")?;
-                Ok(7)
+                Ok(ChildTermination::Exited(7))
             })();
             child_finished.store(true, Ordering::Release);
             result
@@ -1351,7 +1463,7 @@ mod tests {
             stopped: _,
             finished,
         } = live_fixture(root.path(), b"compiler\0\xff".to_vec());
-        let (client, mut server) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
         wire::configure(&client).unwrap();
         wire::configure(&server).unwrap();
         let relay = std::thread::spawn(move || {
@@ -1370,7 +1482,9 @@ mod tests {
         let stdout = tempfile::tempfile().unwrap();
         let stderr = tempfile::tempfile().unwrap();
         let code = receive_result(
-            client,
+            &mut client,
+            &mut wire::FrameReader::default(),
+            &mut ResponseState::default(),
             None,
             deadline,
             &stopped,
@@ -1378,7 +1492,7 @@ mod tests {
             &mut ControlledOutput::new(&stderr, &stopped, deadline).unwrap(),
         )
         .unwrap();
-        assert_eq!(code, 7);
+        assert_eq!(code, ChildTermination::Exited(7));
         relay.join().unwrap().unwrap();
         assert!(finished.load(Ordering::Acquire));
         let mut bytes = vec![0; stdout.metadata().unwrap().len() as usize];
@@ -1387,6 +1501,204 @@ mod tests {
         bytes.resize(stderr.metadata().unwrap().len() as usize, 0);
         stderr.read_exact_at(&mut bytes, 0).unwrap();
         assert_eq!(bytes, b"warning\0\xffend");
+    }
+
+    #[test]
+    fn service_round_trip_preserves_actual_child_signal_and_high_exit() {
+        for (script, expected) in [
+            (
+                "printf output; printf error >&2; exit 143",
+                ChildTermination::Exited(143),
+            ),
+            (
+                "printf output; printf error >&2; exit 137",
+                ChildTermination::Exited(137),
+            ),
+            (
+                "printf output; printf error >&2; kill -TERM $$",
+                ChildTermination::Signaled { signal_number: 15 },
+            ),
+            (
+                "printf output; printf error >&2; kill -KILL $$",
+                ChildTermination::Signaled { signal_number: 9 },
+            ),
+        ] {
+            let root = crate::test_util::private_tempdir();
+            let stdout = output_file(root.path(), "stdout").unwrap();
+            let stderr = output_file(root.path(), "stderr").unwrap();
+            let child_stdout = stdout.try_clone().unwrap();
+            let child_stderr = stderr.try_clone().unwrap();
+            let operation = OperationOwner {
+                stopped: Arc::new(AtomicBool::new(false)),
+                thread: Some(std::thread::spawn(move || {
+                    let status = std::process::Command::new("/bin/sh")
+                        .args(["-c", script])
+                        .stdout(child_stdout)
+                        .stderr(child_stderr)
+                        .status()?;
+                    super::super::native_termination(status)
+                })),
+            };
+            let output = ServiceOutput::accepted(stdout, stderr).unwrap();
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            wire::configure(&client).unwrap();
+            wire::configure(&server).unwrap();
+            let relay = std::thread::spawn(move || {
+                wire::send(
+                    &mut server,
+                    Kind::Accepted,
+                    &[],
+                    Instant::now() + Duration::from_secs(5),
+                    &AtomicBool::new(false),
+                )?;
+                relay_operation(&mut server, operation, output, || true)
+            });
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let actual = receive_result(
+                &mut client,
+                &mut wire::FrameReader::default(),
+                &mut ResponseState::default(),
+                None,
+                Instant::now() + Duration::from_secs(5),
+                &AtomicBool::new(false),
+                &mut stdout,
+                &mut stderr,
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(stdout, b"output");
+            assert_eq!(stderr, b"error");
+            relay.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn service_cancel_half_close_waits_for_owned_operation_to_join() {
+        let root = crate::test_util::private_tempdir();
+        let LiveFixture {
+            operation,
+            output,
+            release: _release,
+            stopped,
+            finished,
+        } = live_fixture(root.path(), b"unseen output".to_vec());
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        wire::configure(&client).unwrap();
+        wire::configure(&server).unwrap();
+        let relay = std::thread::spawn(move || {
+            let result = relay_operation(&mut server, operation, output, || true);
+            report_session_result(&mut server, result)
+        });
+        assert!(!finished.load(Ordering::Acquire));
+        let mut state = ResponseState::default();
+        state
+            .observe(Header::new(Kind::Accepted, 0).unwrap(), &[])
+            .unwrap();
+        cancel_and_drain(
+            &mut client,
+            &mut wire::FrameReader::default(),
+            &mut state,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(
+            finished.load(Ordering::Acquire),
+            "client returned before the operation joined"
+        );
+        relay.join().unwrap().unwrap();
+
+        let (mut client, _unresponsive_server) = UnixStream::pair().unwrap();
+        wire::configure(&client).unwrap();
+        assert_eq!(
+            cancel_and_drain(
+                &mut client,
+                &mut wire::FrameReader::default(),
+                &mut ResponseState::default(),
+                Instant::now() + Duration::from_millis(10)
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn cancelled_client_rejects_bare_eof_and_unconfirmed_cleanup() {
+        let (mut client, mut crashed) = UnixStream::pair().unwrap();
+        wire::configure(&client).unwrap();
+        let receipt_bytes = Header::new(Kind::Cancelled, 0).unwrap().encode();
+        wire::send(
+            &mut crashed,
+            Kind::Stdout,
+            &receipt_bytes,
+            Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        drop(crashed);
+        let mut state = ResponseState::default();
+        state
+            .observe(Header::new(Kind::Accepted, 0).unwrap(), &[])
+            .unwrap();
+        assert!(
+            cancel_and_drain(
+                &mut client,
+                &mut wire::FrameReader::default(),
+                &mut state,
+                Instant::now() + Duration::from_secs(5)
+            )
+            .is_err()
+        );
+        assert!(
+            !state.cleanup_confirmed(),
+            "diagnostic bytes or EOF forged a receipt"
+        );
+
+        let root = crate::test_util::private_tempdir();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let child_stop = Arc::clone(&stopped);
+        let operation = OperationOwner {
+            stopped,
+            thread: Some(std::thread::spawn(move || {
+                while !child_stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    super::UnconfirmedCleanup("unresolved descendants".into()),
+                ))
+            })),
+        };
+        let output = ServiceOutput::accepted(
+            output_file(root.path(), "stdout").unwrap(),
+            output_file(root.path(), "stderr").unwrap(),
+        )
+        .unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        wire::configure(&client).unwrap();
+        wire::configure(&server).unwrap();
+        let server = std::thread::spawn(move || {
+            let result = relay_operation(&mut server, operation, output, || true);
+            report_session_result(&mut server, result)
+        });
+        let mut state = ResponseState::default();
+        state
+            .observe(Header::new(Kind::Accepted, 0).unwrap(), &[])
+            .unwrap();
+        assert!(
+            cancel_and_drain(
+                &mut client,
+                &mut wire::FrameReader::default(),
+                &mut state,
+                Instant::now() + Duration::from_secs(5)
+            )
+            .is_err()
+        );
+        assert!(!state.cleanup_confirmed());
+        let error = server.join().unwrap().unwrap_err();
+        assert!(error.get_ref().unwrap().is::<super::UnconfirmedCleanup>());
     }
 
     fn full_caller_pipe() -> (std::os::fd::OwnedFd, File) {
@@ -1422,7 +1734,7 @@ mod tests {
                 let admissions = OperationAdmissions::new(1, 1);
                 let admitted = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
                 let mut successor = admissions.enqueue().unwrap();
-                let (client, mut server) = UnixStream::pair().unwrap();
+                let (mut client, mut server) = UnixStream::pair().unwrap();
                 wire::configure(&client).unwrap();
                 wire::configure(&server).unwrap();
                 let relay = std::thread::spawn(move || {
@@ -1465,7 +1777,9 @@ mod tests {
                         ControlledOutput::new(&stderr, &client_stopped, deadline).unwrap();
                     ready.send(()).unwrap();
                     let outcome = receive_result(
-                        client,
+                        &mut client,
+                        &mut wire::FrameReader::default(),
+                        &mut ResponseState::default(),
                         None,
                         deadline,
                         &client_stopped,
@@ -1639,7 +1953,7 @@ mod tests {
                 while !observed.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                Ok(code)
+                Ok(ChildTermination::Exited(code))
             });
             OperationOwner {
                 stopped,
@@ -1652,7 +1966,7 @@ mod tests {
         assert!(!second.stopped.load(Ordering::Acquire));
         assert!(!second.finished());
         second.stopped.store(true, Ordering::Release);
-        assert_eq!(second.join().unwrap(), 22);
+        assert_eq!(second.join().unwrap(), ChildTermination::Exited(22));
     }
 
     #[test]

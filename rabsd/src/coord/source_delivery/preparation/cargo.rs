@@ -12,7 +12,7 @@ mod registry;
 mod selection;
 mod vendor;
 
-use super::super::control::PreparationRootGuard;
+use super::super::control::{PreparationRootGuard, UnconfirmedCleanup};
 use super::{PreparationContext, PreparationControl, capture_error};
 use rabs_asupersync::process_groups::ManagedProcessGroup;
 use rabs_asupersync::region_tree::Attribution;
@@ -1514,15 +1514,16 @@ impl OwnedGroup {
                 Ok(true) => break,
                 Err(error) => {
                     self.retain_unresolved_root();
-                    return Err(io::Error::other(format!(
+                    return Err(io::Error::other(UnconfirmedCleanup(format!(
                         "Cargo planning process-group cleanup could not verify closure: {error}"
-                    )));
+                    ))));
                 }
                 Ok(false) if Instant::now() >= deadline => {
                     self.retain_unresolved_root();
-                    return Err(io::Error::other(
-                        "Cargo planning process-group cleanup exceeded its bound with unresolved members",
-                    ));
+                    return Err(io::Error::other(UnconfirmedCleanup(
+                        "Cargo planning process-group cleanup exceeded its bound with unresolved members"
+                            .to_owned(),
+                    )));
                 }
                 Ok(false) => {}
             }
@@ -1546,15 +1547,21 @@ impl OwnedGroup {
             Ok(output) if output.residual_group_members == 0 => Ok(output),
             Ok(_) => {
                 self.retain_unresolved_root();
-                Err(io::Error::other(
-                    "Cargo planning process-group cleanup left unresolved members",
-                ))
+                Err(io::Error::other(UnconfirmedCleanup(
+                    "Cargo planning process-group cleanup left unresolved members".to_owned(),
+                )))
             }
             Err(error) => {
                 if !rabs_asupersync::process_groups::members_from_proc(group)
                     .is_ok_and(|members| members.is_empty())
                 {
                     self.retain_unresolved_root();
+                    return Err(io::Error::new(
+                        error.kind(),
+                        UnconfirmedCleanup(format!(
+                            "Cargo planning process-group cleanup could not verify closure: {error}"
+                        )),
+                    ));
                 }
                 Err(error)
             }
@@ -1639,7 +1646,9 @@ fn bounded_command_with_input(
             std::mem::forget(admission);
             return Err(io::Error::new(
                 error.kind(),
-                format!("Cargo planning spawn did not prove process-group closure: {error}"),
+                UnconfirmedCleanup(format!(
+                    "Cargo planning spawn did not prove process-group closure: {error}"
+                )),
             ));
         }
     };
@@ -2541,6 +2550,12 @@ mod tests {
             if cancel {
                 let error = result.unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+                assert!(
+                    !error
+                        .get_ref()
+                        .is_some_and(|inner| inner.is::<UnconfirmedCleanup>()),
+                    "a verified empty process group must remain an ordinary cancellation"
+                );
             } else {
                 assert_eq!(result.unwrap(), b"complete");
             }
@@ -2732,7 +2747,14 @@ mod tests {
             1024,
             &control,
         );
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<UnconfirmedCleanup>()),
+            "unverified spawn cleanup must survive native cancellation classification"
+        );
         assert_eq!(attempts.get(), 1);
         assert_eq!(acquired.get(), 1);
         assert!(held.get(), "spawn failure refunded unresolved ownership");

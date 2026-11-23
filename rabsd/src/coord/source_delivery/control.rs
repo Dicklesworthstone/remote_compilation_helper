@@ -5,6 +5,23 @@ use std::any::Any;
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
+/// The operation returned without proving that every owned child is gone.
+///
+/// Preserve this marker inside `io::Error` even when the underlying syscall
+/// reports `Interrupted`: cancellation is not a confirmed process-group drain.
+/// Native signal relay and service cancellation acknowledgements must retain
+/// this failure instead of presenting a clean cancellation to the caller.
+#[derive(Debug)]
+pub(crate) struct UnconfirmedCleanup(pub(crate) String);
+
+impl std::fmt::Display for UnconfirmedCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnconfirmedCleanup {}
+
 /// Keeps the caller's root admission alive without coupling preparation to the
 /// service broker. The owner is released only after the managed group drains.
 pub(crate) struct PreparationRootGuard {

@@ -657,20 +657,22 @@ fn main() {
                     config.release_authorization,
                     config.build_identity,
                 );
-                let code = match result {
-                    Ok(code) => code,
+                let termination = match result {
+                    Ok(termination) => termination,
                     Err(error) => {
                         report_canonical_error(format_args!(
                             "rabsd canonical compilation: {error}"
                         ));
-                        if error.kind() == std::io::ErrorKind::InvalidInput {
-                            2
-                        } else {
-                            1
-                        }
+                        rabs_protocol::subscriber_interest::ChildTermination::Exited(
+                            if error.kind() == std::io::ErrorKind::InvalidInput {
+                                2
+                            } else {
+                                1
+                            },
+                        )
                     }
                 };
-                std::process::exit(code);
+                rabsd::coord::canonical_local::exit_like(termination);
             }
             #[cfg(not(target_os = "linux"))]
             {

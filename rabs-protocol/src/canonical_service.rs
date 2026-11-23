@@ -5,8 +5,12 @@
 //! cache lookup or path mapping: the coordinator constructs those capabilities
 //! after capturing and admitting the requested build itself.
 
+use crate::subscriber_interest::ChildTermination;
+
 /// This protocol is deliberately separate from the rustc wrapper endpoint.
-pub const VERSION: u8 = 1;
+/// Version 2 distinguishes native signal termination from ordinary high exits.
+/// A version mismatch is refused before a profile can start an operation.
+pub const VERSION: u8 = 2;
 /// Version, frame kind, and a big-endian payload length.
 pub const HEADER_BYTES: usize = 6;
 /// A complete local compilation profile, before parsing or source capture.
@@ -18,7 +22,7 @@ pub const MAX_OUTPUT_BYTES: u64 = 128 * 1024 * 1024;
 /// A terminal failure is a short UTF-8 explanation, not another output stream.
 pub const MAX_FAILURE_BYTES: usize = 4096;
 
-/// Exactly the messages supported by the first service protocol.
+/// Exactly the messages supported by the canonical service protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Kind {
@@ -34,6 +38,45 @@ pub enum Kind {
     Completed = 5,
     /// UTF-8 failure; never permits an automatic local retry.
     Failed = 6,
+    /// Four-byte big-endian Linux terminating signal, never an exit code.
+    Signaled = 7,
+    /// Empty cancellation acknowledgment, emitted only after owned cleanup.
+    /// A closed connection without this frame is never a cancellation proof.
+    Cancelled = 8,
+}
+
+/// Signals whose native Linux default action terminates a process. Stop,
+/// continue and ignored signals cannot describe a reaped child and must not
+/// suspend a client or masquerade as successful completion. The canonical
+/// namespace/service execution profile is Linux-only.
+fn terminating_signal(signal: i32) -> bool {
+    matches!(signal, 1..=16 | 24..=27 | 29..=64)
+}
+
+/// Encode an exact child outcome, without guessing from the exit-code range.
+pub fn encode_termination(termination: ChildTermination) -> Result<(Kind, [u8; 4]), WireError> {
+    let (kind, value) = match termination {
+        ChildTermination::Exited(code) if (0..=255).contains(&code) => (Kind::Completed, code),
+        ChildTermination::Signaled { signal_number } if terminating_signal(signal_number) => {
+            (Kind::Signaled, signal_number)
+        }
+        _ => return Err(WireError::Payload),
+    };
+    Ok((kind, value.to_be_bytes()))
+}
+
+/// Decode only a validated native outcome. Normal exits such as 137 or 143
+/// remain exits, even though a shell uses those numbers for killed commands.
+pub fn decode_termination(kind: Kind, payload: &[u8]) -> Result<ChildTermination, WireError> {
+    let bytes: [u8; 4] = payload.try_into().map_err(|_| WireError::Payload)?;
+    let value = i32::from_be_bytes(bytes);
+    match kind {
+        Kind::Completed if (0..=255).contains(&value) => Ok(ChildTermination::Exited(value)),
+        Kind::Signaled if terminating_signal(value) => Ok(ChildTermination::Signaled {
+            signal_number: value,
+        }),
+        _ => Err(WireError::Payload),
+    }
 }
 
 /// A malformed or out-of-order service message.
@@ -75,9 +118,9 @@ impl Header {
     pub fn new(kind: Kind, length: usize) -> Result<Self, WireError> {
         let valid = match kind {
             Kind::Profile => (1..=MAX_PROFILE_BYTES).contains(&length),
-            Kind::Accepted => length == 0,
+            Kind::Accepted | Kind::Cancelled => length == 0,
             Kind::Stdout | Kind::Stderr => (1..=MAX_CHUNK_BYTES).contains(&length),
-            Kind::Completed => length == 4,
+            Kind::Completed | Kind::Signaled => length == 4,
             Kind::Failed => (1..=MAX_FAILURE_BYTES).contains(&length),
         };
         if !valid {
@@ -98,6 +141,8 @@ impl Header {
             4 => Kind::Stderr,
             5 => Kind::Completed,
             6 => Kind::Failed,
+            7 => Kind::Signaled,
+            8 => Kind::Cancelled,
             _ => return Err(WireError::Kind),
         };
         let length = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
@@ -134,11 +179,8 @@ impl Header {
             return Err(WireError::Payload);
         }
         match self.kind {
-            Kind::Completed => {
-                let bytes: [u8; 4] = payload.try_into().map_err(|_| WireError::Payload)?;
-                if !(0..=255).contains(&i32::from_be_bytes(bytes)) {
-                    return Err(WireError::Payload);
-                }
+            Kind::Completed | Kind::Signaled => {
+                decode_termination(self.kind, payload)?;
             }
             Kind::Failed => {
                 std::str::from_utf8(payload).map_err(|_| WireError::Payload)?;
@@ -154,6 +196,7 @@ impl Header {
 pub struct ResponseState {
     accepted: bool,
     finished: bool,
+    cleanup_confirmed: bool,
     output_bytes: u64,
 }
 
@@ -185,11 +228,16 @@ impl ResponseState {
                 }
                 self.output_bytes = next;
             }
-            Kind::Completed => {
+            Kind::Completed | Kind::Signaled => {
                 if !self.accepted {
                     return Err(WireError::Order);
                 }
                 self.finished = true;
+                self.cleanup_confirmed = true;
+            }
+            Kind::Cancelled => {
+                self.finished = true;
+                self.cleanup_confirmed = true;
             }
             Kind::Failed => self.finished = true,
         }
@@ -210,6 +258,13 @@ impl ResponseState {
     pub const fn is_finished(&self) -> bool {
         self.finished
     }
+
+    /// An explicit native completion or post-cleanup cancellation was read.
+    /// A failure frame, truncation or EOF cannot establish this fact.
+    #[must_use]
+    pub const fn cleanup_confirmed(&self) -> bool {
+        self.cleanup_confirmed
+    }
 }
 
 #[cfg(test)]
@@ -223,7 +278,7 @@ mod tests {
     #[test]
     fn golden_headers_preserve_binary_stream_payloads_and_native_exit_codes() {
         let header = Header::new(Kind::Stdout, 5).unwrap();
-        assert_eq!(header.encode(), [1, 3, 0, 0, 0, 5]);
+        assert_eq!(header.encode(), [2, 3, 0, 0, 0, 5]);
         assert_eq!(Header::decode(header.encode()), Ok(header));
         let mut state = ResponseState::default();
         observe(&mut state, Kind::Accepted, b"").unwrap();
@@ -236,13 +291,13 @@ mod tests {
 
     #[test]
     fn lengths_versions_and_unknown_kinds_are_refused_from_headers() {
-        assert_eq!(Header::decode([2, 1, 0, 0, 0, 1]), Err(WireError::Version));
-        assert_eq!(Header::decode([1, 0, 0, 0, 0, 1]), Err(WireError::Kind));
+        assert_eq!(Header::decode([1, 1, 0, 0, 0, 1]), Err(WireError::Version));
+        assert_eq!(Header::decode([2, 0, 0, 0, 0, 1]), Err(WireError::Kind));
         for kind in [Kind::Profile, Kind::Stdout, Kind::Stderr, Kind::Failed] {
             assert_eq!(Header::new(kind, 0), Err(WireError::Length));
             assert_eq!(Header::new(kind, usize::MAX), Err(WireError::Length));
             assert_eq!(
-                Header::decode([1, kind as u8, 255, 255, 255, 255]),
+                Header::decode([2, kind as u8, 255, 255, 255, 255]),
                 Err(WireError::Length)
             );
         }
@@ -251,6 +306,68 @@ mod tests {
         assert!(Header::new(Kind::Stdout, MAX_CHUNK_BYTES + 1).is_err());
         assert!(Header::new(Kind::Accepted, 1).is_err());
         assert!(Header::new(Kind::Completed, 3).is_err());
+        assert!(Header::new(Kind::Signaled, 3).is_err());
+    }
+
+    #[test]
+    fn native_termination_never_confuses_high_exits_with_signals() {
+        for termination in [
+            ChildTermination::Exited(0),
+            ChildTermination::Exited(101),
+            ChildTermination::Exited(137),
+            ChildTermination::Exited(143),
+            ChildTermination::Exited(255),
+            ChildTermination::Signaled { signal_number: 1 },
+            ChildTermination::Signaled { signal_number: 2 },
+            ChildTermination::Signaled { signal_number: 9 },
+            ChildTermination::Signaled { signal_number: 15 },
+            ChildTermination::Signaled { signal_number: 32 },
+            ChildTermination::Signaled { signal_number: 33 },
+        ] {
+            let (kind, bytes) = encode_termination(termination).unwrap();
+            assert_eq!(decode_termination(kind, &bytes), Ok(termination));
+            let mut state = ResponseState::default();
+            assert_eq!(observe(&mut state, kind, &bytes), Err(WireError::Order));
+            observe(&mut state, Kind::Accepted, b"").unwrap();
+            observe(&mut state, kind, &bytes).unwrap();
+            state.finish().unwrap();
+            assert_eq!(observe(&mut state, kind, &bytes), Err(WireError::Order));
+        }
+        for signal in [-1_i32, 0, 17, 18, 19, 20, 21, 22, 23, 28, 65, 143] {
+            assert_eq!(
+                decode_termination(Kind::Signaled, &signal.to_be_bytes()),
+                Err(WireError::Payload)
+            );
+            assert!(
+                encode_termination(ChildTermination::Signaled {
+                    signal_number: signal,
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_requires_explicit_terminal_confirmation() {
+        for accepted in [false, true] {
+            let mut state = ResponseState::default();
+            if accepted {
+                observe(&mut state, Kind::Accepted, b"").unwrap();
+            }
+            assert!(!state.cleanup_confirmed());
+            assert_eq!(state.finish(), Err(WireError::Incomplete));
+            observe(&mut state, Kind::Cancelled, b"").unwrap();
+            assert!(state.cleanup_confirmed());
+            state.finish().unwrap();
+            assert_eq!(
+                observe(&mut state, Kind::Cancelled, b""),
+                Err(WireError::Order)
+            );
+        }
+        let mut failed = ResponseState::default();
+        observe(&mut failed, Kind::Failed, b"cleanup unresolved").unwrap();
+        assert!(!failed.cleanup_confirmed());
+        assert!(Header::new(Kind::Cancelled, 1).is_err());
     }
 
     #[test]

@@ -26,7 +26,9 @@ use super::live::{CoordLive, cluster_id};
 use super::live_dependency::LiveDependencyLane;
 use super::live_dependency::canonical::{CanonicalPaths, CommittedOutputExportError};
 use super::live_dependency::remote::{RemoteDependencies, SharedRemoteExecutions};
-use super::source_delivery::control::{PreparationControl, PreparationRootGuard};
+use super::source_delivery::control::{
+    PreparationControl, PreparationRootGuard, UnconfirmedCleanup,
+};
 use crate::controlled_output::ControlledOutput;
 use crate::edge::live_facts::{FileSig, read_stable};
 use crate::edge::server::{
@@ -42,6 +44,7 @@ use rabs_asupersync::region_tree::Attribution;
 use rabs_asupersync::root_permits::{RootPermit, RootPermitBroker};
 use rabs_asupersync::stream_drain::{DrainLimits, DrainedOutput, LiveOutputFiles};
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
+use rabs_protocol::subscriber_interest::{ChildTermination, RelayAction, relay_child_termination};
 use rabs_sandbox::canonical_mounts::{CanonicalMountPlan, UnitMount};
 use rabs_sandbox::canonical_namespace::{
     CanonicalNamespaceSpec, HostIsolationSupport, build_canonical_argv, command_for,
@@ -70,7 +73,7 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -100,6 +103,41 @@ pub fn report_cli_error(message: std::fmt::Arguments<'_>) {
     ) {
         let _ = writeln!(stderr, "{message}");
     }
+}
+
+/// Relay only after the command's operation owner, output writers and signal
+/// bridge have drained. An ordinary high exit must never become a signal.
+pub fn exit_like(termination: ChildTermination) -> ! {
+    match relay_child_termination(termination, true) {
+        RelayAction::ExitWith(code) | RelayAction::ExitWithConventionalCode(code) => {
+            std::process::exit(code)
+        }
+        RelayAction::RestoreDefaultAndResignal { signal_number } => {
+            // The same native relay is used by rabs-wrap. Rust ignores PIPE,
+            // and the caller may leave a signal blocked or handled. Restore
+            // its default and unblock it before raising on this process.
+            let _ = signal_hook::low_level::emulate_default_handler(signal_number);
+            let _ = signal_hook::low_level::raise(signal_number);
+            // Unknown platform signals may have no supported native relay.
+            // This is a last-resort failure, never an inferred classification.
+            std::process::exit(128 + signal_number)
+        }
+    }
+}
+
+fn native_termination(status: std::process::ExitStatus) -> io::Result<ChildTermination> {
+    use std::os::unix::process::ExitStatusExt;
+    let termination = match (status.code(), status.signal()) {
+        (Some(code), None) => ChildTermination::Exited(code),
+        (None, Some(signal_number)) => ChildTermination::Signaled { signal_number },
+        _ => {
+            return Err(invalid(
+                "canonical launcher did not return a terminal native status",
+            ));
+        }
+    };
+    rabs_protocol::canonical_service::encode_termination(termination).map_err(io::Error::other)?;
+    Ok(termination)
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -1224,6 +1262,8 @@ pub(super) struct OperationCancellation {
     pub(super) stopped: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    native_signals: Option<signal_hook::iterator::Handle>,
+    first_signal: Arc<AtomicI32>,
 }
 
 impl OperationCancellation {
@@ -1249,17 +1289,96 @@ impl OperationCancellation {
             stopped,
             done,
             thread: Some(thread),
+            native_signals: None,
+            first_signal: Arc::new(AtomicI32::new(0)),
         })
+    }
+
+    /// The native CLI owns INT/TERM/HUP until cleanup finishes. The persistent
+    /// daemon's shutdown/reload listeners deliberately remain unchanged.
+    fn start_native() -> io::Result<Self> {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+        let handle = signals.handle();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let first_signal = Arc::new(AtomicI32::new(0));
+        let child_stop = Arc::clone(&stopped);
+        let child_signal = Arc::clone(&first_signal);
+        let thread = std::thread::Builder::new()
+            .name("rabs-canonical-native-signals".into())
+            .spawn(move || {
+                let observe = |signal| {
+                    // Standard signals may coalesce, and the iterator does
+                    // not order a pending batch by arrival time. Retain the
+                    // first cancellation observed by this bridge; later
+                    // observations cannot replace it while the operation drains.
+                    if child_signal
+                        .compare_exchange(0, signal, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        child_stop.store(true, Ordering::Release);
+                    }
+                };
+                for signal in signals.forever() {
+                    observe(signal);
+                }
+                // Closing the iterator wakes its thread. A signal may already
+                // be queued even if this bridge has not yet been scheduled;
+                // retain it before releasing the handler and selecting a fate.
+                for signal in signals.pending() {
+                    observe(signal);
+                }
+            })?;
+        Ok(Self {
+            stopped,
+            done: Arc::new(AtomicBool::new(false)),
+            thread: Some(thread),
+            native_signals: Some(handle),
+            first_signal,
+        })
+    }
+
+    fn join_bridge(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(handle) = &self.native_signals {
+            handle.close();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    /// Call only after all operation owners have returned. A service client
+    /// additionally requires the server's drained EOF before relaying a signal.
+    fn finish(
+        mut self,
+        result: io::Result<ChildTermination>,
+        cleanup_confirmed: bool,
+    ) -> io::Result<ChildTermination> {
+        self.join_bridge();
+        let cleanup_confirmed = cleanup_confirmed
+            && (result.is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::Interrupted))
+            && !result.as_ref().is_err_and(|error| {
+                error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<UnconfirmedCleanup>())
+            });
+        match self.first_signal.load(Ordering::Acquire) {
+            signal_number if signal_number != 0 && cleanup_confirmed => {
+                Ok(ChildTermination::Signaled { signal_number })
+            }
+            _ => result,
+        }
     }
 }
 
 impl Drop for OperationCancellation {
     fn drop(&mut self) {
-        self.done.store(true, Ordering::Release);
         self.stopped.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.join_bridge();
     }
 }
 
@@ -1269,46 +1388,59 @@ impl Drop for OperationCancellation {
 ///
 /// Planning output is captured under a byte bound. The actual compilation inherits
 /// stdout/stderr, so diagnostics and Cargo JSON reach the caller immediately
-/// with their original bytes and native pipe/terminal behavior. The exit code
-/// is Cargo's real result; a timeout, cancellation or incomplete process-group
-/// cleanup is an error even when a signal handler managed to exit zero.
+/// with their original bytes and native pipe/terminal behavior. Preserve the
+/// supervised launcher's exact native termination and the first client
+/// cancellation observed by its signal bridge after cleanup. Bubblewrap may already encode an inner
+/// Cargo signal as an ordinary high exit; that ambiguity is never guessed away.
+/// A timeout or incomplete process-group cleanup remains an error even when a
+/// signal handler managed to exit zero.
 pub fn run_profile_with_release(
     path: &Path,
     release_mode: ReleaseAuthorizationMode,
     build_identity: String,
-) -> io::Result<i32> {
-    let (_, bytes) = read_stable(path, 64 * 1024)?;
-    let profile: Profile =
-        serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
-    // Refuse unsupported terminal input before validating source roots,
-    // acquiring state, probing namespaces, or capturing any source bytes.
-    profile.validate_stdin(std::io::stdin().is_terminal())?;
-    if profile.service_socket.is_some() && profile.inherits_stdin()? {
-        return Err(invalid(
-            "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF or stdin_file for captured input",
-        ));
-    }
-    profile.validate()?;
-    if profile.service_socket.is_some() {
-        return service::run_client_profile(path, release_mode, build_identity);
-    }
-    let cancellation = OperationCancellation::start()?;
-    let output = OperationOutput::inherited(
-        &io::stdout(),
-        &io::stderr(),
-        &cancellation.stopped,
-        profile.client_deadline()?,
-    )?;
-    run_operation(
-        profile,
-        release_mode,
-        build_identity,
-        None,
-        Arc::clone(&cancellation.stopped),
-        output,
-        None,
-    )
-    .map(|outcome| outcome.exit_code)
+) -> io::Result<ChildTermination> {
+    let cancellation = OperationCancellation::start_native()?;
+    let mut cleanup_confirmed = true;
+    let result = (|| {
+        let (_, bytes) = read_stable(path, 64 * 1024)?;
+        let profile: Profile =
+            serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+        // Refuse unsupported terminal input before validating source roots,
+        // acquiring state, probing namespaces, or capturing any source bytes.
+        profile.validate_stdin(std::io::stdin().is_terminal())?;
+        if profile.service_socket.is_some() && profile.inherits_stdin()? {
+            return Err(invalid(
+                "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF or stdin_file for captured input",
+            ));
+        }
+        profile.validate()?;
+        if profile.service_socket.is_some() {
+            return service::run_client_profile(
+                path,
+                release_mode,
+                build_identity,
+                &cancellation.stopped,
+                &mut cleanup_confirmed,
+            );
+        }
+        let output = OperationOutput::inherited(
+            &io::stdout(),
+            &io::stderr(),
+            &cancellation.stopped,
+            profile.client_deadline()?,
+        )?;
+        run_operation(
+            profile,
+            release_mode,
+            build_identity,
+            None,
+            Arc::clone(&cancellation.stopped),
+            output,
+            None,
+        )
+        .map(|outcome| outcome.termination)
+    })();
+    cancellation.finish(result, cleanup_confirmed)
 }
 
 pub(super) fn run_shared_profile(
@@ -1318,7 +1450,7 @@ pub(super) fn run_shared_profile(
     stdout: File,
     stderr: File,
     maximum: u64,
-) -> io::Result<i32> {
+) -> io::Result<ChildTermination> {
     require(
         bytes.len() <= 64 * 1024,
         "canonical profile exceeds its byte bound",
@@ -1350,7 +1482,7 @@ pub(super) fn run_shared_profile(
         output,
         None,
     )
-    .map(|outcome| outcome.exit_code)
+    .map(|outcome| outcome.termination)
 }
 
 /// Exact live provenance survives private target retention. Remote delivery
@@ -1366,6 +1498,9 @@ struct OperationProvenance {
 
 struct OperationOutcome {
     exit_code: i32,
+    /// Exact status of the supervised namespace launcher. A numeric status
+    /// already produced by bubblewrap does not identify an inner Cargo signal.
+    termination: ChildTermination,
     retained_target: Option<PathBuf>,
     provenance: OperationProvenance,
 }
@@ -1376,9 +1511,50 @@ fn run_operation(
     build_identity: String,
     shared: Option<Arc<SharedRuntime>>,
     stopped: Arc<AtomicBool>,
-    mut output: OperationOutput<'_>,
+    output: OperationOutput<'_>,
     prepared_inputs: Option<remote_operation::RemoteOperationInputs>,
 ) -> io::Result<OperationOutcome> {
+    let unconfirmed_cleanup = Arc::new(AtomicBool::new(false));
+    let result = run_operation_owned(
+        profile,
+        release_mode,
+        build_identity,
+        shared,
+        stopped,
+        output,
+        OperationCustody {
+            prepared_inputs,
+            unconfirmed_cleanup: Arc::clone(&unconfirmed_cleanup),
+        },
+    );
+    // Every operation-owned coordinator has dropped or explicitly finished
+    // before this barrier, including errors before execution or readiness.
+    if unconfirmed_cleanup.load(Ordering::Acquire) {
+        return Err(io::Error::other(UnconfirmedCleanup(
+            "canonical operation coordinator cleanup was not confirmed".to_owned(),
+        )));
+    }
+    result
+}
+
+struct OperationCustody {
+    prepared_inputs: Option<remote_operation::RemoteOperationInputs>,
+    unconfirmed_cleanup: Arc<AtomicBool>,
+}
+
+fn run_operation_owned(
+    profile: Profile,
+    release_mode: ReleaseAuthorizationMode,
+    build_identity: String,
+    shared: Option<Arc<SharedRuntime>>,
+    stopped: Arc<AtomicBool>,
+    mut output: OperationOutput<'_>,
+    custody: OperationCustody,
+) -> io::Result<OperationOutcome> {
+    let OperationCustody {
+        prepared_inputs,
+        unconfirmed_cleanup,
+    } = custody;
     let remote_operation = prepared_inputs.is_some();
     // Only the authenticated frontend can construct remote input custody. Keep
     // its peer scope independent of all logical settings and source metadata.
@@ -1852,6 +2028,7 @@ fn run_operation(
                 Arc::clone(&stopped),
                 controller,
             )
+            .map(|owner| TrackedServerOwner::new(owner, Arc::clone(&unconfirmed_cleanup)))
         })
         .transpose()?;
     let activity = CanonicalActivity::new();
@@ -1884,7 +2061,8 @@ fn run_operation(
         None,
         Arc::clone(&stopped),
         Arc::new(ShutdownController::new()),
-    )?;
+    )
+    .map(|owner| TrackedServerOwner::new(owner, Arc::clone(&unconfirmed_cleanup)))?;
     wait_ready(&server, &socket, &coord, &stopped)?;
     // A private target clone can make Cargo skip an unchanged producer. Restore
     // its installation witnesses only after this coordinator owns live
@@ -1972,16 +2150,18 @@ fn run_operation(
     let target_provenance = (retain_target && publication_drain.is_ok())
         .then(|| paths.export_committed_outputs(&coord, &cancelled));
     let shutdown = server.finish();
-    let compiled = result?;
-    publication_drain.map_err(io::Error::other)?;
     let receipt = shutdown?;
     // Always join the standalone authority and retain its real shutdown receipt,
-    // even when capture or the final producer barrier refuses this operation.
-    let completion = (|| -> io::Result<Option<PathBuf>> {
-        require(
-            receipt.clean(),
-            "canonical operation edge did not drain cleanly",
-        )?;
+    // including cancelled execution and failed capture/publication barriers.
+    // No intermediate error can bypass the final coordinator cleanup evidence.
+    let completion = (|| -> io::Result<(DrainedOutput, Option<PathBuf>)> {
+        if !receipt.clean() {
+            return Err(io::Error::other(UnconfirmedCleanup(
+                "canonical operation edge did not drain cleanly".to_owned(),
+            )));
+        }
+        let compiled = result?;
+        publication_drain.map_err(io::Error::other)?;
         // The operator-owned image is mounted read-only in the build, but a
         // host mutation must still invalidate this operation before publication
         // or delivery. Do not substitute the mutable toolchain source.
@@ -2055,21 +2235,22 @@ fn run_operation(
         // The rename's fsync can block too. Producer checks use the original
         // registered identities, not the now-moved target's physical paths.
         paths.verify_completed_producers(&coord, &cancelled)?;
-        Ok(delivered)
+        Ok((compiled, delivered))
     })();
     let coordinator_shutdown = standalone_coordinator
-        .map(ServerOwner::finish)
+        .map(TrackedServerOwner::finish)
         .transpose()?;
     let receipt = match coordinator_shutdown {
         Some(coordinator_receipt) => merge_shutdown_receipts(receipt, coordinator_receipt),
         None => receipt,
     };
+    if !receipt.clean() {
+        return Err(io::Error::other(UnconfirmedCleanup(
+            "canonical coordinator did not drain cleanly".to_owned(),
+        )));
+    }
+    let (compiled, delivered) = completion?;
     output.line(&receipt.to_json_line())?;
-    require(
-        receipt.clean(),
-        "canonical coordinator did not drain cleanly",
-    )?;
-    let delivered = completion?;
     preparation.checkpoint()?;
     if shared.is_some() {
         // Shared publication writers outlive this operation, including receipt
@@ -2085,6 +2266,7 @@ fn run_operation(
     }
     use std::os::unix::process::ExitStatusExt;
     Ok(OperationOutcome {
+        termination: native_termination(compiled.status)?,
         exit_code: compiled
             .status
             .code()
@@ -2545,7 +2727,9 @@ fn execute_controlled(
             std::mem::forget(root);
             return Err(io::Error::new(
                 error.kind(),
-                format!("canonical Cargo spawn did not prove process-group closure: {error}"),
+                UnconfirmedCleanup(format!(
+                    "canonical Cargo spawn did not prove process-group closure: {error}"
+                )),
             ));
         }
     };
@@ -2578,9 +2762,9 @@ fn execute_controlled(
         // Failed cleanup is neither a free root nor a clean cancellation. The
         // admission also retains the state lock until the service process exits.
         std::mem::forget(root);
-        return Err(io::Error::other(
-            "canonical Cargo process group did not drain",
-        ));
+        return Err(io::Error::other(UnconfirmedCleanup(
+            "canonical Cargo process group did not drain".to_owned(),
+        )));
     }
     let output = drained?;
     if streamed {
@@ -2688,6 +2872,49 @@ impl Drop for ScopedExit {
     }
 }
 
+/// Retain actual cleanup evidence even when an early return relies on Drop.
+/// This wraps only an operation's private edge/standalone coordinator; the
+/// persistent service coordinator keeps its existing lifecycle.
+struct TrackedServerOwner {
+    owner: Option<ServerOwner>,
+    unconfirmed_cleanup: Arc<AtomicBool>,
+}
+
+impl TrackedServerOwner {
+    fn new(owner: ServerOwner, unconfirmed_cleanup: Arc<AtomicBool>) -> Self {
+        Self {
+            owner: Some(owner),
+            unconfirmed_cleanup,
+        }
+    }
+
+    fn finish(mut self) -> io::Result<ShutdownReceipt> {
+        let result = self.owner.take().expect("live coordinator owner").finish();
+        if !result.as_ref().is_ok_and(|receipt| receipt.clean()) {
+            self.unconfirmed_cleanup.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
+impl std::ops::Deref for TrackedServerOwner {
+    type Target = ServerOwner;
+
+    fn deref(&self) -> &ServerOwner {
+        self.owner.as_ref().expect("live coordinator owner")
+    }
+}
+
+impl Drop for TrackedServerOwner {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take()
+            && !owner.finish().is_ok_and(|receipt| receipt.clean())
+        {
+            self.unconfirmed_cleanup.store(true, Ordering::Release);
+        }
+    }
+}
+
 struct ServerOwner {
     controller: Arc<ShutdownController>,
     worker: Option<JoinHandle<Result<ShutdownReceipt, DaemonError>>>,
@@ -2747,10 +2974,22 @@ impl ServerOwner {
         self.request_shutdown();
         self.worker
             .take()
-            .ok_or_else(|| io::Error::other("canonical coordinator already joined"))?
+            .ok_or_else(|| {
+                io::Error::other(UnconfirmedCleanup(
+                    "canonical coordinator already joined".to_owned(),
+                ))
+            })?
             .join()
-            .map_err(|_| io::Error::other("canonical coordinator panicked"))?
-            .map_err(io::Error::other)
+            .map_err(|_| {
+                io::Error::other(UnconfirmedCleanup(
+                    "canonical coordinator panicked".to_owned(),
+                ))
+            })?
+            .map_err(|error| {
+                io::Error::other(UnconfirmedCleanup(format!(
+                    "canonical coordinator shutdown failed: {error}"
+                )))
+            })
     }
 }
 
@@ -2785,11 +3024,16 @@ fn wait_ready(
 ) -> io::Result<()> {
     let start = Instant::now();
     loop {
-        if stopped.load(Ordering::Acquire)
-            || server
-                .worker
-                .as_ref()
-                .is_none_or(|worker| worker.is_finished())
+        if stopped.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "canonical coordinator startup cancelled",
+            ));
+        }
+        if server
+            .worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
         {
             return Err(io::Error::other(
                 "canonical coordinator stopped during startup",
@@ -4742,6 +4986,233 @@ fn consume_current_input() {
                 StateOwner::acquire(owner.path()).unwrap();
                 assert_eq!(rustix::fs::fcntl_getfl(&writer).unwrap(), flags);
             }
+        }
+    }
+
+    #[test]
+    fn native_termination_child() {
+        let Some(mode) = std::env::var_os("RABS_NATIVE_TERMINATION_CASE") else {
+            return;
+        };
+        let mode = mode.to_str().unwrap();
+        let root = PathBuf::from(std::env::var_os("RABS_NATIVE_TERMINATION_ROOT").unwrap());
+        let state = StateOwner::acquire(&root).unwrap();
+        let termination = if mode == "pending-int" {
+            let cancellation = OperationCancellation::start_native().unwrap();
+            signal_hook::low_level::raise(signal_hook::consts::SIGINT).unwrap();
+            cancellation
+                .finish(Ok(ChildTermination::Exited(0)), true)
+                .unwrap()
+        } else if mode.starts_with("cancel-") {
+            let cancellation = OperationCancellation::start_native().unwrap();
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", "trap '' TERM; /bin/sleep 30 & wait"]);
+            let process =
+                ManagedProcessGroup::spawn_command(command, Attribution::default()).unwrap();
+            fs::write(root.join("group"), process.pgid().to_string()).unwrap();
+            fs::write(root.join("signal-ready"), b"owned").unwrap();
+            let mut later_signal_sent = false;
+            let drained = process
+                .wait_with_bounded_drain_budget(&DrainLimits::default(), 4096, || {
+                    if cancellation.stopped.load(Ordering::Acquire) && !later_signal_sent {
+                        later_signal_sent = true;
+                        // The first cancellation stays authoritative while a
+                        // different signal arrives during descendant cleanup.
+                        let later = if mode == "cancel-term" {
+                            rustix::process::Signal::HUP
+                        } else {
+                            rustix::process::Signal::TERM
+                        };
+                        rustix::process::kill_process(rustix::process::getpid(), later).unwrap();
+                    }
+                    cancellation.stopped.load(Ordering::Acquire)
+                })
+                .unwrap();
+            assert_eq!(drained.residual_group_members, 0);
+            assert!(later_signal_sent);
+            cancellation
+                .finish(
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "native cancellation",
+                    )),
+                    true,
+                )
+                .unwrap()
+        } else {
+            let script = match mode {
+                "exit-143" => "exit 143",
+                "exit-137" => "exit 137",
+                "term" => "kill -TERM $$",
+                "kill" => "kill -KILL $$",
+                _ => panic!("unknown native termination case"),
+            };
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .status()
+                .unwrap();
+            native_termination(status).unwrap()
+        };
+        drop(state);
+        fs::write(root.join("cleanup-completed"), b"drained").unwrap();
+        exit_like(termination);
+    }
+
+    #[test]
+    fn native_exit_and_first_cancellation_signal_survive_process_cleanup() {
+        use std::os::unix::process::ExitStatusExt;
+        struct ChildOwner(std::process::Child);
+        impl Drop for ChildOwner {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        for (mode, code, signal) in [
+            ("exit-143", Some(143), None),
+            ("exit-137", Some(137), None),
+            ("term", None, Some(rustix::process::Signal::TERM)),
+            ("kill", None, Some(rustix::process::Signal::KILL)),
+            ("pending-int", None, Some(rustix::process::Signal::INT)),
+            ("cancel-int", None, Some(rustix::process::Signal::INT)),
+            ("cancel-term", None, Some(rustix::process::Signal::TERM)),
+            ("cancel-hup", None, Some(rustix::process::Signal::HUP)),
+        ] {
+            let root = crate::test_util::private_tempdir();
+            let log = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(root.path().join("child.log"))
+                .unwrap();
+            let mut child = ChildOwner(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "coord::canonical_local::tests::native_termination_child",
+                        "--nocapture",
+                    ])
+                    .env("RABS_NATIVE_TERMINATION_CASE", mode)
+                    .env("RABS_NATIVE_TERMINATION_ROOT", root.path())
+                    .stdin(Stdio::null())
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log)
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            if mode.starts_with("cancel-") {
+                while !root.path().join("signal-ready").exists() {
+                    assert!(
+                        child.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                        "{mode} did not become ready: {}",
+                        fs::read_to_string(root.path().join("child.log")).unwrap()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(StateOwner::acquire(root.path()).is_err());
+                let pid =
+                    rustix::process::Pid::from_raw(i32::try_from(child.0.id()).unwrap()).unwrap();
+                rustix::process::kill_process(pid, signal.unwrap()).unwrap();
+            }
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "{mode} did not finish cleanup");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(status.code(), code, "{mode}");
+            assert_eq!(
+                status.signal(),
+                signal.map(|value| value.as_raw()),
+                "{mode}"
+            );
+            assert_eq!(
+                fs::read(root.path().join("cleanup-completed")).unwrap(),
+                b"drained"
+            );
+            StateOwner::acquire(root.path()).unwrap();
+            if mode.starts_with("cancel-") {
+                let group = fs::read_to_string(root.path().join("group"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    rabs_asupersync::process_groups::members_from_proc(group)
+                        .unwrap()
+                        .is_empty(),
+                    "{mode} left live descendants"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_cancellation_cannot_hide_unconfirmed_process_cleanup() {
+        for kind in [io::ErrorKind::Other, io::ErrorKind::Interrupted] {
+            let cancellation = OperationCancellation::start_native().unwrap();
+            cancellation.first_signal.store(15, Ordering::Release);
+            let result = cancellation.finish(
+                Err(io::Error::new(
+                    kind,
+                    UnconfirmedCleanup("unresolved descendants".into()),
+                )),
+                true,
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(error.get_ref().unwrap().is::<UnconfirmedCleanup>());
+        }
+    }
+
+    #[test]
+    fn native_cancellation_preserves_unrelated_failures() {
+        for kind in [
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Other,
+            io::ErrorKind::TimedOut,
+        ] {
+            let cancellation = OperationCancellation::start_native().unwrap();
+            cancellation.first_signal.store(15, Ordering::Release);
+            let error = cancellation
+                .finish(Err(io::Error::new(kind, "independent failure")), true)
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "independent failure");
+        }
+    }
+
+    #[test]
+    fn coordinator_cleanup_failure_is_retained_on_early_return() {
+        for explicit_finish in [false, true] {
+            let unconfirmed = Arc::new(AtomicBool::new(false));
+            let owner = TrackedServerOwner::new(
+                ServerOwner {
+                    controller: Arc::new(ShutdownController::new()),
+                    worker: Some(std::thread::spawn(|| panic!("failed coordinator cleanup"))),
+                    normal_shutdown: None,
+                },
+                Arc::clone(&unconfirmed),
+            );
+            if explicit_finish {
+                let error = owner.finish().unwrap_err();
+                assert!(error.get_ref().unwrap().is::<UnconfirmedCleanup>());
+            } else {
+                // This is the same owner path used when readiness, source
+                // verification or output fails before normal finalization.
+                let result = (|| -> io::Result<()> {
+                    let _owner = owner;
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "cancelled before execution",
+                    ))
+                })();
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            }
+            assert!(unconfirmed.load(Ordering::Acquire));
         }
     }
 
