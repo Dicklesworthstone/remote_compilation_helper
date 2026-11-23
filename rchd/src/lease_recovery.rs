@@ -3532,6 +3532,7 @@ mod tests {
                     &endpoint.id,
                     Some("pause historical recovery".into()),
                     false,
+                    None,
                 )
                 .await
                 .status,

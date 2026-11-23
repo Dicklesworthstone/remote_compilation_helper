@@ -2311,6 +2311,7 @@ enabled = true
                     &id,
                     Some("maintenance".into()),
                     drain_first,
+                    None,
                 )
                 .await;
                 assert_eq!(response.status, "ok");

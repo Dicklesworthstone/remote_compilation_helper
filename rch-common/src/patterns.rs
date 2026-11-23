@@ -9544,12 +9544,65 @@ mod tests_go_and_typescript {
             "go test -coverprofile=coverage.out -args -custom",
             "go test -coverprofile=$OUTPUT",
             "go test -coverprofile=coverage.out *.go",
-            "go test -coverprofile=coverage.out > diagnostics",
+            "go test -coverprofile=coverage.out < diagnostics",
         ] {
             assert!(go_coverage_invocation(command).is_none(), "{command}");
             assert_eq!(kind_of(command), None, "{command}");
         }
         assert!(go_coverage_invocation("go test -run -coverprofile ./pkg").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_coverage_redirects_are_consumed_by_the_caller_shell() {
+        let command = "go test -coverprofile=coverage.out > diagnostics";
+        // The exact-output planner accepts argv, not shell structure. The hook
+        // nevertheless supports an output redirect by leaving it outside the
+        // `rch exec` argv, where the caller's shell applies it to the stream.
+        assert!(go_coverage_invocation(command).is_none());
+        let classification = classify_command(command);
+        assert_eq!(classification.kind, Some(CompilationKind::GoTest));
+        assert_eq!(classification.command_prefix.as_deref(), Some(""));
+        assert_eq!(classification.extracted_command.as_deref(), Some(command));
+        assert_eq!(
+            classify_command_detailed(command).classification,
+            classification
+        );
+        let rewritten = format!(
+            "{}rch exec -- {}",
+            classification.command_prefix.as_deref().unwrap(),
+            classification.extracted_command.as_deref().unwrap()
+        );
+
+        // Observe the real shell boundary rather than treating `>` as a Go
+        // argument. This function records argv only; compiler/report behavior
+        // is covered separately by the generated-execution tests.
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "rch() {{ printf '%s\\000' \"$@\" > argv; printf 'test diagnostics\\n'; }}\n{rewritten}"
+            ))
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            std::fs::read(directory.path().join("diagnostics")).unwrap(),
+            b"test diagnostics\n"
+        );
+        let argv = std::fs::read(directory.path().join("argv")).unwrap();
+        assert_eq!(argv, b"exec\0--\0go\0test\0-coverprofile=coverage.out\0");
+        let inner = shell_words::join(
+            std::str::from_utf8(&argv)
+                .unwrap()
+                .split_terminator('\0')
+                .skip(2),
+        );
+        let invocation = go_coverage_invocation(&inner).unwrap();
+        assert_eq!(invocation.output.path, "coverage.out");
     }
 
     #[test]

@@ -5711,9 +5711,15 @@ esac
             std::fs::write(root.join("build-id"), target.id.to_string()).unwrap();
             std::fs::write(root.join("mode"), "confirmed").unwrap();
             assert_eq!(
-                crate::workers::handle_worker_disable(&ctx, &id, Some("operator".into()), false)
-                    .await
-                    .status,
+                crate::workers::handle_worker_disable(
+                    &ctx,
+                    &id,
+                    Some("operator".into()),
+                    false,
+                    None
+                )
+                .await
+                .status,
                 "ok"
             );
             for reason in [
@@ -5869,9 +5875,15 @@ esac
             std::fs::rename(&store_path, root.join("saved-admin.json")).unwrap();
             std::fs::create_dir(&store_path).unwrap();
             assert_eq!(
-                crate::workers::handle_worker_disable(&ctx, &id, Some("operator".into()), false)
-                    .await
-                    .status,
+                crate::workers::handle_worker_disable(
+                    &ctx,
+                    &id,
+                    Some("operator".into()),
+                    false,
+                    None
+                )
+                .await
+                .status,
                 "error"
             );
             let deferred = tokio::time::timeout(Duration::from_secs(3), attempt)
@@ -6434,7 +6446,8 @@ fi
                     &ctx,
                     &config.id,
                     Some("maintenance".into()),
-                    false
+                    false,
+                    None
                 )
                 .await
                 .status,
