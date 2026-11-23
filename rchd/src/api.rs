@@ -112,6 +112,12 @@ fn format_wait_time(secs: u64) -> String {
 enum ApiRequest {
     /// Read-only placement observation for `rch admit`; reserves nothing.
     AdmissionPreview(rch_common::admission_preview::PreviewRequest),
+    /// Inspect or explicitly forget estimation evidence, never live reservations.
+    Footprints {
+        project: String,
+        command: Option<String>,
+        forget: bool,
+    },
     SelectWorker {
         request: SelectionRequest,
         /// Client-minted identity supplied before daemon contact.
@@ -846,6 +852,21 @@ async fn handle_connection_with_metrics(
 
     // Parse and handle the request
     let (response_json, content_type) = match request {
+        Ok(ApiRequest::Footprints {
+            project,
+            command,
+            forget,
+        }) => {
+            metrics::inc_requests(if forget {
+                "footprints-forget"
+            } else {
+                "footprints-show"
+            });
+            (
+                handle_footprints(&ctx, project, command, forget).await?,
+                "application/json",
+            )
+        }
         Ok(ApiRequest::SelectWorker {
             request,
             local_wrapper_id,
@@ -1392,6 +1413,15 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 
     if method != "GET" && method != "POST" {
         return Err(anyhow!("Only GET and POST methods supported"));
+    }
+
+    if route_matches_exact_or_child(path, "/footprints") {
+        if !matches!(parts.as_slice(), [_, _] | [_, _, "HTTP/1.0" | "HTTP/1.1"]) {
+            return Err(anyhow!(
+                "Footprint selection must be contained in one encoded request target"
+            ));
+        }
+        return parse_footprint_request(method, path);
     }
 
     if path == "/events" && method == "GET" {
@@ -2350,6 +2380,99 @@ fn parse_worker_id_list(encoded_value: &str) -> Vec<WorkerId> {
         .filter(|id| !id.is_empty())
         .map(WorkerId::new)
         .collect()
+}
+
+fn parse_footprint_request(method: &str, path: &str) -> Result<ApiRequest> {
+    let (route, query) = split_path_query(path);
+    let forget = match (method, route) {
+        ("GET", "/footprints") => false,
+        ("POST", "/footprints/forget") => true,
+        _ => return Err(anyhow!("Use GET /footprints or POST /footprints/forget")),
+    };
+    let mut project = None;
+    let mut command = None;
+    for parameter in query.split('&') {
+        let (key, value) = parameter
+            .split_once('=')
+            .ok_or_else(|| anyhow!("Footprint parameters must be key=value pairs"))?;
+        let slot = match key {
+            "project" => &mut project,
+            "command" => &mut command,
+            _ => return Err(anyhow!("Unknown footprint parameter: {key}")),
+        };
+        if slot.is_some() {
+            return Err(anyhow!("Duplicate footprint parameter: {key}"));
+        }
+        *slot = Some(decode_footprint_query_value(value)?);
+    }
+    let project = project.ok_or_else(|| anyhow!("An exact project ID is required"))?;
+    rch_common::footprints::validate_selection(&project, command.as_deref())
+        .map_err(|reason| anyhow!(reason))?;
+    Ok(ApiRequest::Footprints {
+        project,
+        command: command.map(|command| command.trim().to_owned()),
+        forget,
+    })
+}
+
+/// A reset selector must round-trip exactly. Malformed escapes or lossy UTF-8
+/// would risk selecting evidence for a different project or command.
+fn decode_footprint_query_value(encoded: &str) -> Result<String> {
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut input = encoded.bytes();
+    while let Some(byte) = input.next() {
+        match byte {
+            b'%' => {
+                let high = input.next().and_then(|byte| (byte as char).to_digit(16));
+                let low = input.next().and_then(|byte| (byte as char).to_digit(16));
+                match (high, low) {
+                    (Some(high), Some(low)) => bytes.push(((high << 4) | low) as u8),
+                    _ => return Err(anyhow!("Invalid percent escape in footprint selection")),
+                }
+            }
+            b'+' => bytes.push(b' '),
+            _ => bytes.push(byte),
+        }
+    }
+    String::from_utf8(bytes).context("Footprint selection must be valid UTF-8")
+}
+
+async fn handle_footprints(
+    ctx: &DaemonContext,
+    project: String,
+    command: Option<String>,
+    forget: bool,
+) -> Result<String> {
+    let label = if forget {
+        "footprints forget"
+    } else {
+        "footprints show"
+    };
+    let history = std::sync::Arc::clone(&ctx.history);
+    // Persistence and the footprint mutex are synchronous. Keep both off the
+    // socket runtime; BuildHistory commits the candidate before publishing it.
+    let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+        if forget {
+            let reset = history.forget_footprints(&project, command.as_deref())?;
+            Ok(serde_json::to_value(reset)?)
+        } else {
+            let snapshot = history.footprint_snapshot(&project, command.as_deref());
+            Ok(serde_json::to_value(snapshot)?)
+        }
+    })
+    .await;
+    let response = match result {
+        Ok(Ok(data)) => rch_common::ApiResponse::ok(label, data),
+        Ok(Err(error)) => rch_common::ApiResponse::<serde_json::Value>::err(
+            label,
+            ApiError::internal(format!("Footprint operation failed: {error}")),
+        ),
+        Err(error) => rch_common::ApiResponse::<serde_json::Value>::err(
+            label,
+            ApiError::internal(format!("Footprint operation could not complete: {error}")),
+        ),
+    };
+    Ok(serde_json::to_string(&response)?)
 }
 
 fn query_for_exact_route<'a>(path: &'a str, expected_path: &str) -> Option<&'a str> {
@@ -7765,6 +7888,187 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /events").unwrap();
         assert!(matches!(req, ApiRequest::Events), "expected events request");
+    }
+
+    #[test]
+    fn footprint_routes_require_explicit_unambiguous_selections() {
+        for (request, project, command, forget) in [
+            ("GET /footprints?project=engine", "engine", None, false),
+            (
+                "GET /footprints?project=engine HTTP/1.1",
+                "engine",
+                None,
+                false,
+            ),
+            (
+                "POST /footprints/forget?project=engine%2B%26%CE%B1&command=%20cargo+test%20",
+                "engine+&α",
+                Some("cargo test"),
+                true,
+            ),
+            (
+                "GET /footprints?project=%20engine%20&command=cargo%20test%20--filter%3Dx%26y",
+                " engine ",
+                Some("cargo test --filter=x&y"),
+                false,
+            ),
+        ] {
+            let ApiRequest::Footprints {
+                project: actual_project,
+                command: actual_command,
+                forget: actual_forget,
+            } = parse_request(request).unwrap()
+            else {
+                panic!("expected footprint route: {request}");
+            };
+            assert_eq!(actual_project, project);
+            assert_eq!(actual_command.as_deref(), command);
+            assert_eq!(actual_forget, forget);
+        }
+        for request in [
+            "GET /footprints",
+            "GET /footprints?project=",
+            "GET /footprints?project=+",
+            "GET /footprints?project=engine&command=",
+            "GET /footprints?project=engine&command=%20",
+            "GET /footprints?project=engine&project=other",
+            "GET /footprints?project=engine&command=a&command=b",
+            "GET /footprints?project=engine&all=true",
+            "GET /footprints?project=engine&",
+            "GET /footprints?project=engine&command",
+            "GET /footprints?command=cargo+test",
+            "GET /footprints?project=%",
+            "GET /footprints?project=%0",
+            "GET /footprints?project=%GG",
+            "GET /footprints?project=%FF",
+            "GET /footprints?project=%C3%28",
+            "GET /footprints?project=engine%0A",
+            "GET /footprints?project=engine&command=cargo%00test",
+            "GET /footprints?%70roject=engine",
+            "POST /footprints?project=engine",
+            "GET /footprints/forget?project=engine",
+            "POST /footprints/forget/extra?project=engine",
+            "POST /footprints/forget-extra?project=engine",
+            "POST /footprints-extra?project=engine",
+            "DELETE /footprints/forget?project=engine",
+            "POST /footprints/forget?project=engine &command=cargo+test",
+            "POST /footprints/forget?project=engine\t&command=cargo+test",
+            "POST /footprints/forget?project=engine HTTP/1.0 &command=cargo+test",
+            "POST /footprints/forget?project=engine /other-target",
+            "GET /footprints?project=engine HTTP/2.0",
+        ] {
+            assert!(parse_request(request).is_err(), "must reject {request}");
+        }
+        assert!(parse_request(&format!("GET /footprints?project={}", "x".repeat(4097))).is_err());
+    }
+
+    #[tokio::test]
+    async fn footprint_socket_show_and_scoped_forget_survive_reload() {
+        use crate::headroom::{FootprintBook, family_footprint_key, footprint_key};
+
+        let _guard = test_guard!();
+        let root = tempfile::TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
+        let project = "engine+&α";
+        let command = "cargo test -p core";
+        let other_project = "engine+&α-extra";
+        let now = Utc::now().timestamp();
+        let mut book = FootprintBook::default();
+        book.record(&footprint_key(project, command), 72.0, now, true);
+        book.record(&family_footprint_key(project, command), 50.0, now, false);
+        book.record(&footprint_key(project, "cargo check"), 11.0, now, true);
+        book.record(&footprint_key(other_project, command), 9.0, now, true);
+        book.persist(&path.with_extension("footprints.json"))
+            .unwrap();
+        let mut ctx = make_test_context(WorkerPool::new());
+        replace_test_history(&mut ctx, BuildHistory::load_from_file(&path, 20).unwrap());
+
+        async fn request(ctx: &DaemonContext, line: &str) -> serde_json::Value {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let (shutdown_tx, _) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(handle_connection(server, ctx.clone(), shutdown_tx));
+            client.write_all(line.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_string(&mut response))
+                .await
+                .expect("footprint response deadline")
+                .unwrap();
+            task.await.unwrap().unwrap();
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+        }
+
+        let shown = request(
+            &ctx,
+            "GET /footprints?project=engine%2B%26%CE%B1&command=cargo+test+-p+core\n",
+        )
+        .await;
+        assert_eq!(shown["success"], true);
+        assert_eq!(shown["command"], "footprints show");
+        let snapshot: rch_common::footprints::FootprintSnapshot =
+            serde_json::from_value(shown["data"].clone()).unwrap();
+        assert_eq!(snapshot.project, project);
+        assert_eq!(snapshot.learned_gib, Some(72.0));
+        assert_eq!(snapshot.records.len(), 2);
+
+        let forgotten = request(
+            &ctx,
+            "POST /footprints/forget?project=engine%2B%26%CE%B1&command=cargo+test+-p+core\n",
+        )
+        .await;
+        assert_eq!(forgotten["success"], true);
+        assert_eq!(forgotten["command"], "footprints forget");
+        assert_eq!(forgotten["data"]["removed_entries"], 1);
+        assert_eq!(forgotten["data"]["persisted"], true);
+        let reloaded = BuildHistory::load_from_file(&path, 20).unwrap();
+        assert_eq!(reloaded.learned_footprint_gib(project, command), Some(50.0));
+        assert_eq!(
+            reloaded.learned_footprint_gib(project, "cargo check"),
+            Some(11.0)
+        );
+        assert_eq!(
+            reloaded.learned_footprint_gib(other_project, command),
+            Some(9.0)
+        );
+        assert!(ctx.history.active_builds().is_empty());
+        assert_eq!(ctx.history.queue_depth(), 0);
+
+        let forgotten = request(&ctx, "POST /footprints/forget?project=engine%2B%26%CE%B1\n").await;
+        assert_eq!(forgotten["success"], true);
+        assert_eq!(forgotten["data"]["removed_entries"], 2);
+        let reloaded = BuildHistory::load_from_file(&path, 20).unwrap();
+        assert!(
+            reloaded
+                .footprint_snapshot(project, None)
+                .records
+                .is_empty()
+        );
+        assert_eq!(
+            reloaded.learned_footprint_gib(other_project, command),
+            Some(9.0)
+        );
+
+        // A failed durable reset must be an explicit wire error and leave the
+        // live evidence intact. Block only the temporary fixture's destination.
+        let footprint_path = path.with_extension("footprints.json");
+        std::fs::rename(&footprint_path, root.path().join("saved-footprints.json")).unwrap();
+        std::fs::create_dir(&footprint_path).unwrap();
+        let refused = request(
+            &ctx,
+            "POST /footprints/forget?project=engine%2B%26%CE%B1-extra\n",
+        )
+        .await;
+        assert_eq!(refused["success"], false);
+        assert_eq!(refused["command"], "footprints forget");
+        assert!(
+            refused["error"]["details"]
+                .as_str()
+                .unwrap()
+                .contains("failed")
+        );
+        assert_eq!(
+            ctx.history.learned_footprint_gib(other_project, command),
+            Some(9.0)
+        );
     }
 
     #[tokio::test]

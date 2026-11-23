@@ -7,11 +7,12 @@ use crate::disk_pressure::{
 };
 use crate::headroom::{
     FootprintBook, cold_build_footprint_gib, family_footprint_key, footprint_key,
-    legacy_footprint_key, legacy_scoped_family_footprint_keys, unscoped_family_footprint_key,
-    warm_footprint_key,
+    footprint_project, legacy_footprint_key, legacy_scoped_family_footprint_keys,
+    unscoped_family_footprint_key, warm_footprint_key,
 };
 use crate::workers::{WorkerEndpointIdentity, WorkerEndpointSnapshot};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use rch_common::footprints::{FootprintReset, FootprintSnapshot, validate_selection};
 use rch_common::{
     BuildCancellationMetadata, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation,
     BuildRecord, BuildStats, CommandTimingBreakdown, SavedTimeStats,
@@ -1072,11 +1073,20 @@ impl BuildHistory {
     /// prior, never lower it without a separate retained-pool condition.
     pub(crate) fn learned_footprint_gib(&self, project_id: &str, command: &str) -> Option<f64> {
         let now = Utc::now().timestamp();
+        let book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
+        Self::learned_footprint_from_book(&book, project_id, command, now)
+    }
+
+    fn learned_footprint_from_book(
+        book: &FootprintBook,
+        project_id: &str,
+        command: &str,
+        now: i64,
+    ) -> Option<f64> {
         let cold = cold_build_footprint_gib(command).unwrap_or(16.0);
         let exact_key = footprint_key(project_id, command);
         let family_key = family_footprint_key(project_id, command);
         let legacy_key = legacy_footprint_key(project_id, command);
-        let book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
         let exact = book.admission_estimate_gib(&exact_key, now, cold);
         let estimate = exact
             .filter(|_| book.has_complete_observation(&exact_key, now))
@@ -1106,6 +1116,66 @@ impl BuildHistory {
             (Some(current), Some(legacy)) => Some(current.max(legacy)),
             (current, legacy) => current.or(legacy),
         }
+    }
+
+    /// Inspect learned evidence without touching active reservations or worker
+    /// ownership. Command estimates use the same production admission policy.
+    pub fn footprint_snapshot(&self, project: &str, command: Option<&str>) -> FootprintSnapshot {
+        let cold_prior_gib = command.and_then(cold_build_footprint_gib);
+        let (observed_unix, records, learned_gib) = {
+            let book = self
+                .footprints
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let now = Utc::now().timestamp();
+            (
+                now,
+                book.snapshot_records(project, command, now),
+                command.and_then(|command| {
+                    Self::learned_footprint_from_book(&book, project, command, now)
+                }),
+            )
+        };
+        FootprintSnapshot {
+            project: footprint_project(project).to_owned(),
+            command: command.map(|command| command.trim().to_owned()),
+            observed_unix,
+            persistence_enabled: self.persistence_path.is_some(),
+            cold_prior_gib,
+            learned_gib,
+            growth_budget_gib: learned_gib
+                .or(cold_prior_gib)
+                .map(rch_common::BuildDiskBudget::growth_budget_gib),
+            records,
+        }
+    }
+
+    /// Forget only explicitly selected evidence. A persistent history commits
+    /// its candidate book to disk before publishing the reset in memory.
+    /// Neither success nor failure changes any live or queued reservation.
+    pub fn forget_footprints(
+        &self,
+        project: &str,
+        command: Option<&str>,
+    ) -> std::io::Result<FootprintReset> {
+        validate_selection(project, command)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let mut book = self
+            .footprints
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut candidate = book.clone();
+        let mut reset = candidate.forget_selection(project, command);
+        if reset.removed_entries == 0 {
+            // Do not replace an unreadable on-disk book with an empty no-op.
+            return Ok(reset);
+        }
+        if let Some(path) = self.persistence_path.as_deref().map(footprint_path) {
+            candidate.persist(&path)?;
+            reset.persisted = true;
+        }
+        *book = candidate;
+        Ok(reset)
     }
 
     /// Candidate-specific incremental evidence is a conditional alternative
@@ -5692,6 +5762,225 @@ mod tests {
             reloaded.learned_footprint_gib("fgdb", "cargo test"),
             Some(64.0)
         );
+    }
+
+    #[tokio::test]
+    async fn footprint_forget_persists_scoped_reset_without_releasing_live_reservations() {
+        const GIB: u64 = rch_common::BuildDiskBudget::GIB;
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+        let command = "cargo test --test stale";
+        let now = Utc::now().timestamp();
+        {
+            let mut book = history.footprints.lock().unwrap();
+            book.record(&footprint_key("engine", command), 81.0, now, false);
+            book.record(&family_footprint_key("engine", command), 17.6, now, false);
+            book.record(
+                &serde_json::to_string(&(2_u8, "engine", command)).unwrap(),
+                999.0,
+                now,
+                true,
+            );
+            book.record(
+                &serde_json::to_string(&(3_u8, "engine", "family", "CargoTest", false)).unwrap(),
+                999.0,
+                now,
+                false,
+            );
+            book.record(
+                &footprint_key("engine", "cargo test --test other"),
+                60.0,
+                now,
+                true,
+            );
+            book.record(&footprint_key("engine-copy", command), 90.0, now, true);
+            book.persist(&footprint_path(&path)).unwrap();
+        }
+        let endpoint = warm_test_endpoint().await;
+        let selector = crate::daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            Arc::clone(&history),
+            None,
+        );
+        let request = warm_test_request("engine", command);
+        let budget = selector
+            .build_disk_budget_for_endpoint(&request, &endpoint)
+            .unwrap();
+        assert_eq!(budget.max_growth_bytes, 102 * GIB);
+        let active = warm_test_admit(
+            &history,
+            &endpoint,
+            &request,
+            budget,
+            "operator-active",
+            220.0,
+        )
+        .unwrap();
+        let queued = history
+            .enqueue_build(
+                "engine".into(),
+                "cargo test --test waiting".into(),
+                0,
+                1,
+                Some("operator-queued".into()),
+            )
+            .unwrap();
+        let ownership_path = path.with_extension("ownership.json");
+        let ownership = std::fs::read(&ownership_path).unwrap();
+        {
+            let mut book = history.footprints.lock().unwrap();
+            let key = warm_footprint_key(
+                "engine",
+                command,
+                &WorkerEndpointIdentity::from_config(&endpoint.config),
+            );
+            let observation = warm_test_observation(1, 81);
+            book.record_pool(&key, &observation, now, true);
+            book.record_pool(&key, &observation, now, true);
+            book.persist(&footprint_path(&path)).unwrap();
+        }
+        let before = history.footprint_snapshot("engine", Some(command));
+        assert_eq!(before.cold_prior_gib, Some(24.0));
+        assert_eq!(before.learned_gib, Some(81.0));
+        assert_eq!(before.growth_budget_gib, Some(102));
+        assert_eq!(before.records.len(), 5);
+        assert_eq!(
+            before
+                .records
+                .iter()
+                .filter(|record| record.retired)
+                .count(),
+            2
+        );
+        let reset = history
+            .forget_footprints("engine", Some(" cargo test --test stale "))
+            .unwrap();
+        assert_eq!(reset.command.as_deref(), Some(command));
+        assert_eq!(reset.removed_entries, 3);
+        assert_eq!(reset.removed_pools, 1);
+        assert_eq!(reset.removed_samples, 3);
+        assert!(reset.persisted);
+        let after = history.footprint_snapshot("engine", Some(command));
+        assert_eq!(
+            after.records.len(),
+            2,
+            "current and retired shared family evidence remains"
+        );
+        assert_eq!(after.learned_gib, Some(24.0));
+        assert_eq!(after.growth_budget_gib, Some(30));
+        assert_eq!(
+            history.learned_footprint_gib("engine", "cargo test --test other"),
+            Some(60.0)
+        );
+
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(
+            restored.footprint_snapshot("engine", Some(command)).records,
+            after.records
+        );
+        let full_reset = history.forget_footprints("engine", None).unwrap();
+        assert_eq!(full_reset.removed_entries, 3);
+        assert!(full_reset.persisted);
+        let cold = history.footprint_snapshot("engine", Some(command));
+        assert!(cold.records.is_empty());
+        assert_eq!(cold.learned_gib, None);
+        assert_eq!(cold.growth_budget_gib, Some(30));
+        assert_eq!(
+            history.learned_footprint_gib("engine-copy", command),
+            Some(90.0)
+        );
+        assert_eq!(std::fs::read(&ownership_path).unwrap(), ownership);
+        let retained = history.active_build(active.id).unwrap();
+        assert_eq!(retained.disk_headroom_gib, active.disk_headroom_gib);
+        assert_eq!(retained.disk_floor_gib, active.disk_floor_gib);
+        assert_eq!(retained.disk_warm_policy, active.disk_warm_policy);
+        assert_eq!(
+            active_disk_reservation_gib(&retained),
+            active_disk_reservation_gib(&active)
+        );
+        assert_eq!(
+            history.queued_build(queued.id).unwrap().local_wrapper_id,
+            queued.local_wrapper_id
+        );
+        let restarted = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert!(
+            restarted
+                .footprint_snapshot("engine", None)
+                .records
+                .is_empty()
+        );
+        assert_eq!(
+            restarted.active_build(active.id).unwrap().disk_headroom_gib,
+            102
+        );
+        assert!(restarted.queued_build(queued.id).is_some());
+    }
+
+    #[test]
+    fn footprint_forget_failed_persistence_keeps_memory_and_disk_unchanged() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let book_path = footprint_path(&path);
+        let history = BuildHistory::new(10).with_persistence(path);
+        {
+            let mut book = history.footprints.lock().unwrap();
+            book.record(
+                &footprint_key("engine", "cargo test"),
+                81.0,
+                Utc::now().timestamp(),
+                true,
+            );
+            book.persist(&book_path).unwrap();
+        }
+        let bytes = std::fs::read(&book_path).unwrap();
+        let before = history.footprint_snapshot("engine", Some("cargo test"));
+        let staged = book_path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::create_dir(&staged).unwrap();
+        assert!(history.forget_footprints("engine", None).is_err());
+        let after = history.footprint_snapshot("engine", Some("cargo test"));
+        assert_eq!(after.records, before.records);
+        assert_eq!(after.learned_gib, before.learned_gib);
+        assert_eq!(std::fs::read(&book_path).unwrap(), bytes);
+        assert_eq!(
+            history.forget_footprints(" ", None).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let missing = history.forget_footprints("absent", None).unwrap();
+        assert_eq!(missing.removed_entries, 0);
+        assert!(!missing.persisted);
+        assert_eq!(std::fs::read(&book_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn footprint_forget_noop_preserves_unreadable_books_and_reports_memory_only_reset() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let book_path = footprint_path(&path);
+        std::fs::write(&book_path, b"unreadable retained evidence").unwrap();
+        let history = BuildHistory::load_from_file(&path, 10).unwrap();
+        let reset = history.forget_footprints("engine", None).unwrap();
+        assert_eq!(reset.removed_entries, 0);
+        assert!(!reset.persisted);
+        assert_eq!(
+            std::fs::read(&book_path).unwrap(),
+            b"unreadable retained evidence"
+        );
+        let memory = BuildHistory::new(10);
+        memory.footprints.lock().unwrap().record(
+            &footprint_key("engine", "cargo test"),
+            81.0,
+            Utc::now().timestamp(),
+            true,
+        );
+        let reset = memory
+            .forget_footprints("engine", Some("cargo test"))
+            .unwrap();
+        assert_eq!(reset.removed_entries, 1);
+        assert!(!reset.persisted);
+        let snapshot = memory.footprint_snapshot("engine", Some("cargo test"));
+        assert!(!snapshot.persistence_enabled);
+        assert_eq!(snapshot.growth_budget_gib, Some(30));
     }
 
     #[tokio::test]

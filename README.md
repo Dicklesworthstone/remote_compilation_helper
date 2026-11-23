@@ -364,6 +364,7 @@ rch status [--workers] [--jobs]
 rch check
 rch queue [--watch|--follow]
 rch cancel <id> | --all
+rch footprints show|forget <PROJECT> [--command COMMAND]
 rch gc [--root DIR]... [--workers <id>...]      # PREVIEW stale rch runtime dirs
 rch gc --apply [--root DIR]...                  # ...and actually collect them
 rch cache warm|clean|status [--workers <id>...] # remote source/target caches
@@ -1141,19 +1142,48 @@ accounting. The full budget stays reserved even after a disk sample reflects
 some of the build's output, so admission deliberately errs toward leaving extra
 space. The default is `0`, retaining ordinary disk-pressure admission.
 
-Without a declaration, the daemon still learns each project's footprint. For
-every remote build that had a worker to itself (no other build from this
-daemon overlapped there), it records how far the worker's free build-disk
-space fell between the admission probe and the lowest probe seen while the
-build ran. Footprints are kept per project and command class (`cargo test` is
-learned separately from `cargo check`), for 30 days, in
-`history.footprints.json` beside the build history. When some candidate
-worker has room for the largest recent footprint plus 10% (at least 5 GiB),
-after declared budgets and the remaining growth of builds already running
-there, selection only considers those workers. If none has room, selection is
-unchanged. Learned footprints are evidence, not a budget, so they never refuse
-a build. Other dispatchers' builds can inflate a measurement and cache cleanup
-can shrink one; declare `disk_headroom_gib` when you need a hard requirement.
+The daemon also learns disk allocation for each project and exact command,
+with separate compilation families and narrow/workspace scopes. Valid worker
+observations attribute newly allocated bytes to a build; existing output in a
+shared target directory is not charged again as that build's entire footprint.
+Only a successful measurement from an empty output baseline can establish a
+smaller cold estimate. Incomplete measurements and unshared filesystem deltas
+can raise the conservative default. A warm allowance additionally requires
+qualified evidence for the exact command, endpoint, and retained output pool.
+The resulting growth allowance includes at least 2 GiB or 25% above the estimate;
+worker reserve floors and active reservations are accounted for separately.
+Recent high-water measurements are retained for 30 days in
+`history.footprints.json` beside the build history.
+
+Use the exact project ID from `rch queue --json` to inspect the retained
+evidence and the cold admission budget for a command:
+
+```bash
+rch footprints show franken_engine-5d919732
+rch --json footprints show franken_engine-5d919732 --command 'cargo test -p engine'
+```
+
+The output distinguishes exact measurements, shared family evidence, older
+filesystem observations, and conditional warm pools. Retired schemas remain
+visible with an explicit label. Historical family rows from older scope rules
+are considered only for wide commands. A displayed warm measurement alone does not
+authorize a smaller allocation on another worker or a changed pool.
+
+If retained evidence is no longer representative, clear a deliberate selection
+without restarting the daemon:
+
+```bash
+rch footprints forget franken_engine-5d919732 --command 'cargo test -p engine'
+rch footprints forget franken_engine-5d919732
+```
+
+With `--command`, the reset removes that exact command's measurements and warm
+pool evidence, retaining shared family and legacy observations. Without it,
+the reset removes recognized evidence for that project. Project IDs are literal,
+not patterns; unknown future schemas are preserved. The daemon persists a reset
+before publishing it in memory. Active reservations and queued requests are
+preserved, and future admissions use remaining evidence and conservative
+defaults. Worker growth enforcement and reserve floors remain in force.
 
 Unix artifact downloads estimate the files matched by the retrieval filters
 before transferring them. Their default total retry budget grows with that size

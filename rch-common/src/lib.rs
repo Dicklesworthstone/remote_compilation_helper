@@ -43,6 +43,7 @@ pub mod fleet_diff;
 pub mod fleet_provenance;
 pub mod fleet_smoke_profile;
 pub mod fleet_status;
+pub mod footprints;
 pub mod force_resync;
 pub mod gc_roots;
 pub mod hooks;

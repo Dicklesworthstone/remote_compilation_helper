@@ -19,6 +19,7 @@
 #![allow(dead_code)] // Initial integration; consumers land in follow-on beads.
 
 use crate::history::BuildHistory;
+use rch_common::footprints::{FootprintRecord, FootprintReset, FootprintScope, FootprintSource};
 use rch_common::{BuildDiskObservation, BuildDiskPool, BuildLocation, WorkerId};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -404,7 +405,7 @@ pub fn footprint_key(project_id: &str, command: &str) -> String {
 
 /// Clean-overlay ownership is per invocation, but its project evidence must
 /// survive the next invocation. Strip only the suffix the hook generates.
-fn footprint_project(project_id: &str) -> &str {
+pub(crate) fn footprint_project(project_id: &str) -> &str {
     if let Some((project, nonce)) = project_id.rsplit_once("::clean-overlay::")
         && !project.is_empty()
         && nonce.len() == 16
@@ -439,10 +440,7 @@ pub fn family_footprint_key(project_id: &str, command: &str) -> String {
 /// Version 4's two scopes contain attributed measurements, but raw flag
 /// matching could put a wide command in either bucket. Wide work retains both
 /// high-water marks; neither bucket establishes a new narrow command's cost.
-pub(crate) fn legacy_scoped_family_footprint_keys(
-    project_id: &str,
-    command: &str,
-) -> [String; 2] {
+pub(crate) fn legacy_scoped_family_footprint_keys(project_id: &str, command: &str) -> [String; 2] {
     let kind = rch_common::classify_command(command)
         .kind
         .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
@@ -492,6 +490,224 @@ pub fn cold_build_footprint_gib(command: &str) -> Option<f64> {
     rch_common::BuildDiskBudget::cold_growth_gib(command).map(f64::from)
 }
 
+/// Only recognized schemas may be inspected or removed by operator selection.
+/// Unknown versions and malformed keys remain available for newer readers.
+struct ParsedFootprintKey {
+    source: FootprintSource,
+    version: u32,
+    project: String,
+    kind: String,
+    scope: Option<FootprintScope>,
+    command: Option<String>,
+    endpoint_host: Option<String>,
+}
+
+fn command_footprint_kind(command: &str) -> String {
+    rch_common::classify_command(command)
+        .kind
+        .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"))
+}
+
+fn footprint_scope(wide: bool) -> FootprintScope {
+    if wide {
+        FootprintScope::Wide
+    } else {
+        FootprintScope::Narrow
+    }
+}
+
+fn known_footprint_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "other"
+            | "CargoBuild"
+            | "CargoTest"
+            | "CargoCheck"
+            | "CargoClippy"
+            | "CargoDoc"
+            | "CargoNextest"
+            | "CargoBench"
+            | "CargoZigbuild"
+            | "Rustc"
+            | "Gcc"
+            | "Gpp"
+            | "Clang"
+            | "Clangpp"
+            | "Make"
+            | "CmakeBuild"
+            | "Ninja"
+            | "Meson"
+            | "BunTest"
+            | "BunTypecheck"
+            | "GoBuild"
+            | "GoTest"
+            | "GoVet"
+            | "Tsc"
+            | "NixBuild"
+            | "Job"
+    )
+}
+
+impl ParsedFootprintKey {
+    fn parse(key: &str, warm: bool) -> Option<Self> {
+        let parsed = if warm {
+            let (version, namespace, project, command, endpoint): (
+                u32,
+                String,
+                String,
+                String,
+                crate::workers::WorkerEndpointIdentity,
+            ) = serde_json::from_str(key).ok()?;
+            if version != u32::from(BuildDiskObservation::VERSION) || namespace != "warm_pool" {
+                return None;
+            }
+            rch_common::footprints::validate_selection(&project, Some(&command)).ok()?;
+            Self {
+                source: FootprintSource::Warm,
+                version,
+                project,
+                kind: command_footprint_kind(&command),
+                scope: Some(footprint_scope(
+                    rch_common::BuildDiskBudget::has_wide_scope(&command),
+                )),
+                command: Some(command.trim().to_owned()),
+                endpoint_host: Some(endpoint.host),
+            }
+        } else if let Ok((version, project, command)) =
+            serde_json::from_str::<(u32, String, String)>(key)
+        {
+            if !matches!(version, 2 | 3) {
+                return None;
+            }
+            rch_common::footprints::validate_selection(&project, Some(&command)).ok()?;
+            Self {
+                source: FootprintSource::Exact,
+                version,
+                project,
+                kind: command_footprint_kind(&command),
+                scope: Some(footprint_scope(
+                    rch_common::BuildDiskBudget::has_wide_scope(&command),
+                )),
+                command: Some(command.trim().to_owned()),
+                endpoint_host: None,
+            }
+        } else if let Ok((version, project, namespace, kind)) =
+            serde_json::from_str::<(u32, String, String, String)>(key)
+        {
+            if version != 2 || namespace != "family" || !known_footprint_kind(&kind) {
+                return None;
+            }
+            Self {
+                source: FootprintSource::Family,
+                version,
+                project,
+                kind,
+                scope: None,
+                command: None,
+                endpoint_host: None,
+            }
+        } else if let Ok((version, project, namespace, kind, scope)) =
+            serde_json::from_str::<(u32, String, String, String, bool)>(key)
+        {
+            if !matches!(version, 3 | 4 | 5)
+                || namespace != "family"
+                || !known_footprint_kind(&kind)
+            {
+                return None;
+            }
+            Self {
+                source: FootprintSource::Family,
+                version,
+                project,
+                kind,
+                scope: Some(footprint_scope(scope)),
+                command: None,
+                endpoint_host: None,
+            }
+        } else {
+            if key.trim_start().starts_with('[') {
+                return None;
+            }
+            let (project, kind) = key.rsplit_once('\u{1f}')?;
+            if !known_footprint_kind(kind) {
+                return None;
+            }
+            Self {
+                source: FootprintSource::Legacy,
+                version: 1,
+                project: project.to_owned(),
+                kind: kind.to_owned(),
+                scope: None,
+                command: None,
+                endpoint_host: None,
+            }
+        };
+        rch_common::footprints::validate_selection(&parsed.project, parsed.command.as_deref())
+            .ok()?;
+        Some(parsed)
+    }
+
+    fn matches_project(&self, project: &str) -> bool {
+        footprint_project(&self.project) == footprint_project(project)
+    }
+
+    fn matches_snapshot(&self, project: &str, command: Option<&str>) -> bool {
+        if !self.matches_project(project) {
+            return false;
+        }
+        let Some(command) = command else {
+            return true;
+        };
+        match self.source {
+            FootprintSource::Exact | FootprintSource::Warm => {
+                self.command.as_deref() == Some(command.trim())
+            }
+            FootprintSource::Legacy => self.kind == command_footprint_kind(command),
+            FootprintSource::Family => {
+                if self.kind != command_footprint_kind(command) {
+                    return false;
+                }
+                let scope = footprint_scope(rch_common::BuildDiskBudget::has_wide_scope(command));
+                if matches!(self.version, 2 | 4) {
+                    scope == FootprintScope::Wide
+                } else {
+                    self.scope == Some(scope)
+                }
+            }
+        }
+    }
+
+    fn matches_forget(&self, project: &str, command: Option<&str>) -> bool {
+        self.matches_project(project)
+            && command.is_none_or(|command| {
+                matches!(self.source, FootprintSource::Exact | FootprintSource::Warm)
+                    && self.command.as_deref() == Some(command.trim())
+            })
+    }
+
+    fn record(self) -> FootprintRecord {
+        FootprintRecord {
+            source: self.source,
+            version: self.version,
+            retired: matches!(
+                (self.source, self.version),
+                (FootprintSource::Exact, 2) | (FootprintSource::Family, 3)
+            ),
+            kind: Some(self.kind),
+            scope: self.scope,
+            command: self.command,
+            endpoint_host: self.endpoint_host,
+            sample_count: 0,
+            valid_sample_count: 0,
+            complete_sample_count: 0,
+            high_water_gib: None,
+            latest_observed_unix: None,
+            pool_count: 0,
+            qualified_pool_count: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 struct FootprintSample {
     growth_gib: f64,
@@ -513,7 +729,7 @@ impl FootprintSample {
     }
 }
 
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PoolFootprint {
     identity: [u8; 32],
@@ -576,7 +792,7 @@ fn record_footprint_sample(
 /// Partial builds and worker df changes cannot establish a complete footprint.
 /// Warm estimates require separate pool evidence. Retain high-water marks so
 /// repeated small builds cannot erase evidence of a larger allocation.
-#[derive(Debug, Default, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct FootprintBook {
     #[serde(default)]
     entries: HashMap<String, VecDeque<FootprintSample>>,
@@ -602,6 +818,109 @@ impl FootprintBook {
         let staged = path.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&staged, serde_json::to_vec(self)?)?;
         std::fs::rename(&staged, path)
+    }
+
+    pub(crate) fn snapshot_records(
+        &self,
+        project: &str,
+        command: Option<&str>,
+        now_unix: i64,
+    ) -> Vec<FootprintRecord> {
+        fn add_sample(record: &mut FootprintRecord, sample: &FootprintSample, valid: bool) {
+            record.sample_count += 1;
+            if !valid {
+                return;
+            }
+            record.valid_sample_count += 1;
+            record.complete_sample_count += usize::from(sample.complete);
+            record.high_water_gib = Some(
+                record
+                    .high_water_gib
+                    .map_or(sample.growth_gib, |high| high.max(sample.growth_gib)),
+            );
+            record.latest_observed_unix = Some(
+                record
+                    .latest_observed_unix
+                    .map_or(sample.observed_unix, |latest| {
+                        latest.max(sample.observed_unix)
+                    }),
+            );
+        }
+
+        let mut records = Vec::new();
+        for (key, samples) in &self.entries {
+            let Some(parsed) = ParsedFootprintKey::parse(key, false)
+                .filter(|parsed| parsed.matches_snapshot(project, command))
+            else {
+                continue;
+            };
+            let mut record = parsed.record();
+            for sample in samples {
+                add_sample(&mut record, sample, sample.valid_at(now_unix));
+            }
+            records.push((key, record));
+        }
+        for (key, pools) in &self.pools {
+            let Some(parsed) = ParsedFootprintKey::parse(key, true)
+                .filter(|parsed| parsed.matches_snapshot(project, command))
+            else {
+                continue;
+            };
+            let mut record = parsed.record();
+            record.pool_count = pools.len();
+            record.qualified_pool_count = self
+                .warm_estimate(key, now_unix)
+                .map_or(0, |(_, proofs)| proofs.iter().flatten().count());
+            for pool in pools {
+                for sample in &pool.samples {
+                    add_sample(
+                        &mut record,
+                        sample,
+                        pool.fresh_at(now_unix) && sample.valid_at(now_unix),
+                    );
+                }
+            }
+            records.push((key, record));
+        }
+        records.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        records.into_iter().map(|(_, record)| record).collect()
+    }
+
+    /// Mutate a candidate book only. The caller persists it before replacing
+    /// the live book, so failed operator writes never publish a partial reset.
+    pub(crate) fn forget_selection(
+        &mut self,
+        project: &str,
+        command: Option<&str>,
+    ) -> FootprintReset {
+        let mut reset = FootprintReset {
+            project: footprint_project(project).to_owned(),
+            command: command.map(|command| command.trim().to_owned()),
+            removed_entries: 0,
+            removed_pools: 0,
+            removed_samples: 0,
+            persisted: false,
+        };
+        self.entries.retain(|key, samples| {
+            let selected = ParsedFootprintKey::parse(key, false)
+                .is_some_and(|parsed| parsed.matches_forget(project, command));
+            if selected {
+                reset.removed_entries += 1;
+                reset.removed_samples += samples.len();
+            }
+            !selected
+        });
+        self.pools.retain(|key, pools| {
+            let selected = ParsedFootprintKey::parse(key, true)
+                .is_some_and(|parsed| parsed.matches_forget(project, command));
+            if selected {
+                reset.removed_entries += 1;
+                reset.removed_pools += pools.len();
+                reset.removed_samples += pools.iter().map(|pool| pool.samples.len()).sum::<usize>();
+            }
+            !selected
+        });
+        reset
     }
 
     /// Record one observed growth. Returns whether the book changed.
@@ -1429,6 +1748,226 @@ mod tests {
         assert_eq!(footprint_requirement_gib(2.0), 4.0);
         assert_eq!(footprint_requirement_gib(64.0), 80.0);
         assert_eq!(footprint_requirement_gib(f64::NAN), f64::from(u32::MAX));
+    }
+
+    fn footprint_admin_endpoint() -> crate::workers::WorkerEndpointIdentity {
+        crate::workers::WorkerEndpointIdentity {
+            id: WorkerId::new("footprint-worker"),
+            host: "footprint-host".into(),
+            user: "builder".into(),
+            identity_file: "/private/ssh/identity".into(),
+            declared_os: Some("linux".into()),
+        }
+    }
+
+    #[test]
+    fn footprint_snapshot_reports_valid_samples_and_applicable_contributors() {
+        let now = 1_800_000_000;
+        let command = "cargo test --test first";
+        let mut book = FootprintBook::default();
+        book.entries.insert(
+            footprint_key("engine", command),
+            [
+                FootprintSample {
+                    growth_gib: 8.0,
+                    observed_unix: now - 30,
+                    complete: true,
+                },
+                FootprintSample {
+                    growth_gib: 42.0,
+                    observed_unix: now - 10,
+                    complete: false,
+                },
+                FootprintSample {
+                    growth_gib: 999.0,
+                    observed_unix: now - FOOTPRINT_MAX_AGE_SECS - 1,
+                    complete: true,
+                },
+                FootprintSample {
+                    growth_gib: 88.0,
+                    observed_unix: now + 1,
+                    complete: true,
+                },
+                FootprintSample {
+                    growth_gib: 0.0,
+                    observed_unix: now,
+                    complete: true,
+                },
+            ]
+            .into(),
+        );
+        for (key, growth) in [
+            (family_footprint_key("engine", command), 12.0),
+            (
+                serde_json::to_string(&(2_u8, "engine", command)).unwrap(),
+                888.0,
+            ),
+            (
+                serde_json::to_string(&(3_u8, "engine", "family", "CargoTest", false)).unwrap(),
+                777.0,
+            ),
+            (
+                serde_json::to_string(&(4_u8, "engine", "family", "CargoTest", false)).unwrap(),
+                81.0,
+            ),
+            (
+                serde_json::to_string(&(4_u8, "engine", "family", "CargoTest", true)).unwrap(),
+                96.0,
+            ),
+            (
+                family_footprint_key("engine", "cargo test --workspace"),
+                100.0,
+            ),
+            (unscoped_family_footprint_key("engine", command), 80.8),
+            (legacy_footprint_key("engine", command), 64.0),
+            (family_footprint_key("engine", "cargo check"), 8.0),
+            (footprint_key("engine", "cargo test --test second"), 55.0),
+            (footprint_key("engine-copy", command), 88.0),
+        ] {
+            book.record(&key, growth, now, false);
+        }
+        let warm = warm_footprint_key("engine", command, &footprint_admin_endpoint());
+        let retained = pool_snapshot(1, 2, 81);
+        let observation =
+            pool_observation(retained, retained, 2 * rch_common::BuildDiskBudget::GIB, 0);
+        book.record_pool(&warm, &observation, now, true);
+        book.record_pool(&warm, &observation, now, true);
+
+        let records = book.snapshot_records("engine", Some(" cargo test --test first "), now);
+        assert_eq!(records.len(), 6);
+        assert_eq!(records.iter().filter(|record| record.retired).count(), 2);
+        let exact = records
+            .iter()
+            .find(|record| record.source == FootprintSource::Exact && !record.retired)
+            .unwrap();
+        assert_eq!(exact.sample_count, 5);
+        assert_eq!(exact.valid_sample_count, 2);
+        assert_eq!(exact.complete_sample_count, 1);
+        assert_eq!(exact.high_water_gib, Some(42.0));
+        assert_eq!(exact.latest_observed_unix, Some(now - 10));
+        let family = records
+            .iter()
+            .find(|record| record.source == FootprintSource::Family && !record.retired)
+            .unwrap();
+        assert_eq!(family.version, 5);
+        assert_eq!(family.scope, Some(FootprintScope::Narrow));
+        let warm = records
+            .iter()
+            .find(|record| record.source == FootprintSource::Warm)
+            .unwrap();
+        assert_eq!(warm.pool_count, 1);
+        assert_eq!(warm.qualified_pool_count, 1);
+        assert_eq!(warm.valid_sample_count, 1);
+        assert_eq!(warm.complete_sample_count, 1);
+        assert_eq!(warm.high_water_gib, Some(2.0));
+        assert_eq!(warm.endpoint_host.as_deref(), Some("footprint-host"));
+        assert!(
+            !serde_json::to_string(&records)
+                .unwrap()
+                .contains("/private/ssh")
+        );
+        assert_eq!(records, book.snapshot_records("engine", Some(command), now));
+
+        let wide = book.snapshot_records("engine", Some("cargo test --workspace"), now);
+        assert_eq!(
+            wide.len(),
+            5,
+            "wide work sees v5 wide, both old v4 scopes, v2 family, and legacy evidence"
+        );
+        assert_eq!(
+            wide.iter()
+                .filter(|record| record.source == FootprintSource::Family)
+                .count(),
+            4
+        );
+        assert_eq!(wide.iter().filter(|record| record.version == 4).count(), 2);
+        assert!(wide.iter().all(|record| !record.retired));
+        assert!(
+            !wide
+                .iter()
+                .any(|record| record.source == FootprintSource::Exact
+                    || record.source == FootprintSource::Warm)
+        );
+    }
+
+    #[test]
+    fn footprint_forget_matches_project_and_exact_command_without_erasing_unknown_schemas() {
+        let now = 1_800_000_000;
+        let command = "cargo test --test first";
+        let mut book = FootprintBook::default();
+        for key in [
+            footprint_key("engine", command),
+            footprint_key("engine", "cargo test --test second"),
+            family_footprint_key("engine", command),
+            serde_json::to_string(&(2_u8, "engine", command)).unwrap(),
+            serde_json::to_string(&(3_u8, "engine", "family", "CargoTest", false)).unwrap(),
+            serde_json::to_string(&(4_u8, "engine", "family", "CargoTest", false)).unwrap(),
+            serde_json::to_string(&(4_u8, "engine", "family", "CargoTest", true)).unwrap(),
+            unscoped_family_footprint_key("engine", command),
+            legacy_footprint_key("engine", command),
+            // A known old row may still contain the generated overlay suffix.
+            serde_json::to_string(&(
+                2_u8,
+                "engine::clean-overlay::0123456789abcdef",
+                "cargo check",
+            ))
+            .unwrap(),
+        ] {
+            book.record(&key, 81.0, now, true);
+        }
+        let preserved = [
+            footprint_key("engine-copy", command),
+            footprint_key(" engine ", command),
+            footprint_key("engine::clean-overlay::not-a-nonce", command),
+            r#"[4,"engine","cargo test --test first"]"#.to_owned(),
+            r#"[6,"engine","family","CargoTest",false]"#.to_owned(),
+            r#"[3,"engine","family","CargoTest","wide"]"#.to_owned(),
+            r#"[3,"engine","family","CargoTest",null]"#.to_owned(),
+            r#"[2,"engine","future","CargoTest"]"#.to_owned(),
+            r#"[2,"engine","family","FutureCompiler"]"#.to_owned(),
+            r#"[2,"engine",""]"#.to_owned(),
+            r#"[2,"engine","cargo test\n"]"#.to_owned(),
+            r#"[2,"engine","cargo test",false]"#.to_owned(),
+        ];
+        for key in &preserved {
+            book.record(key, 99.0, now, true);
+        }
+        let warm = warm_footprint_key("engine", command, &footprint_admin_endpoint());
+        let retained = pool_snapshot(1, 2, 81);
+        let observation =
+            pool_observation(retained, retained, 2 * rch_common::BuildDiskBudget::GIB, 0);
+        for key in [&warm, "unrecognized warm key"] {
+            book.record_pool(key, &observation, now, true);
+            book.record_pool(key, &observation, now, true);
+        }
+        let selected = book.forget_selection("engine", Some(" cargo test --test first "));
+        assert_eq!(selected.removed_entries, 3);
+        assert_eq!(selected.removed_pools, 1);
+        assert_eq!(selected.removed_samples, 3);
+        assert!(!selected.persisted);
+        assert_eq!(
+            book.estimate_gib(&family_footprint_key("engine", command), now),
+            Some(81.0)
+        );
+        assert_eq!(
+            book.estimate_gib(&legacy_footprint_key("engine", command), now),
+            Some(81.0)
+        );
+        assert_eq!(
+            book.estimate_gib(&footprint_key("engine", "cargo test --test second"), now),
+            Some(81.0)
+        );
+
+        let project = book.forget_selection("engine::clean-overlay::fedcba9876543210", None);
+        assert_eq!(project.project, "engine");
+        assert_eq!(project.removed_entries, 8);
+        assert_eq!(project.removed_samples, 8);
+        assert_eq!(project.removed_pools, 0);
+        for key in preserved {
+            assert_eq!(book.estimate_gib(&key, now), Some(99.0), "{key}");
+        }
+        assert!(book.pools.contains_key("unrecognized warm key"));
+        assert!(book.snapshot_records("engine", None, now).is_empty());
     }
 
     fn pool_snapshot(identity: u8, state: u8, gib: u64) -> BuildDiskPool {

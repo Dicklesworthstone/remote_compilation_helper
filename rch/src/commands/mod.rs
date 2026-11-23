@@ -14,6 +14,7 @@ mod config;
 mod config_doctor;
 mod config_init;
 pub(crate) mod daemon;
+pub mod footprints;
 mod helpers;
 mod hook;
 mod init;

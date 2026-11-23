@@ -469,6 +469,22 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
         action: CacheAction,
     },
 
+    /// Inspect or forget learned disk estimates without restarting the daemon
+    ///
+    /// PROJECT is the exact project ID shown by `rch queue --json`. Forgetting
+    /// estimates affects future admission only; active reservations and worker
+    /// disk limits remain in force. A command filter forgets only that exact
+    /// command and its warm proofs, preserving shared family observations.
+    #[command(after_help = r#"EXAMPLES:
+    rch footprints show franken_engine-5d919732
+    rch --json footprints show franken_engine-5d919732 --command 'cargo test -p engine'
+    rch footprints forget franken_engine-5d919732 --command 'cargo test -p engine'
+    rch footprints forget franken_engine-5d919732"#)]
+    Footprints {
+        #[command(subcommand)]
+        action: commands::footprints::FootprintAction,
+    },
+
     /// Collect stale rch runtime dirs on workers. PREVIEWS BY DEFAULT.
     ///
     /// Scans every root rch itself writes to — the pooled `remote_base`, an
@@ -2515,6 +2531,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             } => commands::rabs_gc::run_release_verdict(action, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
+            Commands::Footprints { action } => commands::footprints::run(action, &ctx).await,
             Commands::Gc {
                 dry_run,
                 apply,
