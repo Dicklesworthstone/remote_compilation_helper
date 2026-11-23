@@ -2979,7 +2979,8 @@ fn apply_env_overrides_inner(
         }
     }
 
-    // Path topology overrides
+    // Empty launcher-forwarded values are unset, just like empty TOML roots.
+    // They must neither replace configured roots nor suppress scratch aliases.
     let canonical_before_env = config
         .path_topology
         .to_policy()
@@ -2992,7 +2993,9 @@ fn apply_env_overrides_inner(
     if derived_scratch_alias.is_some() {
         config.path_topology.off_root = true;
     }
-    if let Some(val) = get_env("RCH_CANONICAL_PROJECT_ROOT") {
+    if let Some(val) = get_env("RCH_CANONICAL_PROJECT_ROOT")
+        && !val.is_empty()
+    {
         config.path_topology.canonical_root = Some(val);
         if let Some(ref mut sources) = sources {
             set_source(
@@ -3002,7 +3005,9 @@ fn apply_env_overrides_inner(
             );
         }
     }
-    if let Some(val) = get_env("RCH_ALIAS_PROJECT_ROOT") {
+    if let Some(val) = get_env("RCH_ALIAS_PROJECT_ROOT")
+        && !val.is_empty()
+    {
         config.path_topology.alias_root = Some(val);
         if let Some(ref mut sources) = sources {
             set_source(
@@ -5491,6 +5496,74 @@ canonical_root = "/from/toml"
     }
 
     #[test]
+    fn empty_path_topology_env_preserves_roots_and_configuration_sources() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user = dir.path().join("user.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &user,
+            "[path_topology]\ncanonical_root = '/home/alex/projects'\nalias_root = '/home/alex/p'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            "[path_topology]\ncanonical_root = '/srv/projects'\nalias_root = '/srv/p'\n",
+        )
+        .unwrap();
+
+        for keys in [
+            vec!["RCH_CANONICAL_PROJECT_ROOT"],
+            vec!["RCH_ALIAS_PROJECT_ROOT"],
+            vec!["RCH_CANONICAL_PROJECT_ROOT", "RCH_ALIAS_PROJECT_ROOT"],
+        ] {
+            let env = keys
+                .into_iter()
+                .map(|key| (key.to_string(), String::new()))
+                .collect();
+            for (user_path, project_path) in [
+                (None, None),
+                (Some(user.as_path()), None),
+                (Some(user.as_path()), Some(project.as_path())),
+            ] {
+                let baseline = load_config_with_sources_from_paths(
+                    user_path,
+                    project_path,
+                    Some(&HashMap::new()),
+                )
+                .unwrap();
+                let loaded =
+                    load_config_with_sources_from_paths(user_path, project_path, Some(&env))
+                        .unwrap();
+                assert_eq!(
+                    loaded.config.path_topology.canonical_root,
+                    baseline.config.path_topology.canonical_root
+                );
+                assert_eq!(
+                    loaded.config.path_topology.alias_root,
+                    baseline.config.path_topology.alias_root
+                );
+                assert_eq!(
+                    loaded.config.path_topology.to_policy(),
+                    baseline.config.path_topology.to_policy()
+                );
+                for key in ["path_topology.canonical_root", "path_topology.alias_root"] {
+                    assert_eq!(loaded.sources.get(key), baseline.sources.get(key));
+                }
+
+                // Cached loads reapply the same overrides without a source map.
+                let cached_bytes = serde_json::to_vec(&baseline.config).unwrap();
+                let mut cached: RchConfig = serde_json::from_slice(&cached_bytes).unwrap();
+                apply_env_overrides_inner(&mut cached, None, Some(&env));
+                assert_eq!(
+                    cached.path_topology.to_policy(),
+                    loaded.config.path_topology.to_policy()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn scratch_canonical_root_gets_its_own_alias_unless_one_is_given() {
         // bd-xz7at: keeping `/dp` for a scratch canonical root claimed all of
         // /data/projects on workers and was refused as an overlapping owner.
@@ -5519,6 +5592,35 @@ canonical_root = "/from/toml"
             Some(&ConfigValueSource::EnvVar(
                 "RCH_CANONICAL_PROJECT_ROOT".to_string()
             ))
+        );
+        let empty_alias = load(&[
+            ("RCH_CANONICAL_PROJECT_ROOT", "/data/tmp/je-flc-test/"),
+            ("RCH_ALIAS_PROJECT_ROOT", ""),
+        ]);
+        assert_eq!(
+            empty_alias.config.path_topology.to_policy(),
+            scratch.config.path_topology.to_policy()
+        );
+        assert_eq!(
+            empty_alias.sources.get("path_topology.alias_root"),
+            scratch.sources.get("path_topology.alias_root")
+        );
+        let alias_only = load(&[
+            ("RCH_CANONICAL_PROJECT_ROOT", ""),
+            ("RCH_ALIAS_PROJECT_ROOT", "/data/tmp/explicit-alias"),
+        ]);
+        assert_eq!(
+            alias_only.config.path_topology.canonical_root.as_deref(),
+            Some("/data/projects")
+        );
+        assert_eq!(
+            alias_only.config.path_topology.alias_root.as_deref(),
+            Some("/data/tmp/explicit-alias")
+        );
+        assert!(!alias_only.config.path_topology.off_root);
+        assert_eq!(
+            alias_only.sources.get("path_topology.alias_root"),
+            Some(&ConfigValueSource::EnvVar("RCH_ALIAS_PROJECT_ROOT".into()))
         );
         let explicit = load(&[
             ("RCH_CANONICAL_PROJECT_ROOT", "/data/tmp/je-flc-test"),
