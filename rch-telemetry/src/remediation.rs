@@ -144,6 +144,7 @@ pub const WORKER_INELIGIBLE_LABELS: &[&str] = &[
     "circuit_breaker",
     "os_arch_mismatch",
     "process_observation",
+    "runtime_execution",
 ];
 
 /// Temporary-bypass lifecycle transitions ([`BypassTransition`]).

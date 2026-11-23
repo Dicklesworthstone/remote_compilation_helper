@@ -54,6 +54,10 @@ pub struct RecoveryProbe {
     /// completion evidence when required by this worker's quarantine.
     #[serde(default)]
     pub process_observation_ok: bool,
+    /// A fresh fixed Rust fixture compiled, executed and returned its expected
+    /// output when a recorded runtime failure requires this additional probe.
+    #[serde(default)]
+    pub runtime_execution_ok: bool,
 }
 
 impl RecoveryProbe {
@@ -69,6 +73,7 @@ impl RecoveryProbe {
             load_ok: true,
             telemetry_ok: true,
             process_observation_ok: true,
+            runtime_execution_ok: true,
         }
     }
 
@@ -83,6 +88,7 @@ impl RecoveryProbe {
             && self.load_ok
             && self.telemetry_ok
             && self.process_observation_ok
+            && self.runtime_execution_ok
     }
 
     /// The first failing dimension, in a stable check order, for diagnostics.
@@ -104,6 +110,8 @@ impl RecoveryProbe {
             Some("telemetry")
         } else if !self.process_observation_ok {
             Some("process_observation")
+        } else if !self.runtime_execution_ok {
+            Some("runtime_execution")
         } else {
             None
         }
@@ -253,6 +261,7 @@ mod tests {
             "load" => p.load_ok = false,
             "telemetry" => p.telemetry_ok = false,
             "process_observation" => p.process_observation_ok = false,
+            "runtime_execution" => p.runtime_execution_ok = false,
             _ => unreachable!(),
         }
         p
@@ -270,6 +279,7 @@ mod tests {
             "load",
             "telemetry",
             "process_observation",
+            "runtime_execution",
         ] {
             let p = probe_failing(dim);
             assert!(!p.fully_healthy(), "{dim} failure should not be healthy");
@@ -287,6 +297,22 @@ mod tests {
         let probe: RecoveryProbe = serde_json::from_value(value).unwrap();
         assert!(!probe.fully_healthy());
         assert_eq!(probe.first_failure(), Some("process_observation"));
+        assert!(matches!(
+            decide_probe(record(), &probe, TS + 1),
+            ProbeDecision::StayBypassed { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_execution_evidence_fails_closed() {
+        let mut value = serde_json::to_value(RecoveryProbe::all_ok()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_execution_ok");
+        let probe: RecoveryProbe = serde_json::from_value(value).unwrap();
+        assert!(!probe.fully_healthy());
+        assert_eq!(probe.first_failure(), Some("runtime_execution"));
         assert!(matches!(
             decide_probe(record(), &probe, TS + 1),
             ProbeDecision::StayBypassed { .. }

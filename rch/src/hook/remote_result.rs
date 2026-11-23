@@ -313,9 +313,7 @@ pub(super) fn signal_name(signal: i32) -> &'static str {
         1 => "SIGHUP",
         2 => "SIGINT",
         3 => "SIGQUIT",
-        // 4/7: CPU-capability faults (bd-68hon) — an Ivy-Bridge-class
-        // worker executing x86-64-v3 codegen dies by SIGILL; logging
-        // it as UNKNOWN hid the real cause behind "exit 132".
+        // Name these signals without inferring their cause from the exit code.
         4 => "SIGILL",
         6 => "SIGABRT",
         7 => "SIGBUS",
@@ -328,36 +326,33 @@ pub(super) fn signal_name(signal: i32) -> &'static str {
     }
 }
 
-/// Whether a signal indicates a WORKER CPU-CAPABILITY fault rather than
-/// resource exhaustion (bd-68hon): SIGILL means the worker's CPU cannot
-/// execute the build's codegen (e.g. AVX2 on a pre-v3 microarch). The
-/// build is fine; the WORKER is incompatible — quarantine it and retry
-/// on any other worker, instead of the OOM heuristic of "retry bigger".
-pub(super) const fn is_cpu_capability_signal(signal: i32) -> bool {
+/// Whether an observed signal requires runtime health recovery. SIGILL can be
+/// caused by the application, toolchain, execution environment or CPU features;
+/// it cannot diagnose missing AVX2 or justify permanent administrative disable.
+pub(super) const fn is_runtime_fault_signal(signal: i32) -> bool {
     signal == 4
 }
 
-/// Detect a build-tool-WRAPPED CPU-capability signal death.
+/// Detect a Cargo-wrapped SIGILL without asserting a CPU-capability diagnosis.
 ///
 /// Live verification against ovh-b (2026-08-09) showed the incident-class
 /// fault never reaches the exit-code arm: when a build script or proc-macro
 /// dies by SIGILL, cargo does NOT propagate 128+N — it prints
 /// `process didn't exit successfully: `…` (signal: 4, SIGILL: illegal
-/// instruction)` and exits 101, so the CPU-capability fault masquerades as
-/// an ordinary build failure and the worker is never quarantined.
+/// instruction)` and exits 101, hiding the signal behind a build failure.
 ///
 /// Sniff cargo's diagnostic line instead. Both markers must appear on the
 /// SAME line so incidental strings in test output cannot spoof a quarantine,
-/// and a zero exit never classifies.
+/// and only Cargo's failure exit 101 classifies.
 ///
-/// Only SIGILL is a CPU-capability fault, exactly as for the exit-code arm
-/// ([`is_cpu_capability_signal`]). SIGBUS means a bad memory access: almost
+/// Only SIGILL enters this recovery class, exactly as for the exit-code arm
+/// ([`is_runtime_fault_signal`]). SIGBUS means a bad memory access: almost
 /// always a truncated mmap, a full tmpfs or an I/O error, sometimes a bug in
 /// the project under test. Counting it here quarantined ts1 (which has AVX2)
 /// on 2026-11-08, when a frankensqlite `fsqlite-vfs` lib test died with
 /// SIGBUS and the hook recorded a fixed "build-script SIGILL" reason.
-pub(super) fn wrapped_cpu_capability_signal(exit_code: i32, output: &str) -> Option<i32> {
-    if exit_code == 0 {
+pub(super) fn wrapped_runtime_fault_signal(exit_code: i32, output: &str) -> Option<i32> {
+    if exit_code != EXIT_TEST_FAILURES {
         return None;
     }
     output
@@ -366,6 +361,15 @@ pub(super) fn wrapped_cpu_capability_signal(exit_code: i32, output: &str) -> Opt
             line.contains("didn't exit successfully") && line.contains("(signal: 4, SIGILL")
         })
         .then_some(4)
+}
+
+/// Decide health reporting before release, while admission ownership is live.
+/// A deadline-enforced result cannot turn an earlier diagnostic into a new
+/// runtime incident. Successful fixtures and ordinary failed tests never do so.
+pub(super) fn remote_result_requires_runtime_recovery(result: &RemoteExecutionResult) -> bool {
+    !result.deadline_triggered
+        && (is_signal_killed(result.exit_code).is_some_and(is_runtime_fault_signal)
+            || wrapped_runtime_fault_signal(result.exit_code, &result.stderr).is_some())
 }
 
 /// Whether a completed non-zero remote result blames the WORKER rather than
@@ -389,8 +393,8 @@ pub(super) fn remote_failure_is_worker_fault(stderr: &str, exit_code: i32) -> bo
     }
     is_toolchain_failure(stderr, exit_code)
         || detect_worker_system_dependency_failure(stderr, exit_code).is_some()
-        || is_signal_killed(exit_code).is_some_and(is_cpu_capability_signal)
-        || wrapped_cpu_capability_signal(exit_code, stderr).is_some()
+        || is_signal_killed(exit_code).is_some_and(is_runtime_fault_signal)
+        || wrapped_runtime_fault_signal(exit_code, stderr).is_some()
         || remote_failure_is_disk_full(stderr, exit_code)
 }
 
@@ -463,14 +467,14 @@ fn extract_workspace_package_field(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod wrapped_signal_tests {
-    use super::wrapped_cpu_capability_signal;
+    use super::wrapped_runtime_fault_signal;
 
     const CARGO_SIGILL_LINE: &str = "  process didn't exit successfully: `/data/projects/avx2probe/.rch-target-ovh-b-pool-75509f/debug/build/avx2probe/b03d/out/build_script_build` (signal: 4, SIGILL: illegal instruction)";
 
     #[test]
     fn detects_cargo_wrapped_build_script_sigill_at_exit_101() {
         assert_eq!(
-            wrapped_cpu_capability_signal(101, CARGO_SIGILL_LINE),
+            wrapped_runtime_fault_signal(101, CARGO_SIGILL_LINE),
             Some(4)
         );
     }
@@ -480,9 +484,9 @@ mod wrapped_signal_tests {
     #[test]
     fn cargo_wrapped_sigbus_is_not_a_cpu_capability_fault() {
         let test_binary = "process didn't exit successfully: `/data/projects/frankensqlite/.rch-target-ts1-pool-1f2e/debug/deps/fsqlite_vfs-0c1d2e3f4a5b6c7d` (signal: 7, SIGBUS: access to undefined memory)";
-        assert_eq!(wrapped_cpu_capability_signal(101, test_binary), None);
+        assert_eq!(wrapped_runtime_fault_signal(101, test_binary), None);
         let build_script = "  process didn't exit successfully: `/data/projects/p/target/debug/build/p-1a2b/build-script-build` (signal: 7, SIGBUS: access to undefined memory)";
-        assert_eq!(wrapped_cpu_capability_signal(101, build_script), None);
+        assert_eq!(wrapped_runtime_fault_signal(101, build_script), None);
         assert!(
             !super::remote_failure_is_worker_fault(test_binary, 101),
             "SIGBUS alone is not a CPU-capability worker fault"
@@ -494,13 +498,15 @@ mod wrapped_signal_tests {
         let output = format!(
             "process didn't exit successfully: `t` (signal: 7, SIGBUS: access to undefined memory)\n{CARGO_SIGILL_LINE}"
         );
-        assert_eq!(wrapped_cpu_capability_signal(101, &output), Some(4));
+        assert_eq!(wrapped_runtime_fault_signal(101, &output), Some(4));
         assert!(super::remote_failure_is_worker_fault(&output, 101));
     }
 
     #[test]
     fn zero_exit_never_classifies_even_with_marker() {
-        assert_eq!(wrapped_cpu_capability_signal(0, CARGO_SIGILL_LINE), None);
+        assert_eq!(wrapped_runtime_fault_signal(0, CARGO_SIGILL_LINE), None);
+        assert_eq!(wrapped_runtime_fault_signal(137, CARGO_SIGILL_LINE), None);
+        assert_eq!(wrapped_runtime_fault_signal(1, CARGO_SIGILL_LINE), None);
     }
 
     #[test]
@@ -509,19 +515,19 @@ mod wrapped_signal_tests {
         // mentions the signal marker without cargo's process-death prefix.
         let output =
             "left: `didn't exit successfully`\nright: `(signal: 4, SIGILL: illegal instruction)`";
-        assert_eq!(wrapped_cpu_capability_signal(101, output), None);
+        assert_eq!(wrapped_runtime_fault_signal(101, output), None);
     }
 
     #[test]
     fn other_signals_in_marker_do_not_classify() {
         // SIGKILL (OOM) stays with the resource-exhaustion handling.
         let line = "process didn't exit successfully: `rustc …` (signal: 9, SIGKILL: kill)";
-        assert_eq!(wrapped_cpu_capability_signal(101, line), None);
+        assert_eq!(wrapped_runtime_fault_signal(101, line), None);
     }
 
     #[test]
     fn ordinary_build_error_output_does_not_classify() {
         let output = "error[E0308]: mismatched types\n --> src/main.rs:1:1";
-        assert_eq!(wrapped_cpu_capability_signal(101, output), None);
+        assert_eq!(wrapped_runtime_fault_signal(101, output), None);
     }
 }

@@ -5438,8 +5438,16 @@ mod execution_resource_tests {
                     env: &env,
                 },
                 &fixture.plan.host_triple,
-            )
-            .unwrap();
+            );
+            if !own_generated && static_flag {
+                assert_eq!(
+                    fresh.unwrap_err(),
+                    rabs_key::live_dependency::LiveRefusal::MissingEnv("OUT_DIR"),
+                    "direct native directives require their own Cargo build-script owner"
+                );
+                continue;
+            }
+            let fresh = fresh.unwrap();
             fixture.plan = plan_propagated_native_workspace_dag_metadata(&fresh).unwrap();
             let plan = &fixture.plan;
             let policy = CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata;

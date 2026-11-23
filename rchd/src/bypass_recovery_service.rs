@@ -71,6 +71,7 @@ fn now_unix_ms() -> u64 {
 
 const RECOVERY_ENDPOINT: &str = "recovery_endpoint_v1";
 const PROCESS_OBSERVATION_REQUIRED: &str = "process_observation_required";
+const RUNTIME_EXECUTION_REQUIRED: &str = "runtime_execution_required";
 
 // The scoped control path has bounded admission and process-census retries.
 // A 10s capability/SSH probe cannot enclose that lifecycle on a loaded host.
@@ -84,14 +85,22 @@ const PROCESS_OBSERVATION_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 // were measured at 6--16s on busy workers. The old recovery default of 10s is
 // inappropriate when recovering precisely this host-pressure failure.
 const BUSY_WORKER_CONTROL_TIMEOUT: Duration = Duration::from_secs(25);
+// The native worker owns a 10s compile/run deadline. Enclose SSH setup and its
+// bounded output drain without restarting the complete recovery trial clock.
+const RUNTIME_EXECUTION_PROBE_TIMEOUT: Duration = Duration::from_secs(25);
 
 fn process_observation_required(record: &BypassRecord) -> bool {
     record.failure_class == BypassFailureClass::ProcessObservation
         || record.details.contains_key(PROCESS_OBSERVATION_REQUIRED)
 }
 
+fn runtime_execution_required(record: &BypassRecord) -> bool {
+    record.failure_class == BypassFailureClass::RuntimeExecution
+        || record.details.contains_key(RUNTIME_EXECUTION_REQUIRED)
+}
+
 fn recovery_capability_timeout(config: &BypassRecoveryConfig, record: &BypassRecord) -> Duration {
-    let budget = if process_observation_required(record) {
+    let budget = if process_observation_required(record) || runtime_execution_required(record) {
         config.probe_timeout.max(BUSY_WORKER_CONTROL_TIMEOUT)
     } else {
         config.probe_timeout
@@ -105,11 +114,14 @@ fn recovery_canary_timeout(config: &BypassRecoveryConfig) -> Duration {
 
 fn recovery_probe_budget(config: &BypassRecoveryConfig, record: &BypassRecord) -> Duration {
     let capability = recovery_capability_timeout(config, record).saturating_mul(2);
-    let budget = if process_observation_required(record) {
+    let mut budget = if process_observation_required(record) {
         capability.saturating_add(scale_duration(PROCESS_OBSERVATION_PROBE_TIMEOUT))
     } else {
         capability
     };
+    if runtime_execution_required(record) {
+        budget = budget.saturating_add(scale_duration(RUNTIME_EXECUTION_PROBE_TIMEOUT));
+    }
     budget.min(MAX_CONTROL_TIMEOUT)
 }
 
@@ -202,6 +214,7 @@ fn unreachable_recovery_probe() -> RecoveryProbe {
         load_ok: false,
         telemetry_ok: false,
         process_observation_ok: false,
+        runtime_execution_ok: false,
     }
 }
 
@@ -265,6 +278,39 @@ fn process_observation_probe_command() -> String {
 
 fn process_observation_probe_passed(result: &rch_common::CommandResult) -> bool {
     result.success() && result.stdout.trim() == "RCH_PROCESS_HEALTH_V1"
+}
+
+fn runtime_execution_probe_command() -> String {
+    format!(
+        "{}{}\nrch_wkr_locate || exit 127\nexec \"$RCH_WKR\" runtime-probe --json",
+        shell_prefix(),
+        rch_common::wkr_locate::WKR_LOCATE_SHELL,
+    )
+}
+
+/// This attests only a fresh baseline compile/run, not the failed workload's
+/// instruction requirements or a diagnosis of the SIGILL's cause.
+fn runtime_execution_probe_passed(result: &rch_common::CommandResult) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Receipt {
+        schema_version: u32,
+        probe: String,
+        compiled: bool,
+        executed: bool,
+        output_verified: bool,
+    }
+
+    if !result.success() || result.stdout.len() > 4096 {
+        return false;
+    }
+    serde_json::from_str::<Receipt>(&result.stdout).is_ok_and(|receipt| {
+        receipt.schema_version == 1
+            && receipt.probe == "rust_compile_run"
+            && receipt.compiled
+            && receipt.executed
+            && receipt.output_verified
+    })
 }
 
 fn recovery_endpoint(config: &WorkerConfig) -> String {
@@ -643,6 +689,40 @@ impl SshRecoveryProber {
         })
     }
 
+    async fn runtime_execution_probe(
+        &self,
+        config: &WorkerConfig,
+        caller_deadline: Instant,
+    ) -> bool {
+        // Git Bash is not native descendant ownership. Retain the obligation
+        // until the worker probe supports a Windows Job Object; do not spawn
+        // a compiler through a POSIX wrapper and treat direct-child exit as
+        // proof that the trial settled. The worker also refuses non-Unix hosts.
+        if rch_common::declared_os(&config.tags)
+            .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+        {
+            return false;
+        }
+        let budget = scale_duration(RUNTIME_EXECUTION_PROBE_TIMEOUT);
+        let Some(deadline) = Instant::now().checked_add(budget) else {
+            return false;
+        };
+        let deadline = deadline.min(caller_deadline);
+        let options = SshOptions {
+            connect_timeout: recovery_canary_timeout(&self.config),
+            command_timeout: budget,
+            ..Default::default()
+        };
+        Self::ssh_run(
+            config,
+            &runtime_execution_probe_command(),
+            options,
+            deadline,
+        )
+        .await
+        .is_some_and(|result| Instant::now() < deadline && runtime_execution_probe_passed(&result))
+    }
+
     /// Preserve both UTC validation and the stored monotonic observation age.
     /// Queued readers cannot stamp old telemetry fresh at publication.
     fn telemetry_valid_until(
@@ -720,7 +800,7 @@ impl SshRecoveryProber {
 }
 
 /// Map exact-path capability [`ProbedFacts`] (+ fresh load + telemetry verdict)
-/// onto the 7-dimension [`RecoveryProbe`]. Pure, so the dimension fidelity is
+/// onto the capability dimensions of [`RecoveryProbe`]. Pure, so the fidelity is
 /// unit-tested without real SSH.
 ///
 /// `worker_binary_ok` requires the exact-path `rch-wkr` to have reported a
@@ -749,6 +829,7 @@ fn assess_probe_facts(
             load_ok: false,
             telemetry_ok: false,
             process_observation_ok: false,
+            runtime_execution_ok: false,
         };
     }
 
@@ -797,6 +878,7 @@ fn assess_probe_facts(
         // Ordinary capability recovery has no process-failure obligation.
         // assess_recovery_probe_facts fails this dimension closed when it does.
         process_observation_ok: true,
+        runtime_execution_ok: true,
     }
 }
 
@@ -846,6 +928,7 @@ fn assess_recovery_probe_facts(
         probe.disk_ok &= has_complete_disk_evidence(facts, &config);
     }
     probe.process_observation_ok = !process_observation_required(record);
+    probe.runtime_execution_ok = !runtime_execution_required(record);
     probe
 }
 
@@ -897,6 +980,11 @@ impl RecoveryProber for SshRecoveryProber {
                 // ownership of every old job remains retained.
                 probe.process_observation_ok =
                     self.process_observation_probe(config, deadline).await;
+            }
+            if runtime_execution_required(&record) {
+                // Capability/version facts alone never satisfy a SIGILL
+                // quarantine. Every counted pass needs a new compile/run.
+                probe.runtime_execution_ok = self.runtime_execution_probe(config, deadline).await;
             }
             if Instant::now() >= deadline {
                 return None;
@@ -1039,15 +1127,76 @@ pub(crate) async fn record_process_observation_failure(
     incident: &str,
     now_ms: u64,
 ) -> anyhow::Result<()> {
+    record_owned_execution_failure(
+        store,
+        worker,
+        endpoint,
+        incident,
+        now_ms,
+        OwnedExecutionFailure::ProcessObservation,
+    )
+    .await
+}
+
+/// Record an owner-authenticated SIGILL without asserting a CPU diagnosis or
+/// changing deliberate administrative intent. The baseline runtime obligation
+/// survives later failures and must be freshly measured before a guarded retry.
+pub(crate) async fn record_runtime_execution_failure(
+    store: &Arc<Mutex<BypassRecordStore>>,
+    worker: &Arc<WorkerState>,
+    endpoint: &WorkerEndpointSnapshot,
+    incident: &str,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    record_owned_execution_failure(
+        store,
+        worker,
+        endpoint,
+        incident,
+        now_ms,
+        OwnedExecutionFailure::RuntimeExecution,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum OwnedExecutionFailure {
+    ProcessObservation,
+    RuntimeExecution,
+}
+
+async fn record_owned_execution_failure(
+    store: &Arc<Mutex<BypassRecordStore>>,
+    worker: &Arc<WorkerState>,
+    endpoint: &WorkerEndpointSnapshot,
+    incident: &str,
+    now_ms: u64,
+    failure: OwnedExecutionFailure,
+) -> anyhow::Result<()> {
+    let (requested_class, required_key, required_probe, incident_key, diagnostic) = match failure {
+        OwnedExecutionFailure::ProcessObservation => (
+            BypassFailureClass::ProcessObservation,
+            PROCESS_OBSERVATION_REQUIRED,
+            "scoped_lifecycle_v1",
+            "process_observation_incidents",
+            "remote process completion unconfirmed",
+        ),
+        OwnedExecutionFailure::RuntimeExecution => (
+            BypassFailureClass::RuntimeExecution,
+            RUNTIME_EXECUTION_REQUIRED,
+            "rust_compile_run_v1",
+            "runtime_execution_incidents",
+            "SIGILL observed; runtime cause unverified",
+        ),
+    };
     let mut store = store.lock().await;
     let Some(config) = worker.lock_current_endpoint(endpoint).await else {
-        anyhow::bail!("process observation belongs to a replaced worker endpoint");
+        anyhow::bail!("execution failure belongs to a replaced worker endpoint");
     };
     let id = config.id.as_str();
-    const INCIDENTS: &str = "process_observation_incidents";
     let previous = store.get(id);
     let mut incidents: Vec<String> = previous
-        .and_then(|record| record.details.get(INCIDENTS))
+        .and_then(|record| record.details.get(incident_key))
         .map(|json| serde_json::from_str(json))
         .transpose()?
         .unwrap_or_default();
@@ -1064,7 +1213,7 @@ pub(crate) async fn record_process_observation_failure(
     {
         BypassFailureClass::DiskInodePressure
     } else {
-        BypassFailureClass::ProcessObservation
+        requested_class
     };
     let mut record = if let Some(previous) = previous {
         let mut record = previous.clone();
@@ -1072,28 +1221,26 @@ pub(crate) async fn record_process_observation_failure(
         if retargeted {
             record.last_failure_unix_ms = now_ms;
             record.consecutive_failures = 1;
-            record = record.with_diagnostic("remote process completion unconfirmed");
+            record = record.with_diagnostic(diagnostic);
         } else {
-            record.record_failure(now_ms, "remote process completion unconfirmed");
+            record.record_failure(now_ms, diagnostic);
         }
         record.failure_class = class;
         record.reason_code = class.incident_reason_code();
         record
     } else {
-        BypassRecord::new(id, &config.host, &config.user, class, now_ms)
-            .with_diagnostic("remote process completion unconfirmed")
+        BypassRecord::new(id, &config.host, &config.user, class, now_ms).with_diagnostic(diagnostic)
     };
     record.local_fallback_allowed = false;
-    record.details.insert(
-        PROCESS_OBSERVATION_REQUIRED.into(),
-        "scoped_lifecycle_v1".into(),
-    );
+    record
+        .details
+        .insert(required_key.into(), required_probe.into());
     record
         .details
         .insert(RECOVERY_ENDPOINT.into(), recovery_endpoint(&config));
     // Keep bounded retry deduplication without refusing fresh failures.
-    // Each retained build contributes one cancellation incident, regardless
-    // of how often cleanup retries. An ancient duplicate may conservatively
+    // Each retained build contributes one incident of each type, regardless
+    // of how often reporting retries. An ancient duplicate may conservatively
     // count again once evicted; a new failure must always interrupt a canary.
     if incidents.len() >= 4096 {
         drop(incidents.drain(..incidents.len() - 4095));
@@ -1101,13 +1248,13 @@ pub(crate) async fn record_process_observation_failure(
     incidents.push(incident.into());
     record
         .details
-        .insert(INCIDENTS.into(), serde_json::to_string(&incidents)?);
+        .insert(incident_key.into(), serde_json::to_string(&incidents)?);
     // Even persistence failure must stop new admissions in this daemon. The
     // caller receives an error and can retry; no successful ack is fabricated.
     worker.enter_bypass(class).await;
     store.upsert(record)?;
     remediation::record_bypass_transition(BypassTransition::Bypassed);
-    remediation::record_worker_ineligible(BypassFailureClass::ProcessObservation);
+    remediation::record_worker_ineligible(requested_class);
     Ok(())
 }
 
@@ -2241,6 +2388,7 @@ mod tests {
             "load" => p.load_ok = false,
             "telemetry" => p.telemetry_ok = false,
             "process_observation" => p.process_observation_ok = false,
+            "runtime_execution" => p.runtime_execution_ok = false,
             _ => unreachable!(),
         }
         p
@@ -3095,6 +3243,236 @@ mod tests {
     }
 
     #[test]
+    fn runtime_execution_probe_requires_fresh_compile_run_receipt() {
+        let valid = serde_json::json!({
+            "schema_version": 1,
+            "probe": "rust_compile_run",
+            "compiled": true,
+            "executed": true,
+            "output_verified": true,
+        });
+        let mut cases = vec![
+            (0, valid.to_string(), true),
+            (132, valid.to_string(), false),
+        ];
+        for field in ["compiled", "executed", "output_verified"] {
+            let mut failed = valid.clone();
+            failed[field] = serde_json::json!(false);
+            cases.push((0, failed.to_string(), false));
+            failed.as_object_mut().unwrap().remove(field);
+            cases.push((0, failed.to_string(), false));
+        }
+        let mut wrong_version = valid.clone();
+        wrong_version["schema_version"] = serde_json::json!(2);
+        cases.push((0, wrong_version.to_string(), false));
+        let mut wrong_probe = valid.clone();
+        wrong_probe["probe"] = serde_json::json!("rustc_version");
+        cases.push((0, wrong_probe.to_string(), false));
+        let mut extra = valid.clone();
+        extra["cached"] = serde_json::json!(true);
+        cases.push((0, extra.to_string(), false));
+        cases.extend([
+            (0, "rustc 1.100.0\n".into(), false),
+            (0, String::new(), false),
+            (0, format!("{valid}\n{valid}"), false),
+            (0, format!("{}{valid}", " ".repeat(4096)), false),
+            (0, r#"{"schema_version":1,"probe":"rust_compile_run","compiled":false,"compiled":true,"executed":true,"output_verified":true}"#.into(), false),
+        ]);
+        for (exit_code, stdout, expected) in cases {
+            assert_eq!(
+                runtime_execution_probe_passed(&rch_common::CommandResult {
+                    exit_code,
+                    stdout: stdout.clone(),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                }),
+                expected,
+                "exit={exit_code}, stdout={stdout:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn capability_success_never_satisfies_runtime_execution_recovery() {
+        let config = BypassRecoveryConfig::default();
+        for class in [
+            BypassFailureClass::RuntimeExecution,
+            BypassFailureClass::Ssh,
+        ] {
+            let record = BypassRecord::new("css", "h", "u", class, T0)
+                .with_detail(RUNTIME_EXECUTION_REQUIRED, "rust_compile_run_v1");
+            let probe =
+                assess_recovery_probe_facts(&facts_all_good(), Some(1.0), true, &config, &record);
+            assert!(probe.ssh_ok && probe.toolchain_ok && probe.telemetry_ok);
+            assert!(!probe.fully_healthy());
+            assert_eq!(probe.first_failure(), Some("runtime_execution"));
+            assert_eq!(
+                recovery_probe_budget(&config, &record),
+                BUSY_WORKER_CONTROL_TIMEOUT.saturating_mul(2) + RUNTIME_EXECUTION_PROBE_TIMEOUT,
+            );
+            let combined = record.with_detail(PROCESS_OBSERVATION_REQUIRED, "scoped_lifecycle_v1");
+            assert_eq!(
+                recovery_probe_budget(&config, &combined),
+                (BUSY_WORKER_CONTROL_TIMEOUT.saturating_mul(2)
+                    + RUNTIME_EXECUTION_PROBE_TIMEOUT
+                    + PROCESS_OBSERVATION_PROBE_TIMEOUT)
+                    .min(MAX_CONTROL_TIMEOUT),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_execution_obligation_survives_restart_until_two_fresh_passes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bypass.json");
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(&path)));
+        let endpoint = worker.endpoint_snapshot().await;
+        for (incident, now) in [("job-1", T0), ("job-1", T0 + 1), ("job-2", T0 + 2)] {
+            record_runtime_execution_failure(&store, &worker, &endpoint, incident, now)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.lock().await.get("css").unwrap().consecutive_failures,
+            2
+        );
+        let restarted_pool = pool_with(&["css"]).await;
+        let restarted = restarted_pool.get(&WorkerId::new("css")).await.unwrap();
+        assert!(restarted.reserve_slots(1).await);
+        let restored = Arc::new(Mutex::new(BypassRecordStore::load(&path)));
+        let service = BypassRecoveryService::new(
+            restarted_pool,
+            restored.clone(),
+            FakeProber::new(
+                vec![
+                    RecoveryProbe::all_ok(),
+                    probe_failing("runtime_execution"),
+                    RecoveryProbe::all_ok(),
+                    RecoveryProbe::all_ok(),
+                ],
+                probe_failing("runtime_execution"),
+                CanaryOutcome::Passed,
+            ),
+            BypassRecoveryConfig::default(),
+        );
+        service.reconcile_on_start().await;
+        assert!(!restarted.lifecycle().await.is_schedulable());
+        for round in 0..4 {
+            let due = restored.lock().await.get("css").unwrap().next_probe_unix_ms;
+            service.evaluate_once(due).await;
+            assert_eq!(restarted.lifecycle().await.is_schedulable(), round == 3);
+            assert_eq!(
+                restarted.used_slots(),
+                1,
+                "health recovery cannot retire an owner"
+            );
+        }
+        assert!(!restored.lock().await.contains("css"));
+        assert!(!BypassRecordStore::load(path).contains("css"));
+    }
+
+    #[tokio::test]
+    async fn later_incidents_preserve_independent_runtime_and_process_obligations() {
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        let endpoint = worker.endpoint_snapshot().await;
+        let store = store();
+        record_runtime_execution_failure(&store, &worker, &endpoint, "job-1", T0)
+            .await
+            .unwrap();
+        record_process_observation_failure(&store, &worker, &endpoint, "job-1", T0 + 1)
+            .await
+            .unwrap();
+        for class in [
+            BypassFailureClass::Ssh,
+            BypassFailureClass::DiskInodePressure,
+        ] {
+            record_worker_bypass(&store, &worker, class, "another failure", T0 + 2).await;
+            let record = store.lock().await.get("css").cloned().unwrap();
+            assert!(runtime_execution_required(&record));
+            assert!(process_observation_required(&record));
+            let probe = assess_recovery_probe_facts(
+                &facts_all_good(),
+                Some(1.0),
+                true,
+                &BypassRecoveryConfig::default(),
+                &record,
+            );
+            assert!(!probe.runtime_execution_ok);
+            assert!(!probe.process_observation_ok);
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_execution_recovery_never_probes_an_administrative_disable() {
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        let store = store();
+        record_runtime_execution_failure(
+            &store,
+            &worker,
+            &worker.endpoint_snapshot().await,
+            "job-1",
+            T0,
+        )
+        .await
+        .unwrap();
+        let before = store.lock().await.get("css").cloned().unwrap();
+        worker.disable(Some("operator maintenance".into())).await;
+        let service = BypassRecoveryService::new(
+            pool,
+            store.clone(),
+            GatedRecoveryProber::new(
+                RecoveryObservation::fixture(RecoveryProbe::all_ok()),
+                None,
+                None,
+            ),
+            BypassRecoveryConfig::default(),
+        );
+        service.evaluate_once(T0 + 60_000).await;
+        service.evaluate_once(T0 + 5_000_000).await;
+        assert_eq!(
+            service
+                .prober
+                .probe_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            service
+                .prober
+                .canary_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(store.lock().await.get("css"), Some(&before));
+        assert_eq!(worker.lifecycle().await.admin, AdminIntent::Disabled);
+    }
+
+    #[tokio::test]
+    async fn unsupported_or_expired_runtime_trial_never_returns_recovery_evidence() {
+        let prober = SshRecoveryProber::new(
+            Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
+            BypassRecoveryConfig::default(),
+        );
+        let mut config = worker_config("runtime");
+        config.tags = vec!["os:windows".into()];
+        assert!(
+            !prober
+                .runtime_execution_probe(&config, Instant::now() + Duration::from_secs(5))
+                .await
+        );
+        config.tags.clear();
+        assert!(
+            !prober
+                .runtime_execution_probe(&config, Instant::now())
+                .await
+        );
+    }
+
+    #[test]
     fn capability_success_never_satisfies_process_observation_recovery() {
         let config = BypassRecoveryConfig::default();
         let facts = facts_all_good();
@@ -3221,6 +3599,7 @@ mod tests {
     struct ObservationDuringCanary {
         store: Arc<Mutex<BypassRecordStore>>,
         new_incident: bool,
+        failure: OwnedExecutionFailure,
     }
 
     impl RecoveryProber for ObservationDuringCanary {
@@ -3234,12 +3613,13 @@ mod tests {
         }
 
         async fn canary(&self, worker: Arc<WorkerState>, _deadline: Instant) -> CanaryOutcome {
-            record_process_observation_failure(
+            record_owned_execution_failure(
                 &self.store,
                 &worker,
                 &worker.endpoint_snapshot().await,
                 if self.new_incident { "job-2" } else { "job-1" },
                 T0 + 10_000_000,
+                self.failure,
             )
             .await
             .unwrap();
@@ -3283,50 +3663,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_new_observation_failure_invalidates_an_inflight_canary() {
-        for new_incident in [false, true] {
-            let pool = pool_with(&["css"]).await;
-            let worker = pool.get(&WorkerId::new("css")).await.unwrap();
-            assert!(worker.reserve_slots(1).await);
-            let store = store();
-            record_process_observation_failure(
-                &store,
-                &worker,
-                &worker.endpoint_snapshot().await,
-                "job-1",
-                T0,
-            )
-            .await
-            .unwrap();
-            record_worker_bypass(
-                &store,
-                &worker,
-                BypassFailureClass::Ssh,
-                "later SSH fault",
-                T0 + 1,
-            )
-            .await;
-            let service = BypassRecoveryService::new(
-                pool,
-                store.clone(),
-                ObservationDuringCanary {
-                    store: store.clone(),
-                    new_incident,
-                },
-                BypassRecoveryConfig::default(),
-            );
-            for _ in 0..2 {
-                let due = store.lock().await.get("css").unwrap().next_probe_unix_ms;
-                service.evaluate_once(due).await;
-            }
-            assert_eq!(store.lock().await.contains("css"), new_incident);
-            assert_eq!(worker.lifecycle().await.is_schedulable(), !new_incident);
-            assert_eq!(worker.used_slots(), 1);
-            if new_incident {
-                let current = store.lock().await.get("css").cloned().unwrap();
-                assert_eq!(current.consecutive_failures, 1);
-                assert_eq!(current.consecutive_passes, 0);
-                assert_eq!(current.state, BypassState::TemporaryBypass);
+    async fn only_a_new_owned_execution_failure_invalidates_an_inflight_canary() {
+        for failure in [
+            OwnedExecutionFailure::ProcessObservation,
+            OwnedExecutionFailure::RuntimeExecution,
+        ] {
+            for new_incident in [false, true] {
+                let pool = pool_with(&["css"]).await;
+                let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+                assert!(worker.reserve_slots(1).await);
+                let store = store();
+                record_owned_execution_failure(
+                    &store,
+                    &worker,
+                    &worker.endpoint_snapshot().await,
+                    "job-1",
+                    T0,
+                    failure,
+                )
+                .await
+                .unwrap();
+                record_worker_bypass(
+                    &store,
+                    &worker,
+                    BypassFailureClass::Ssh,
+                    "later SSH fault",
+                    T0 + 1,
+                )
+                .await;
+                let service = BypassRecoveryService::new(
+                    pool,
+                    store.clone(),
+                    ObservationDuringCanary {
+                        store: store.clone(),
+                        new_incident,
+                        failure,
+                    },
+                    BypassRecoveryConfig::default(),
+                );
+                for _ in 0..2 {
+                    let due = store.lock().await.get("css").unwrap().next_probe_unix_ms;
+                    service.evaluate_once(due).await;
+                }
+                assert_eq!(store.lock().await.contains("css"), new_incident);
+                assert_eq!(worker.lifecycle().await.is_schedulable(), !new_incident);
+                assert_eq!(worker.used_slots(), 1);
+                if new_incident {
+                    let current = store.lock().await.get("css").cloned().unwrap();
+                    assert_eq!(current.consecutive_failures, 1);
+                    assert_eq!(current.consecutive_passes, 0);
+                    assert_eq!(current.state, BypassState::TemporaryBypass);
+                }
             }
         }
     }
@@ -3490,6 +3877,92 @@ mod tests {
                 "{recovery}: restart must not restore a retired quarantine"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn timed_disable_expiry_preserves_runtime_execution_obligation() {
+        let directory = tempfile::tempdir().unwrap();
+        let administrative = Arc::new(Mutex::new(
+            rch_common::bypass_record::AdminDisableStore::try_load(
+                directory.path().join("admin.json"),
+            )
+            .unwrap(),
+        ));
+        let records = Arc::new(Mutex::new(BypassRecordStore::with_path(
+            directory.path().join("bypass.json"),
+        )));
+        let pool = WorkerPool::new().with_admin_disable_store(administrative.clone());
+        pool.add_worker(worker_config("timed-runtime")).await;
+        let id = WorkerId::new("timed-runtime");
+        let worker = pool.get(&id).await.unwrap();
+        assert!(worker.reserve_slots(2).await);
+        record_runtime_execution_failure(
+            &records,
+            &worker,
+            &worker.endpoint_snapshot().await,
+            "job-1",
+            T0,
+        )
+        .await
+        .unwrap();
+        let mut context = crate::test_daemon_context(pool.clone());
+        context.admin_disable_store = Some(administrative.clone());
+        context.bypass_store = Some(records.clone());
+        let disabled = crate::workers::handle_worker_disable(
+            &context,
+            &id,
+            Some("maintenance after SIGILL".into()),
+            false,
+            Some(1),
+        )
+        .await;
+        let deadline = disabled.expires_unix_ms.unwrap();
+        let service = BypassRecoveryService::new(
+            pool,
+            records.clone(),
+            FakeProber::new(
+                vec![
+                    probe_failing("runtime_execution"),
+                    RecoveryProbe::all_ok(),
+                    RecoveryProbe::all_ok(),
+                ],
+                probe_failing("runtime_execution"),
+                CanaryOutcome::Passed,
+            ),
+            BypassRecoveryConfig::default(),
+        );
+        service.evaluate_once(deadline).await;
+        assert!(administrative.lock().await.get(id.as_str()).is_none());
+        assert_eq!(worker.lifecycle().await.admin, AdminIntent::Active);
+        assert!(!worker.lifecycle().await.is_schedulable());
+        let after_expiry = records.lock().await.get(id.as_str()).cloned().unwrap();
+        assert!(runtime_execution_required(&after_expiry));
+        assert_eq!(after_expiry.consecutive_passes, 0);
+        assert_eq!(service.prober.probes.lock().await.len(), 3);
+        worker
+            .record_transport_result(
+                true,
+                Duration::from_secs(30),
+                &rch_common::CircuitBreakerConfig::default(),
+            )
+            .await;
+        for round in 0..3 {
+            let due = records
+                .lock()
+                .await
+                .get(id.as_str())
+                .unwrap()
+                .next_probe_unix_ms;
+            service.evaluate_once(due).await;
+            assert_eq!(worker.lifecycle().await.is_schedulable(), round == 2);
+            assert_eq!(worker.used_slots(), 2);
+            if round < 2 {
+                assert!(runtime_execution_required(
+                    records.lock().await.get(id.as_str()).unwrap()
+                ));
+            }
+        }
+        assert!(!records.lock().await.contains(id.as_str()));
     }
 
     #[tokio::test]

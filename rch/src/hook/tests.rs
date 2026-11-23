@@ -8245,24 +8245,55 @@ fn test_signal_name() {
 }
 
 #[test]
-fn test_sigill_classifies_as_cpu_capability_fault_not_oom() {
+fn test_sigill_requires_runtime_recovery_without_a_cpu_diagnosis() {
     let _guard = test_guard!();
-    // bd-68hon: exit 132 (128+4) is a WORKER capability fault — the
-    // quarantine-and-retry-anywhere arm — never the OOM
-    // retry-on-bigger heuristic. SIGKILL/SIGSEGV stay in the generic
-    // signal arm.
-    use super::remote_result::is_cpu_capability_signal;
+    // SIGILL requests a fresh runtime probe, never a guessed CPU floor.
+    // Other signals retain their independent existing handling.
+    use super::remote_result::is_runtime_fault_signal;
     assert_eq!(is_signal_killed(132), Some(4));
-    assert!(is_cpu_capability_signal(4));
+    assert!(is_runtime_fault_signal(4));
     assert!(
-        !is_cpu_capability_signal(9),
-        "OOM is not a capability fault"
+        !is_runtime_fault_signal(9),
+        "SIGKILL is not an observed illegal instruction"
     );
-    assert!(!is_cpu_capability_signal(11));
+    assert!(!is_runtime_fault_signal(11));
     assert!(
-        !is_cpu_capability_signal(7),
+        !is_runtime_fault_signal(7),
         "SIGBUS is named but not auto-quarantined"
     );
+}
+
+#[test]
+fn runtime_recovery_reporting_only_uses_observed_direct_or_cargo_wrapped_sigill() {
+    let wrapped = "process didn't exit successfully: `build-script-build` (signal: 4, SIGILL: illegal instruction)";
+    for (exit_code, stderr, deadline_triggered, expected) in [
+        (132, "", false, true),
+        (101, wrapped, false, true),
+        (0, wrapped, false, false),
+        (101, "test failed", false, false),
+        (135, "", false, false),
+        (1, wrapped, false, false),
+        (137, wrapped, true, false),
+        (132, "", true, false),
+    ] {
+        let result = remote_result::RemoteExecutionResult {
+            deadline_triggered,
+            exit_code,
+            stderr: stderr.to_owned(),
+            duration_ms: 1,
+            timing: CommandTimingBreakdown::default(),
+            result_dirs: Vec::new(),
+            disk_roots: Vec::new(),
+            disk_peak_output_bytes: None,
+            disk_observation: None,
+            cargo_stdout: None,
+        };
+        assert_eq!(
+            remote_result_requires_runtime_recovery(&result),
+            expected,
+            "{result:?}"
+        );
+    }
 }
 
 #[test]

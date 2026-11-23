@@ -558,7 +558,7 @@ impl ParsedFootprintKey {
                 String,
                 crate::workers::WorkerEndpointIdentity,
             ) = serde_json::from_str(key).ok()?;
-            if version != u32::from(BuildDiskObservation::VERSION) || namespace != "warm_pool" {
+            if version != BuildDiskObservation::VERSION || namespace != "warm_pool" {
                 return None;
             }
             rch_common::footprints::validate_selection(&project, Some(&command)).ok()?;
@@ -609,10 +609,7 @@ impl ParsedFootprintKey {
         } else if let Ok((version, project, namespace, kind, scope)) =
             serde_json::from_str::<(u32, String, String, String, bool)>(key)
         {
-            if !matches!(version, 3 | 4 | 5)
-                || namespace != "family"
-                || !known_footprint_kind(&kind)
-            {
+            if !matches!(version, 3..=5) || namespace != "family" || !known_footprint_kind(&kind) {
                 return None;
             }
             Self {
@@ -882,7 +879,7 @@ impl FootprintBook {
             }
             records.push((key, record));
         }
-        records.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        records.sort_unstable_by_key(|(left, _)| *left);
         records.into_iter().map(|(_, record)| record).collect()
     }
 

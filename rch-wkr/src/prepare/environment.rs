@@ -1329,7 +1329,7 @@ mod tests {
         launcher(&private.join("node"), b"\x7fELFprivate runtime");
         launcher(&usable.join("node"), b"\x7fELFusable runtime");
         fixture.set("PATH", std::env::join_paths([&private, &usable]).unwrap());
-        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(
             std::fs::metadata(private.join("node")).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
@@ -1343,7 +1343,7 @@ mod tests {
         let available = fixture.capture().unwrap();
         assert_ne!(before.digest, available.digest);
 
-        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
         launcher(&usable.join("node"), b"\x7fELFupdated usable runtime");
         let changed = fixture.capture();
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();

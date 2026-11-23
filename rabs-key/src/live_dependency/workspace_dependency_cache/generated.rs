@@ -712,11 +712,11 @@ mod tests {
         captured
     }
 
-    fn propagated_execution(
+    fn propagated_request(
         own_generated: bool,
         explicit_archive: bool,
         native_library: bool,
-    ) -> DependencyActionPlan {
+    ) -> (Vec<String>, Vec<(String, String)>) {
         let (mut argv, env) = request(PROPAGATED_POLICY, own_generated, explicit_archive);
         argv.extend([
             format!("-Lnative={FOREIGN_NATIVE_B}/nested"),
@@ -725,6 +725,15 @@ mod tests {
         if native_library {
             argv.push("-lstatic=provider".into());
         }
+        (argv, env)
+    }
+
+    fn propagated_execution(
+        own_generated: bool,
+        explicit_archive: bool,
+        native_library: bool,
+    ) -> DependencyActionPlan {
+        let (argv, env) = propagated_request(own_generated, explicit_archive, native_library);
         execution(&argv, &env)
     }
 
@@ -865,8 +874,25 @@ mod tests {
         for own_generated in [false, true] {
             for explicit_archive in [false, true] {
                 for native_library in [false, true] {
-                    let fresh =
-                        propagated_execution(own_generated, explicit_archive, native_library);
+                    let (argv, env) =
+                        propagated_request(own_generated, explicit_archive, native_library);
+                    let fresh = plan_canonical_workspace_execution(
+                        LiveRustcRequest {
+                            argv: &argv,
+                            env: &env,
+                            cwd: WORKSPACE,
+                        },
+                        HOST,
+                    );
+                    if !own_generated && native_library {
+                        assert_eq!(
+                            fresh.unwrap_err(),
+                            LiveRefusal::MissingEnv("OUT_DIR"),
+                            "direct native directives require their own Cargo build-script owner"
+                        );
+                        continue;
+                    }
+                    let fresh = fresh.unwrap();
                     let plan = plan_propagated_native_workspace_dag_metadata(&fresh).unwrap();
                     let captured = propagated_inputs(&plan);
                     let record = own_generated.then_some(RECORD);
@@ -1043,7 +1069,7 @@ mod tests {
             let plan = plan_propagated_native_workspace_dag_metadata(&propagated_execution(
                 own_generated,
                 false,
-                true,
+                own_generated,
             ))
             .unwrap();
             let captured = propagated_inputs(&plan);
@@ -1133,7 +1159,7 @@ mod tests {
 
     #[test]
     fn propagated_native_metadata_refuses_other_execution_modes_and_unclosed_native_searches() {
-        let fresh = propagated_execution(false, false, true);
+        let fresh = propagated_execution(false, false, false);
         for mutation in 0..12 {
             let mut changed = fresh.clone();
             match mutation {

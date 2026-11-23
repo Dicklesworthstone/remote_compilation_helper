@@ -228,6 +228,13 @@ enum ApiRequest {
         build_id: u64,
         local_wrapper_id: Option<String>,
     },
+    /// Report an observed SIGILL without completing/releasing the admitted job
+    /// or changing administrative intent. The underlying cause is unverified.
+    WorkerRuntimeExecutionFailure {
+        worker_id: WorkerId,
+        build_id: u64,
+        local_wrapper_id: Option<String>,
+    },
     /// Get repo convergence status for all or a specific worker.
     RepoConvergenceStatus {
         worker_id: Option<WorkerId>,
@@ -1374,6 +1381,35 @@ async fn handle_connection_with_metrics(
             };
             (response.to_string(), "application/json")
         }
+        Ok(ApiRequest::WorkerRuntimeExecutionFailure {
+            worker_id,
+            build_id,
+            local_wrapper_id,
+        }) => {
+            metrics::inc_requests("worker-runtime-execution-failure");
+            let response = match handle_runtime_execution_failure(
+                &ctx,
+                &worker_id,
+                build_id,
+                local_wrapper_id.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => serde_json::json!({
+                    "status": "ok",
+                    "build_id": build_id,
+                    "ownership_retained": true,
+                    "slots_released": 0,
+                }),
+                Err(error) => serde_json::json!({
+                    "status": "error",
+                    "build_id": build_id,
+                    "slots_released": 0,
+                    "message": error.to_string(),
+                }),
+            };
+            (response.to_string(), "application/json")
+        }
         Ok(ApiRequest::RepoConvergenceStatus { worker_id }) => {
             metrics::inc_requests("repo-convergence-status");
             let response = handle_repo_convergence_status(&ctx, worker_id.as_ref()).await;
@@ -2096,7 +2132,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                         for_secs,
                     });
                 }
-                "process-observation-failure" => {
+                "process-observation-failure" | "runtime-execution-failure" => {
                     let mut build_id = None;
                     let mut local_wrapper_id = None;
                     for param in query.split('&').filter(|value| !value.is_empty()) {
@@ -2110,10 +2146,19 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                                 anyhow::ensure!(!value.is_empty(), "empty wrapper identity");
                                 local_wrapper_id = Some(value);
                             }
-                            _ => anyhow::bail!("unknown or repeated process-observation parameter"),
+                            _ => anyhow::bail!("unknown or repeated execution-failure parameter"),
                         }
                     }
                     anyhow::ensure!(!worker_id.is_empty(), "empty worker identity");
+                    if action == "runtime-execution-failure" {
+                        let build_id = build_id.context("missing build_id parameter")?;
+                        anyhow::ensure!(build_id > 0, "invalid build id");
+                        return Ok(ApiRequest::WorkerRuntimeExecutionFailure {
+                            worker_id: WorkerId::new(worker_id),
+                            build_id,
+                            local_wrapper_id,
+                        });
+                    }
                     return Ok(ApiRequest::WorkerProcessObservationFailure {
                         worker_id: WorkerId::new(worker_id),
                         build_id: build_id.context("missing build_id parameter")?,
@@ -4736,6 +4781,55 @@ async fn handle_process_observation_failure(
         anyhow::bail!("process-observation quarantine requires durable bypass storage");
     };
     crate::bypass_recovery_service::record_process_observation_failure(
+        store,
+        &worker,
+        endpoint,
+        &format!("build:{build_id}:{}", build.started_at),
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+    )
+    .await
+}
+
+/// A typed SIGILL report is bound to the active admission before release. It
+/// grants no CPU diagnosis, slot release, terminal result or administrative
+/// mutation; a separate fresh runtime trial controls eventual eligibility.
+async fn handle_runtime_execution_failure(
+    ctx: &DaemonContext,
+    worker_id: &WorkerId,
+    build_id: u64,
+    local_wrapper_id: Option<&str>,
+) -> Result<()> {
+    let _release = ctx.history.lock_releases().await;
+    let build = ctx
+        .history
+        .active_build(build_id)
+        .context("runtime-execution report has no active build owner")?;
+    anyhow::ensure!(
+        build.worker_id == worker_id.as_str()
+            && build.local_wrapper_id.as_deref() == local_wrapper_id
+            && build.location == rch_common::BuildLocation::Remote,
+        "runtime-execution build ownership mismatch"
+    );
+    let endpoint = build
+        .worker_endpoint
+        .as_ref()
+        .context("runtime-execution report has no admitted worker endpoint")?;
+    let worker = ctx
+        .pool
+        .get(worker_id)
+        .await
+        .context("runtime-execution worker is no longer in inventory")?;
+    let Some(store) = &ctx.bypass_store else {
+        let _endpoint = worker
+            .lock_current_endpoint(endpoint)
+            .await
+            .context("runtime-execution worker endpoint changed")?;
+        worker
+            .enter_bypass(rch_common::BypassFailureClass::RuntimeExecution)
+            .await;
+        anyhow::bail!("runtime-execution quarantine requires durable bypass storage");
+    };
+    crate::bypass_recovery_service::record_runtime_execution_failure(
         store,
         &worker,
         endpoint,
@@ -11827,6 +11921,222 @@ mod tests {
             .unwrap();
         assert!(worker.reserve_slots(2).await);
         (directory, ctx, worker, build.id)
+    }
+
+    #[test]
+    fn runtime_execution_report_requires_one_unambiguous_owner() {
+        let request = parse_request(
+            "POST /workers/worker%2Fone/runtime-execution-failure?build_id=42&local_wrapper_id=owner%26one",
+        )
+        .unwrap();
+        let ApiRequest::WorkerRuntimeExecutionFailure {
+            worker_id,
+            build_id,
+            local_wrapper_id,
+        } = request
+        else {
+            panic!("runtime execution report expected");
+        };
+        assert_eq!(worker_id.as_str(), "worker/one");
+        assert_eq!(build_id, 42);
+        assert_eq!(local_wrapper_id.as_deref(), Some("owner&one"));
+        for request in [
+            "GET /workers/w/runtime-execution-failure?build_id=42",
+            "POST /workers/w/runtime-execution-failure",
+            "POST /workers/w/runtime-execution-failure?build_id=0",
+            "POST /workers/w/runtime-execution-failure?build_id=no",
+            "POST /workers/w/runtime-execution-failure?build_id=42&build_id=43",
+            "POST /workers/w/runtime-execution-failure?build_id=42&local_wrapper_id=",
+            "POST /workers/w/runtime-execution-failure?build_id=42&local_wrapper_id=a&local_wrapper_id=b",
+            "POST /workers/w/runtime-execution-failure?build_id=42&slots=1",
+            "POST /workers/w/runtime-execution-failure?build_id=42&reason=AVX2",
+        ] {
+            assert!(parse_request(request).is_err(), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_execution_report_survives_release_without_administrative_disable() {
+        let (directory, mut ctx, worker, build_id) = process_observation_fixture().await;
+        let admin_path = directory.path().join("admin.json");
+        ctx.admin_disable_store = Some(Arc::new(tokio::sync::Mutex::new(
+            rch_common::bypass_record::AdminDisableStore::with_path(&admin_path),
+        )));
+        let id = WorkerId::new("worker1");
+        for _ in 0..2 {
+            handle_runtime_execution_failure(&ctx, &id, build_id, Some("owner1"))
+                .await
+                .unwrap();
+        }
+        let before = BypassRecordStore::load(directory.path().join("bypass.json"))
+            .get("worker1")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            before.failure_class,
+            rch_common::BypassFailureClass::RuntimeExecution
+        );
+        assert_eq!(before.consecutive_failures, 1, "reports are idempotent");
+        assert_eq!(
+            before
+                .details
+                .get("runtime_execution_required")
+                .map(String::as_str),
+            Some("rust_compile_run_v1")
+        );
+        assert!(before.last_diagnostic.contains("cause unverified"));
+        assert!(ctx.history.active_build(build_id).is_some());
+        assert!(!ctx.history.has_terminal_build(build_id));
+        assert_eq!(worker.used_slots(), 2);
+        assert!(!worker.reserve_slots(1).await);
+        assert_eq!(
+            worker.lifecycle().await.admin,
+            crate::workers::AdminIntent::Active
+        );
+        assert!(!admin_path.exists());
+
+        let ApiRequest::ReleaseWorker(request) = parse_request(&format!(
+            "POST /release-worker?worker=worker1&build_id={build_id}&local_wrapper_id=owner1&exit_code=132&worker_fault=1"
+        ))
+        .unwrap()
+        else {
+            panic!("release request expected");
+        };
+        handle_release_worker(&ctx, (*request).clone())
+            .await
+            .unwrap();
+        handle_release_worker(&ctx, *request).await.unwrap();
+        assert_eq!(worker.used_slots(), 0);
+        assert!(ctx.history.has_terminal_build(build_id));
+        assert!(ctx.history.active_build(build_id).is_none());
+        worker.record_success().await;
+        worker.apply_health_status(WorkerStatus::Healthy).await;
+        assert!(!worker.reserve_slots(1).await);
+        assert!(!handle_ready(&ctx).await.workers_available);
+        let after = BypassRecordStore::load(directory.path().join("bypass.json"))
+            .get("worker1")
+            .cloned()
+            .unwrap();
+        assert_eq!(after.details, before.details);
+        assert_eq!(after.consecutive_failures, 1);
+        assert!(
+            handle_runtime_execution_failure(&ctx, &id, build_id, Some("owner1"))
+                .await
+                .is_err(),
+            "completed ownership cannot submit a new quarantine"
+        );
+        assert!(!admin_path.exists());
+    }
+
+    #[tokio::test]
+    async fn runtime_execution_report_rejects_wrong_owner_and_replaced_endpoint() {
+        for change in ["wrapper", "missing_wrapper", "worker", "retarget", "aba"] {
+            let (_directory, ctx, worker, build_id) = process_observation_fixture().await;
+            let original = worker.config.read().await.clone();
+            if matches!(change, "retarget" | "aba") {
+                let mut replacement = original.clone();
+                replacement.host = "replacement.example".into();
+                worker.update_config(replacement).await;
+                if change == "aba" {
+                    worker.update_config(original).await;
+                }
+            }
+            let id = WorkerId::new(if change == "worker" {
+                "worker2"
+            } else {
+                "worker1"
+            });
+            let wrapper = match change {
+                "wrapper" => Some("owner2"),
+                "missing_wrapper" => None,
+                _ => Some("owner1"),
+            };
+            assert!(
+                handle_runtime_execution_failure(&ctx, &id, build_id, wrapper)
+                    .await
+                    .is_err(),
+                "{change}"
+            );
+            assert!(
+                ctx.bypass_store
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .await
+                    .all()
+                    .is_empty()
+            );
+            assert_eq!(worker.used_slots(), 2);
+            assert!(ctx.history.active_build(build_id).is_some());
+            assert_ne!(
+                worker.eligibility().await,
+                crate::workers::EligibilityState::TemporaryBypass
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_execution_persistence_failure_retains_quarantine_and_owner() {
+        let (directory, ctx, worker, build_id) = process_observation_fixture().await;
+        let path = directory.path().join("bypass.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            handle_runtime_execution_failure(
+                &ctx,
+                &WorkerId::new("worker1"),
+                build_id,
+                Some("owner1")
+            )
+            .await
+            .is_err()
+        );
+        assert!(!worker.lifecycle().await.is_schedulable());
+        assert_eq!(worker.used_slots(), 2);
+        assert!(ctx.history.active_build(build_id).is_some());
+        std::fs::rename(&path, directory.path().join("preserved-obstacle")).unwrap();
+        handle_runtime_execution_failure(&ctx, &WorkerId::new("worker1"), build_id, Some("owner1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            BypassRecordStore::load(path)
+                .get("worker1")
+                .unwrap()
+                .consecutive_failures,
+            1
+        );
+        assert_eq!(worker.used_slots(), 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_execution_report_never_changes_human_or_legacy_disable_intent() {
+        for reason in [
+            "operator maintenance",
+            "cpu-capability-fault (build-script SIGILL) — likely missing ISA (e.g. AVX2)",
+        ] {
+            let (directory, mut ctx, worker, build_id) = process_observation_fixture().await;
+            let path = directory.path().join("admin.json");
+            ctx.admin_disable_store = Some(Arc::new(tokio::sync::Mutex::new(
+                rch_common::bypass_record::AdminDisableStore::with_path(&path),
+            )));
+            let id = WorkerId::new("worker1");
+            assert_eq!(
+                handle_worker_disable(&ctx, &id, Some(reason.into()), false, None)
+                    .await
+                    .status,
+                "ok"
+            );
+            let before = std::fs::read(&path).unwrap();
+            handle_runtime_execution_failure(&ctx, &id, build_id, Some("owner1"))
+                .await
+                .unwrap();
+            assert_eq!(
+                worker.lifecycle().await.admin,
+                crate::workers::AdminIntent::Disabled
+            );
+            assert_eq!(worker.status().await, WorkerStatus::Disabled);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(worker.used_slots(), 2);
+        }
     }
 
     #[tokio::test]

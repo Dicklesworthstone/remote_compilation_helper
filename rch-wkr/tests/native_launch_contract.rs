@@ -3,6 +3,8 @@
 #![cfg(unix)]
 #![forbid(unsafe_code)]
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const WORKER: &str = env!("CARGO_BIN_EXE_rch-wkr");
@@ -13,6 +15,133 @@ fn fixture() -> tempfile::TempDir {
         .disable_cleanup(true)
         .tempdir()
         .unwrap()
+}
+
+fn installed_rustc() -> PathBuf {
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(compiler)
+        .args(["--print", "sysroot"])
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .expect("resolve the installed test compiler before changing the child PATH");
+    assert!(output.status.success(), "{output:?}");
+    let sysroot = String::from_utf8(output.stdout).unwrap();
+    let compiler = Path::new(sysroot.trim()).join("bin/rustc");
+    let compiler = std::fs::canonicalize(compiler).expect("installed toolchain compiler");
+    assert!(compiler.is_file(), "{}", compiler.display());
+    compiler
+}
+
+fn compiler_script(directory: &Path, source: &str) {
+    let path = directory.join("rustc");
+    std::fs::write(&path, format!("#!/bin/sh\n{source}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn native_runtime_probe_cli_compiles_and_runs_fresh_programs() {
+    let rustc = installed_rustc();
+    let directory = fixture();
+    let bin = directory.path().join("bin");
+    let temporary = directory.path().join("temporary");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&temporary).unwrap();
+    let temporary = std::fs::canonicalize(temporary).unwrap();
+    let compilations = directory.path().join("compilations");
+    // Observe each actual compiler invocation, then delegate unchanged to the
+    // pre-resolved installed compiler. The executable and its verified output
+    // still come from real Rust compilation, not a replacement success fixture.
+    compiler_script(
+        &bin,
+        "printf '%s\\n' \"$PWD\" >> \"$RCH_NATIVE_PROBE_TEST_COMPILES\"\nexec \"$RCH_NATIVE_PROBE_TEST_RUSTC\" \"$@\"",
+    );
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+    let expected = serde_json::json!({
+        "schema_version": 1,
+        "probe": "rust_compile_run",
+        "compiled": true,
+        "executed": true,
+        "output_verified": true,
+    });
+    for attempt in 0..2 {
+        let output = Command::new(WORKER)
+            .args(["runtime-probe", "--json"])
+            .current_dir(directory.path())
+            .env("PATH", &path)
+            .env("TMPDIR", &temporary)
+            .env("RCH_NATIVE_PROBE_TEST_COMPILES", &compilations)
+            .env("RCH_NATIVE_PROBE_TEST_RUSTC", &rustc)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "attempt {attempt}: {output:?}");
+        assert!(output.stderr.is_empty(), "attempt {attempt}: {output:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+            expected,
+            "attempt {attempt} did not return one exact runtime receipt"
+        );
+    }
+    let observed = std::fs::read_to_string(compilations).unwrap();
+    let directories = observed.lines().map(PathBuf::from).collect::<Vec<_>>();
+    assert_eq!(
+        directories.len(),
+        2,
+        "each receipt requires a new compiler invocation"
+    );
+    assert_ne!(
+        directories[0], directories[1],
+        "a previous compile was reused"
+    );
+    for path in directories {
+        assert!(
+            path.starts_with(&temporary),
+            "compile left its private temporary root: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn native_runtime_probe_cli_refuses_missing_or_version_only_compilers() {
+    let directory = fixture();
+    let bin = directory.path().join("bin");
+    let temporary = directory.path().join("temporary");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&temporary).unwrap();
+    for version_only in [false, true] {
+        if version_only {
+            compiler_script(&bin, "printf 'rustc 1.100.0 version-only fixture\\n'");
+        }
+        let output = Command::new(WORKER)
+            .args(["runtime-probe", "--json"])
+            .current_dir(directory.path())
+            .env("PATH", &bin)
+            .env("TMPDIR", &temporary)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "version_only={version_only}: {output:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "failed probe emitted a success receipt: {output:?}"
+        );
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        let expected = if version_only {
+            "did not produce an executable"
+        } else {
+            "spawn runtime compile command"
+        };
+        assert!(
+            diagnostic.contains(expected),
+            "version_only={version_only}: {diagnostic}"
+        );
+    }
 }
 
 #[test]

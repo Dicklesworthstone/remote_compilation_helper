@@ -90,6 +90,9 @@ pub enum BypassFailureClass {
     /// Remote process admission/completion could not be observed reliably.
     /// SSH reachability alone cannot clear this failure (issue #129).
     ProcessObservation,
+    /// A remote compiler, build script or command terminated with SIGILL.
+    /// Its cause is unverified; a fresh compile/run probe gates a guarded retry.
+    RuntimeExecution,
 }
 
 impl BypassFailureClass {
@@ -106,6 +109,7 @@ impl BypassFailureClass {
         Self::CircuitBreaker,
         Self::OsArchMismatch,
         Self::ProcessObservation,
+        Self::RuntimeExecution,
     ];
 
     /// Stable `snake_case` wire identifier (matches the serde form).
@@ -122,6 +126,7 @@ impl BypassFailureClass {
             Self::CircuitBreaker => "circuit_breaker",
             Self::OsArchMismatch => "os_arch_mismatch",
             Self::ProcessObservation => "process_observation",
+            Self::RuntimeExecution => "runtime_execution",
         }
     }
 
@@ -139,6 +144,7 @@ impl BypassFailureClass {
             Self::CircuitBreaker => "circuit breaker open",
             Self::OsArchMismatch => "OS/arch mismatch",
             Self::ProcessObservation => "process admission/completion unconfirmed",
+            Self::RuntimeExecution => "SIGILL observed; runtime cause unverified",
         }
     }
 
@@ -162,6 +168,7 @@ impl BypassFailureClass {
             Self::CircuitBreaker => IncidentReasonCode::CircuitOpen,
             Self::OsArchMismatch => IncidentReasonCode::OsArchMismatch,
             Self::ProcessObservation => IncidentReasonCode::HardPreflight,
+            Self::RuntimeExecution => IncidentReasonCode::HardPreflight,
         }
     }
 

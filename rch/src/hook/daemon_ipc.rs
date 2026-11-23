@@ -1120,6 +1120,42 @@ pub(super) async fn report_process_observation_failure(
     build_id: u64,
     local_wrapper_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    report_admitted_worker_fault(
+        socket_path,
+        worker_id,
+        build_id,
+        local_wrapper_id,
+        "process-observation-failure",
+    )
+    .await
+}
+
+/// Record an observed SIGILL while the active admission still authenticates
+/// the worker endpoint. This requests recoverable runtime bypass, never an
+/// administrative disable or a claim about the workload's required ISA.
+pub(super) async fn report_runtime_execution_failure(
+    socket_path: &str,
+    worker_id: &WorkerId,
+    build_id: u64,
+    local_wrapper_id: Option<&str>,
+) -> anyhow::Result<()> {
+    report_admitted_worker_fault(
+        socket_path,
+        worker_id,
+        build_id,
+        local_wrapper_id,
+        "runtime-execution-failure",
+    )
+    .await
+}
+
+async fn report_admitted_worker_fault(
+    socket_path: &str,
+    worker_id: &WorkerId,
+    build_id: u64,
+    local_wrapper_id: Option<&str>,
+    route: &str,
+) -> anyhow::Result<()> {
     #[derive(Deserialize)]
     struct Acknowledgement {
         status: String,
@@ -1135,7 +1171,7 @@ pub(super) async fn report_process_observation_failure(
         let stream = UnixStream::connect(socket_path).await?;
         let (reader, mut writer) = stream.into_split();
         let mut request = format!(
-            "POST /workers/{}/process-observation-failure?build_id={build_id}",
+            "POST /workers/{}/{route}?build_id={build_id}",
             urlencoding_encode(worker_id.as_str()),
         );
         if let Some(wrapper) = local_wrapper_id {
@@ -1151,15 +1187,15 @@ pub(super) async fn report_process_observation_failure(
                 && ack.build_id == build_id
                 && ack.ownership_retained
                 && ack.slots_released == 0,
-            "daemon did not acknowledge process-observation quarantine with retained ownership"
+            "daemon did not acknowledge {route} bypass with retained ownership"
         );
         Ok(())
     })
     .await
-    .context("process-observation quarantine report timed out")?
+    .with_context(|| format!("{route} bypass report timed out"))?
 }
 
-/// Quarantine a worker by reporting a fault to the daemon (bd-68hon):
+/// Report legacy orphan quarantine to the daemon:
 /// `POST /workers/{id}/disable?reason=…`. Fire-and-forget with the same
 /// fail-open discipline as `record_build` — a missing/busy daemon never
 /// blocks the hook, and the caller's retry logic proceeds either way.
@@ -1757,6 +1793,15 @@ mod bounded_ipc_tests {
 
     #[tokio::test]
     async fn process_observation_report_requires_exact_retained_owner_ack() {
+        admitted_fault_report_requires_exact_retained_owner_ack(false).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_execution_report_requires_exact_retained_owner_ack() {
+        admitted_fault_report_requires_exact_retained_owner_ack(true).await;
+    }
+
+    async fn admitted_fault_report_requires_exact_retained_owner_ack(runtime_fault: bool) {
         let valid = serde_json::json!({
             "status": "ok",
             "build_id": 42,
@@ -1772,7 +1817,7 @@ mod bounded_ipc_tests {
             "header_only",
         ] {
             let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("process-health.sock");
+            let path = directory.path().join("worker-health.sock");
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
             let mut body = valid.clone();
             match case {
@@ -1797,23 +1842,44 @@ mod bounded_ipc_tests {
                     .unwrap();
                 assert_eq!(
                     request,
-                    "POST /workers/worker%2Fone/process-observation-failure?build_id=42&local_wrapper_id=owner%26one\n"
+                    format!(
+                        "POST /workers/worker%2Fone/{}?build_id=42&local_wrapper_id=owner%26one\n",
+                        if runtime_fault {
+                            "runtime-execution-failure"
+                        } else {
+                            "process-observation-failure"
+                        }
+                    )
                 );
                 assert!(!request.contains("release-worker"));
+                assert!(!request.contains("/disable"));
                 writer.write_all(response.as_bytes()).await.unwrap();
             };
             let worker_id = WorkerId::new("worker/one");
-            let client = report_process_observation_failure(
-                path.to_str().unwrap(),
-                &worker_id,
-                42,
-                Some("owner&one"),
-            );
+            let client = async {
+                if runtime_fault {
+                    report_runtime_execution_failure(
+                        path.to_str().unwrap(),
+                        &worker_id,
+                        42,
+                        Some("owner&one"),
+                    )
+                    .await
+                } else {
+                    report_process_observation_failure(
+                        path.to_str().unwrap(),
+                        &worker_id,
+                        42,
+                        Some("owner&one"),
+                    )
+                    .await
+                }
+            };
             let (result, ()) = timeout(Duration::from_secs(2), async {
                 tokio::join!(client, server)
             })
             .await
-            .expect("process-observation reporting must terminate");
+            .expect("admitted health reporting must terminate");
             assert_eq!(result.is_ok(), case == "valid", "{case}: {result:?}");
         }
     }

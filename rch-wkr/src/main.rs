@@ -17,6 +17,8 @@ mod job_results;
 mod prepare;
 mod recovery_reserve;
 mod result_probe;
+#[cfg(unix)]
+mod runtime_probe;
 mod scoped_launch;
 mod source_admission;
 mod source_claim_link;
@@ -273,6 +275,13 @@ enum Commands {
     /// Respond to health check
     Health,
 
+    /// Compile and execute a fresh Rust fixture before runtime-fault recovery.
+    RuntimeProbe {
+        /// Emit the versioned recovery receipt after both stages succeed.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Report system info (human-readable)
     Info,
 
@@ -472,6 +481,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Commands::PrepareJobResults = &cli.command {
         std::process::exit(job_results::main());
+    }
+    if let Commands::RuntimeProbe { json } = &cli.command {
+        #[cfg(unix)]
+        return runtime_probe::run(*json);
+        #[cfg(not(unix))]
+        {
+            let _ = json;
+            anyhow::bail!(
+                "runtime recovery requires owned compiler process-tree cleanup; unavailable on this platform"
+            );
+        }
     }
     // This bounded control-plane probe is called by watchdogs and recovery.
     // Do not start a thread pool or initialize optional logging sinks for it:
@@ -809,6 +829,9 @@ async fn run_worker(cli: Cli) -> Result<()> {
         Commands::Health => {
             println!("OK");
             Ok(())
+        }
+        Commands::RuntimeProbe { .. } => {
+            anyhow::bail!("runtime-probe requires the bounded control entry point")
         }
         Commands::Info => {
             print_system_info();
