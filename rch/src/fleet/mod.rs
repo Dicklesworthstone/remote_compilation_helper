@@ -398,7 +398,7 @@ pub async fn rollback(
         Ok(workers) => workers,
         Err(error) => {
             if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::<()>::err("fleet rollback", error));
+                let _ = ctx.json(&ApiResponse::<()>::err("fleet rollback", *error));
             } else {
                 println!("{} {}", StatusIndicator::Error.display(style), error);
             }
@@ -538,22 +538,22 @@ pub async fn rollback(
 fn rollback_targets<'a>(
     workers: &'a [rch_common::WorkerConfig],
     requested: Option<&str>,
-) -> std::result::Result<Vec<&'a rch_common::WorkerConfig>, ApiError> {
+) -> std::result::Result<Vec<&'a rch_common::WorkerConfig>, Box<ApiError>> {
     if workers.is_empty() {
-        return Err(ApiError::new(
+        return Err(Box::new(ApiError::new(
             ErrorCode::ConfigNotFound,
             "No workers configured.",
-        ));
+        )));
     }
     let targets: Vec<_> = match requested {
         Some(ids) => {
             let ids: Vec<_> = ids.split(',').map(str::trim).collect();
             for id in &ids {
                 if id.is_empty() || !workers.iter().any(|worker| worker.id.0 == *id) {
-                    return Err(ApiError::new(
+                    return Err(Box::new(ApiError::new(
                         ErrorCode::ConfigInvalidWorker,
                         format!("Worker '{}' not found", id),
-                    ));
+                    )));
                 }
             }
             workers
@@ -564,10 +564,10 @@ fn rollback_targets<'a>(
         None => workers.iter().collect(),
     };
     if targets.is_empty() {
-        return Err(ApiError::new(
+        return Err(Box::new(ApiError::new(
             ErrorCode::ConfigInvalidWorker,
             format!("Worker(s) '{}' not found", requested.unwrap_or_default()),
-        ));
+        )));
     }
     Ok(targets)
 }

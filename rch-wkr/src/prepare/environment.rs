@@ -467,9 +467,15 @@ fn capture_toolchain(
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::PermissionDenied
                 ) =>
             {
+                // execvp continues searching after an inaccessible PATH
+                // candidate. Record it as unavailable so an unrelated private
+                // directory cannot disable dependency preparation. A later
+                // capture still notices if that candidate becomes executable.
                 false
             }
             Err(error) => return Err(error).context("inspect dependency launcher"),
@@ -1303,6 +1309,45 @@ mod tests {
         assert_eq!(initial, fixture.capture().unwrap());
         launcher(&prepared.join("node"), b"\x7fELFnew runtime");
         assert_ne!(initial.digest, fixture.capture().unwrap().digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_path_candidates_do_not_hide_usable_tools_or_permission_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root can traverse mode-000 directories, so it cannot exercise the
+        // execvp EACCES case. The ordinary unprivileged test run covers it.
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let mut fixture = ConfigFixture::new();
+        let private = fixture.project.join("private-tools");
+        let usable = fixture.project.join("usable-tools");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::create_dir(&usable).unwrap();
+        launcher(&private.join("node"), b"\x7fELFprivate runtime");
+        launcher(&usable.join("node"), b"\x7fELFusable runtime");
+        fixture.set("PATH", std::env::join_paths([&private, &usable]).unwrap());
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            std::fs::metadata(private.join("node")).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let before = fixture.capture();
+        // Restore access even when the regression fails, retaining normal
+        // ownership of this fixture's temporary files.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = before.unwrap();
+        let available = fixture.capture().unwrap();
+        assert_ne!(before.digest, available.digest);
+
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0)).unwrap();
+        launcher(&usable.join("node"), b"\x7fELFupdated usable runtime");
+        let changed = fixture.capture();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_ne!(before.digest, changed.unwrap().digest);
     }
 
     #[cfg(unix)]
