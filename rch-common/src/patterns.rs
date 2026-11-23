@@ -3088,6 +3088,62 @@ pub(crate) fn unquote_literal_option_word(token: &str) -> &str {
     }
 }
 
+/// Size an already-classified Cargo invocation from its literal build options.
+/// The caller supplies the classifier's extracted compilation command, not an
+/// entire `&&` chain or outer shell wrapper. This grants no offload authority.
+pub(crate) fn cargo_build_scope_is_wide(command: &str) -> bool {
+    let command = match find_first_structural_boundary(command) {
+        Some(boundary)
+            if matches!(boundary.kind, BoundaryKind::Pipe | BoundaryKind::Background)
+                && suffix_is_benign(boundary.kind, &command[boundary.byte_pos..]) =>
+        {
+            &command[..boundary.byte_pos]
+        }
+        // Redirections can occur between Cargo arguments, not just after
+        // them (`cargo test >log --workspace`). A shell-word parser does not
+        // remove redirection operands, so keep the broad prior rather than
+        // guessing that all words after the first redirect are filenames.
+        Some(_) => return true,
+        None => command,
+    };
+    let normalized = normalize_command(command);
+    let Ok(words) = shell_words::split(normalized.as_ref()) else {
+        return true;
+    };
+    let mut words = words.iter().map(String::as_str);
+    if !matches!(
+        words.next(),
+        Some("cargo" | "cargo-zigbuild" | "cargo-xwin")
+    ) {
+        return true;
+    }
+    // Expansion may introduce extra options even inside a nominal operand.
+    // shell_words removes quoting without expanding, so uncertain words keep
+    // the broad prior. No shell is evaluated to estimate a disk reservation.
+    let literal = |word: &str| !word.contains(['$', '`', '*', '?', '[', '{', '}', '<', '>']);
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if !literal(word) {
+            return true;
+        }
+        if crate::cargo_args::takes_separate_value(word) {
+            if !words.next().is_some_and(literal) {
+                return true;
+            }
+            continue;
+        }
+        if matches!(
+            word,
+            "--workspace" | "--all" | "--all-targets" | "--all-features"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Single-file Cargo packages do not have the Cargo.toml dependency closure
 /// required by remote source planning. Keep them local before reserving a
 /// worker. Parse argv only on the uncommon script-shaped path, so ordinary

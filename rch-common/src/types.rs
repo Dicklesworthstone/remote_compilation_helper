@@ -861,6 +861,21 @@ impl BuildDiskBudget {
     /// Keep learned command families aligned with the cold estimator's scope.
     /// Workspace/all-target builds must not set a narrow package's prior.
     pub fn has_wide_scope(command: &str) -> bool {
+        let classification = crate::classify_command(command);
+        if classification
+            .kind
+            .is_some_and(|kind| kind.command_base() == "cargo")
+        {
+            // The classifier owns shell-wrapper and compound-command extraction.
+            // Only Cargo's build options determine its family and cold prior.
+            return crate::patterns::cargo_build_scope_is_wide(
+                classification
+                    .extracted_command
+                    .as_deref()
+                    .unwrap_or(command),
+            );
+        }
+        // Preserve existing family scope for non-Cargo and unclassified jobs.
         command.split_whitespace().any(|arg| {
             matches!(
                 arg,
@@ -5932,6 +5947,183 @@ retry_max = 2
         assert_eq!(BuildDiskBudget::cold_growth_gib("echo hello"), None);
         for invalid in [f64::NAN, f64::INFINITY, -1.0] {
             assert_eq!(BuildDiskBudget::growth_budget_gib(invalid), u32::MAX);
+        }
+    }
+
+    #[test]
+    fn build_disk_budget_cargo_scope_reads_quoted_flags_and_aliases() {
+        for (command, expected) in [
+            ("cargo test '--workspace'", 32),
+            (r#"cargo test "--workspace""#, 32),
+            ("cargo test --work'space'", 32),
+            (r"cargo test --work\space", 32),
+            ("cargo t '--all'", 32),
+            ("cargo +nightly t '--all-targets'", 32),
+            ("cargo b '--all-features'", 16),
+            ("cargo c '--workspace'", 8),
+            ("cargo +nightly check '--workspace'", 8),
+            ("cargo clippy '--all-targets'", 8),
+            ("cargo bench '--workspace'", 32),
+            ("cargo nextest run '--workspace'", 32),
+            ("cargo-zigbuild zigbuild '--workspace'", 16),
+            ("cargo-xwin build '--workspace'", 16),
+        ] {
+            assert_eq!(
+                BuildDiskBudget::cold_growth_gib(command),
+                Some(expected),
+                "scope for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_disk_budget_cargo_scope_consumes_option_operands() {
+        for (command, expected) in [
+            ("cargo test --test '--workspace'", 24),
+            ("cargo test --test --workspace", 24),
+            ("cargo test --test=--workspace", 24),
+            ("cargo test --bin '--all'", 24),
+            ("cargo test --bin --all-features", 24),
+            ("cargo test --example=--all-targets", 24),
+            ("cargo test --features '--all-features'", 24),
+            ("cargo test -F '--workspace'", 24),
+            ("cargo test -qF '--workspace'", 24),
+            ("cargo --config 'alias.w=--workspace' test", 24),
+            ("cargo test --test '--workspace' --all-targets", 32),
+            ("cargo nextest run -E '--workspace'", 24),
+            ("cargo nextest run --filterset=--workspace", 24),
+            ("cargo nextest run -P '--workspace'", 24),
+            ("cargo build --bin '--workspace'", 8),
+            ("cargo check --bin '--all'", 2),
+        ] {
+            assert_eq!(
+                BuildDiskBudget::cold_growth_gib(command),
+                Some(expected),
+                "scope for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_disk_budget_cargo_scope_stops_at_program_arguments() {
+        for (command, expected) in [
+            ("cargo test -- --workspace", 24),
+            ("cargo test '--' '--all-targets'", 24),
+            ("cargo run -- --all-features", 8),
+            ("cargo test -- $FILTER", 24),
+            ("cargo run -- $OPTIONS", 8),
+            ("cargo test --workspace -- --ignored", 32),
+            ("cargo test --test '--workspace' -- --all-targets", 24),
+        ] {
+            assert_eq!(
+                BuildDiskBudget::cold_growth_gib(command),
+                Some(expected),
+                "scope for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_disk_budget_cargo_scope_follows_extracted_compilation() {
+        for (command, expected) in [
+            ("env SCOPE=--workspace cargo test", 24),
+            ("env NOTE='scope --workspace ignored' cargo test", 24),
+            ("SCOPE='--workspace' cargo check", 2),
+            ("env -u SCOPE cargo test '--workspace'", 32),
+            ("time cargo check '--workspace'", 8),
+            ("timeout 30s cargo check", 2),
+            ("bash -c 'cargo test --workspace'", 32),
+            ("sh -c 'cargo test -- --workspace'", 24),
+            ("printf '%s' --workspace && cargo test", 24),
+            ("cargo test --workspace && cargo check", 2),
+            ("cargo check && cargo test '--workspace'", 32),
+            ("bash -c 'cargo test --workspace && cargo check'", 2),
+            ("cargo test | grep -- '--workspace'", 24),
+            ("cargo test | grep -- --workspace", 24),
+            ("cargo test &", 24),
+        ] {
+            assert_eq!(
+                BuildDiskBudget::cold_growth_gib(command),
+                Some(expected),
+                "scope for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_disk_budget_cargo_scope_keeps_unknown_argv_conservative() {
+        for (command, expected) in [
+            ("cargo test $CARGO_SCOPE", 32),
+            ("cargo check --features $FEATURES", 8),
+            ("cargo build --features 'feature*'", 16),
+            ("cargo test --test", 32),
+            ("cargo check 'unterminated", 8),
+            ("cargo check >build.log --workspace", 8),
+            ("cargo test --workspace>build.log", 32),
+            ("cargo test --workspace>&2", 32),
+            ("cargo check >build.log", 8),
+        ] {
+            assert_eq!(
+                BuildDiskBudget::cold_growth_gib(command),
+                Some(expected),
+                "scope for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_disk_budget_cargo_scope_preserves_other_kind_priors_and_refusals() {
+        for (command, expected) in [
+            ("cargo doc '--workspace'", 8),
+            ("rustc foo.rs", 2),
+            ("go test ./...", 4),
+            ("make", 16),
+        ] {
+            assert_eq!(
+                BuildDiskBudget::cold_growth_gib(command),
+                Some(expected),
+                "prior for {command:?}"
+            );
+        }
+        for command in [
+            "echo --workspace",
+            "cargo clean --workspace",
+            "cargo metadata --all-features",
+            "cargo test || cargo check --workspace",
+            "env -C /other cargo test --workspace",
+        ] {
+            assert_eq!(
+                BuildDiskBudget::cold_growth_gib(command),
+                None,
+                "refused command {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_disk_budget_shared_scope_preserves_public_family_contract() {
+        for (command, expected_scope, expected_prior) in [
+            ("cargo test '--workspace'", true, Some(32)),
+            ("cargo test --test --workspace", false, Some(24)),
+            ("cargo test -- --workspace", false, Some(24)),
+            ("cargo test --workspace && cargo check", false, Some(2)),
+            ("cargo check $SCOPE", true, Some(8)),
+            ("cargo doc '--workspace'", true, Some(8)),
+            ("cargo doc --bin --workspace", false, Some(8)),
+            ("make --all-targets", true, Some(16)),
+            ("make '--all-targets'", false, Some(16)),
+            ("echo --workspace", true, None),
+        ] {
+            assert_eq!(
+                BuildDiskBudget::has_wide_scope(command),
+                expected_scope,
+                "family scope for {command:?}"
+            );
+            assert_eq!(
+                BuildDiskBudget::cold_growth_gib(command),
+                expected_prior,
+                "cold prior for {command:?}"
+            );
         }
     }
 

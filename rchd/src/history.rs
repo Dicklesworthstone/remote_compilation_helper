@@ -7,7 +7,8 @@ use crate::disk_pressure::{
 };
 use crate::headroom::{
     FootprintBook, cold_build_footprint_gib, family_footprint_key, footprint_key,
-    legacy_footprint_key, unscoped_family_footprint_key, warm_footprint_key,
+    legacy_footprint_key, legacy_scoped_family_footprint_keys, unscoped_family_footprint_key,
+    warm_footprint_key,
 };
 use crate::workers::{WorkerEndpointIdentity, WorkerEndpointSnapshot};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1081,11 +1082,14 @@ impl BuildHistory {
             .filter(|_| book.has_complete_observation(&exact_key, now))
             .or_else(|| {
                 let mut family = book.estimate_gib(&family_key, now);
-                if rch_common::BuildDiskBudget::has_wide_scope(command)
-                    && let Some(unscoped) =
-                        book.estimate_gib(&unscoped_family_footprint_key(project_id, command), now)
-                {
-                    family = Some(family.map_or(unscoped, |growth| growth.max(unscoped)));
+                if rch_common::BuildDiskBudget::has_wide_scope(command) {
+                    for key in std::iter::once(unscoped_family_footprint_key(project_id, command))
+                        .chain(legacy_scoped_family_footprint_keys(project_id, command))
+                    {
+                        if let Some(previous) = book.estimate_gib(&key, now) {
+                            family = Some(family.map_or(previous, |growth| growth.max(previous)));
+                        }
+                    }
                 }
                 // A warmed or partial exact observation is only a lower bound.
                 // It cannot overrule larger applicable family evidence.
@@ -5688,6 +5692,95 @@ mod tests {
             reloaded.learned_footprint_gib("fgdb", "cargo test"),
             Some(64.0)
         );
+    }
+
+    #[tokio::test]
+    async fn footprint_scope_migration_keeps_old_attributed_growth_for_wide_jobs_only() {
+        const GIB: u64 = rch_common::BuildDiskBudget::GIB;
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let history = Arc::new(BuildHistory::new(10).with_persistence(path.clone()));
+        let narrow = warm_test_request("engine", "cargo test --test focused");
+        let wide = warm_test_request("engine", "cargo test --workspace");
+        let now = Utc::now().timestamp();
+        let old = legacy_scoped_family_footprint_keys("engine", "cargo test");
+        {
+            let mut book = history.footprints.lock().unwrap();
+            // Raw whitespace could misclassify a quoted workspace flag as
+            // narrow. Its genuine attributed high-water must survive for wide
+            // work, while unrelated narrow commands return to their prior.
+            book.record(&old[0], 81.0, now, false);
+            book.record(&old[1], 40.0, now, false);
+            book.record(
+                &unscoped_family_footprint_key("engine", "cargo test"),
+                50.0,
+                now,
+                false,
+            );
+            book.record(
+                &family_footprint_key("engine", narrow.command.as_deref().unwrap()),
+                17.6,
+                now,
+                false,
+            );
+            book.record(
+                &family_footprint_key("engine", wide.command.as_deref().unwrap()),
+                36.0,
+                now,
+                false,
+            );
+            book.persist(&footprint_path(&path)).unwrap();
+        }
+        let endpoint = warm_test_endpoint().await;
+        let selector = crate::daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            Arc::clone(&history),
+            None,
+        );
+        assert_eq!(
+            selector
+                .build_disk_budget_for_endpoint(&narrow, &endpoint)
+                .unwrap()
+                .max_growth_bytes,
+            30 * GIB
+        );
+        assert_eq!(
+            selector
+                .build_disk_budget_for_endpoint(&wide, &endpoint)
+                .unwrap()
+                .max_growth_bytes,
+            102 * GIB
+        );
+        {
+            let mut book = history.footprints.lock().unwrap();
+            book.record(&old[1], 96.0, now, false);
+            book.record(
+                &footprint_key("engine", wide.command.as_deref().unwrap()),
+                8.0,
+                now,
+                false,
+            );
+            book.persist(&footprint_path(&path)).unwrap();
+        }
+        assert_eq!(
+            selector
+                .build_disk_budget_for_endpoint(&wide, &endpoint)
+                .unwrap()
+                .max_growth_bytes,
+            120 * GIB
+        );
+        let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(
+            restored.learned_footprint_gib("engine", narrow.command.as_deref().unwrap()),
+            Some(24.0)
+        );
+        assert_eq!(
+            restored.learned_footprint_gib("engine", wide.command.as_deref().unwrap()),
+            Some(96.0)
+        );
+        let book = restored.footprints.lock().unwrap();
+        assert_eq!(book.estimate_gib(&old[0], now), Some(81.0));
+        assert_eq!(book.estimate_gib(&old[1], now), Some(96.0));
     }
 
     #[test]

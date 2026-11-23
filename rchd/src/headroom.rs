@@ -418,21 +418,38 @@ fn footprint_project(project_id: &str) -> &str {
     }
 }
 
-/// Version 3 separated scopes but still accepted ambiguous total-only
-/// receipts. Version 4 shares only attributed allocation and incomplete df
-/// lower bounds, never the historical contents of a retained pool.
+/// Version 3 accepted ambiguous total-only receipts. Version 4 learned
+/// attributed allocation, but classified scope from raw whitespace. Version 5
+/// uses parsed Cargo arguments, so old incorrectly grouped samples cannot
+/// inflate a narrow invocation's budget.
 pub fn family_footprint_key(project_id: &str, command: &str) -> String {
     let kind = rch_common::classify_command(command)
         .kind
         .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
     serde_json::to_string(&(
-        4_u8,
+        5_u8,
         footprint_project(project_id),
         "family",
         kind,
         rch_common::BuildDiskBudget::has_wide_scope(command),
     ))
     .expect("string tuple serializes")
+}
+
+/// Version 4's two scopes contain attributed measurements, but raw flag
+/// matching could put a wide command in either bucket. Wide work retains both
+/// high-water marks; neither bucket establishes a new narrow command's cost.
+pub(crate) fn legacy_scoped_family_footprint_keys(
+    project_id: &str,
+    command: &str,
+) -> [String; 2] {
+    let kind = rch_common::classify_command(command)
+        .kind
+        .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
+    [false, true].map(|wide| {
+        serde_json::to_string(&(4_u8, footprint_project(project_id), "family", &kind, wide))
+            .expect("string tuple serializes")
+    })
 }
 
 /// Version 2 mixed narrow and workspace-wide jobs, and charged whole retained
@@ -1259,7 +1276,7 @@ mod tests {
         );
         assert_eq!(
             family_footprint_key("fgdb", "cargo test"),
-            r#"[4,"fgdb","family","CargoTest",false]"#
+            r#"[5,"fgdb","family","CargoTest",false]"#
         );
         assert_ne!(
             family_footprint_key("fgdb", "cargo test --all-features"),
