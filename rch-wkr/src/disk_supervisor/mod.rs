@@ -953,8 +953,18 @@ mod unix {
             } else {
                 failure.free
             };
+            // A later scan/probe failure may carry no allocation measurement.
+            // Keep the peak already observed while this workload was running;
+            // prelaunch accounting can never establish workload growth.
+            let growth = if started {
+                accounting.map_or(failure.growth, |accounting| {
+                    failure.growth.max(accounting.peak_growth)
+                })
+            } else {
+                0
+            };
             let mut value = json!({
-                "reason": failure.reason, "free_bytes": free, "growth_bytes": failure.growth,
+                "reason": failure.reason, "free_bytes": free, "growth_bytes": growth,
                 "max_growth_bytes": invocation.budget, "min_free_bytes": invocation.floor,
                 "started": started, "detail": failure.detail.chars().take(240).collect::<String>(),
                 "peak_output_bytes": accounting.map(|accounting| accounting.peak_output).or(peak),
@@ -1303,6 +1313,49 @@ mod unix {
             let receipts = failure_receipts(&invocation, &measured, true, Some(&accounting), None);
             assert_eq!(receipts[0].1.as_ref().unwrap()["free_bytes"], 7);
             assert_eq!(receipts[0].1.as_ref().unwrap()["growth_bytes"], 19);
+        }
+
+        #[test]
+        fn monitor_failure_receipt_retains_observed_growth_without_charging_the_old_pool() {
+            let fixture = tempfile::tempdir().unwrap();
+            let target = fixture.path().canonicalize().unwrap();
+            std::fs::write(target.join("retained"), vec![0x5a; 80 * 1024]).unwrap();
+            let scanner =
+                scan::Scanner::new(&target, std::slice::from_ref(&target), &[], None, "boot")
+                    .unwrap();
+            let mut accounting = scan::Accounting::new(1 << 20, 0, &scanner, None, false).unwrap();
+            let output = target.join("new-output");
+            std::fs::write(&output, vec![0x6b; 16 * 1024]).unwrap();
+            let allocated = std::fs::metadata(&output).unwrap().blocks() * 512;
+            assert!(allocated > 0);
+            accounting.observe_output(scanner.scan().unwrap()).unwrap();
+            let observed = accounting.peak_growth;
+            assert!(observed >= allocated);
+            assert!(accounting.peak_output > observed);
+
+            let invocation = Invocation::parse(&arguments(plan())).unwrap();
+            let unavailable = Failure::unavailable("later output scan failed");
+            assert_eq!(unavailable.growth, 0);
+            let receipts =
+                failure_receipts(&invocation, &unavailable, true, Some(&accounting), None);
+            let failure = receipts[0].1.as_ref().unwrap();
+            assert_eq!(failure["growth_bytes"], observed);
+            assert_eq!(failure["peak_output_bytes"], accounting.peak_output);
+            assert_eq!(failure["started"], true);
+            let usage = receipts[1].1.as_ref().unwrap();
+            assert_eq!(usage["peak_growth_bytes"], observed);
+            assert_eq!(usage["complete"], false);
+
+            let larger = Failure::new("growth", 0, observed + 1, "newer allocation observation");
+            let receipts = failure_receipts(&invocation, &larger, true, Some(&accounting), None);
+            assert_eq!(
+                receipts[0].1.as_ref().unwrap()["growth_bytes"],
+                observed + 1
+            );
+            let prelaunch = failure_receipts(&invocation, &larger, false, Some(&accounting), None);
+            assert_eq!(prelaunch.len(), 1);
+            assert_eq!(prelaunch[0].1.as_ref().unwrap()["growth_bytes"], 0);
+            assert_eq!(prelaunch[0].1.as_ref().unwrap()["started"], false);
         }
 
         #[test]

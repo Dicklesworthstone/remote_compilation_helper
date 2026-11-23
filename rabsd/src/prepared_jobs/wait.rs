@@ -169,7 +169,9 @@ fn follow(
             }
             Some("completed" | "cancelled") => {
                 if status["execution_may_have_run"] != true
-                    || !status["attempt"].as_u64().is_some_and(|attempt| attempt > 0)
+                    || !status["attempt"]
+                        .as_u64()
+                        .is_some_and(|attempt| attempt > 0)
                 {
                     return Err(invalid("terminal job lacks executed-result evidence"));
                 }

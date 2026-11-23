@@ -1169,6 +1169,7 @@ mod tests {
                     duration_ms: Some(1),
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: None,

@@ -883,6 +883,9 @@ pub(crate) struct ReleaseFaults<'a> {
     pub(crate) source_topology_mismatch: Option<&'a rch_common::SourceTopologyMismatch>,
     /// Attributable output high water, even when the job exceeded its budget.
     pub(crate) disk_peak_output_bytes: Option<u64>,
+    /// Additional allocation lower bound from a settled, started disk failure.
+    /// This never supplies a complete build or retained-pool observation.
+    pub(crate) disk_peak_growth_bytes: Option<u64>,
     pub(crate) disk_observation: Option<rch_common::BuildDiskObservation>,
 }
 
@@ -904,6 +907,24 @@ pub(crate) async fn release_worker_with_fault(
     local_wrapper_id: Option<&str>,
     faults: ReleaseFaults<'_>,
 ) -> anyhow::Result<()> {
+    // A release without a durable build cannot teach the daemon a footprint.
+    // Preserve its original slot-release path without unbound new evidence.
+    let disk_peak_growth_bytes = faults
+        .disk_peak_growth_bytes
+        .filter(|_| build_id.is_some_and(|id| id > 0));
+    anyhow::ensure!(
+        disk_peak_growth_bytes.is_none_or(|growth| {
+            exit_code == Some(137)
+                && faults.worker_fault
+                && faults.disk_observation.is_none()
+                && faults.disk_peak_output_bytes.is_some_and(|peak| {
+                    peak <= i64::MAX as u64
+                        && growth <= i64::MAX as u64
+                        && growth <= peak.saturating_mul(2)
+                })
+        }),
+        "failed disk growth requires bounded output and a started worker failure"
+    );
     if !Path::new(socket_path).exists() {
         anyhow::bail!("daemon socket is missing; release was not acknowledged");
     }
@@ -941,6 +962,9 @@ pub(crate) async fn release_worker_with_fault(
     }
     if let Some(peak) = faults.disk_peak_output_bytes {
         request.push_str(&format!("&disk_peak_output_bytes={peak}"));
+    }
+    if let Some(growth) = disk_peak_growth_bytes {
+        request.push_str(&format!("&disk_peak_growth_bytes={growth}"));
     }
     if let Some(observation) = faults.disk_observation {
         anyhow::ensure!(
@@ -1901,6 +1925,7 @@ mod bounded_ipc_tests {
                     source_busy,
                     source_topology_mismatch: None,
                     disk_peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                 },
             );
@@ -1937,6 +1962,110 @@ mod bounded_ipc_tests {
                 request.contains("&worker_source_busy=1"),
                 source_busy,
                 "{request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_disk_release_keeps_growth_distinct_from_retained_output() {
+        let gib = rch_common::BuildDiskBudget::GIB;
+        for (build_id, growth) in [
+            (Some(42), None),
+            (Some(42), Some(0)),
+            (Some(42), Some(2 * gib)),
+            // Warm accounting can charge an unproven rewritten baseline twice.
+            (Some(42), Some(164 * gib)),
+            (None, Some(2 * gib)),
+        ] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let path = root.join("ipc.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                writer.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+                request
+            };
+            let worker = WorkerId::new("growth-worker");
+            let client = release_worker_with_fault(
+                path.to_str().unwrap(),
+                &worker,
+                1,
+                build_id,
+                Some(137),
+                None,
+                None,
+                None,
+                Some("growth-owner"),
+                ReleaseFaults {
+                    worker_fault: true,
+                    disk_peak_output_bytes: Some(82 * gib),
+                    disk_peak_growth_bytes: growth,
+                    ..Default::default()
+                },
+            );
+            let (result, request) = timeout(Duration::from_secs(2), async {
+                tokio::join!(client, server)
+            })
+            .await
+            .expect("failed disk release fixture must terminate");
+            result.unwrap();
+            assert!(request.contains(&format!("&disk_peak_output_bytes={}", 82 * gib)));
+            if let Some(growth) = growth.filter(|_| build_id.is_some()) {
+                assert!(request.contains(&format!("&disk_peak_growth_bytes={growth}")));
+            } else {
+                assert!(!request.contains("disk_peak_growth_bytes="), "{request}");
+            }
+            assert!(!request.contains("disk_observation="), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_disk_release_rejects_contradictory_growth_before_connecting() {
+        let gib = rch_common::BuildDiskBudget::GIB;
+        let root = tempfile::tempdir().unwrap().keep();
+        let path = root.join("not-connected.sock");
+        let worker = WorkerId::new("growth-worker");
+        for case in 0..8 {
+            let mut exit_code = Some(137);
+            let mut faults = ReleaseFaults {
+                worker_fault: true,
+                disk_peak_output_bytes: Some(82 * gib),
+                disk_peak_growth_bytes: Some(2 * gib),
+                ..Default::default()
+            };
+            match case {
+                0 => exit_code = Some(0),
+                1 => exit_code = None,
+                2 => exit_code = Some(130),
+                3 => faults.worker_fault = false,
+                4 => faults.disk_peak_output_bytes = None,
+                5 => faults.disk_peak_output_bytes = Some(u64::MAX),
+                6 => faults.disk_peak_growth_bytes = Some(u64::MAX),
+                _ => faults.disk_peak_growth_bytes = Some(164 * gib + 1),
+            }
+            let error = release_worker_with_fault(
+                path.to_str().unwrap(),
+                &worker,
+                1,
+                Some(42),
+                exit_code,
+                None,
+                None,
+                None,
+                Some("growth-owner"),
+                faults,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("failed disk growth"),
+                "{case}: {error}"
             );
         }
     }

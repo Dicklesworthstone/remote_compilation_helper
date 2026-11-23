@@ -9713,10 +9713,14 @@ fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
                 reason: reason.into(),
                 started,
                 free_bytes: 12 * rch_common::BuildDiskBudget::GIB,
-                growth_bytes: 21 * rch_common::BuildDiskBudget::GIB,
+                growth_bytes: if started {
+                    21 * rch_common::BuildDiskBudget::GIB
+                } else {
+                    0
+                },
                 max_growth_bytes: 20 * rch_common::BuildDiskBudget::GIB,
                 min_free_bytes: 13 * rch_common::BuildDiskBudget::GIB,
-                peak_output_bytes: Some(21 * rch_common::BuildDiskBudget::GIB),
+                peak_output_bytes: Some(101 * rch_common::BuildDiskBudget::GIB),
                 required_growth_bytes: None,
                 detail: "guard stopped before ENOSPC".into(),
             };
@@ -9738,11 +9742,29 @@ fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
             let faults = remote_release_faults(&result, &worker);
             assert!(faults.worker_fault);
             assert_eq!(faults.worker_disk_full, reason == "free_floor");
-            assert_eq!(faults.disk_peak_output_bytes, failure.peak_output_bytes);
+            assert_eq!(
+                faults.disk_peak_output_bytes,
+                failure.peak_output_bytes.filter(|_| started)
+            );
+            assert_eq!(
+                faults.disk_peak_growth_bytes,
+                started.then_some(failure.growth_bytes),
+                "a retained 80 GiB pool must not replace this job's 21 GiB allocation"
+            );
+            assert!(faults.disk_observation.is_none());
             assert_eq!(
                 remote_release_faults(&result, &WorkerId::new("other-worker")),
                 daemon_ipc::ReleaseFaults::default()
             );
+            let legacy = Err(anyhow::Error::new(
+                crate::transfer::RemoteBuildDiskBudgetExceeded {
+                    peak_output_bytes: None,
+                    ..failure.clone()
+                },
+            ));
+            let legacy_faults = remote_release_faults(&legacy, &worker);
+            assert!(legacy_faults.disk_peak_output_bytes.is_none());
+            assert!(legacy_faults.disk_peak_growth_bytes.is_none());
 
             let error =
                 anyhow::Error::new(failure).context(crate::transfer::RemoteExecutionUnconfirmed);
@@ -9813,6 +9835,8 @@ fn changed_pool_requires_one_owner_confirmed_cold_readmission_before_launch() {
         "a changed pool is not an unhealthy worker"
     );
     assert!(!faults.worker_disk_full);
+    assert_eq!(faults.disk_peak_output_bytes, None);
+    assert_eq!(faults.disk_peak_growth_bytes, None);
     for invalid in [
         crate::transfer::RemoteBuildDiskBudgetExceeded {
             started: true,

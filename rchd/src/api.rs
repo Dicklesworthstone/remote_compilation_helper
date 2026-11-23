@@ -1775,6 +1775,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut duration_ms = None;
         let mut bytes_transferred = None;
         let mut disk_peak_output_bytes = None;
+        let mut disk_peak_growth_bytes = None;
         let mut disk_observation = None;
         let mut local_wrapper_id = None;
         let mut worker_fault = false;
@@ -1811,6 +1812,17 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                         value
                             .parse::<u64>()
                             .context("Invalid disk peak output measurement")?,
+                    );
+                }
+                "disk_peak_growth_bytes" => {
+                    anyhow::ensure!(
+                        disk_peak_growth_bytes.is_none(),
+                        "Duplicate failed disk growth measurement"
+                    );
+                    disk_peak_growth_bytes = Some(
+                        value
+                            .parse::<u64>()
+                            .context("Invalid failed disk growth measurement")?,
                     );
                 }
                 "disk_observation" => {
@@ -1863,7 +1875,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             }),
             "Disk observation requires a valid peak and explicit release exit code"
         );
-        return Ok(ApiRequest::ReleaseWorker(Box::new(ReleaseRequest {
+        let request = ReleaseRequest {
             worker_id: rch_common::WorkerId::new(worker_id),
             slots,
             build_id,
@@ -1871,6 +1883,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             duration_ms,
             bytes_transferred,
             disk_peak_output_bytes,
+            disk_peak_growth_bytes,
             disk_observation,
             local_wrapper_id,
             timing: None,
@@ -1880,7 +1893,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             worker_live_checkout_refused,
             worker_source_busy,
             worker_source_topology_mismatch,
-        })));
+        };
+        validate_failed_disk_growth(&request)?;
+        return Ok(ApiRequest::ReleaseWorker(Box::new(request)));
     }
 
     if let Some(query) = query_for_exact_route(path, "/record-build") {
@@ -4248,6 +4263,27 @@ fn lease_waits_for_restart_admission(lease: &DurableJobLease) -> bool {
         && !lease.terminal_acknowledged
 }
 
+/// Failed growth is a lower bound from a stopped worker execution. It cannot
+/// qualify a successful result or replace the complete retained-pool proof.
+/// The durable owner applies the tighter cold/warm bound before completion.
+fn validate_failed_disk_growth(request: &ReleaseRequest) -> Result<()> {
+    anyhow::ensure!(
+        request.disk_peak_growth_bytes.is_none_or(|growth| {
+            request.exit_code == Some(137)
+                && request.build_id.is_some_and(|id| id > 0)
+                && request.worker_fault
+                && request.disk_observation.is_none()
+                && request.disk_peak_output_bytes.is_some_and(|peak| {
+                    peak <= i64::MAX as u64
+                        && growth <= i64::MAX as u64
+                        && growth <= peak.saturating_mul(2)
+                })
+        }),
+        "Failed disk growth requires bounded output and a started worker failure"
+    );
+    Ok(())
+}
+
 /// Handle a release-worker request that has no connection peer.
 #[cfg(test)]
 pub(crate) async fn handle_release_worker(
@@ -4267,6 +4303,7 @@ async fn handle_release_worker_from(
     mut request: ReleaseRequest,
     peer: Option<&MaintenancePeer>,
 ) -> Result<()> {
+    validate_failed_disk_growth(&request)?;
     anyhow::ensure!(
         request.disk_peak_output_bytes.is_none() || request.exit_code.is_some(),
         "Disk output measurement requires an explicit release exit code"
@@ -4330,6 +4367,7 @@ async fn handle_release_worker_from(
                         duration_ms: request.duration_ms,
                         bytes_transferred: request.bytes_transferred,
                         disk_peak_output_bytes: request.disk_peak_output_bytes,
+                        disk_peak_growth_bytes: request.disk_peak_growth_bytes,
                         disk_observation: request.disk_observation,
                         timing: request.timing,
                         cancellation: None,
@@ -6419,6 +6457,7 @@ mod tests {
         let release = |owner: &str| ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             local_wrapper_id: Some(owner.into()),
             worker_id: WorkerId::new("large"),
@@ -6531,6 +6570,7 @@ mod tests {
         ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             local_wrapper_id: Some("rchw-disk-owner".into()),
             worker_id: WorkerId::new("disk-worker"),
@@ -7053,6 +7093,114 @@ mod tests {
         ] {
             assert!(parse_request(line).is_err(), "accepted {line}");
         }
+    }
+
+    #[tokio::test]
+    async fn failed_disk_growth_api_preserves_owner_and_attributed_cold_bounds() {
+        let _guard = test_guard!();
+        let directory = tempfile::tempdir().unwrap().keep();
+        let history_path = directory.join("history.jsonl");
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("growth-worker", 8)).await;
+        set_test_build_disk(&pool, "growth-worker", 200.0).await;
+        let mut ctx = make_test_context(pool);
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::new(100).with_persistence(history_path.clone()),
+        );
+        let gib = rch_common::BuildDiskBudget::GIB;
+        let ApiRequest::SelectWorker { request, .. } = parse_request(
+            "GET /select-worker?project=failed-growth&command=cargo%20test%20-p%20core&cores=1&worker=growth-worker&runtime=none",
+        ).unwrap() else {
+            panic!("expected selection");
+        };
+        let selected = handle_select_worker_with_wrapper(
+            &ctx,
+            request.clone(),
+            false,
+            None,
+            Some("growth-owner".into()),
+        )
+        .await
+        .unwrap();
+        let build_id = selected.build_id.unwrap();
+        let budget = selected.worker.unwrap().disk_budget.unwrap();
+        assert_eq!(budget.max_growth_bytes, 30 * gib);
+        let line = format!(
+            "POST /release-worker?worker=growth-worker&build_id={build_id}&local_wrapper_id=growth-owner&exit_code=137&worker_fault=1&disk_peak_output_bytes={}&disk_peak_growth_bytes={}",
+            82 * gib,
+            2 * gib,
+        );
+        let ApiRequest::ReleaseWorker(receipt) = parse_request(&line).unwrap() else {
+            panic!("expected failed disk release");
+        };
+        for case in ["owner", "cold-bound", "successful"] {
+            let mut invalid = receipt.clone();
+            match case {
+                "owner" => invalid.local_wrapper_id = Some("different-owner".into()),
+                // The wire ceiling allows doubled warm accounting, but this
+                // exact admitted operation had no warm pool condition.
+                "cold-bound" => invalid.disk_peak_growth_bytes = Some(83 * gib),
+                _ => invalid.exit_code = Some(0),
+            }
+            assert!(
+                handle_release_worker(&ctx, *invalid).await.is_err(),
+                "{case}"
+            );
+            assert!(ctx.history.active_build(build_id).is_some(), "{case}");
+            assert_eq!(ctx.history.reserved_disk_headroom_gib("growth-worker"), 30);
+            assert_eq!(
+                ctx.history
+                    .learned_footprint_gib("failed-growth", "cargo test -p core"),
+                None,
+                "{case}: rejected evidence must not teach a footprint"
+            );
+        }
+        handle_release_worker(&ctx, *receipt.clone()).await.unwrap();
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("growth-worker"), 0);
+        // A repeated terminal request cannot revise its original measurement.
+        let mut repeated = *receipt;
+        repeated.disk_peak_growth_bytes = Some(80 * gib);
+        handle_release_worker(&ctx, repeated).await.unwrap();
+        replace_test_history(
+            &mut ctx,
+            BuildHistory::load_from_file(&history_path, 100).unwrap(),
+        );
+        assert_eq!(
+            ctx.history
+                .learned_footprint_gib("failed-growth", "cargo test -p core"),
+            Some(24.0),
+            "partial allocation preserves the cold prior without charging the retained pool"
+        );
+        assert_eq!(
+            ctx.history
+                .learned_footprint_gib("failed-growth", "cargo test -p cli"),
+            Some(24.0),
+            "the family lower bound cannot replace its cold minimum with 2 GiB"
+        );
+        set_test_build_disk(&ctx.pool, "growth-worker", 50.0).await;
+        let preview = handle_select_worker_dry_run(&ctx, &request).await;
+        let repeated = preview
+            .worker
+            .expect("the same command must not relearn the retained pool as its own allocation");
+        let repeated_budget = repeated.disk_budget.unwrap();
+        assert_eq!(repeated_budget.max_growth_bytes, 30 * gib);
+        assert_eq!(repeated_budget.min_free_bytes, 10 * gib);
+        assert!(repeated_budget.warm_policy.is_none());
+        let mut sibling = request.clone();
+        sibling.command = Some("cargo test -p cli".into());
+        let preview = handle_select_worker_dry_run(&ctx, &sibling).await;
+        let next = preview.worker.expect("the sibling fits its cold allowance");
+        assert_eq!(next.disk_budget.unwrap().max_growth_bytes, 30 * gib);
+        set_test_build_disk(&ctx.pool, "growth-worker", 39.0).await;
+        assert!(
+            handle_select_worker_dry_run(&ctx, &request)
+                .await
+                .worker
+                .is_none(),
+            "failed growth cannot bypass the cold allowance and protected free-space floor"
+        );
+        assert!(ctx.history.active_builds().is_empty());
     }
 
     #[tokio::test]
@@ -9639,6 +9787,7 @@ mod tests {
                 worker_source_topology_mismatch: None,
                 local_wrapper_id: Some("rchw-daemon-correlation".to_string()),
                 disk_peak_output_bytes: None,
+                disk_peak_growth_bytes: None,
                 disk_observation: None,
                 worker_id: WorkerId::new("worker1"),
                 slots: 2,
@@ -11738,6 +11887,74 @@ mod tests {
     }
 
     #[test]
+    fn failed_disk_growth_requires_one_bounded_failed_execution_measurement() {
+        let valid = "POST /release-worker?worker=hz3&build_id=42&exit_code=137&worker_fault=1&disk_peak_output_bytes=100";
+        for growth in [0, 2, 100, 200] {
+            let ApiRequest::ReleaseWorker(request) =
+                parse_request(&format!("{valid}&disk_peak_growth_bytes={growth}")).unwrap()
+            else {
+                panic!("expected failed disk release");
+            };
+            assert_eq!(request.disk_peak_output_bytes, Some(100));
+            assert_eq!(request.disk_peak_growth_bytes, Some(growth));
+            assert!(request.disk_observation.is_none());
+        }
+        for growth in [
+            "-1",
+            "NaN",
+            "201",
+            "18446744073709551616",
+            "9223372036854775808",
+            "1&disk_peak_growth_bytes=2",
+        ] {
+            assert!(
+                parse_request(&format!("{valid}&disk_peak_growth_bytes={growth}")).is_err(),
+                "accepted {growth}"
+            );
+        }
+        for (from, to) in [
+            ("&build_id=42", ""),
+            ("&build_id=42", "&build_id=0"),
+            ("&exit_code=137", ""),
+            ("&exit_code=137", "&exit_code=0"),
+            ("&exit_code=137", "&exit_code=101"),
+            ("&exit_code=137", "&exit_code=130"),
+            ("&worker_fault=1", ""),
+            ("&worker_fault=1", "&worker_fault=0"),
+            ("&disk_peak_output_bytes=100", ""),
+            (
+                "&disk_peak_output_bytes=100",
+                "&disk_peak_output_bytes=9223372036854775808",
+            ),
+        ] {
+            let invalid = format!("{}&disk_peak_growth_bytes=2", valid.replace(from, to));
+            assert!(parse_request(&invalid).is_err(), "accepted {invalid}");
+        }
+        let retained = rch_common::BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: 98,
+        };
+        let observation = rch_common::BuildDiskObservation {
+            version: rch_common::BuildDiskObservation::VERSION,
+            baseline_output_bytes: 98,
+            peak_added_output_bytes: 2,
+            peak_free_drop_bytes: 2,
+            baseline_pool: retained,
+            final_pool: retained,
+        };
+        assert!(observation.valid_for_peak(100));
+        let observation = urlencoding_encode(&serde_json::to_string(&observation).unwrap());
+        assert!(
+            parse_request(&format!(
+                "{valid}&disk_peak_growth_bytes=2&disk_observation={observation}"
+            ))
+            .is_err(),
+            "failed growth cannot impersonate a complete retained-pool observation"
+        );
+    }
+
+    #[test]
     fn disk_peak_requires_an_explicit_unambiguous_terminal_status() {
         for status in ["", "&exit_code=bad", "&exit_code=1&exit_code=0"] {
             assert!(
@@ -13572,6 +13789,7 @@ mod tests {
         ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             local_wrapper_id: Some("disk-owner".into()),
             worker_id: WorkerId::new("worker1"),
@@ -13634,6 +13852,7 @@ mod tests {
                         exit_code: 101,
                         duration_ms: Some(50),
                         disk_peak_output_bytes: None,
+                        disk_peak_growth_bytes: None,
                         disk_observation: None,
                         bytes_transferred: None,
                         timing: None,
@@ -13868,6 +14087,7 @@ mod tests {
                                 exit_code: 101,
                                 duration_ms: None,
                                 disk_peak_output_bytes: None,
+                                disk_peak_growth_bytes: None,
                                 disk_observation: None,
                                 bytes_transferred: None,
                                 timing: None,
@@ -13976,6 +14196,7 @@ mod tests {
             slots: 4,
             build_id: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             exit_code: None,
             duration_ms: None,
@@ -14082,6 +14303,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: None,
+                        disk_peak_growth_bytes: None,
                         disk_observation: None,
                         timing: None,
                         cancellation: None,
@@ -14131,6 +14353,7 @@ mod tests {
             slots: 4,
             build_id: Some(build_id),
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             exit_code: Some(0),
             duration_ms: None,
@@ -14211,6 +14434,7 @@ mod tests {
             build_id: Some(build_id),
             exit_code: Some(0),
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
@@ -14345,6 +14569,7 @@ mod tests {
                 local_wrapper_id: None,
                 worker_id: original.id.clone(),
                 disk_peak_output_bytes: None,
+                disk_peak_growth_bytes: None,
                 disk_observation: None,
                 slots: 999,
                 build_id: Some(build_id),
@@ -14415,6 +14640,7 @@ mod tests {
             worker_id: WorkerId::new("worker1"),
             slots: 0,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             build_id: Some(build_id),
             exit_code: Some(0),
@@ -14456,6 +14682,7 @@ mod tests {
         let release = || ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
@@ -14509,6 +14736,7 @@ mod tests {
                         worker_source_topology_mismatch: None,
                         local_wrapper_id: None,
                         disk_peak_output_bytes: None,
+                        disk_peak_growth_bytes: None,
                         disk_observation: None,
                         worker_id: WorkerId::new("worker1"),
                         slots: 4,
@@ -14554,6 +14782,7 @@ mod tests {
                 worker_id: WorkerId::new("worker1"),
                 slots: 4,
                 disk_peak_output_bytes: None,
+                disk_peak_growth_bytes: None,
                 disk_observation: None,
                 build_id: Some(build_id),
                 exit_code: Some(1),
@@ -14603,6 +14832,7 @@ mod tests {
         let release = |build_id| ReleaseRequest {
             worker_source_topology_mismatch: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             local_wrapper_id: None,
             worker_id: WorkerId::new("worker1"),
@@ -14728,6 +14958,7 @@ mod tests {
             build_id: Some(build_id),
             exit_code: Some(101),
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             duration_ms: Some(5000),
             bytes_transferred: Some(1024 * 1024),
@@ -15277,6 +15508,7 @@ mod tests {
                 local_wrapper_id: None,
                 worker_id: WorkerId::new("disk-worker"),
                 disk_peak_output_bytes: None,
+                disk_peak_growth_bytes: None,
                 disk_observation: None,
                 slots: 4,
                 build_id: Some(build_id),

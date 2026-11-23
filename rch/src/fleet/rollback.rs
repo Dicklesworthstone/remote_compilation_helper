@@ -1823,10 +1823,8 @@ mod tests {
 
         let worker = mock_worker("worker1");
         let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "unknown");
-        let transport = MockSshExecutor::new().with_command(
-            "set -efu",
-            MockCommandResult::ok("RCH_ROLLBACK_OK 0.9.0\n"),
-        );
+        let transport = MockSshExecutor::new()
+            .with_command("set -efu", MockCommandResult::ok("RCH_ROLLBACK_OK 0.9.0\n"));
         let result =
             execute_rollback_with_runner(&worker, &backup, "0.9.0", false, &transport).await;
         assert!(result.success, "{result:?}");
@@ -1840,7 +1838,9 @@ mod tests {
         let other_worker = mock_backup_with_hash("worker2", "2.0.0", 4, "other");
         let registry = [older, newer, latest, other_worker];
         assert_eq!(
-            select_backup(&registry, "worker1", None).unwrap().binary_hash,
+            select_backup(&registry, "worker1", None)
+                .unwrap()
+                .binary_hash,
             "latest"
         );
         assert_eq!(
@@ -1896,12 +1896,9 @@ mod tests {
             }
 
             fn run(&self, verify: bool, tools: Option<&Path>) -> Output {
-                let script = rollback_command(
-                    &self.backup,
-                    self.destination.to_str().unwrap(),
-                    verify,
-                )
-                .unwrap();
+                let script =
+                    rollback_command(&self.backup, self.destination.to_str().unwrap(), verify)
+                        .unwrap();
                 let mut command = Command::new("/bin/sh");
                 command.args(["-c", &script]);
                 if let Some(tools) = tools {
@@ -1954,7 +1951,10 @@ mod tests {
                 std::fs::read(&fixture.destination).unwrap(),
                 fixture.source_bytes
             );
-            assert_eq!(std::fs::read(&fixture.source).unwrap(), fixture.source_bytes);
+            assert_eq!(
+                std::fs::read(&fixture.source).unwrap(),
+                fixture.source_bytes
+            );
             assert_eq!(
                 std::fs::metadata(&fixture.destination)
                     .unwrap()
@@ -1973,9 +1973,8 @@ mod tests {
 
         #[test]
         fn rollback_rejects_hash_mismatch_before_executing_backup() {
-            let mut fixture = Fixture::new(
-                "#!/bin/sh\n: > \"${0%/*}/executed\"\nprintf 'rch-wkr 0.9.0\\n'\n",
-            );
+            let mut fixture =
+                Fixture::new("#!/bin/sh\n: > \"${0%/*}/executed\"\nprintf 'rch-wkr 0.9.0\\n'\n");
             fixture.backup.binary_hash = "0".repeat(64);
             let output = fixture.run(true, None);
             fixture.assert_preserved(&output);
@@ -2023,9 +2022,7 @@ mod tests {
                 let tools = fixture.tools(Some(broken));
                 let output = fixture.run(false, Some(&tools));
                 fixture.assert_preserved(&output);
-                assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("Staged backup retained")
-                );
+                assert!(String::from_utf8_lossy(&output.stderr).contains("Staged backup retained"));
             }
         }
 
@@ -2078,7 +2075,10 @@ mod tests {
             assert!(!output.status.success(), "{output:?}");
             assert_eq!(std::fs::read(&saved).unwrap(), OLD_BINARY);
             assert_eq!(std::fs::read_dir(&fixture.destination).unwrap().count(), 0);
-            assert_eq!(std::fs::read(&fixture.source).unwrap(), fixture.source_bytes);
+            assert_eq!(
+                std::fs::read(&fixture.source).unwrap(),
+                fixture.source_bytes
+            );
         }
 
         #[test]
@@ -2119,7 +2119,10 @@ mod tests {
             assert!(!String::from_utf8_lossy(&output.stdout).contains("RCH_ROLLBACK_OK"));
             assert!(String::from_utf8_lossy(&output.stderr).contains("unconfirmed"));
             assert_eq!(std::fs::read(saved).unwrap(), OLD_BINARY);
-            assert_eq!(std::fs::read(&fixture.source).unwrap(), fixture.source_bytes);
+            assert_eq!(
+                std::fs::read(&fixture.source).unwrap(),
+                fixture.source_bytes
+            );
             let entries: Vec<_> = std::fs::read_dir(&fixture.destination)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())

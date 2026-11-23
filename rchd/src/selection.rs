@@ -8458,6 +8458,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: Some(64 * rch_common::BuildDiskBudget::GIB),
+                    disk_peak_growth_bytes: None,
                     disk_observation: Some(crate::headroom::cold_footprint_observation(64)),
                     timing: None,
                     cancellation: None,
@@ -8467,6 +8468,11 @@ mod tests {
         assert_eq!(
             history.learned_footprint_gib(&request.project, "cargo build --workspace"),
             Some(64.0)
+        );
+        assert_eq!(
+            history.learned_footprint_gib(&request.project, "cargo build"),
+            None,
+            "wide build evidence must not be attributed to a new narrow command"
         );
 
         let set_free = |id: &'static str, free: f64| {
@@ -8562,6 +8568,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        disk_peak_growth_bytes: None,
                         disk_observation: Some(crate::headroom::cold_footprint_observation(gib)),
                         timing: None,
                         cancellation: None,
@@ -8767,6 +8774,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: None,

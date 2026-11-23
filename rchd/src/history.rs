@@ -222,6 +222,9 @@ pub struct BuildCompletion {
     pub bytes_transferred: Option<u64>,
     /// Attributed peak allocated output, including the starting artifact pool.
     pub disk_peak_output_bytes: Option<u64>,
+    /// Per-job growth from a settled worker-supervisor failure. This is only a
+    /// lower bound and never establishes a successful cold or warm footprint.
+    pub disk_peak_growth_bytes: Option<u64>,
     /// Complete, versioned allocation and retained-pool observations. These
     /// never replace cold evidence without a worker-validated pool condition.
     pub disk_observation: Option<rch_common::BuildDiskObservation>,
@@ -1149,14 +1152,15 @@ impl BuildHistory {
     /// entire history. Only a successful observation with an empty baseline
     /// establishes complete cold evidence; warmed runs retain the cold prior
     /// unless a separate, exact retained-pool proof qualifies a warm allowance.
-    /// Total-only receipts cannot establish either kind of evidence. Unshared
-    /// filesystem deltas remain incomplete lower bounds because concurrent
-    /// cleanup can hide growth even when this daemon owns the worker's only job.
+    /// Total-only receipts cannot establish either kind of evidence. Settled
+    /// supervisor failures and eligible unshared filesystem deltas remain
+    /// incomplete lower bounds; neither can prove a successful cold footprint.
     fn learn_footprint(
         &self,
         state: &ActiveBuildState,
         exit_code: i32,
         disk_peak_output_bytes: Option<u64>,
+        disk_peak_growth_bytes: Option<u64>,
         disk_observation: Option<rch_common::BuildDiskObservation>,
         cancelled: bool,
     ) {
@@ -1197,18 +1201,32 @@ impl BuildHistory {
             }
             return;
         }
-        let measured_growth = observation.map(|observation| {
-            (observation.additional_bytes() as f64 / rch_common::BuildDiskBudget::GIB as f64)
-                .max(1.0)
-        });
-        let growth = match measured_growth {
-            Some(growth) => Some(growth),
-            None if !state.disk_shared => state
+        let unshared_df = if !state.disk_shared
+            && state
+                .worker_endpoint
+                .as_ref()
+                .is_none_or(|endpoint| !endpoint.source_was_retargeted())
+        {
+            state
                 .disk_free_start_gib
                 .zip(state.disk_free_min_gib)
-                .map(|(start, min)| start.saturating_sub(min) as f64),
-            None => None,
+                .map(|(start, min)| start.saturating_sub(min) as f64)
+        } else {
+            None
         };
+        let attributed_growth = observation
+            .map(|observation| observation.additional_bytes())
+            .or_else(|| {
+                disk_peak_growth_bytes.filter(|_| {
+                    state
+                        .worker_endpoint
+                        .as_ref()
+                        .is_some_and(|endpoint| !endpoint.source_was_retargeted())
+                })
+            });
+        let growth = attributed_growth
+            .map(|bytes| (bytes as f64 / rch_common::BuildDiskBudget::GIB as f64).max(1.0))
+            .or(unshared_df);
         let complete = exit_code == 0
             && observation.is_some_and(|observation| observation.baseline_output_bytes == 0);
         if let Some(growth) = growth {
@@ -1494,6 +1512,7 @@ impl BuildHistory {
                 duration_ms,
                 bytes_transferred,
                 disk_peak_output_bytes: None,
+                disk_peak_growth_bytes: None,
                 disk_observation: None,
                 timing,
                 cancellation: None,
@@ -1520,6 +1539,7 @@ impl BuildHistory {
                 duration_ms: None,
                 bytes_transferred,
                 disk_peak_output_bytes: None,
+                disk_peak_growth_bytes: None,
                 disk_observation: None,
                 timing: None,
                 cancellation,
@@ -3154,6 +3174,7 @@ impl BuildHistory {
             duration_ms,
             bytes_transferred,
             disk_peak_output_bytes,
+            disk_peak_growth_bytes,
             disk_observation,
             timing,
             cancellation,
@@ -3177,6 +3198,28 @@ impl BuildHistory {
                 std::io::ErrorKind::PermissionDenied,
                 "build ownership mismatch",
             ));
+        }
+        if let Some(growth) = disk_peak_growth_bytes {
+            let valid = state.location == BuildLocation::Remote
+                && exit_code == 137
+                && cancellation.is_none()
+                && disk_observation.is_none()
+                && growth <= i64::MAX as u64
+                && disk_peak_output_bytes.is_some_and(|peak| {
+                    let warm = state.disk_warm_policy.is_some_and(|policy| {
+                        policy.valid_for_budget(
+                            u64::from(state.disk_headroom_gib) * rch_common::BuildDiskBudget::GIB,
+                        )
+                    });
+                    peak <= i64::MAX as u64
+                        && growth <= if warm { peak.saturating_mul(2) } else { peak }
+                });
+            if !valid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid worker-supervisor growth observation",
+                ));
+            }
         }
         if state.source_topology_mismatch.is_some() && exit_code == 0 {
             return Err(std::io::Error::new(
@@ -3299,6 +3342,7 @@ impl BuildHistory {
             &state,
             exit_code,
             disk_peak_output_bytes.filter(|_| record.cancellation.is_none()),
+            disk_peak_growth_bytes,
             disk_observation,
             record.cancellation.is_some(),
         );
@@ -3930,6 +3974,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: None,
@@ -4004,6 +4049,7 @@ mod tests {
                         duration_ms: Some(1),
                         bytes_transferred: None,
                         disk_peak_output_bytes: None,
+                        disk_peak_growth_bytes: None,
                         disk_observation: None,
                         timing: None,
                         cancellation: None,
@@ -4036,6 +4082,7 @@ mod tests {
                     duration_ms: Some(1),
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: None,
@@ -4299,6 +4346,7 @@ mod tests {
             duration_ms: None,
             bytes_transferred: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             timing: None,
             cancellation: None,
@@ -4457,12 +4505,9 @@ mod tests {
             // The same exact command already has a misleading "complete"
             // pooled total, and the first scoped family format accepted these
             // totals too. Neither may block admission after a daemon restart.
-            let old_exact = serde_json::to_string(&(
-                2_u8,
-                project,
-                narrow.command.as_deref().unwrap(),
-            ))
-            .unwrap();
+            let old_exact =
+                serde_json::to_string(&(2_u8, project, narrow.command.as_deref().unwrap()))
+                    .unwrap();
             let old_scoped = r#"[3,"franken_engine-5d919732","family","CargoTest",false]"#;
             book.record(&old_exact, 81.0, now - 3600, true);
             book.record(old_scoped, 82.0, now - 3600, false);
@@ -4565,7 +4610,11 @@ mod tests {
         let now = Utc::now().timestamp();
         let family = family_footprint_key("pooled", request.command.as_deref().unwrap());
         assert_eq!(
-            history.footprints.lock().unwrap().estimate_gib(&family, now),
+            history
+                .footprints
+                .lock()
+                .unwrap()
+                .estimate_gib(&family, now),
             Some(2.0)
         );
         assert_eq!(
@@ -4668,6 +4717,346 @@ mod tests {
             .unwrap();
         assert_eq!(empty_budget.max_growth_bytes, 53 * GIB);
         assert!(empty_budget.warm_policy.is_none());
+    }
+
+    #[test]
+    fn total_output_without_growth_never_establishes_a_family_footprint() {
+        for exit_code in [0, 101] {
+            let history = BuildHistory::new(10);
+            let active = disk_budget_admit(&history, "total-only", "worker", 0, 220.0).unwrap();
+            warm_test_complete(&history, &active, 80, None, exit_code);
+            assert_eq!(
+                history.learned_footprint_gib("total-only", "cargo test"),
+                None,
+                "a total-only receipt cannot establish attributed exact evidence"
+            );
+            assert_eq!(
+                history.learned_footprint_gib("total-only", "cargo test --test unseen"),
+                None,
+                "a retained pool's total does not describe another command"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn family_df_fallback_is_independent_of_retained_output_totals() {
+        const GIB: u64 = rch_common::BuildDiskBudget::GIB;
+        let history = Arc::new(BuildHistory::new(20));
+        let endpoint = warm_test_endpoint().await;
+        let selector = crate::daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            Arc::clone(&history),
+            None,
+        );
+        let first = warm_test_request("df-family", "cargo test --test first");
+        let budget = selector
+            .build_disk_budget_for_endpoint(&first, &endpoint)
+            .unwrap();
+        let active =
+            warm_test_admit(&history, &endpoint, &first, budget, "df-first", 220.0).unwrap();
+        history.observe_build_disk(&active.worker_id, 218, Instant::now());
+        warm_test_complete(&history, &active, 80, None, 0);
+        let family = family_footprint_key("df-family", "cargo test");
+        assert_eq!(
+            history
+                .footprints
+                .lock()
+                .unwrap()
+                .estimate_gib(&family, Utc::now().timestamp()),
+            Some(2.0),
+            "the two-GiB unshared decline remains distinct from the 80-GiB pool"
+        );
+        assert_eq!(
+            history.learned_footprint_gib("df-family", "cargo test --test first"),
+            Some(24.0),
+            "a filesystem decline cannot prove a complete cold footprint"
+        );
+
+        for exit_code in [0, 101] {
+            let request = warm_test_request(
+                "df-family",
+                &format!("cargo test --test no-probe-{exit_code}"),
+            );
+            let budget = selector
+                .build_disk_budget_for_endpoint(&request, &endpoint)
+                .unwrap();
+            let active = warm_test_admit(
+                &history,
+                &endpoint,
+                &request,
+                budget,
+                &format!("df-no-probe-{exit_code}"),
+                220.0,
+            )
+            .unwrap();
+            warm_test_complete(&history, &active, 120, None, exit_code);
+            assert_eq!(
+                history
+                    .footprints
+                    .lock()
+                    .unwrap()
+                    .estimate_gib(&family, Utc::now().timestamp()),
+                Some(2.0),
+                "later total-only receipts cannot reinflate the scoped family"
+            );
+        }
+        let mut request = warm_test_request("df-family", "cargo test --test growing");
+        request.disk_headroom_gib = 128;
+        let budget = selector
+            .build_disk_budget_for_endpoint(&request, &endpoint)
+            .unwrap();
+        let active =
+            warm_test_admit(&history, &endpoint, &request, budget, "df-growth", 220.0).unwrap();
+        history.observe_build_disk(&active.worker_id, 178, Instant::now());
+        warm_test_complete(&history, &active, 80, None, 101);
+        let next = warm_test_request("df-family", "cargo test --test unseen");
+        assert_eq!(
+            selector
+                .build_disk_budget_for_endpoint(&next, &endpoint)
+                .unwrap()
+                .max_growth_bytes,
+            53 * GIB,
+            "an eligible 42-GiB decline still raises the next reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_or_retargeted_df_cannot_turn_pool_totals_into_family_evidence() {
+        for shared in [true, false] {
+            let history = BuildHistory::new(20);
+            let original = warm_test_endpoint().await.config;
+            let pool = crate::workers::WorkerPool::new();
+            pool.add_worker(original.clone()).await;
+            let endpoint = pool
+                .get(&original.id)
+                .await
+                .unwrap()
+                .endpoint_snapshot()
+                .await;
+            let request = warm_test_request("unqualified-family", "cargo test --test first");
+            let budget = rch_common::BuildDiskBudget::cold_for_command("cargo test").unwrap();
+            let active = warm_test_admit(
+                &history,
+                &endpoint,
+                &request,
+                budget,
+                "unqualified-owner",
+                220.0,
+            )
+            .unwrap();
+            let neighbour = if shared {
+                let other = warm_test_request("other-project", "cargo test");
+                let neighbour =
+                    warm_test_admit(&history, &endpoint, &other, budget, "neighbour", 220.0)
+                        .unwrap();
+                assert!(history.active_build(active.id).unwrap().disk_shared);
+                Some(neighbour)
+            } else {
+                pool.add_worker(rch_common::WorkerConfig {
+                    host: "replacement-host".into(),
+                    ..original
+                })
+                .await;
+                assert!(endpoint.source_was_retargeted());
+                None
+            };
+            history.observe_build_disk(&active.worker_id, 100, Instant::now());
+            warm_test_complete(&history, &active, 80, None, 0);
+            assert_eq!(
+                history.learned_footprint_gib("unqualified-family", "cargo test --test unseen"),
+                None
+            );
+            assert_eq!(
+                history.learned_footprint_gib("unqualified-family", "cargo test --test first"),
+                None,
+                "unqualified deltas and pool totals cannot establish exact attribution"
+            );
+            if let Some(neighbour) = neighbour {
+                finish_owned(&history, &neighbour, 130);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_growth_failure_preserves_ownership_and_teaches_only_actual_growth() {
+        const GIB: u64 = rch_common::BuildDiskBudget::GIB;
+        let history = Arc::new(BuildHistory::new(20));
+        let endpoint = warm_test_endpoint().await;
+        let request = warm_test_request("failed-growth", "cargo test -p core --test first");
+        let selector = crate::daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            Arc::clone(&history),
+            None,
+        );
+        let budget = selector
+            .build_disk_budget_for_endpoint(&request, &endpoint)
+            .unwrap();
+        let active = warm_test_admit(
+            &history,
+            &endpoint,
+            &request,
+            budget,
+            "supervised-growth",
+            220.0,
+        )
+        .unwrap();
+        assert_eq!(budget.max_growth_bytes, 30 * GIB);
+        let completion = |peak, growth, exit_code| BuildCompletion {
+            disk_peak_output_bytes: peak,
+            disk_peak_growth_bytes: Some(growth),
+            ..disk_budget_completion(exit_code)
+        };
+        let mut contradictory = completion(Some(80 * GIB), 2 * GIB, 137);
+        contradictory.disk_observation = Some(warm_test_observation(1, 80));
+        for invalid in [
+            completion(None, 2 * GIB, 137),
+            completion(Some(80 * GIB), 81 * GIB, 137),
+            completion(Some(i64::MAX as u64 + 1), 2 * GIB, 137),
+            completion(Some(80 * GIB), i64::MAX as u64 + 1, 137),
+            completion(Some(80 * GIB), 2 * GIB, 0),
+            completion(Some(80 * GIB), 2 * GIB, 101),
+            contradictory,
+        ] {
+            let error = history
+                .complete_durable(
+                    active.id,
+                    &active.worker_id,
+                    active.local_wrapper_id.as_deref(),
+                    invalid,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(history.active_build(active.id).is_some());
+            assert_eq!(history.reserved_disk_headroom_gib(&active.worker_id), 30);
+            assert_eq!(
+                history.learned_footprint_gib("failed-growth", request.command.as_deref().unwrap()),
+                None
+            );
+        }
+        history
+            .complete_durable(
+                active.id,
+                &active.worker_id,
+                active.local_wrapper_id.as_deref(),
+                completion(Some(80 * GIB), 31 * GIB, 137),
+            )
+            .unwrap()
+            .unwrap();
+        let next = warm_test_request("failed-growth", "cargo test -p core --test second");
+        let next_budget = selector
+            .build_disk_budget_for_endpoint(&next, &endpoint)
+            .unwrap();
+        assert_eq!(next_budget.max_growth_bytes, 39 * GIB);
+        assert!(next_budget.warm_policy.is_none());
+        assert_eq!(
+            history.learned_footprint_gib("failed-growth", request.command.as_deref().unwrap()),
+            Some(31.0),
+            "a failed invocation teaches its observed allocation, not retained pool totals"
+        );
+        assert!(
+            !history.footprints.lock().unwrap().has_complete_observation(
+                &footprint_key("failed-growth", request.command.as_deref().unwrap()),
+                Utc::now().timestamp(),
+            ),
+            "a failed supervisor receipt is only an incomplete lower bound"
+        );
+        assert!(
+            history
+                .complete_durable(
+                    active.id,
+                    &active.worker_id,
+                    active.local_wrapper_id.as_deref(),
+                    completion(Some(100 * GIB), 50 * GIB, 137),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            selector
+                .build_disk_budget_for_endpoint(&next, &endpoint)
+                .unwrap()
+                .max_growth_bytes,
+            39 * GIB,
+            "a duplicate terminal report cannot rewrite learned growth"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_growth_above_total_output_requires_owned_warm_accounting() {
+        const GIB: u64 = rch_common::BuildDiskBudget::GIB;
+        let history = BuildHistory::new(20);
+        let endpoint = warm_test_endpoint().await;
+        let request = warm_test_request("warm-failure", "cargo check -p first");
+        let mut pools = [None; 8];
+        pools[0] = Some(rch_common::BuildDiskPool {
+            identity: [1; 32],
+            state: [2; 32],
+            retained_bytes: GIB,
+        });
+        let budget = rch_common::BuildDiskBudget {
+            max_growth_bytes: 4 * GIB,
+            min_free_bytes: 10 * GIB,
+            warm_policy: Some(rch_common::BuildDiskWarmPolicy {
+                cold_growth_bytes: 20 * GIB,
+                pools,
+            }),
+        };
+        let active = warm_test_admit(
+            &history,
+            &endpoint,
+            &request,
+            budget,
+            "supervised-warm-growth",
+            220.0,
+        )
+        .unwrap();
+        let completion = |growth| BuildCompletion {
+            disk_peak_output_bytes: Some(3 * GIB),
+            disk_peak_growth_bytes: Some(growth),
+            ..disk_budget_completion(137)
+        };
+        assert_eq!(
+            history
+                .complete_durable(
+                    active.id,
+                    &active.worker_id,
+                    active.local_wrapper_id.as_deref(),
+                    completion(7 * GIB),
+                )
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(history.active_build(active.id).is_some());
+        // Warm accounting can charge an unproven baseline plus its rewrite,
+        // but neither component may exceed the observed total-output peak.
+        history
+            .complete_durable(
+                active.id,
+                &active.worker_id,
+                active.local_wrapper_id.as_deref(),
+                completion(5 * GIB),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            history.learned_footprint_gib("warm-failure", "cargo check -p second"),
+            Some(5.0)
+        );
+        assert_eq!(
+            history.learned_footprint_gib("warm-failure", request.command.as_deref().unwrap()),
+            Some(5.0),
+            "the exact estimate includes the supervisor's owned warm accounting charge"
+        );
+        assert_eq!(
+            history.learned_warm_footprint(
+                "warm-failure",
+                request.command.as_deref().unwrap(),
+                &WorkerEndpointIdentity::from_config(&endpoint.config),
+            ),
+            None,
+            "a failed supervisor receipt grants no warm qualification"
+        );
     }
 
     #[tokio::test]
@@ -6069,6 +6458,7 @@ mod tests {
             duration_ms: None,
             bytes_transferred: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             timing: None,
             cancellation: None,
@@ -7650,6 +8040,7 @@ mod tests {
             duration_ms: Some(10),
             bytes_transferred: None,
             disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
             disk_observation: None,
             timing: None,
             cancellation: None,
@@ -7741,6 +8132,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: None,
@@ -7810,6 +8202,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: None,
@@ -8362,6 +8755,7 @@ mod tests {
                     duration_ms: Some(17),
                     bytes_transferred: Some(23),
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: None,
@@ -8631,6 +9025,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: None,
+                        disk_peak_growth_bytes: None,
                         disk_observation: None,
                         timing: None,
                         cancellation: None,
@@ -9549,6 +9944,7 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: None,

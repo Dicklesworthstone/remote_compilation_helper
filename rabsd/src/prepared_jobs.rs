@@ -691,12 +691,8 @@ mod tests {
                 } else {
                     (&ordinary, &pipe)
                 };
-                let error = client_console_to(
-                    stdout,
-                    stderr,
-                    &deadline,
-                    &stopped,
-                    |stdout, stderr| {
+                let error =
+                    client_console_to(stdout, stderr, &deadline, &stopped, |stdout, stderr| {
                         // The console already owns both descriptors when the
                         // direct client's signal bridge revokes its writes.
                         stopped.store(true, Ordering::Release);
@@ -705,9 +701,8 @@ mod tests {
                         } else {
                             stderr.write_all(b"live stderr")
                         }
-                    },
-                )
-                .unwrap_err();
+                    })
+                    .unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::Interrupted);
                 assert_eq!(ordinary.metadata().unwrap().len(), 0);
             });

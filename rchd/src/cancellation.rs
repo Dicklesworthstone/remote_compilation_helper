@@ -1308,6 +1308,7 @@ impl CancellationOrchestrator {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                     timing: None,
                     cancellation: Some(cancellation),
@@ -4107,7 +4108,10 @@ wait
                 .cloned()
                 .unwrap();
             if matches!(attempt, 0 | 2) {
-                assert_eq!(current.consecutive_failures, if attempt == 0 { 1 } else { 2 });
+                assert_eq!(
+                    current.consecutive_failures,
+                    if attempt == 0 { 1 } else { 2 }
+                );
                 expected = Some(current);
             } else {
                 assert_eq!(

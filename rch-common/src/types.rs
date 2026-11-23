@@ -1091,6 +1091,10 @@ pub struct ReleaseRequest {
     /// Only a confirmed worker receipt may supply this measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_peak_output_bytes: Option<u64>,
+    /// Additional allocation lower bound from a started disk-budget failure
+    /// after confirmed teardown. Never complete-build or retained-pool proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_peak_growth_bytes: Option<u64>,
     /// Qualified additional allocation evidence, never inferred from an old
     /// total-output or filesystem-delta sample.
     #[serde(default, skip_serializing_if = "Option::is_none")]

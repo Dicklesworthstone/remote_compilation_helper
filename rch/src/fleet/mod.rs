@@ -1377,7 +1377,10 @@ mod tests {
             ["one", "two"]
         );
         assert_eq!(rollback_targets(&workers, None).unwrap().len(), 2);
-        assert_eq!(rollback_targets(&workers, Some("one,one")).unwrap().len(), 1);
+        assert_eq!(
+            rollback_targets(&workers, Some("one,one")).unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

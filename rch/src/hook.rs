@@ -561,6 +561,7 @@ fn remote_release_faults<'a>(
             source_busy: false,
             source_topology_mismatch: None,
             disk_peak_output_bytes: result.disk_peak_output_bytes,
+            disk_peak_growth_bytes: None,
             disk_observation: result.disk_observation,
         },
         Err(error) if !requires_recovery_before_release(error) => {
@@ -581,7 +582,13 @@ fn remote_release_faults<'a>(
                     worker_fault: failure.reason != "cold_required",
                     worker_disk_full: failure.reason == "free_floor",
                     worker_disk_roots: &failure.roots,
-                    disk_peak_output_bytes: failure.peak_output_bytes,
+                    // A refusal before launch only inspected retained output;
+                    // it did not measure this command's allocation demand.
+                    disk_peak_output_bytes: failure.peak_output_bytes.filter(|_| failure.started),
+                    disk_peak_growth_bytes: failure
+                        .peak_output_bytes
+                        .filter(|_| failure.started)
+                        .map(|_| failure.growth_bytes),
                     ..Default::default()
                 };
             }
@@ -596,6 +603,7 @@ fn remote_release_faults<'a>(
                     source_busy,
                     source_topology_mismatch: None,
                     disk_peak_output_bytes: None,
+                    disk_peak_growth_bytes: None,
                     disk_observation: None,
                 },
                 None => daemon_ipc::ReleaseFaults {
