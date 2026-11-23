@@ -219,6 +219,8 @@ enum ApiRequest {
         reason: Option<String>,
         /// If true, drain existing jobs before fully disabling.
         drain_first: bool,
+        /// Explicit administrative duration, in positive whole seconds.
+        for_secs: Option<u64>,
     },
     /// Report loss of process observability without completing/releasing a job.
     WorkerProcessObservationFailure {
@@ -1335,9 +1337,11 @@ async fn handle_connection_with_metrics(
             worker_id,
             reason,
             drain_first,
+            for_secs,
         }) => {
             metrics::inc_requests("worker-disable");
-            let response = handle_worker_disable(&ctx, &worker_id, reason, drain_first).await;
+            let response =
+                handle_worker_disable(&ctx, &worker_id, reason, drain_first, for_secs).await;
             log_worker_admin_action("disable", &worker_id, &response.status, peer_pid).await;
             (serde_json::to_string(&response)?, "application/json")
         }
@@ -2059,6 +2063,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "disable" => {
                     let mut reason = None;
                     let mut drain_first = false;
+                    let mut for_secs = None;
 
                     for param in query.split('&') {
                         if param.is_empty() {
@@ -2073,6 +2078,13 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                             "drain" => {
                                 drain_first = value == "1" || value.eq_ignore_ascii_case("true")
                             }
+                            "for_secs" => {
+                                anyhow::ensure!(for_secs.is_none(), "duplicate disable duration");
+                                let seconds =
+                                    value.parse::<u64>().context("invalid disable duration")?;
+                                anyhow::ensure!(seconds > 0, "disable duration must be positive");
+                                for_secs = Some(seconds);
+                            }
                             _ => {}
                         }
                     }
@@ -2081,6 +2093,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                         worker_id: WorkerId::new(worker_id),
                         reason,
                         drain_first,
+                        for_secs,
                     });
                 }
                 "process-observation-failure" => {
@@ -11522,6 +11535,7 @@ mod tests {
             reason: None,
             message: Some("Worker draining started".to_string()),
             active_slots: Some(4),
+            expires_unix_ms: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"action\":\"drain\""));
@@ -12083,10 +12097,12 @@ mod tests {
                 worker_id,
                 reason,
                 drain_first,
+                for_secs,
             } => {
                 assert_eq!(worker_id.as_str(), "css");
                 assert!(reason.is_none());
                 assert!(!drain_first);
+                assert_eq!(for_secs, None);
             }
             _ => assert!(false, "expected worker disable request"),
         }
@@ -12097,12 +12113,42 @@ mod tests {
                 worker_id,
                 reason,
                 drain_first,
+                for_secs,
             } => {
                 assert_eq!(worker_id.as_str(), "css");
                 assert_eq!(reason, Some("maintenance".to_string()));
                 assert!(drain_first);
+                assert_eq!(for_secs, None);
             }
             _ => assert!(false, "expected worker disable request with options"),
+        }
+    }
+
+    #[test]
+    fn timed_worker_disable_request_requires_one_positive_integer_duration() {
+        let request =
+            parse_request("POST /workers/css/disable?reason=maintenance&drain=true&for_secs=3600")
+                .unwrap();
+        assert!(matches!(
+            request,
+            ApiRequest::WorkerDisable {
+                for_secs: Some(3600),
+                drain_first: true,
+                ..
+            }
+        ));
+        for query in [
+            "for_secs=0",
+            "for_secs=-1",
+            "for_secs=1.5",
+            "for_secs=",
+            "for_secs=1&for_secs=2",
+            "for_secs=18446744073709551616",
+        ] {
+            assert!(
+                parse_request(&format!("POST /workers/css/disable?{query}")).is_err(),
+                "{query}"
+            );
         }
     }
 
@@ -12535,7 +12581,7 @@ mod tests {
         let ctx = make_test_context(pool);
 
         let response =
-            handle_worker_disable(&ctx, &WorkerId::new("nonexistent"), None, false).await;
+            handle_worker_disable(&ctx, &WorkerId::new("nonexistent"), None, false, None).await;
         assert_eq!(response.status, "error");
         assert!(response.message.unwrap().contains("not found"));
     }
@@ -12551,6 +12597,7 @@ mod tests {
             &WorkerId::new("worker1"),
             Some("maintenance".to_string()),
             false,
+            None,
         )
         .await;
         assert_eq!(response.status, "ok");
@@ -12569,7 +12616,8 @@ mod tests {
         let worker = ctx.pool.get(&WorkerId::new("worker1")).await.unwrap();
         assert!(worker.reserve_slots(1).await);
 
-        let response = handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true).await;
+        let response =
+            handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true, None).await;
         assert_eq!(response.status, "ok");
         assert_eq!(response.action, "disable");
         // When drain_first is true, should set to draining first
@@ -12594,6 +12642,7 @@ mod tests {
             &WorkerId::new("worker1"),
             Some("cpu-capability-fault (SIGILL)".to_string()),
             false,
+            None,
         )
         .await;
         assert_eq!(response.status, "ok");
@@ -12633,7 +12682,8 @@ mod tests {
 
         let worker = ctx.pool.get(&WorkerId::new("worker1")).await.unwrap();
         assert!(worker.reserve_slots(1).await);
-        let response = handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true).await;
+        let response =
+            handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true, None).await;
         assert_eq!(response.new_status, Some("draining".to_string()));
 
         // The intent is durable even while the worker is still draining.

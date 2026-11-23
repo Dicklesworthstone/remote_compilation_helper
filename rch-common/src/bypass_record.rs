@@ -736,9 +736,9 @@ impl BypassRecordStore {
 /// (observed live 2026-08-09: ovh-b, quarantined for SIGILL-ing AVX2 build
 /// scripts, rejoined the pool after a `launchctl kickstart` and would have
 /// served one false build failure per restart). Unlike a [`BypassRecord`],
-/// an admin disable has NO recovery probing or auto-rejoin: hardware does not
-/// heal on restart, and an operator's explicit disable stands until an
-/// explicit enable removes the record.
+/// a permanent admin disable has no recovery probing or auto-rejoin. Only an
+/// explicit operator deadline permits the daemon to replace that disable with
+/// durable quarantine and fresh recovery probes; expiry is not health evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminDisableRecord {
     /// Worker id (the store's key).
@@ -748,6 +748,19 @@ pub struct AdminDisableRecord {
     pub reason: Option<String>,
     /// Unix epoch milliseconds when the disable was recorded.
     pub disabled_unix_ms: u64,
+    /// Explicit operator deadline. Older records and system fault disables are
+    /// permanent. Passing this deadline permits recovery, never direct rejoin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix_ms: Option<u64>,
+}
+
+impl AdminDisableRecord {
+    /// A malformed or backward deadline cannot authorize automatic recovery.
+    #[must_use]
+    pub fn expiry_due(&self, now_unix_ms: u64) -> bool {
+        self.expires_unix_ms
+            .is_some_and(|deadline| deadline > self.disabled_unix_ms && now_unix_ms >= deadline)
+    }
 }
 
 /// On-disk document for [`AdminDisableStore`].
@@ -958,12 +971,15 @@ impl AdminDisableStore {
         let mut records = BTreeMap::new();
         for record in file.records {
             if record.worker_id.trim().is_empty()
+                || record
+                    .expires_unix_ms
+                    .is_some_and(|deadline| deadline <= record.disabled_unix_ms)
                 || records.insert(record.worker_id.clone(), record).is_some()
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "empty or duplicate worker id in administrative disable state {}",
+                        "invalid deadline or empty/duplicate worker id in administrative disable state {}",
                         path.display()
                     ),
                 ));
@@ -1049,6 +1065,15 @@ impl AdminDisableStore {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "administrative disable worker id cannot be empty",
+            ));
+        }
+        if record
+            .expires_unix_ms
+            .is_some_and(|deadline| deadline <= record.disabled_unix_ms)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "administrative disable deadline must follow its creation time",
             ));
         }
         // Stop live recovery even if persistence fails. The API already keeps
@@ -1940,6 +1965,7 @@ mod tests {
                 worker_id: "ovh-b".to_string(),
                 reason: Some("cpu-capability-fault (SIGILL)".to_string()),
                 disabled_unix_ms: 1_700_000_000_000,
+                expires_unix_ms: None,
             })
             .unwrap();
 
@@ -1963,11 +1989,76 @@ mod tests {
                 worker_id: "w1".to_string(),
                 reason: None,
                 disabled_unix_ms: 1,
+                expires_unix_ms: None,
             })
             .unwrap();
         assert!(store.remove("w1").unwrap().is_some());
         assert!(store.remove("w1").unwrap().is_none());
         assert!(AdminDisableStore::load(&path).get("w1").is_none());
+    }
+
+    #[test]
+    fn timed_admin_disable_roundtrips_and_legacy_records_remain_permanent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"records":[{"worker_id":"legacy","reason":"operator","disabled_unix_ms":1000}]}"#,
+        )
+        .unwrap();
+        let mut store = AdminDisableStore::try_load(&path).unwrap();
+        assert_eq!(store.get("legacy").unwrap().expires_unix_ms, None);
+        assert!(!store.get("legacy").unwrap().expiry_due(u64::MAX));
+        let timed = AdminDisableRecord {
+            worker_id: "timed".into(),
+            reason: Some("maintenance".into()),
+            disabled_unix_ms: 1000,
+            expires_unix_ms: Some(2000),
+        };
+        store.upsert(timed.clone()).unwrap();
+        let mut reloaded = AdminDisableStore::try_load(&path).unwrap();
+        assert_eq!(reloaded.get("timed"), Some(&timed));
+        assert!(!timed.expiry_due(1999));
+        assert!(timed.expiry_due(2000));
+        assert!(reloaded.automatic_network_permit("timed").is_none());
+        // Time passing alone is not permission to contact the worker. The
+        // daemon must first establish its durable recovery quarantine.
+        assert!(reloaded.effective_disable("timed").is_some());
+        assert!(reloaded.automatic_network_permit("timed").is_none());
+    }
+
+    #[test]
+    fn timed_admin_disable_rejects_invalid_deadlines_without_changing_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let mut store = AdminDisableStore::with_path(&path);
+        let permanent = AdminDisableRecord {
+            worker_id: "worker".into(),
+            reason: Some("operator".into()),
+            disabled_unix_ms: 1000,
+            expires_unix_ms: None,
+        };
+        store.upsert(permanent.clone()).unwrap();
+        for deadline in [0, 999, 1000] {
+            let invalid = AdminDisableRecord {
+                expires_unix_ms: Some(deadline),
+                ..permanent.clone()
+            };
+            assert!(!invalid.expiry_due(u64::MAX));
+            assert!(store.upsert(invalid.clone()).is_err());
+            assert_eq!(store.effective_disable("worker"), Some(permanent.clone()));
+            let malformed = directory.path().join(format!("invalid-{deadline}.json"));
+            std::fs::write(
+                &malformed,
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "records": [invalid],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(AdminDisableStore::try_load(&malformed).is_err());
+        }
     }
 
     #[test]
@@ -2036,6 +2127,7 @@ mod tests {
             worker_id: "offline".into(),
             reason: Some("operator: powered off".into()),
             disabled_unix_ms: TS,
+            expires_unix_ms: None,
         };
         store.upsert(disabled.clone()).unwrap();
         let bytes = fs::read(&path).unwrap();
@@ -2058,6 +2150,7 @@ mod tests {
             worker_id: "offline".into(),
             reason: Some("operator: do not reconnect".into()),
             disabled_unix_ms: TS,
+            expires_unix_ms: None,
         };
         store.upsert(disabled.clone()).unwrap();
         let bytes = fs::read(&target).unwrap();
@@ -2105,6 +2198,7 @@ mod tests {
             worker_id: "offline".into(),
             reason: Some("operator: maintenance".into()),
             disabled_unix_ms: TS,
+            expires_unix_ms: None,
         };
         store.upsert(disabled.clone()).unwrap();
         let retained = directory.path().join("retained-state-home");
@@ -2206,6 +2300,7 @@ mod tests {
             worker_id: "w1".into(),
             reason: Some("operator: powered off".into()),
             disabled_unix_ms: 123,
+            expires_unix_ms: None,
         };
         store.upsert(record.clone()).unwrap();
         std::fs::rename(&path, &saved).unwrap();
@@ -2243,6 +2338,7 @@ mod tests {
             worker_id: "w1".into(),
             reason: Some("operator: keep out".into()),
             disabled_unix_ms: 123,
+            expires_unix_ms: None,
         };
         store.upsert(original.clone()).unwrap();
         std::fs::rename(&path, &saved).unwrap();
@@ -2254,6 +2350,7 @@ mod tests {
                         worker_id: worker_id.into(),
                         reason: Some("replacement intent".into()),
                         disabled_unix_ms: 456,
+                        expires_unix_ms: None,
                     })
                     .is_err()
             );
@@ -2297,6 +2394,7 @@ mod tests {
                 worker_id: "absent-worker".into(),
                 reason: Some("operator".into()),
                 disabled_unix_ms: 123,
+                expires_unix_ms: None,
             })
             .unwrap();
         store.remove("absent-worker").unwrap();
@@ -2324,6 +2422,7 @@ mod tests {
                 worker_id: "disabled".into(),
                 reason: Some("operator".into()),
                 disabled_unix_ms: 123,
+                expires_unix_ms: None,
             })
             .unwrap();
         let mut restarted = AdminDisableStore::try_load(&path).unwrap();
@@ -2348,6 +2447,7 @@ mod tests {
             worker_id: "absent-worker".into(),
             reason: Some("operator".into()),
             disabled_unix_ms: 456,
+            expires_unix_ms: None,
         };
         assert!(unwritable.upsert(volatile.clone()).is_err());
         assert!(!permit.is_current());

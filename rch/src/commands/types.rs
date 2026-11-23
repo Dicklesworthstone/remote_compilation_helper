@@ -169,6 +169,9 @@ pub struct WorkerActionResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Confirmed durable deadline for a timed worker disable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_unix_ms: Option<u64>,
 }
 
 // =============================================================================

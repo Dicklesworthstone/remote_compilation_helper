@@ -292,7 +292,7 @@ fn rebind_recovery(record: &mut BypassRecord, config: &WorkerConfig, now_ms: u64
     true
 }
 
-fn reset_recovery(record: &mut BypassRecord, config: &WorkerConfig, now_ms: u64) {
+pub(crate) fn reset_recovery(record: &mut BypassRecord, config: &WorkerConfig, now_ms: u64) {
     record.host.clone_from(&config.host);
     record.user.clone_from(&config.user);
     record
@@ -303,6 +303,41 @@ fn reset_recovery(record: &mut BypassRecord, config: &WorkerConfig, now_ms: u64)
     record.consecutive_passes = 0;
     record.backoff = BypassBackoff::initial();
     record.next_probe_unix_ms = now_ms;
+}
+
+/// Expiry authorizes fresh recovery, not the retirement of existing faults.
+/// Retain incident/disk obligations and require a new full probe streak and
+/// canary even if a pre-maintenance record had already reached its trial.
+pub(crate) fn recovery_after_timed_disable(
+    existing: Option<&BypassRecord>,
+    config: &WorkerConfig,
+    now_ms: u64,
+) -> BypassRecord {
+    let mut record = existing.cloned().unwrap_or_else(|| {
+        BypassRecord::new(
+            config.id.to_string(),
+            config.host.clone(),
+            config.user.clone(),
+            BypassFailureClass::StaleTelemetry,
+            now_ms,
+        )
+        .with_diagnostic("timed administrative disable requires fresh recovery before rejoin")
+    });
+    record.host.clone_from(&config.host);
+    record.user.clone_from(&config.user);
+    record
+        .details
+        .insert(RECOVERY_ENDPOINT.into(), recovery_endpoint(config));
+    record.state = BypassState::TemporaryBypass;
+    record.consecutive_passes = 0;
+    record.next_probe_unix_ms =
+        existing.map_or(now_ms, |prior| prior.next_probe_unix_ms.max(now_ms));
+    record.auto_rejoin.required_consecutive_passes = record
+        .auto_rejoin
+        .required_consecutive_passes
+        .max(rch_common::bypass_record::AutoRejoinCriteria::default().required_consecutive_passes);
+    record.auto_rejoin.canary_required = true;
+    record
 }
 
 /// Bytes per gigabyte, for the disk-free-GB → bytes threshold.
@@ -1348,6 +1383,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         prober: P,
         config: BypassRecoveryConfig,
     ) -> Self {
+        pool.attach_bypass_store(Arc::clone(&store));
         Self {
             pool,
             store,
@@ -1580,6 +1616,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         let Ok(_evaluation) = self.evaluation.try_lock() else {
             return;
         };
+        self.pool.expire_admin_disables(&self.store, now_ms).await;
         let records: Vec<BypassRecord> = {
             let store = self.store.lock().await;
             store.all().into_iter().cloned().collect()
@@ -3452,6 +3489,211 @@ mod tests {
                 BypassRecordStore::load(&path).get("css").is_none(),
                 "{recovery}: restart must not restore a retired quarantine"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_disable_rejoins_only_after_fresh_connection_probes_and_successful_canary() {
+        for canary in [CanaryOutcome::Passed, CanaryOutcome::Failed] {
+            let directory = tempfile::tempdir().unwrap();
+            let administrative = Arc::new(Mutex::new(
+                rch_common::bypass_record::AdminDisableStore::try_load(
+                    directory.path().join("admin.json"),
+                )
+                .unwrap(),
+            ));
+            let records = Arc::new(Mutex::new(BypassRecordStore::with_path(
+                directory.path().join("bypass.json"),
+            )));
+            let pool = WorkerPool::new().with_admin_disable_store(administrative.clone());
+            pool.add_worker(worker_config("timed")).await;
+            let worker = pool.get(&WorkerId::new("timed")).await.unwrap();
+            assert!(worker.reserve_slots(2).await);
+            let mut context = crate::test_daemon_context(pool.clone());
+            context.admin_disable_store = Some(administrative.clone());
+            context.bypass_store = Some(records.clone());
+            let disabled = crate::workers::handle_worker_disable(
+                &context,
+                &WorkerId::new("timed"),
+                None,
+                false,
+                Some(1),
+            )
+            .await;
+            let deadline = disabled.expires_unix_ms.unwrap();
+            let service = BypassRecoveryService::new(
+                pool,
+                records.clone(),
+                FakeProber::new(
+                    vec![RecoveryProbe::all_ok(), RecoveryProbe::all_ok()],
+                    RecoveryProbe::all_ok(),
+                    canary,
+                ),
+                BypassRecoveryConfig::default(),
+            );
+            service.evaluate_once(deadline - 1).await;
+            assert!(worker.is_disabled().await);
+            service.evaluate_once(deadline).await;
+            assert_eq!(
+                service.prober.probes.lock().await.len(),
+                2,
+                "expiry cannot reuse old transport evidence"
+            );
+            assert_eq!(
+                worker.eligibility().await,
+                EligibilityState::TemporaryBypass
+            );
+            assert!(administrative.lock().await.get("timed").is_none());
+            worker
+                .record_transport_result(
+                    true,
+                    Duration::from_secs(30),
+                    &rch_common::CircuitBreakerConfig::default(),
+                )
+                .await;
+            service.evaluate_once(deadline + 1).await;
+            assert_eq!(
+                records
+                    .lock()
+                    .await
+                    .get("timed")
+                    .unwrap()
+                    .consecutive_passes,
+                1
+            );
+            assert!(
+                !worker.reserve_slots(1).await,
+                "one passing probe cannot rejoin"
+            );
+            service.evaluate_once(deadline + 1_000_000).await;
+            assert!(service.prober.probes.lock().await.is_empty());
+            assert_eq!(
+                worker.used_slots(),
+                2,
+                "recovery must not release owned builds"
+            );
+            if canary == CanaryOutcome::Passed {
+                assert!(worker.lifecycle().await.is_schedulable());
+                assert!(!records.lock().await.contains("timed"));
+                assert!(
+                    !BypassRecordStore::load(directory.path().join("bypass.json"))
+                        .contains("timed")
+                );
+            } else {
+                assert_eq!(
+                    worker.eligibility().await,
+                    EligibilityState::TemporaryBypass
+                );
+                assert!(records.lock().await.contains("timed"));
+                assert!(!worker.reserve_slots(1).await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_disable_recovery_cannot_publish_after_new_disable_or_retarget() {
+        for change in ["disable", "retarget"] {
+            let directory = tempfile::tempdir().unwrap();
+            let administrative = Arc::new(Mutex::new(
+                rch_common::bypass_record::AdminDisableStore::try_load(
+                    directory.path().join("admin.json"),
+                )
+                .unwrap(),
+            ));
+            let records = Arc::new(Mutex::new(BypassRecordStore::with_path(
+                directory.path().join("bypass.json"),
+            )));
+            let pool = WorkerPool::new().with_admin_disable_store(administrative.clone());
+            pool.add_worker(worker_config("timed")).await;
+            let worker = pool.get(&WorkerId::new("timed")).await.unwrap();
+            let mut context = crate::test_daemon_context(pool.clone());
+            context.admin_disable_store = Some(administrative);
+            context.bypass_store = Some(records.clone());
+            let disabled = crate::workers::handle_worker_disable(
+                &context,
+                &WorkerId::new("timed"),
+                None,
+                false,
+                Some(1),
+            )
+            .await;
+            let deadline = disabled.expires_unix_ms.unwrap();
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let service = BypassRecoveryService::new(
+                pool.clone(),
+                records.clone(),
+                GatedRecoveryProber::new(
+                    RecoveryObservation::fixture(RecoveryProbe::all_ok()),
+                    Some(gate.clone()),
+                    None,
+                ),
+                BypassRecoveryConfig::default(),
+            );
+            service.evaluate_once(deadline).await;
+            worker
+                .record_transport_result(
+                    true,
+                    Duration::from_secs(30),
+                    &rch_common::CircuitBreakerConfig::default(),
+                )
+                .await;
+            let run = service.clone();
+            let evaluation = tokio::spawn(async move { run.evaluate_once(deadline + 1).await });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                service.prober.probe_started.notified(),
+            )
+            .await
+            .unwrap();
+            if change == "disable" {
+                assert_eq!(
+                    crate::workers::handle_worker_disable(
+                        &context,
+                        &WorkerId::new("timed"),
+                        Some("new permanent intent".into()),
+                        false,
+                        None
+                    )
+                    .await
+                    .status,
+                    "ok"
+                );
+            } else {
+                let mut replacement = worker_config("timed");
+                replacement.host = "new-endpoint".into();
+                pool.add_worker(replacement).await;
+            }
+            gate.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), evaluation)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!worker.lifecycle().await.is_schedulable(), "{change}");
+            assert_eq!(
+                records
+                    .lock()
+                    .await
+                    .get("timed")
+                    .unwrap()
+                    .consecutive_passes,
+                0,
+                "{change}"
+            );
+            assert_eq!(
+                service
+                    .prober
+                    .canary_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            if change == "disable" {
+                assert!(worker.is_disabled().await);
+            } else {
+                assert_eq!(
+                    records.lock().await.get("timed").unwrap().host,
+                    "new-endpoint"
+                );
+            }
         }
     }
 

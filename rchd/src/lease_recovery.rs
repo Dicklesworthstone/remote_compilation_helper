@@ -1536,6 +1536,7 @@ mod tests {
             worker_id: worker_id.to_owned(),
             reason: Some("intentional maintenance".into()),
             disabled_unix_ms: 1,
+            expires_unix_ms: None,
         }
     }
 

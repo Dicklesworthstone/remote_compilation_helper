@@ -6743,6 +6743,7 @@ fi
                 worker_id: "w1".into(),
                 reason: Some("operator".into()),
                 disabled_unix_ms: 1,
+                expires_unix_ms: None,
             })
             .unwrap();
         let mut ctx = make_test_context(WorkerPool::new(), Arc::new(BuildHistory::new(10)));

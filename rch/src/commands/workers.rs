@@ -1979,6 +1979,7 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
                             action: "drain".to_string(),
                             success: false,
                             message: Some(failure),
+                            expires_unix_ms: None,
                         },
                     ));
                 } else {
@@ -1995,6 +1996,7 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
                         worker_id: worker_id.to_string(),
                         action: "drain".to_string(),
                         success: true,
+                        expires_unix_ms: None,
                         message: Some("Worker is now draining".to_string()),
                     },
                 ));
@@ -2059,6 +2061,78 @@ fn worker_action_failure(response: &str) -> Option<String> {
     }
 }
 
+fn worker_disable_request(
+    worker_id: &str,
+    reason: Option<&str>,
+    drain_first: bool,
+    for_secs: Option<u64>,
+) -> Result<String> {
+    if for_secs.is_some_and(|seconds| seconds == 0 || seconds.checked_mul(1000).is_none()) {
+        anyhow::bail!("Timed worker disable requires a positive, representable duration");
+    }
+    let mut url = format!("POST /workers/{}/disable", urlencoding_encode(worker_id));
+    let mut query_parts = Vec::new();
+    if let Some(reason) = reason {
+        query_parts.push(format!("reason={}", urlencoding_encode(reason)));
+    }
+    if drain_first {
+        query_parts.push("drain=true".to_string());
+    }
+    if let Some(seconds) = for_secs {
+        query_parts.push(format!("for_secs={seconds}"));
+    }
+    if !query_parts.is_empty() {
+        url.push('?');
+        url.push_str(&query_parts.join("&"));
+    }
+    url.push('\n');
+    Ok(url)
+}
+
+fn worker_disable_response(worker_id: &str, timed: bool, response: &str) -> WorkerActionResponse {
+    let body = extract_json_body(response).unwrap_or(response).trim();
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let expires_unix_ms = value
+        .as_ref()
+        .and_then(|value| value.get("expires_unix_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|deadline| *deadline > 0);
+    let failure = worker_action_failure(response).or_else(|| {
+        (timed && expires_unix_ms.is_none()).then(|| {
+            "Daemon did not confirm a durable timed disable. The worker may remain disabled; update the daemon or explicitly enable the worker."
+                .to_string()
+        })
+    });
+    let success = failure.is_none();
+    let message = failure.or_else(|| {
+        value
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
+    WorkerActionResponse {
+        worker_id: worker_id.to_string(),
+        action: "disable".to_string(),
+        success,
+        message: message.or_else(|| Some("Worker is now disabled".to_string())),
+        expires_unix_ms: success.then_some(expires_unix_ms).flatten(),
+    }
+}
+
+fn worker_disable_timing(deadline: u64) -> String {
+    let at = i64::try_from(deadline)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis);
+    match at {
+        Some(at) => format!(
+            "Recovery checks may resume at {}; scheduling resumes only after they pass.",
+            at.format("%Y-%m-%d %H:%M:%S UTC")
+        ),
+        None => "Timed disable saved; fresh recovery checks must pass after its deadline.".into(),
+    }
+}
+
 /// Enable a worker (requires daemon).
 pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
@@ -2099,6 +2173,7 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
                             action: "enable".to_string(),
                             success: false,
                             message: Some(failure),
+                            expires_unix_ms: None,
                         },
                     ));
                 } else {
@@ -2116,6 +2191,7 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
                         action: "enable".to_string(),
                         success: true,
                         message: Some("Worker is now enabled".to_string()),
+                        expires_unix_ms: None,
                     },
                 ));
             } else {
@@ -2156,10 +2232,12 @@ pub async fn workers_disable(
     worker_id: &str,
     reason: Option<String>,
     drain_first: bool,
+    for_secs: Option<u64>,
     skip_confirm: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let style = ctx.theme();
+    let url = worker_disable_request(worker_id, reason.as_deref(), drain_first, for_secs)?;
 
     let socket_path_str = configured_socket_path()?;
     if !Path::new(&socket_path_str).exists() {
@@ -2196,6 +2274,12 @@ pub async fn workers_disable(
                 StatusIndicator::Info.display(style)
             );
         }
+        if let Some(seconds) = for_secs {
+            println!(
+                "  {} Recovery checks may resume after {seconds} seconds; scheduling resumes only after they pass.",
+                StatusIndicator::Info.display(style)
+            );
+        }
         let confirmed = confirm_or_explain_non_interactive("Disable this worker?")?;
         if !confirmed {
             println!("{} Aborted.", StatusIndicator::Info.display(style));
@@ -2203,57 +2287,25 @@ pub async fn workers_disable(
         }
     }
 
-    // Build the request URL with optional reason and drain flag
-    let mut url = format!("POST /workers/{}/disable", urlencoding_encode(worker_id));
-    let mut query_parts = Vec::new();
-    if let Some(ref r) = reason {
-        query_parts.push(format!("reason={}", urlencoding_encode(r)));
-    }
-    if drain_first {
-        query_parts.push("drain=true".to_string());
-    }
-    if !query_parts.is_empty() {
-        url = format!("{}?{}", url, query_parts.join("&"));
-    }
-    url.push('\n');
-
-    let mut failed = false;
+    let failed;
 
     match send_daemon_command(&url).await {
         Ok(response) => {
-            if let Some(failure) = worker_action_failure(&response) {
-                failed = true;
-                if ctx.is_json() {
-                    let _ = ctx.json(&ApiResponse::ok(
-                        "workers disable",
-                        WorkerActionResponse {
-                            worker_id: worker_id.to_string(),
-                            action: "disable".to_string(),
-                            success: false,
-                            message: Some(failure),
-                        },
-                    ));
-                } else {
-                    println!(
-                        "{} Failed to disable worker: {}",
-                        StatusIndicator::Error.display(style),
-                        style.muted(&failure)
-                    );
-                }
-            } else if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::ok(
-                    "workers disable",
-                    WorkerActionResponse {
-                        worker_id: worker_id.to_string(),
-                        action: "disable".to_string(),
-                        success: true,
-                        message: Some(if drain_first {
-                            "Worker is draining before disable".to_string()
-                        } else {
-                            "Worker is now disabled".to_string()
-                        }),
-                    },
-                ));
+            let response = worker_disable_response(worker_id, for_secs.is_some(), &response);
+            failed = !response.success;
+            if ctx.is_json() {
+                let _ = ctx.json(&ApiResponse::ok("workers disable", response));
+            } else if failed {
+                println!(
+                    "{} Failed to disable worker: {}",
+                    StatusIndicator::Error.display(style),
+                    style.muted(
+                        response
+                            .message
+                            .as_deref()
+                            .unwrap_or("unknown daemon error")
+                    )
+                );
             } else if drain_first {
                 println!(
                     "{} Worker {} is draining before disable.",
@@ -2271,6 +2323,13 @@ pub async fn workers_disable(
                         style.muted(r)
                     );
                 }
+                if let Some(deadline) = response.expires_unix_ms {
+                    println!(
+                        "  {} {}",
+                        StatusIndicator::Info.display(style),
+                        worker_disable_timing(deadline)
+                    );
+                }
             } else {
                 println!(
                     "{} Worker {} is now disabled.",
@@ -2286,6 +2345,13 @@ pub async fn workers_disable(
                         "  {} Reason: {}",
                         StatusIndicator::Info.display(style),
                         style.muted(r)
+                    );
+                }
+                if let Some(deadline) = response.expires_unix_ms {
+                    println!(
+                        "  {} {}",
+                        StatusIndicator::Info.display(style),
+                        worker_disable_timing(deadline)
                     );
                 }
             }
@@ -2319,6 +2385,65 @@ mod probe_summary_tests {
     use crate::ui::context::OutputConfig;
     use crate::ui::writer::SharedOutputBuffer;
     use rch_common::WorkerId;
+
+    #[test]
+    fn timed_disable_request_preserves_duration_and_escapes_administrative_text() {
+        assert_eq!(
+            worker_disable_request("css", None, false, None).unwrap(),
+            "POST /workers/css/disable\n"
+        );
+        assert_eq!(
+            worker_disable_request(
+                "worker&for_secs=1",
+                Some("maintenance&drain=false"),
+                true,
+                Some(7200)
+            )
+            .unwrap(),
+            "POST /workers/worker%26for_secs%3D1/disable?reason=maintenance%26drain%3Dfalse&drain=true&for_secs=7200\n"
+        );
+        for seconds in [0, u64::MAX] {
+            assert!(worker_disable_request("css", None, false, Some(seconds)).is_err());
+        }
+    }
+
+    #[test]
+    fn timed_disable_requires_confirmed_durable_expiry_and_preserves_daemon_errors() {
+        let permanent = r#"{"status":"ok","message":"Worker disabled"}"#;
+        assert!(worker_disable_response("css", false, permanent).success);
+        let unconfirmed = worker_disable_response("css", true, permanent);
+        assert!(!unconfirmed.success);
+        assert!(unconfirmed.message.unwrap().contains("may remain disabled"));
+
+        for expiry in ["null", "0", "-1", "\"7200\""] {
+            let response = format!(r#"{{"status":"ok","expires_unix_ms":{expiry}}}"#);
+            assert!(!worker_disable_response("css", true, &response).success);
+        }
+        let saved = worker_disable_response(
+            "css",
+            true,
+            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"ok\",\"message\":\"Draining before disable\",\"expires_unix_ms\":1795478400000}",
+        );
+        assert!(saved.success);
+        assert_eq!(saved.expires_unix_ms, Some(1795478400000));
+        assert_eq!(saved.message.as_deref(), Some("Draining before disable"));
+        assert_eq!(
+            serde_json::to_value(saved).unwrap()["expires_unix_ms"],
+            1795478400000_u64
+        );
+
+        let failed = worker_disable_response(
+            "css",
+            true,
+            r#"{"status":"error","message":"durable state could not be saved","expires_unix_ms":1795478400000}"#,
+        );
+        assert!(!failed.success);
+        assert!(failed.expires_unix_ms.is_none());
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("durable state could not be saved")
+        );
+    }
 
     #[test]
     fn probe_refresh_request_targets_one_worker_and_cannot_change_refresh_policy() {

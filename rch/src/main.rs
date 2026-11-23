@@ -59,6 +59,25 @@ fn parse_required_tool(value: &str) -> std::result::Result<String, String> {
     Ok(value.to_owned())
 }
 
+fn parse_worker_disable_duration(value: &str) -> std::result::Result<u64, String> {
+    let (amount, multiplier) = match value.as_bytes().last() {
+        Some(b's') => (&value[..value.len() - 1], 1),
+        Some(b'm') => (&value[..value.len() - 1], 60),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60),
+        Some(b'd') => (&value[..value.len() - 1], 24 * 60 * 60),
+        _ => (value, 1),
+    };
+    let seconds = (!amount.is_empty() && amount.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| amount.parse::<u64>().ok())
+        .flatten()
+        .and_then(|amount| amount.checked_mul(multiplier))
+        .filter(|seconds| *seconds > 0 && seconds.checked_mul(1000).is_some());
+    seconds.ok_or_else(|| {
+        "--for requires a positive whole duration, such as 30m, 2h, or 1d (bare numbers are seconds)"
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod exact_runtime_cli_tests;
 
@@ -1470,12 +1489,16 @@ The worker will transition: DRAINING/DRAINED/DISABLED → HEALTHY"#)]
     /// Use this when a worker is unavailable (e.g., maintenance, network issues).
     /// Optionally specify --reason to document why the worker is disabled.
     /// Use --drain to complete active builds before disabling.
+    /// Use --for to resume recovery checks after a temporary maintenance window.
     #[command(after_help = r#"EXAMPLES:
     rch workers disable css                    # Disable immediately
     rch workers disable css --reason "hardware upgrade"
     rch workers disable css --drain            # Finish builds first
+    rch workers disable css --for 2h --reason "maintenance"
 
-Use 'rch workers enable css' to bring the worker back online."#)]
+Without --for, the disable remains until 'rch workers enable css'.
+A timed disable survives daemon restarts. Its expiry starts fresh recovery
+checks; the worker accepts builds only after those checks pass."#)]
     Disable {
         /// Worker ID to disable
         worker: String,
@@ -1485,6 +1508,9 @@ Use 'rch workers enable css' to bring the worker back online."#)]
         /// Drain active builds before fully disabling
         #[arg(long)]
         drain: bool,
+        /// Begin recovery checks after this duration (seconds, or suffix s/m/h/d)
+        #[arg(long = "for", value_name = "DURATION", value_parser = parse_worker_disable_duration)]
+        for_secs: Option<u64>,
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
@@ -4249,9 +4275,10 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
             worker,
             reason,
             drain,
+            for_secs,
             yes,
         } => {
-            commands::workers_disable(&worker, reason, drain, yes, ctx).await?;
+            commands::workers_disable(&worker, reason, drain, for_secs, yes, ctx).await?;
         }
         WorkersAction::DeployBinary {
             worker,
@@ -9667,6 +9694,85 @@ mod tests {
             }
             _ => fail_expected("Expected workers enable command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_timed_worker_disable_without_changing_permanent_disables() {
+        for (duration, seconds) in [
+            ("1", 1),
+            ("30s", 30),
+            ("30m", 1800),
+            ("2h", 7200),
+            ("1d", 86400),
+        ] {
+            let cli = Cli::try_parse_from([
+                "rch",
+                "workers",
+                "disable",
+                "css",
+                "--for",
+                duration,
+                "--drain",
+                "--reason",
+                "maintenance",
+                "--yes",
+            ])
+            .unwrap();
+            match cli.command {
+                Some(Commands::Workers {
+                    action:
+                        WorkersAction::Disable {
+                            worker,
+                            reason,
+                            drain,
+                            for_secs,
+                            yes,
+                        },
+                }) => {
+                    assert_eq!(worker, "css");
+                    assert_eq!(reason.as_deref(), Some("maintenance"));
+                    assert!(drain && yes);
+                    assert_eq!(for_secs, Some(seconds));
+                }
+                _ => fail_expected("Expected timed worker disable"),
+            }
+        }
+        let cli = Cli::try_parse_from(["rch", "workers", "disable", "css"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Workers {
+                action: WorkersAction::Disable { for_secs: None, .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_invalid_worker_disable_durations() {
+        for duration in [
+            "",
+            "0",
+            "0m",
+            "-1",
+            "+1",
+            "1.5h",
+            "1h30m",
+            "30 m",
+            "1w",
+            "18446744073709551615",
+            "18446744073709551615d",
+        ] {
+            assert!(
+                Cli::try_parse_from(["rch", "workers", "disable", "css", "--for", duration])
+                    .is_err(),
+                "accepted invalid disable duration {duration:?}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "rch", "workers", "disable", "css", "--for", "1h", "--for", "2h",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

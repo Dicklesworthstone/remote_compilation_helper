@@ -291,6 +291,7 @@ mod tests {
                         worker_id: worker.id.to_string(),
                         reason: Some("operator: keep out".into()),
                         disabled_unix_ms: 2,
+                        expires_unix_ms: None,
                     })
                     .unwrap();
             }
@@ -322,6 +323,7 @@ mod tests {
                 worker_id: "w1".into(),
                 reason: Some(reason.clone()),
                 disabled_unix_ms: 1,
+                expires_unix_ms: None,
             })
             .unwrap();
         let pool = WorkerPool::new();
@@ -428,6 +430,7 @@ mod tests {
                 worker_id: "w1".into(),
                 reason: Some(reason.clone()),
                 disabled_unix_ms: 1,
+                expires_unix_ms: None,
             })
             .unwrap();
         worker.disable(Some(reason)).await;
@@ -585,6 +588,7 @@ mod tests {
                     worker_id: "w1".into(),
                     reason: Some(reason.clone()),
                     disabled_unix_ms: 1,
+                    expires_unix_ms: None,
                 })
                 .unwrap();
             let worker = pool.get(&WorkerId::new("w1")).await.unwrap();
@@ -714,6 +718,7 @@ mod tests {
                 worker_id: "w1".into(),
                 reason: Some(quarantine_reason(Some(&evidence()))),
                 disabled_unix_ms: now_ms,
+                expires_unix_ms: None,
             })
             .unwrap();
         let service = OrphanQuarantineService::new(
@@ -963,6 +968,7 @@ mod tests {
                     worker_id: "w1".into(),
                     reason: Some(reason.clone()),
                     disabled_unix_ms: 2,
+                    expires_unix_ms: None,
                 })
                 .unwrap();
             worker.disable(Some(reason.clone())).await;

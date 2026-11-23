@@ -4972,6 +4972,7 @@ mod tests {
                 worker_id: "ovh-a".into(),
                 reason: Some("maintenance".into()),
                 disabled_unix_ms: 1,
+                expires_unix_ms: None,
             })
             .unwrap();
         assert_eq!(
@@ -4988,6 +4989,7 @@ mod tests {
                     worker_id: id.into(),
                     reason: None,
                     disabled_unix_ms: 1,
+                    expires_unix_ms: None,
                 })
                 .unwrap();
         }
