@@ -10,7 +10,7 @@
 use rabs_cas::blob_store::RAW_PROFILE_V1;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
 use rabs_cas::metadata_store::{
-    QuarantineScope, RabsMetadataStore, SqlEngine, SqlValue, digest_key,
+    QuarantineScope, RabsMetadataStore, RusqliteEngine, SqlEngine, SqlValue, digest_key,
 };
 use rabs_key::live_dependency::{
     LiveRustcRequest, ToolchainFacts, canonicalize_compiler_transcript, live_dependency_key,
@@ -74,6 +74,15 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Inject durable faults through a separate connection to this fixture's
+    /// private database. Keep the live store locked while changing its rows;
+    /// production callers retain only the transactional metadata API.
+    fn inject_metadata_fault(&self, sql: &str, params: &[SqlValue]) -> usize {
+        let _store = self.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&self.cas.cas_root().join("meta.sqlite")).unwrap();
+        engine.execute(sql, params).unwrap()
+    }
+
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cargo = dir.path().join("cargo");
@@ -499,21 +508,14 @@ fn logical_transcript_quarantine_blocks_preview_with_either_hex_spelling() {
             let (domain, hex) = canonical.rsplit_once(':').unwrap();
             let alternate = format!("{domain}:{}", hex.to_ascii_uppercase());
             assert_ne!(canonical, alternate);
-            let changed = fixture
-                .cas
-                .store()
-                .lock()
-                .unwrap()
-                .engine_mut()
-                .execute(
-                    "UPDATE decision_receipts SET decision = ?1 WHERE kind = ?2 AND subject = ?3 AND seq = 0",
-                    &[
-                        SqlValue::Text(alternate),
-                        SqlValue::Text(LIVE_TRANSCRIPT_RECEIPT.into()),
-                        SqlValue::Text(digest_key(&key)),
-                    ],
-                )
-                .unwrap();
+            let changed = fixture.inject_metadata_fault(
+                "UPDATE decision_receipts SET decision = ?1 WHERE kind = ?2 AND subject = ?3 AND seq = 0",
+                &[
+                    SqlValue::Text(alternate),
+                    SqlValue::Text(LIVE_TRANSCRIPT_RECEIPT.into()),
+                    SqlValue::Text(digest_key(&key)),
+                ],
+            );
             assert_eq!(changed, 1, "fixture transcript receipt was not replaced");
         }
         fixture.quarantine_transcript(&transcript);
@@ -562,23 +564,16 @@ fn transcript_quarantine_after_staging_prevents_metadata_and_terminal_replay() {
         // after the lane's initial check but before destination publication.
         // This exercises the actual callback/final-delivery boundaries without
         // relying on filesystem timing or a production-only test hook.
-        fixture
-            .cas
-            .store()
-            .lock()
-            .unwrap()
-            .engine_mut()
-            .execute(
-                &format!(
-                    "CREATE TRIGGER quarantine_transcript_on_install AFTER INSERT ON decision_receipts \
-                     WHEN NEW.kind = 'rabs-live-replay-install-v1' BEGIN \
-                     INSERT INTO quarantines (scope, subject, reason) \
-                     VALUES ('logical-object', '{}', 'fixture post-staging quarantine'); END",
-                    digest_key(&transcript),
-                ),
-                &[],
-            )
-            .unwrap();
+        fixture.inject_metadata_fault(
+            &format!(
+                "CREATE TRIGGER quarantine_transcript_on_install AFTER INSERT ON decision_receipts \
+                 WHEN NEW.kind = 'rabs-live-replay-install-v1' BEGIN \
+                 INSERT INTO quarantines (scope, subject, reason) \
+                 VALUES ('logical-object', '{}', 'fixture post-staging quarantine'); END",
+                digest_key(&transcript),
+            ),
+            &[],
+        );
         let result = if metadata {
             pending.install_with_metadata(|_| panic!("post-staging quarantine leaked a prefix"))
         } else {
@@ -663,18 +658,11 @@ fn transcript_quarantine_store_failure_never_falls_through_to_a_healthy_replica(
     let (fixture, _, transcript) = Fixture::replayable();
     let (primary, replica, canonical) = fixture.transcript_replica(&transcript);
     std::fs::write(&primary, b"corrupt transcript fixture").unwrap();
-    fixture
-        .cas
-        .store()
-        .lock()
-        .unwrap()
-        .engine_mut()
-        .execute(
-            "CREATE TRIGGER refuse_transcript_quarantine BEFORE UPDATE OF quarantined ON object_locations \
-             WHEN NEW.quarantined = 1 BEGIN SELECT RAISE(ABORT, 'fixture quarantine unavailable'); END",
-            &[],
-        )
-        .unwrap();
+    fixture.inject_metadata_fault(
+        "CREATE TRIGGER refuse_transcript_quarantine BEFORE UPDATE OF quarantined ON object_locations \
+         WHEN NEW.quarantined = 1 BEGIN SELECT RAISE(ABORT, 'fixture quarantine unavailable'); END",
+        &[],
+    );
     let decision = fixture.lane.decide(fixture.request());
     assert!(
         !matches!(decision, LiveDecision::Hit(_)),
@@ -712,17 +700,10 @@ fn transcript_store_read_failure_revokes_preview_without_destination_writes() {
         // Retain the fixture's metadata while making the next lookup fail.
         // Neither an unreadable binding nor an unreadable quarantine index
         // may be interpreted as permission to replay already retained bytes.
-        fixture
-            .cas
-            .store()
-            .lock()
-            .unwrap()
-            .engine_mut()
-            .execute(
-                &format!("ALTER TABLE {table} RENAME TO retained_{table}"),
-                &[],
-            )
-            .unwrap();
+        fixture.inject_metadata_fault(
+            &format!("ALTER TABLE {table} RENAME TO retained_{table}"),
+            &[],
+        );
         let result = pending.install_with_metadata(|_| {
             panic!("failed transcript metadata lookup exposed a replay prefix")
         });

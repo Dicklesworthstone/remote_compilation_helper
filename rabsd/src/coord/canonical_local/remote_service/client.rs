@@ -3284,7 +3284,8 @@ mod tests {
                 &selected,
             )
             .unwrap();
-            let declaration: Manifest = serde_json::from_value(upload.wire_manifest()).unwrap();
+            let declaration: wire::Manifest =
+                serde_json::from_value(upload.wire_manifest()).unwrap();
             let manifest = declaration.native().unwrap();
             let mut source =
                 SourceReceiver::create(&owner.path().join("sealed-source"), manifest.clone())

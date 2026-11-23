@@ -476,7 +476,7 @@ mod tests {
                 "::stalled_capture_notice_releases_store_and_only_owned_pins"
             ),
             || {
-                use rabs_cas::metadata_store::SqlValue;
+                use rabs_cas::metadata_store::{RusqliteEngine, SqlEngine, SqlValue};
 
                 let dir = crate::test_util::private_tempdir();
                 let cas = Arc::new(mount_and_reconcile(dir.path()).unwrap());
@@ -492,17 +492,20 @@ mod tests {
                 // ownership. It must be retained while the later owned pin is
                 // released even when the retention notice cannot be consumed.
                 assert_eq!(
-                    cas.store()
-                        .lock()
-                        .unwrap()
-                        .execute(
-                            "UPDATE pins SET owner = ?1 WHERE id_hex = ?2",
-                            &[
-                                SqlValue::Text("changed-owner".into()),
-                                SqlValue::Text(format!("{changed_id:032x}")),
-                            ],
-                        )
-                        .unwrap(),
+                    {
+                        let _store = cas.store().lock().unwrap();
+                        let mut engine =
+                            RusqliteEngine::open(&cas.cas_root().join("meta.sqlite")).unwrap();
+                        engine
+                            .execute(
+                                "UPDATE pins SET owner = ?1 WHERE id_hex = ?2",
+                                &[
+                                    SqlValue::Text("changed-owner".into()),
+                                    SqlValue::Text(format!("{changed_id:032x}")),
+                                ],
+                            )
+                            .unwrap()
+                    },
                     1
                 );
                 drop(pins);
