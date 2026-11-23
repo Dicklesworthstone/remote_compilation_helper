@@ -99,11 +99,14 @@ local/shared-coordinator profiles and `build` for a direct worker profile.
 operation identity. It never submits another build. The standalone
 `rabs-recover` command continues to default to inspection.
 
-The legacy `scripts/install-rabs` bundle installer still selects the script
-launcher; installing this native Cargo subcommand uses the Cargo command above.
-Migration of that installer's generation and release-validation contracts is
-separate. Installing the native frontend does not establish a new release,
-fleet rollout, compiler-cache hit or performance result.
+`install.sh --with-rabs` and `scripts/install-rabs` install the native
+`cargo-rabs` in the same atomic generation as the other RABS executables. Source
+builds select it from `wrapper-release`; bundles must contain a native executable
+matching the other tools' architecture. Source-verified packaging checks its
+compiled build identity alongside every other native tool. The bundle installer
+still requires its existing installation interpreter; running `cargo rabs` uses
+only the Rust frontend and native helpers. Installing the frontend does not
+establish a fleet rollout, compiler-cache hit or performance result.
 
 ## Native canonical Cargo entry point
 
@@ -1313,7 +1316,7 @@ readiness.
 
 ## Validation and remaining work
 
-The launcher regression suite executes the production Python entry point and
+The retained legacy launcher regression suite executes the script entry point and
 real exec, filesystem, pipes and signals with a clearly marked native-driver
 **double**. It does not execute Rust, Cargo, TLS or bubblewrap. Python site startup
 is omitted in subprocess fixtures so unrelated installed hooks do not own test

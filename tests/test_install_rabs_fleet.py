@@ -96,9 +96,6 @@ class TargetDeploymentTests(unittest.TestCase):
         for target, machine in [(X86, 62), (ARM, 183)]:
             bundle = self.root / target
             bundle.mkdir()
-            for name in installer.PYTHON_TOOLS:
-                (bundle / name).write_text(
-                    "#!/usr/bin/env python3\nprint(" + repr(target) + ")\n")
             for name in installer.NATIVE_TOOLS:
                 fixture = bytearray(native)
                 fixture[18:20] = machine.to_bytes(2, "little")
@@ -149,9 +146,11 @@ class TargetDeploymentTests(unittest.TestCase):
             self.assertFalse(worker["receipt"]["cargo_config_changed"])
         self.assertEqual(result["workers"][0]["receipt"]["files"],
                          result["workers"][2]["receipt"]["files"])
-        # The launcher is real Python. No ARM fixture is ever executed.
-        launcher = self.root / "x86-one" / ".local" / "bin" / "cargo-rabs"
-        self.assertEqual(subprocess.check_output([str(launcher)], text=True), X86 + "\n")
+        # Execute only the real host-native ELF fixture. The other architecture
+        # is validated byte-for-byte above and is never executed on this host.
+        host = "x86-one" if installer.host_machine() == 62 else "arm-one"
+        launcher = self.root / host / ".local" / "bin" / "cargo-rabs"
+        self.assertEqual(subprocess.run([str(launcher)], timeout=5).returncode, 0)
 
     def test_dispatcher_architecture_never_selects_worker_images(self):
         with mock.patch.object(installer.platform, "machine", return_value="unsupported-dispatcher"):

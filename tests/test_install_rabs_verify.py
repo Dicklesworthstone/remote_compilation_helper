@@ -1,8 +1,9 @@
 """Read-only recovery of interrupted RABS installs using real files and processes.
 
-Native `true` executables stand in for compiled RABS tools. Only SSH transport
-is replaced with a local peer; the actual inspector, lock, hashes, framing and
-installer run. These tests do not qualify Rust execution or a live fleet.
+Native `true` executables and a tiny Rust marker fixture stand in for compiled
+RABS tools. SSH transport is replaced with a local peer; the actual inspector,
+lock, hashes, framing and installer run. These tests do not qualify RABS
+execution or a live fleet.
 """
 
 import contextlib
@@ -101,10 +102,19 @@ class InstallationVerificationTests(unittest.TestCase):
                     "RABS_VERIFY_TEST_ROOT": str(self.root)}
 
     def launcher(self, label):
-        (self.bundle / "cargo-rabs").write_text(
-            "#!/usr/bin/env python3\nfrom pathlib import Path\n"
-            "Path(" + repr(str(self.marker)) + ").write_text(" + repr(label) + ")\n")
-        (self.bundle / "cargo-rabs").chmod(0o755)
+        # If verification ever executes a supplied tool, the same marker as
+        # before exposes it. The supplied launcher now passes native validation.
+        source = self.root / "native_launcher.rs"
+        source.write_text(
+            'fn main() {\n'
+            '    std::fs::write(env!("RABS_INSTALL_FIXTURE_MARKER"),\n'
+            '        env!("RABS_INSTALL_FIXTURE_LABEL")).unwrap();\n'
+            '}\n', encoding="utf-8")
+        subprocess.run(["rustc", "--edition=2021", str(source),
+                        "-o", str(self.bundle / "cargo-rabs")],
+                       env={**os.environ, "RABS_INSTALL_FIXTURE_LABEL": label,
+                            "RABS_INSTALL_FIXTURE_MARKER": str(self.marker)},
+                       check=True, timeout=30)
 
     def paths(self):
         return installer.source_files(self.bundle, None)

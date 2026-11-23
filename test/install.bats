@@ -367,6 +367,7 @@ EOF
         [[ $calls == 2 ]]
     '
     [[ "$status" -eq 0 ]]
+    grep -Fx -- 'cargo-rabs' "$TEST_DIR/cargo-1"
     grep -Fx -- 'rabs-cargo' "$TEST_DIR/cargo-1"
     grep -Fx -- 'rabs-recover' "$TEST_DIR/cargo-1"
     grep -Fx -- 'rabs-wrap' "$TEST_DIR/cargo-1"
@@ -379,7 +380,7 @@ EOF
     grep -Fx -- "$TEST_DIR/custom target/x86_64-unknown-linux-gnu" "$TEST_DIR/installation"
 }
 
-@test "RABS source build refuses activation when the native Cargo frontend fails to build" {
+@test "RABS source build refuses activation when the Cargo subcommand fails to build" {
     run bash -euc '
         export RCH_INSTALLER_LIB=1
         source "$INSTALL_SCRIPT"
@@ -394,7 +395,7 @@ EOF
             calls=$((calls + 1))
             printf "%s\n" "$@" > "$TEST_DIR/cargo-$calls"
             for argument in "$@"; do
-                if [[ $argument == rabs-cargo ]]; then return 23; fi
+                if [[ $argument == cargo-rabs ]]; then return 23; fi
             done
         }
         install_rabs_toolset() {

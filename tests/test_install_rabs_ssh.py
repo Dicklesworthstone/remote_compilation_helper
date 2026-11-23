@@ -82,9 +82,14 @@ class SSHDeploymentTests(unittest.TestCase):
         self.reserve = installer.MIN_DEPLOY_RESERVE
 
     def launcher(self, label):
-        (self.bundle / "cargo-rabs").write_text(
-            "#!/usr/bin/env python3\nprint(" + repr(label) + ")\n")
-        (self.bundle / "cargo-rabs").chmod(0o755)
+        source = self.root / "native_launcher.rs"
+        source.write_text(
+            'fn main() { println!("{}", env!("RABS_INSTALL_FIXTURE_LABEL")); }\n',
+            encoding="utf-8")
+        subprocess.run(["rustc", "--edition=2021", str(source),
+                        "-o", str(self.bundle / "cargo-rabs")],
+                       env={**os.environ, "RABS_INSTALL_FIXTURE_LABEL": label},
+                       check=True, timeout=30)
 
     def paths(self):
         return installer.source_files(self.bundle, None)
@@ -349,11 +354,9 @@ class SSHDeploymentTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         copied_installer = scripts / "install-rabs"
         shutil.copyfile(SCRIPT, copied_installer)
-        for name in installer.PYTHON_TOOLS:
-            shutil.copy2(self.bundle / name, scripts / name)
         target = checkout / "target" / "selected-platform"
         for name, profile in [("rabs-wrap", "wrapper-release"), ("rabs-recover", "wrapper-release"),
-                              ("rabs-cargo", "wrapper-release"),
+                              ("cargo-rabs", "wrapper-release"), ("rabs-cargo", "wrapper-release"),
                               ("rabsd", "daemon-release"),
                               ("rabs-wkr", "daemon-release"), ("rabs-cargo-root", "daemon-release"),
                               ("rabs-delivery-cas", "daemon-release")]:

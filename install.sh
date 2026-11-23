@@ -495,7 +495,7 @@ check_prerequisites() {
 
     if [[ "${WITH_RABS:-false}" == "true" ]]; then
         if ! command_exists python3 || ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
-            die "--with-rabs requires Python 3.9 or later for installation and cargo-rabs"
+            die "--with-rabs requires Python 3.9 or later for the bundle installer"
         fi
         if [[ "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}" != /* ]]; then
             die "The RABS installation directory must be absolute (RCH_RABS_INSTALL_DIR or RCH_INSTALL_DIR)"
@@ -874,7 +874,7 @@ build_rabs_toolset() {
     local project_dir="$1"
     info "Building the requested RABS toolset..."
     if ! cargo build --locked --profile wrapper-release -p rabs-wrap -p rabs-cli \
-        --bin rabs-wrap --bin rabs-cargo --bin rabs-recover \
+        --bin rabs-wrap --bin cargo-rabs --bin rabs-cargo --bin rabs-recover \
         --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS wrapper/operator build failed; installation stopped"
     fi

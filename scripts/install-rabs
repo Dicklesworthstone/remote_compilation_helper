@@ -52,9 +52,8 @@ import time
 import zlib
 
 
-PYTHON_TOOLS = ("cargo-rabs",)
-NATIVE_TOOLS = ("rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root", "rabs-delivery-cas", "rabs-recover", "rabs-cargo")
-TOOLS = PYTHON_TOOLS + NATIVE_TOOLS
+NATIVE_TOOLS = ("cargo-rabs", "rabs-wrap", "rabsd", "rabs-wkr", "rabs-cargo-root", "rabs-delivery-cas", "rabs-recover", "rabs-cargo")
+TOOLS = NATIVE_TOOLS
 VERSIONS = ".rabs-versions"
 CURRENT = ".rabs-current"
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
@@ -160,7 +159,7 @@ def source_files(bundle, build):
     else:
         root = Path(build).absolute()
         paths = {
-            "cargo-rabs": Path(__file__).resolve().with_name("cargo-rabs"),
+            "cargo-rabs": root / "wrapper-release" / "cargo-rabs",
             "rabs-cargo": root / "wrapper-release" / "rabs-cargo",
             "rabs-recover": root / "wrapper-release" / "rabs-recover",
             "rabs-wrap": root / "wrapper-release" / "rabs-wrap",
@@ -320,13 +319,7 @@ def copy_tool(name, source, destination, machine):
             remaining -= len(chunk)
         if reader.read(1) or copied.digest() != digest.digest():
             raise InstallError("staged executable failed digest verification: " + name)
-    if name in PYTHON_TOOLS:
-        # Reject truncated/invalid launchers, without executing supplied code.
-        if count > 1024 * 1024 or not prefix.startswith(b"#!/usr/bin/env python3\n"):
-            raise InstallError("invalid " + name + " Python launcher")
-        ast.parse(destination.read_text(encoding="utf-8"), filename=name)
-    else:
-        require_native_elf(name, prefix, machine)
+    require_native_elf(name, prefix, machine)
     return {"sha256": digest.hexdigest(), "bytes": count}
 
 
@@ -416,9 +409,8 @@ def validate_toolset(manifest):
         raise InstallError("invalid complete RABS toolset manifest")
     total = 0
     for name, entry in manifest["files"].items():
-        limit = 1024 * 1024 if name in PYTHON_TOOLS else MAX_FILE_BYTES
         if (not isinstance(entry, dict) or set(entry) != {"bytes", "sha256"}
-                or type(entry["bytes"]) is not int or not 0 < entry["bytes"] <= limit
+                or type(entry["bytes"]) is not int or not 0 < entry["bytes"] <= MAX_FILE_BYTES
                 or not isinstance(entry["sha256"], str)
                 or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None):
             raise InstallError("invalid expected executable identity: " + name)
@@ -435,13 +427,11 @@ def toolset_digest(expected):
 
 def inspect_tool_bytes(name, reader, size):
     """Hash exactly one bounded tool without executing it or following links."""
-    limit = 1024 * 1024 if name in PYTHON_TOOLS else MAX_FILE_BYTES
-    if type(size) is not int or not 0 < size <= limit:
+    if type(size) is not int or not 0 < size <= MAX_FILE_BYTES:
         raise InstallError("invalid executable size: " + name)
     remaining = size
     digest = hashlib.sha256()
     prefix = b""
-    launcher = bytearray()
     while remaining:
         chunk = reader.read(min(1024 * 1024, remaining))
         if not chunk:
@@ -450,18 +440,10 @@ def inspect_tool_bytes(name, reader, size):
         digest.update(chunk)
         if len(prefix) < 64:
             prefix = (prefix + chunk)[:64]
-        if name in PYTHON_TOOLS:
-            launcher.extend(chunk)
-    machine = None
-    if name in PYTHON_TOOLS:
-        if not prefix.startswith(b"#!/usr/bin/env python3\n"):
-            raise InstallError("invalid " + name + " Python launcher")
-        ast.parse(launcher.decode("utf-8"), filename=name)
-    else:
-        machine = int.from_bytes(prefix[18:20], "little")
-        if machine not in TARGET_MACHINES.values():
-            raise InstallError("unsupported executable architecture: " + name)
-        require_native_elf(name, prefix, machine)
+    machine = int.from_bytes(prefix[18:20], "little")
+    if machine not in TARGET_MACHINES.values():
+        raise InstallError("unsupported executable architecture: " + name)
+    require_native_elf(name, prefix, machine)
     return {"bytes": size, "sha256": digest.hexdigest()}, machine
 
 
@@ -651,8 +633,7 @@ def verify_package_source(snapshot, expected, entries, required_source, source_r
 
     if expected_toolset(source_files(snapshot, None)) != expected:
         raise InstallError("package snapshot differs from captured toolset")
-    scripts = {name: script_bytes(name, 1024 * 1024) for name in PYTHON_TOOLS}
-    scripts["install-rabs"] = script_bytes("install-rabs", MAX_INSTALLER_BYTES)
+    scripts = {"install-rabs": script_bytes("install-rabs", MAX_INSTALLER_BYTES)}
     unchanged()
     git = ["git", "--no-replace-objects", "-C", str(Path(source_repository).absolute())]
     deadline = time.monotonic() + 30
@@ -791,7 +772,7 @@ def package_archive(paths, output, target, required_source=None, source_reposito
         if expected_toolset(source_files(verification, None)) != expected:
             raise InstallError("produced archive failed installer round-trip verification")
         # The consumer deliberately ignores the bundled installer. Check that
-        # sixth member separately so the published helper is also byte-bound.
+        # installer member separately so the published helper is also byte-bound.
         with tarfile.open(archive_path, "r:gz", tarinfo=ReleaseMember) as archive:
             member = archive.getmember("install-rabs")
             if member.size != entries["install-rabs"]["bytes"]:
