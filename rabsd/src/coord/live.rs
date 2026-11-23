@@ -501,6 +501,8 @@ const LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS: &str =
     "rustc-workspace-native-generated-dag-metadata-v1";
 const LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS: &str =
     "rustc-workspace-propagated-native-dag-metadata-v1";
+const LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_RLIB_CLASS: &str =
+    "rustc-workspace-propagated-native-dag-rlib-v1";
 const LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
     "rustc-workspace-terminal-leaf-metadata-v2";
 const LIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str = "rustc-workspace-terminal-metadata-v2";
@@ -566,6 +568,9 @@ fn record_descriptor_class(
             }
             CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata => {
                 LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS
+            }
+            CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib => {
+                LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_RLIB_CLASS
             }
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
@@ -691,6 +696,9 @@ fn recorded_action_risk(
                 if class == LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS =>
             {
                 Ok(ActionClassRisk::PropagatedNativeWorkspaceDagMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_RLIB_CLASS => {
+                Ok(ActionClassRisk::PropagatedNativeWorkspaceDagRlib)
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
                 Ok(ActionClassRisk::WorkspaceTerminalLeafMetadata)
@@ -5675,7 +5683,8 @@ mod tests {
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
             plan_generated_terminal_workspace_metadata, plan_generated_workspace_dag_library,
             plan_mixed_workspace_library, plan_propagated_native_workspace_dag_metadata,
-            plan_terminal_workspace_metadata, remote_committed_dependency_key,
+            plan_propagated_native_workspace_dag_rlib, plan_terminal_workspace_metadata,
+            remote_committed_dependency_key,
             remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
         };
         use rabs_key::live_dependency::{
@@ -5691,8 +5700,11 @@ mod tests {
                                          policy: Option<CommittedDependencyPolicy>,
                                          generated: bool,
                                          native: bool| {
-            let propagated =
-                policy == Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata);
+            let propagated = matches!(
+                policy,
+                Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib)
+            );
             assert!(!native || generated || propagated);
             assert!(
                 !generated
@@ -5705,6 +5717,7 @@ mod tests {
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
                                 | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
+                                | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
                                 | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
                                 | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
                         )
@@ -5780,7 +5793,12 @@ mod tests {
                 } else {
                     "/__rabs/out/cargo/debug/build/leaf-generated/out"
                 };
-                argv.extend([format!("-Lnative={root}"), "-lstatic=leaf_native".into()]);
+                argv.push(format!("-Lnative={root}"));
+                // Cargo propagates search roots to consumers without an own
+                // build script; direct -l directives require that own owner.
+                if generated {
+                    argv.push("-lstatic=leaf_native".into());
+                }
             }
             let request = LiveRustcRequest {
                 argv: &argv,
@@ -5809,6 +5827,9 @@ mod tests {
                 ) => plan_generated_workspace_dag_library(&execution),
                 Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata) => {
                     plan_propagated_native_workspace_dag_metadata(&execution)
+                }
+                Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib) => {
+                    plan_propagated_native_workspace_dag_rlib(&execution)
                 }
                 Some(
                     CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
@@ -6130,6 +6151,24 @@ mod tests {
                     true,
                 ),
                 ActionClassRisk::PropagatedNativeWorkspaceDagMetadata,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib),
+                    false,
+                    true,
+                ),
+                ActionClassRisk::PropagatedNativeWorkspaceDagRlib,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib),
+                    true,
+                    true,
+                ),
+                ActionClassRisk::PropagatedNativeWorkspaceDagRlib,
             ),
             (
                 descriptor_with_generated(

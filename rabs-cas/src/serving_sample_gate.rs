@@ -125,6 +125,10 @@ pub enum ActionClassRisk {
     /// trees and committed Rust ancestry. Its samples cannot be borrowed from
     /// own-OUT_DIR native metadata, pure DAGs, or archive classes.
     PropagatedNativeWorkspaceDagMetadata,
+    /// Workspace archives with inherited static native trees and committed
+    /// archive-capable Rust ancestry. Neither metadata nor own-OUT_DIR archive
+    /// samples qualify this independently keyed output-closure contract.
+    PropagatedNativeWorkspaceDagRlib,
     /// Exact selected binary/example or harness metadata checks with a proven
     /// empty candidate inventory. Terminal outputs never authorize consumers.
     WorkspaceTerminalLeafMetadata,

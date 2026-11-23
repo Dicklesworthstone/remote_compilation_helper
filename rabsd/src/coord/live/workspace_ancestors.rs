@@ -56,7 +56,8 @@ impl ProducerPolicy {
             CommittedDependencyPolicy::ImmutableDagMetadata => (true, ProducerDomain::ImmutableDag),
             CommittedDependencyPolicy::WorkspaceDagRlib
             | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
-            | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib => {
+            | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
+            | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib => {
                 (false, ProducerDomain::WorkspaceDag)
             }
             CommittedDependencyPolicy::WorkspaceDagMetadata
@@ -111,6 +112,9 @@ impl ProducerPolicy {
             ActionClassRisk::PropagatedNativeWorkspaceDagMetadata => {
                 CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
             }
+            ActionClassRisk::PropagatedNativeWorkspaceDagRlib => {
+                CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
+            }
             ActionClassRisk::WorkspaceTerminalMetadata => {
                 CommittedDependencyPolicy::WorkspaceTerminalMetadata
             }
@@ -151,7 +155,8 @@ impl ProducerPolicy {
             ActionClassRisk::ImmutableDagMetadata => immutable_dag && self.metadata_allowed,
             ActionClassRisk::WorkspaceDagRlib
             | ActionClassRisk::GeneratedWorkspaceDagRlib
-            | ActionClassRisk::NativeGeneratedWorkspaceDagRlib => {
+            | ActionClassRisk::NativeGeneratedWorkspaceDagRlib
+            | ActionClassRisk::PropagatedNativeWorkspaceDagRlib => {
                 self.domain == ProducerDomain::WorkspaceDag
             }
             ActionClassRisk::WorkspaceDagMetadata
@@ -884,6 +889,7 @@ fn verify_graph(
                     | ActionClassRisk::NativeGeneratedWorkspaceDagRlib
                     | ActionClassRisk::NativeGeneratedWorkspaceDagMetadata
                     | ActionClassRisk::PropagatedNativeWorkspaceDagMetadata
+                    | ActionClassRisk::PropagatedNativeWorkspaceDagRlib
             ) && ancestors.is_empty())
         {
             return Err(format!(
@@ -1151,6 +1157,9 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata => {
                     LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS
                 }
+                CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib => {
+                    LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_RLIB_CLASS
+                }
                 _ => panic!("DAG fixture requires an independently keyed DAG policy"),
             };
             self.prepare_class(tag, parents, outputs, class)
@@ -1240,6 +1249,7 @@ pub(crate) mod tests {
                 LIVE_NATIVE_GENERATED_WORKSPACE_METADATA_CLASS => 32,
                 LIVE_NATIVE_GENERATED_WORKSPACE_DAG_METADATA_CLASS => 33,
                 LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_METADATA_CLASS => 36,
+                LIVE_PROPAGATED_NATIVE_WORKSPACE_DAG_RLIB_CLASS => 37,
                 LIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 24,
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
                 LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 34,
@@ -1782,6 +1792,7 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::WorkspaceDagRlib,
                 CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
                 CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+                CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib,
             ] {
                 assert!(
                     fixture

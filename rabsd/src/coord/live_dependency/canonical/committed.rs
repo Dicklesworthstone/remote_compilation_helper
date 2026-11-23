@@ -1128,6 +1128,7 @@ impl CanonicalPaths {
             | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
             | DependencySourceKind::WorkspaceNativeGeneratedDagMetadata
             | DependencySourceKind::WorkspacePropagatedNativeDagMetadata
+            | DependencySourceKind::WorkspacePropagatedNativeDagRlib
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
             | DependencySourceKind::WorkspaceMixedMetadata => None,
@@ -2604,6 +2605,7 @@ mod tests {
             CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
             CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata,
             CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata,
+            CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let archive = matches!(
@@ -2612,6 +2614,7 @@ mod tests {
                     | CommittedDependencyPolicy::WorkspaceDagRlib
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
+                    | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
             );
             let workspace = matches!(
                 policy,
@@ -2622,6 +2625,7 @@ mod tests {
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
                     | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
             );
             let mut parent_outputs =
                 vec![("libparent.rmeta", OutputRole::ProvisionalMetadata, METADATA)];
@@ -2712,6 +2716,7 @@ mod tests {
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
                     | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
+                    | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
             ) {
                 let ordinary = if archive {
                     CommittedDependencyPolicy::WorkspaceDagRlib

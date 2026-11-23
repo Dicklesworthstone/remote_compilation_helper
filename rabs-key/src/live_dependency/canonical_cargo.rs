@@ -124,6 +124,7 @@ pub(super) fn canonical_layout(plan: &DependencyActionPlan) -> Result<(), LiveRe
         | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
         | DependencySourceKind::WorkspaceNativeGeneratedDagMetadata
         | DependencySourceKind::WorkspacePropagatedNativeDagMetadata
+        | DependencySourceKind::WorkspacePropagatedNativeDagRlib
         | DependencySourceKind::WorkspaceCommittedRlib
         | DependencySourceKind::WorkspaceCommittedMetadata
         | DependencySourceKind::WorkspaceMixedRlib

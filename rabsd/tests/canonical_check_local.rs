@@ -9656,6 +9656,246 @@ fn canonical_cargo_check_replays_propagated_native_workspace_metadata() {
     worker.finish();
 }
 
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; committed native workspace archive samples, relocated replay, native-input invalidation and delivered executable validation"]
+fn canonical_cargo_build_replays_propagated_native_workspace_archives() {
+    use rabs_cas::metadata_store::RabsMetadataStore;
+    use rabs_protocol::result_identity::OutputRole;
+
+    let (owner, mut profile) = native_fixture();
+    let source = owner.path().join("source-a");
+    let relocated = owner.path().join("source-b");
+    for root in [&source, &relocated] {
+        generated_native_workspace(root, true);
+        // The executable belongs to the downstream package. Its result must
+        // traverse the propagated consumer and the provider's bundled C object,
+        // rather than bypassing the new archive class by linking the leaf alone.
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname='canonical_app'\nversion='0.1.0'\nedition='2021'\nautobins=false\n[lib]\nname='native_provider'\n[workspace]\nmembers=['consumer']\nresolver='2'\n[features]\nremote_workspace=[]\n",
+        );
+        write(
+            root,
+            "Cargo.lock",
+            "version=4\n\n[[package]]\nname='canonical_app'\nversion='0.1.0'\n\n[[package]]\nname='propagated_consumer'\nversion='0.1.0'\ndependencies=['canonical_app']\n",
+        );
+        write(
+            root,
+            "consumer/Cargo.toml",
+            "[package]\nname='propagated_consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nnative_provider={package='canonical_app',path='..',features=['remote_workspace']}\n[[bin]]\nname='canonical_app'\npath='src/main.rs'\n",
+        );
+        write(
+            root,
+            "consumer/src/lib.rs",
+            "pub fn answer() -> u32 { native_provider::answer() }\npub const BINDING: &str = native_provider::NATIVE_BINDING;\n",
+        );
+        write(
+            root,
+            "consumer/src/main.rs",
+            "fn main() { assert_eq!(propagated_consumer::BINDING, \"native binding one\"); println!(\"{}\", propagated_consumer::answer()); }\n",
+        );
+    }
+    profile["command"] = json!("build");
+    profile["selection"] = json!({"workspace":true,"features":["remote_workspace"]});
+    assert!(profile.get("target_cache").is_none());
+    let names = ["native_provider", "propagated_consumer"];
+    let stock = |number: u32, profile: &Value, expected_answer: u32| {
+        // A separate store prevents incumbent executions from training either
+        // native class or borrowing remote samples from the surrounding test.
+        let root = owner
+            .path()
+            .join(format!("propagated-native-stock-{number}"));
+        for directory in [root.clone(), root.join("state"), root.join("ops")] {
+            fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+        }
+        let mut profile = profile.clone();
+        profile["state_root"] = json!(root.join("state"));
+        profile["operation_root"] = json!(root.join("ops"));
+        let (code, events, output) = run(owner.path(), 2700 + number, &profile);
+        assert_eq!(code, 0, "stock propagated native build failed: {output}");
+        for decision in ["remote-offer", "hit", "execute"] {
+            assert!(decisions(&events, decision).is_empty(), "{output}");
+        }
+        let (_, archives) = delivered_build_with_dependencies(
+            &root,
+            2700 + number,
+            &events,
+            &output,
+            expected_answer,
+            &names,
+        );
+        let (_, files, diagnostics) = workspace_dag_archive_outputs(&events, &output, &names);
+        (archives, files, diagnostics)
+    };
+    let mut expected = stock(0, &profile, 43);
+    let initial_provider_archive = expected.0["native_provider"].clone();
+    let (mut worker, environment) = NativeWorker::start(owner.path());
+    let mut targets = BTreeSet::new();
+    let mut original_keys: Option<BTreeMap<String, String>> = None;
+    let mut changed_keys: Option<BTreeMap<String, String>> = None;
+    for number in 1..=8 {
+        if number == 4 {
+            profile["source_root"] = json!(relocated);
+        }
+        if number == 5 {
+            // Keep manifests, Rust source and build.rs unchanged. The native
+            // input changes the provider's bundled object and must invalidate
+            // the consumer even if its own Rust codegen bytes stay identical.
+            write(&relocated, "workspace-native-value.txt", "2\n");
+            expected = stock(number, &profile, 44);
+            assert_ne!(expected.0["native_provider"], initial_provider_archive);
+        }
+        if number == 8 {
+            write(&source, "workspace-native-value.txt", "2\n");
+            profile["source_root"] = json!(source);
+        }
+        let replay = matches!(number, 4 | 8);
+        let journal = replay.then(|| read_bounded(&worker.state.join("requests.json")));
+        let (code, events, output) =
+            run_with_environment(owner.path(), 2600 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        assert!(
+            output.contains("RABS_NATIVE_WORKSPACE_BUILD_SCRIPT_RAN"),
+            "{output}"
+        );
+        let (delivered, archives) = delivered_build_with_dependencies(
+            owner.path(),
+            2600 + number,
+            &events,
+            &output,
+            if number < 5 { 43 } else { 44 },
+            &names,
+        );
+        assert!(
+            targets.insert(delivered.clone()),
+            "each build needs its own cold target"
+        );
+        let (target, files, diagnostics) = workspace_dag_archive_outputs(&events, &output, &names);
+        assert_eq!(target, delivered.join("target"));
+        assert_eq!(
+            (&archives, &files, &diagnostics),
+            (&expected.0, &expected.1, &expected.2),
+            "stock, isolated execution and replay must preserve exact archive, dep-info and diagnostics"
+        );
+        let offers = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        let keys = if replay {
+            assert!(
+                offers.is_empty(),
+                "qualified replay dispatched a compiler: {output}"
+            );
+            assert_eq!(
+                journal.unwrap(),
+                read_bounded(&worker.state.join("requests.json"))
+            );
+            assert_metadata_delivery(&events, &hits, false, &output);
+            &hits
+        } else {
+            assert!(
+                hits.is_empty(),
+                "unsampled or changed native input replayed: {output}"
+            );
+            assert_metadata_delivery(&events, &offers, true, &output);
+            for key in offers.values() {
+                assert!(
+                    events.iter().any(|event| {
+                        event["kind"] == "rabsd-remote-dependency-executed" && event["key"] == *key
+                    }),
+                    "a qualifying native archive sample never executed: {output}"
+                );
+            }
+            &offers
+        };
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert_eq!(
+            keys.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(names)
+        );
+        let expected_keys = if number < 5 {
+            &mut original_keys
+        } else {
+            &mut changed_keys
+        };
+        if let Some(expected) = expected_keys.as_ref() {
+            assert_eq!(
+                keys, expected,
+                "sampling or checkout relocation split native archive keys"
+            );
+        } else {
+            *expected_keys = Some(keys.clone());
+        }
+        if number >= 5 {
+            for name in names {
+                assert_ne!(
+                    keys[name],
+                    original_keys.as_ref().unwrap()[name],
+                    "native input did not invalidate {name}"
+                );
+            }
+        }
+        for (name, class) in [
+            (
+                "native_provider",
+                "rustc-workspace-native-generated-rlib-v1",
+            ),
+            (
+                "propagated_consumer",
+                "rustc-workspace-propagated-native-dag-rlib-v1",
+            ),
+        ] {
+            assert_closed_workspace_leaf_evidence(
+                owner.path(),
+                &keys[name],
+                if number >= 5 { number - 4 } else { number }.min(3) as usize,
+                class,
+            );
+        }
+        assert_workspace_dag_ancestry(owner.path(), keys, &files, &names);
+        let cas = rabsd::janitor::store::mount_and_reconcile(
+            &owner.path().join("state/canonical-compile-v1/cas"),
+        )
+        .unwrap();
+        let mut store = cas.store().lock().unwrap();
+        let manifest_key = store
+            .published_manifest_key_str(&keys["propagated_consumer"])
+            .unwrap()
+            .unwrap();
+        let manifest = rabsd::coord::live::load_manifest(&mut *store, &manifest_key).unwrap();
+        assert_eq!(
+            manifest.key_epoch, 37,
+            "archive replay must not borrow metadata's epoch"
+        );
+        let materializable = manifest
+            .logical_outputs
+            .iter()
+            .filter(|output| output.role == OutputRole::Materializable)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            materializable.len(),
+            1,
+            "only the library archive receives materializable authority"
+        );
+        assert!(
+            materializable[0]
+                .virtual_path
+                .as_bytes()
+                .ends_with(b".rlib")
+        );
+        assert!(manifest.logical_outputs.iter().all(|output| matches!(
+            output.role,
+            OutputRole::Materializable | OutputRole::ProvisionalMetadata | OutputRole::DepInfo,
+        )));
+        rabs_sandbox::native_archive::validate_rlib_native_closure(&archives["native_provider"])
+            .unwrap();
+        rabs_sandbox::native_archive::validate_rlib_native_closure(
+            &archives["propagated_consumer"],
+        )
+        .unwrap();
+    }
+    worker.finish();
+}
+
 fn native_workspace_metadata_outputs(
     root: &Path,
     events: &[Value],

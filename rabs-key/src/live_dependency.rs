@@ -485,6 +485,10 @@ pub enum DependencySourceKind {
     /// their completed Cargo records and exact committed Rust producer ancestry.
     /// An own generated tree is optional; no archive or terminal authority.
     WorkspacePropagatedNativeDagMetadata,
+    /// Closed library archive with complete propagated native OUT_DIR trees,
+    /// exact Cargo records and committed archive-capable Rust ancestry.
+    /// Independently qualified from metadata and final-link execution.
+    WorkspacePropagatedNativeDagRlib,
     /// Closed canonical workspace archive whose entire retained Rust candidate
     /// inventory comes from verified, already committed workspace producers.
     WorkspaceCommittedRlib,
@@ -534,6 +538,9 @@ impl DependencySourceKind {
             Self::WorkspacePropagatedNativeDagMetadata => {
                 "canonical-workspace-propagated-native-dag-metadata-v1"
             }
+            Self::WorkspacePropagatedNativeDagRlib => {
+                "canonical-workspace-propagated-native-dag-rlib-v1"
+            }
             Self::WorkspaceCommittedRlib => "canonical-workspace-committed-rlib-v2",
             Self::WorkspaceCommittedMetadata => "canonical-workspace-committed-metadata-v2",
             Self::WorkspaceMixedRlib => "canonical-workspace-committed-mixed-rlib-v2",
@@ -560,6 +567,7 @@ impl DependencySourceKind {
                 | Self::WorkspaceNativeGeneratedDagRlib
                 | Self::WorkspaceNativeGeneratedDagMetadata
                 | Self::WorkspacePropagatedNativeDagMetadata
+                | Self::WorkspacePropagatedNativeDagRlib
                 | Self::WorkspaceCommittedRlib
                 | Self::WorkspaceCommittedMetadata
                 | Self::WorkspaceMixedRlib
@@ -1896,6 +1904,7 @@ fn captured_action_key(
                             | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
                             | DependencySourceKind::WorkspaceNativeGeneratedDagMetadata
                             | DependencySourceKind::WorkspacePropagatedNativeDagMetadata
+                            | DependencySourceKind::WorkspacePropagatedNativeDagRlib
                             | DependencySourceKind::WorkspaceCommittedRlib
                             | DependencySourceKind::WorkspaceCommittedMetadata
                             | DependencySourceKind::WorkspaceMixedRlib
@@ -1973,6 +1982,7 @@ fn captured_action_key(
             | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
             | DependencySourceKind::WorkspaceNativeGeneratedDagMetadata
             | DependencySourceKind::WorkspacePropagatedNativeDagMetadata
+            | DependencySourceKind::WorkspacePropagatedNativeDagRlib
             | DependencySourceKind::WorkspaceCommittedRlib
             | DependencySourceKind::WorkspaceCommittedMetadata
             | DependencySourceKind::WorkspaceMixedRlib
@@ -2091,6 +2101,9 @@ fn captured_action_key(
                 }
                 DependencySourceKind::WorkspacePropagatedNativeDagMetadata => {
                     workspace_dependency_cache::PROPAGATED_NATIVE_DAG_METADATA_ISOLATION_PROFILE
+                }
+                DependencySourceKind::WorkspacePropagatedNativeDagRlib => {
+                    workspace_dependency_cache::PROPAGATED_NATIVE_DAG_RLIB_ISOLATION_PROFILE
                 }
                 DependencySourceKind::WorkspaceCommittedRlib => {
                     workspace_dependency_cache::ISOLATION_PROFILE

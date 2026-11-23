@@ -2019,10 +2019,40 @@ these generations again before publication and delivery. The class requires
 its own successful verification samples and quarantine checks, so earlier
 pure-Rust or own-`OUT_DIR` metadata evidence cannot enable its replay.
 
-This path uses the closed metadata sandbox and publishes only metadata,
+This metadata path uses the closed metadata sandbox and publishes only metadata,
 dep-info and diagnostics. It supplies no archive, final-link, harness or
-build-script execution authority. Unsupported or unqualified requests retain
-the existing fresh execution path; build scripts still execute under Cargo.
+build-script execution authority.
+
+Ordinary workspace library builds with inherited native search roots can also
+qualify through the separate
+`canonical-workspace-propagated-native-dag-rlib-v1` class (key epoch 37).
+This closes the archive-reuse gap for a native dependency feeding one or more
+workspace libraries, including consumers without their own build script:
+
+```sh
+cargo rabs --rabs-canonical-local ./canonical-compile.json -- build --workspace --lib
+```
+
+The archive class uses the existing isolated `Rlib` worker context. It retains
+every foreign native tree and completed Cargo record, any own generated tree,
+the whole captured workspace, exact compiler environment, ordered Rust
+candidate inventory, and current committed producer ancestry. Archive consumers
+require archive-capable producers; metadata-only publications cannot qualify
+them. Every returned archive must pass the existing native-member closure
+validation before publication or delivery.
+
+Archive and metadata results have distinct action identities, verification
+samples and class quarantine. An archive hit restores its verified `.rlib`,
+metadata, dep-info and diagnostics through the existing delivery owner. A
+changed native object, directory listing, Cargo record, compiler environment or
+producer witness requires a new key or refuses reuse. A previously qualified
+consumer still rechecks its transitive producers before serving.
+
+These classes cache consuming Rust library actions. Final executable linking,
+test execution and build-script execution keep their existing execution paths.
+Unsupported or unqualified requests retain fresh execution; build scripts still
+execute under Cargo. The broader native compiler and exact-link caching
+milestones remain separate.
 
 The general workspace execution profile executes each accepted request afresh.
 Its identity binds the entire
@@ -4173,6 +4203,27 @@ the build case's archive bytes and executable result. The existing own-native
 dependency fixtures now likewise require their downstream workspace units to
 execute remotely. These are native acceptance tests to run on a capable host;
 their presence does not establish a completed native qualification or speedup.
+
+The propagated-native workspace archive cache has an additional acceptance case:
+
+```sh
+RABS_CANONICAL_TEST_WRAPPER="$PWD/target/debug/rabs-wrap" \
+RABS_TEST_WORKER_BIN="$PWD/target/debug/rabs-wkr" \
+  cargo test -p rabsd --test canonical_check_local --locked \
+    canonical_cargo_build_replays_propagated_native_workspace_archives \
+    -- --ignored --exact --nocapture
+```
+
+It compiles a real C archive, bundles it in a workspace provider library, and
+builds a downstream workspace library that inherits the native search root.
+Three independent worker executions must match the stock compiler before the
+downstream epoch-37 action can replay from a relocated checkout. The fixture
+checks exact archives, dep-info and diagnostics, committed ancestry and the
+returned executable's value. Changing only the native source must invalidate
+both library actions and change that executable's result; the changed action
+must earn fresh samples before replay. It requires the complete namespace and
+worker prerequisites above. Adding or compiling this test does not establish
+that native execution, cache reuse or a performance target has been qualified.
 
 ### Select local Cargo units from the Cargo command line
 

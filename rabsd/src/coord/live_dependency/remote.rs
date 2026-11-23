@@ -1068,6 +1068,7 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
             | DependencySourceKind::WorkspaceNativeGeneratedDagRlib
             | DependencySourceKind::WorkspaceNativeGeneratedDagMetadata
             | DependencySourceKind::WorkspacePropagatedNativeDagMetadata
+            | DependencySourceKind::WorkspacePropagatedNativeDagRlib
     ) {
         let policy = CommittedDependencyPolicy::from_source_kind(plan.source_kind)
             .ok_or("generated workspace DAG lost its committed-input policy")?;

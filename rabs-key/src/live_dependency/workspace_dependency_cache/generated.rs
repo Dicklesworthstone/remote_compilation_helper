@@ -8,8 +8,10 @@
 //! the coordinator and are not supplied by these pure key facts.
 //! Explicit bundled static libraries in the complete own OUT_DIR have
 //! separate archive and closed metadata classes. Propagated native searches
-//! have a separate metadata-only DAG class retaining every foreign OUT_DIR and
-//! its completed Cargo record, with an optional complete own generated tree.
+//! have separate metadata and archive DAG classes retaining every foreign
+//! OUT_DIR and its completed Cargo record, with an optional complete own
+//! generated tree. Archives require archive-capable committed producers and
+//! the existing output-archive native closure checks.
 //! Dynamic native requests retain fresh execution without these authorities.
 
 use super::{
@@ -192,6 +194,44 @@ pub(super) const PROPAGATED_NATIVE_METADATA: DagContract = DagContract {
     profile: PROPAGATED_NATIVE_DAG_METADATA_ISOLATION_PROFILE,
 };
 
+pub(in crate::live_dependency) const PROPAGATED_NATIVE_DAG_RLIB_ISOLATION_PROFILE: &str = "canonical-workspace-propagated-native-dag-rlib-v1: \
+    driver-retained Cargo-selected ordinary library build; independently \
+    negotiated canonical-workspace-exec-v3 Rlib namespace without procfs or \
+    entropy devices; complete immutable workspace files and directory listings; \
+    every foreign Cargo OUT_DIR selected by propagated native searches bound \
+    to its completed root-output/stdout record and complete immutable tree, \
+    including empty directories; exact logical roots, native search order and \
+    supported static bundle, whole-archive and verbatim flags; optional own \
+    OUT_DIR retains its complete tree, exact completed Cargo stdout and matching \
+    fully keyed environment; build scripts execute normally and supply no \
+    compiler or run-cache authority; exact argv, cwd, manifest, output placement, \
+    complete retained toolchain and measured ELF runtime; every loadable Rust \
+    candidate bound to its operation-owned installed generation and exact \
+    committed archive-capable producer action, descriptor, manifest, role and \
+    whole object identity; whole explicit archives and existing metadata-shadow \
+    projection, exact empty search metadata remains keyed without producer \
+    authority; explicit empty externs refuse; complete nonempty H028 ancestry, \
+    each intermediate's producer policy and current transitive serving, class, \
+    quarantine and native archive closure rechecked at commit and delivery; \
+    metadata-only producers cannot authorize any input, including rmeta; \
+    original source, generated/native trees, Cargo records and dependency \
+    generations revalidated; authenticated completed drained receipt, exact \
+    dep-info and diagnostics, tracked-control read veto and complete output \
+    rlib native closure including source link attributes, thin archives and \
+    linker scripts; separate propagated-native archive samples, class quarantine \
+    and private installation gates; no arbitrary host or dynamic/framework \
+    search, external linker, final executable, proc macro, incremental state, \
+    local completion, provisional publication, adopted or request-owned authority";
+
+pub(super) const PROPAGATED_NATIVE_RLIB: DagContract = DagContract {
+    epoch: 37,
+    class: ActionClass::RustcWorkspaceCompile,
+    isolation_domain: "rabs.canonical-workspace-propagated-native-dag-rlib.isolation.v1",
+    semantics_domain: "rabs.canonical-workspace-propagated-native-dag-rlib.semantics.v1",
+    dependencies_domain: "rabs.canonical-workspace-propagated-native-dag-rlib.dependencies.v1",
+    profile: PROPAGATED_NATIVE_DAG_RLIB_ISOLATION_PROFILE,
+};
+
 pub(super) const RLIB: DagContract = DagContract {
     epoch: 28,
     class: ActionClass::RustcWorkspaceCompile,
@@ -280,15 +320,59 @@ pub fn plan_propagated_native_workspace_dag_metadata(
     }
     let mut plan = execution.clone();
     plan.source_kind = DependencySourceKind::WorkspacePropagatedNativeDagMetadata;
-    validate_propagated_native_metadata_plan(&plan)?;
+    validate_propagated_native_plan(
+        &plan,
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata,
+    )?;
     Ok(plan)
 }
 
-fn validate_propagated_native_metadata_plan(
+/// Refine an original fresh workspace library build with inherited native
+/// searches into the separately qualified archive class. Input trees and Cargo
+/// records remain complete, and every Rust producer must have archive authority.
+/// The output rlib still requires the existing native closure proof before
+/// publication; an unbundled link edge never acquires cache authority here.
+///
+/// # Errors
+/// A nonfresh plan, no foreign native root, nonlibrary or nonarchive output,
+/// unclosed native input, or unsupported executable/compiler state.
+pub fn plan_propagated_native_workspace_dag_rlib(
+    execution: &DependencyActionPlan,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    if execution.source_kind != DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "propagated native archive planning requires the original fresh workspace plan".into(),
+        ));
+    }
+    let mut plan = execution.clone();
+    plan.source_kind = DependencySourceKind::WorkspacePropagatedNativeDagRlib;
+    validate_propagated_native_plan(
+        &plan,
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib,
+    )?;
+    Ok(plan)
+}
+
+fn validate_propagated_native_plan(
     plan: &DependencyActionPlan,
+    policy: CommittedDependencyPolicy,
 ) -> Result<(), LiveRefusal> {
+    let source_kind = match policy {
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata => {
+            DependencySourceKind::WorkspacePropagatedNativeDagMetadata
+        }
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib => {
+            DependencySourceKind::WorkspacePropagatedNativeDagRlib
+        }
+        _ => {
+            return Err(LiveRefusal::Facts(
+                "propagated native workspace caching requires its distinct committed-input policy"
+                    .into(),
+            ));
+        }
+    };
     workspace_layout(plan)?;
-    if plan.source_kind != DependencySourceKind::WorkspacePropagatedNativeDagMetadata
+    if plan.source_kind != source_kind
         || !matches!(plan.invocation.crate_types.as_slice(), [kind] if matches!(kind.as_str(), "lib" | "rlib"))
         || plan
             .invocation
@@ -298,10 +382,10 @@ fn validate_propagated_native_metadata_plan(
         || plan.native_roots.is_empty()
         || remote::validate_plan_native_roots(plan)?.is_empty()
         || remote::remote_dependency_output_class(&plan.invocation)
-            != Ok(RemoteDependencyOutputClass::Metadata)
+            != Ok(policy.output_class())
     {
         return Err(LiveRefusal::Facts(
-            "propagated native workspace caching requires an ordinary library metadata check with complete foreign Cargo OUT_DIR inputs and exact committed Rust ancestry"
+            "propagated native workspace caching requires its exact ordinary library output class, complete foreign Cargo OUT_DIR inputs and committed Rust ancestry"
                 .into(),
         ));
     }
@@ -312,8 +396,12 @@ pub(super) fn validate_plan(
     plan: &DependencyActionPlan,
     policy: CommittedDependencyPolicy,
 ) -> Result<(), LiveRefusal> {
-    if policy == CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata {
-        return validate_propagated_native_metadata_plan(plan);
+    if matches!(
+        policy,
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
+            | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
+    ) {
+        return validate_propagated_native_plan(plan, policy);
     }
     workspace_layout(plan)?;
     let source_kind = match policy {
@@ -421,6 +509,11 @@ pub(super) fn key(
             "rabs.canonical-workspace-propagated-native-dag-metadata.environment.v1",
             "rabs.canonical-workspace-propagated-native-dag-metadata.invocation.v1",
         ),
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib => (
+            &PROPAGATED_NATIVE_RLIB,
+            "rabs.canonical-workspace-propagated-native-dag-rlib.environment.v1",
+            "rabs.canonical-workspace-propagated-native-dag-rlib.invocation.v1",
+        ),
         _ => unreachable!("generated DAG shape checked its exact policy"),
     };
     let externs = remote::remote_extern_facts(plan, directories)?;
@@ -516,6 +609,8 @@ mod tests {
     const FOREIGN_NATIVE_B: &str = "/__rabs/out/cargo/debug/build/provider-b/out";
     const PROPAGATED_POLICY: CommittedDependencyPolicy =
         CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata;
+    const PROPAGATED_ARCHIVE_POLICY: CommittedDependencyPolicy =
+        CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib;
     const RECORD: &[u8] = b"cargo:rerun-if-changed=build.rs\ncargo:rustc-env=BUILD_TAG=generated\n";
     const NATIVE_RECORD: &[u8] = b"cargo:rerun-if-changed=build.rs\ncargo:rustc-env=BUILD_TAG=generated\ncargo:rustc-link-search=native=/__rabs/out/cargo/debug/build/consumer-123/out\ncargo:rustc-link-lib=static=generated\n";
     const POLICIES: [CommittedDependencyPolicy; 2] = [
@@ -734,6 +829,22 @@ mod tests {
         native_library: bool,
     ) -> DependencyActionPlan {
         let (argv, env) = propagated_request(own_generated, explicit_archive, native_library);
+        execution(&argv, &env)
+    }
+
+    fn propagated_archive_execution(
+        own_generated: bool,
+        explicit_archive: bool,
+        native_library: bool,
+    ) -> DependencyActionPlan {
+        let (mut argv, env) = request(PROPAGATED_ARCHIVE_POLICY, own_generated, explicit_archive);
+        argv.extend([
+            format!("-Lnative={FOREIGN_NATIVE_B}/nested"),
+            format!("-Lnative={FOREIGN_NATIVE_A}"),
+        ]);
+        if native_library {
+            argv.push("-lstatic=provider".into());
+        }
         execution(&argv, &env)
     }
 
@@ -1303,6 +1414,247 @@ mod tests {
         ] {
             assert!(dep_info_closure_violation(&plan, extra.as_bytes(), is_input).is_some());
         }
+    }
+
+    #[test]
+    fn propagated_native_archives_require_their_distinct_full_input_contract() {
+        for own_generated in [false, true] {
+            for explicit_archive in [false, true] {
+                for native_library in [false, true] {
+                    if !own_generated && native_library {
+                        continue; // Native directives require an own Cargo build-script owner.
+                    }
+                    let fresh = propagated_archive_execution(
+                        own_generated,
+                        explicit_archive,
+                        native_library,
+                    );
+                    let plan = plan_propagated_native_workspace_dag_rlib(&fresh).unwrap();
+                    let captured = propagated_inputs(&plan);
+                    let record = own_generated.then_some(RECORD);
+                    let keyed = build_key(
+                        &plan,
+                        PROPAGATED_ARCHIVE_POLICY,
+                        &dependencies(),
+                        &captured,
+                        record,
+                    )
+                    .unwrap();
+                    assert_eq!(plan.invocation, fresh.invocation);
+                    assert_eq!(plan.execution_env, fresh.execution_env);
+                    assert_eq!(plan.native_roots, [FOREIGN_NATIVE_A, FOREIGN_NATIVE_B]);
+                    assert_eq!(plan.generated_root.is_some(), own_generated);
+                    assert_eq!(
+                        plan.source_kind,
+                        DependencySourceKind::WorkspacePropagatedNativeDagRlib
+                    );
+                    assert_eq!(
+                        CommittedDependencyPolicy::from_source_kind(plan.source_kind),
+                        Some(PROPAGATED_ARCHIVE_POLICY)
+                    );
+                    assert_eq!(keyed.descriptor.key_epoch, 37);
+                    assert_eq!(
+                        committed::committed_dependency_descriptor_policy(&keyed.descriptor),
+                        Some(PROPAGATED_ARCHIVE_POLICY)
+                    );
+                    assert_eq!(
+                        plan.output_names(),
+                        ["consumer.d", "libconsumer.rmeta", "libconsumer.rlib"]
+                    );
+                    assert!(plan_propagated_native_workspace_dag_rlib(&plan).is_err());
+                    assert!(plan_propagated_native_workspace_dag_metadata(&fresh).is_err());
+                    assert!(plan_generated_workspace_dag_library(&fresh).is_err());
+                    assert!(leaf::plan_closed_workspace_library(&fresh).is_err());
+                    assert!(
+                        build_key(&plan, PROPAGATED_POLICY, &dependencies(), &captured, record)
+                            .is_err()
+                    );
+                    let metadata = plan_propagated_native_workspace_dag_metadata(
+                        &propagated_execution(own_generated, explicit_archive, native_library),
+                    )
+                    .unwrap();
+                    let metadata_key = build_key(
+                        &metadata,
+                        PROPAGATED_POLICY,
+                        &dependencies(),
+                        &propagated_inputs(&metadata),
+                        record,
+                    )
+                    .unwrap();
+                    assert_ne!(keyed.action_key, metadata_key.action_key);
+                    assert_ne!(
+                        keyed.descriptor.sandbox_semantic_policy,
+                        metadata_key.descriptor.sandbox_semantic_policy
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn propagated_native_archive_keys_close_native_bytes_records_membership_and_producers() {
+        let fresh = propagated_archive_execution(true, true, true);
+        let plan = plan_propagated_native_workspace_dag_rlib(&fresh).unwrap();
+        let captured = propagated_inputs(&plan);
+        let dependencies = dependencies();
+        let keyed = |plan: &DependencyActionPlan,
+                     inputs: &ActionInputManifest,
+                     producers: &[CommittedWorkspaceDependency]| {
+            build_key(
+                plan,
+                PROPAGATED_ARCHIVE_POLICY,
+                producers,
+                inputs,
+                Some(RECORD),
+            )
+        };
+        let original = keyed(&plan, &captured, &dependencies).unwrap();
+        for position in 0..captured.inputs.len() {
+            let mut changed = captured.clone();
+            changed.inputs[position].object.0.bytes[0] ^= 1;
+            assert_ne!(
+                original.action_key,
+                keyed(&plan, &changed, &dependencies).unwrap().action_key,
+                "input {:?}",
+                captured.inputs[position].virtual_path
+            );
+        }
+        let mut changed = captured.clone();
+        changed.directory_enumerations.push(listing(
+            plan.native_input_virtual_path(0, "empty/nested"),
+            &[],
+        ));
+        changed
+            .directory_enumerations
+            .iter_mut()
+            .find(|entry| {
+                entry.virtual_path.as_bytes()
+                    == plan.native_input_virtual_path(0, "empty").as_bytes()
+            })
+            .unwrap()
+            .entries
+            .push(RawBytes::from("nested"));
+        assert_ne!(
+            original.action_key,
+            keyed(&plan, &changed, &dependencies).unwrap().action_key
+        );
+        let mut reordered = plan.clone();
+        reordered.invocation.lib_search.reverse();
+        assert_ne!(
+            original.action_key,
+            keyed(&reordered, &captured, &dependencies).unwrap().action_key
+        );
+        for index in 0..plan.native_roots.len() {
+            for path in [
+                plan.native_record_virtual_path(index),
+                plan.native_input_virtual_path(index, "libprovider.a"),
+            ] {
+                let mut missing = captured.clone();
+                missing
+                    .inputs
+                    .retain(|input| input.virtual_path.as_bytes() != path.as_bytes());
+                assert!(keyed(&plan, &missing, &dependencies).is_err());
+            }
+        }
+        let mut missing = dependencies.clone();
+        missing.pop();
+        assert!(
+            key_with_inventory(
+                &plan,
+                PROPAGATED_ARCHIVE_POLICY,
+                &directories(&dependencies),
+                &missing,
+                &captured,
+                Some(RECORD),
+            )
+            .is_err()
+        );
+        assert!(keyed(&plan, &captured, &[]).is_err());
+        for position in 0..dependencies.len() {
+            let mut changed = dependencies.clone();
+            changed[position].producer_manifest.bytes[0] ^= 1;
+            assert_ne!(
+                original.action_key,
+                keyed(&plan, &captured, &changed).unwrap().action_key
+            );
+        }
+        let is_input = |path: &str| {
+            captured
+                .inputs
+                .iter()
+                .any(|input| input.virtual_path.as_bytes() == path.as_bytes())
+        };
+        assert!(
+            dep_info_closure_violation(
+                &plan,
+                format!(
+                    "{OUTPUT}/libconsumer.rlib: consumer/src/lib.rs {GENERATED}/value.rs {FOREIGN_NATIVE_A}/nested/libprovider.a\n"
+                )
+                .as_bytes(),
+                is_input,
+            )
+            .is_none()
+        );
+        for unclosed in [
+            format!("{OUTPUT}/libconsumer.rlib: /usr/include/unretained.h\n"),
+            "# env-dep:CARGO_MAKEFLAGS=--jobserver-auth=3,4\n".into(),
+        ] {
+            assert!(dep_info_closure_violation(&plan, unclosed.as_bytes(), is_input).is_some());
+        }
+    }
+
+    #[test]
+    fn propagated_native_archives_refuse_nonbundled_inputs_and_mislabeled_authority() {
+        let fresh = propagated_archive_execution(false, true, false);
+        for mutation in 0..12 {
+            let mut changed = fresh.clone();
+            match mutation {
+                0 => changed.native_roots.clear(),
+                1 => changed.native_roots.reverse(),
+                2 => changed.native_roots.push(changed.native_roots[0].clone()),
+                3 => changed.native_roots[0] = "/__rabs/out/cargo/debug/build/unbound/out".into(),
+                4 => changed.invocation.native_libs = vec!["dylib=provider".into()],
+                5 => changed.invocation.native_libs = vec!["static:-bundle=provider".into()],
+                6 => changed.invocation.native_libs = vec!["static:+verbatim=../outside.a".into()],
+                7 => changed.invocation.lib_search.push("native=/usr/lib".into()),
+                8 => changed.invocation.lib_search.push("framework=/System/Library".into()),
+                9 => changed.invocation.emit.retain(|kind| kind != "link"),
+                10 => changed.invocation.crate_types = vec!["bin".into()],
+                _ => changed.invocation.passthrough.push("--test".into()),
+            }
+            assert!(
+                plan_propagated_native_workspace_dag_rlib(&changed).is_err(),
+                "mutation={mutation}"
+            );
+        }
+        let plan = plan_propagated_native_workspace_dag_rlib(&fresh).unwrap();
+        let captured = propagated_inputs(&plan);
+        let original = build_key(
+            &plan,
+            PROPAGATED_ARCHIVE_POLICY,
+            &dependencies(),
+            &captured,
+            None,
+        )
+        .unwrap();
+        for mutation in 0..5 {
+            let mut forged = original.descriptor.clone();
+            match mutation {
+                0 => forged.key_epoch = 36,
+                1 => forged.key_epoch = crate::live_dependency::LIVE_DEPENDENCY_KEY_EPOCH,
+                2 => forged.action_class = ActionClass::RustcDependencyCompile,
+                3 => forged.dependency_inputs = digest(b"unqualified producer inventory"),
+                _ => {
+                    forged.sandbox_semantic_policy = compute(
+                        PROPAGATED_NATIVE_METADATA.isolation_domain,
+                        PROPAGATED_NATIVE_METADATA.profile.as_bytes(),
+                    );
+                }
+            }
+            assert!(committed::committed_dependency_descriptor_policy(&forged).is_none());
+            assert!(committed::uses_committed_dependency_namespace(&forged));
+        }
+        assert!(leaf::closed_workspace_library_descriptor_class(&original.descriptor).is_none());
     }
 
     #[test]
