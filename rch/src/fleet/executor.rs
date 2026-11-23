@@ -16,13 +16,12 @@ use crate::fleet::progress::{DeployPhase, FleetProgress};
 use crate::fleet::rollback::{
     MAX_BACKUPS_PER_WORKER, REMOTE_BACKUP_DIR, REMOTE_RCH_PATH, RollbackManager, WorkerBackup,
 };
-use crate::fleet::ssh::{CommandOutput, FleetSshError, SshExecutor};
+use crate::fleet::ssh::{CommandOutput, CommandRunner, FleetSshError, SshExecutor};
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
 
 use crate::error::{FleetError, SshError};
-use futures::future::BoxFuture;
 use rch_common::capability_probe::{
     CapabilityRequirement, CapabilityVerdict, NamedToolProbe, ProbeSpec, assess_admissibility,
     build_capability_probe_script, parse_capability_probe,
@@ -1875,32 +1874,6 @@ pub async fn backup_before_deploy(
 ) -> Result<Option<WorkerBackup>> {
     let ssh = SshExecutor::new(worker);
     backup_before_deploy_with_runner(worker, rollback_manager, &ssh).await
-}
-
-trait CommandRunner {
-    fn run_command<'a>(
-        &'a self,
-        cmd: &'a str,
-    ) -> BoxFuture<'a, Result<CommandOutput, FleetSshError>>;
-}
-
-impl<'a> CommandRunner for SshExecutor<'a> {
-    fn run_command<'b>(
-        &'b self,
-        cmd: &'b str,
-    ) -> BoxFuture<'b, Result<CommandOutput, FleetSshError>> {
-        Box::pin(SshExecutor::run_command(self, cmd))
-    }
-}
-
-#[cfg(test)]
-impl CommandRunner for crate::fleet::ssh::MockSshExecutor {
-    fn run_command<'a>(
-        &'a self,
-        cmd: &'a str,
-    ) -> BoxFuture<'a, Result<CommandOutput, FleetSshError>> {
-        Box::pin(crate::fleet::ssh::MockSshExecutor::run_command(self, cmd))
-    }
 }
 
 async fn backup_before_deploy_with_runner<R: CommandRunner>(

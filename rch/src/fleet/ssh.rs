@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 
 use crate::error::FleetError;
+use futures::future::BoxFuture;
 use rch_common::WorkerConfig;
 use rch_common::mock;
 use rch_common::ssh_utils::shell_escape_path_with_home;
@@ -223,6 +224,34 @@ pub struct SshExecutor<'a> {
     command_timeout: Duration,
     /// SCP transfer timeout.
     scp_timeout: Duration,
+}
+
+/// Shared transport boundary for fleet operations. Tests replace the transport
+/// while exercising the same deployment and rollback implementation.
+pub(super) trait CommandRunner {
+    fn run_command<'a>(
+        &'a self,
+        cmd: &'a str,
+    ) -> BoxFuture<'a, Result<CommandOutput, FleetSshError>>;
+}
+
+impl CommandRunner for SshExecutor<'_> {
+    fn run_command<'a>(
+        &'a self,
+        cmd: &'a str,
+    ) -> BoxFuture<'a, Result<CommandOutput, FleetSshError>> {
+        Box::pin(SshExecutor::run_command(self, cmd))
+    }
+}
+
+#[cfg(test)]
+impl CommandRunner for MockSshExecutor {
+    fn run_command<'a>(
+        &'a self,
+        cmd: &'a str,
+    ) -> BoxFuture<'a, Result<CommandOutput, FleetSshError>> {
+        Box::pin(MockSshExecutor::run_command(self, cmd))
+    }
 }
 
 impl<'a> SshExecutor<'a> {

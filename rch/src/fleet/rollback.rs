@@ -14,15 +14,15 @@
 //! The registry uses atomic writes with file locking to handle concurrent access.
 
 use crate::fleet::history::HistoryManager;
-use crate::fleet::ssh::SshExecutor;
+use crate::fleet::ssh::{CommandRunner, SshExecutor};
 use crate::state::lock::ConfigLock;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result};
 
-use crate::error::FleetError;
 use futures::stream::{self, StreamExt};
 use rch_common::WorkerConfig;
+use rch_common::ssh_utils::{shell_escape_path_with_home, shell_escape_value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -37,7 +37,6 @@ use tracing::{debug, error, info, warn};
 // =============================================================================
 
 /// Default remote path to the rch-wkr binary on workers.
-#[allow(dead_code)] // Used by planned rollback commands
 pub const REMOTE_RCH_PATH: &str = "~/.local/bin/rch-wkr";
 
 /// Default remote backup directory on workers.
@@ -51,7 +50,6 @@ pub const MAX_BACKUPS_PER_WORKER: usize = 3;
 const REGISTRY_FILE: &str = "registry.json";
 
 /// Timeout for rollback operations.
-#[allow(dead_code)] // Reserved for future timeout handling
 const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout for acquiring the backup registry lock.
@@ -231,9 +229,7 @@ impl RollbackManager {
     pub fn get_backup(&self, worker_id: &str, version: &str) -> Option<WorkerBackup> {
         let registry = self.load_registry().ok()?;
 
-        registry
-            .into_iter()
-            .find(|b| b.worker_id == worker_id && b.version == version)
+        select_backup(&registry, worker_id, Some(version)).cloned()
     }
 
     /// Prune old backups, keeping only the most recent `max_per_worker` for each worker.
@@ -307,18 +303,16 @@ impl RollbackManager {
     ///
     /// This function restores workers to a previous binary version by:
     /// 1. Looking up the backup for each worker (specific version or latest)
-    /// 2. Gracefully stopping any running rch-wkr process
-    /// 3. Copying the backup binary back to the main rch-wkr location via SSH
-    /// 4. Optionally verifying the restored binary hash matches the backup record
-    /// 5. Verifying the version after restoration
-    /// 6. Restarting the rch-wkr service
+    /// 2. Staging a private copy beside the installed binary
+    /// 3. Checking its exact version and, when requested, its recorded SHA-256
+    /// 4. Atomically replacing the installed path, preserving running helpers
     ///
     /// # Arguments
     ///
     /// * `workers` - List of workers to roll back
     /// * `to_version` - Optional specific version to roll back to (uses previous if None)
     /// * `parallelism` - Maximum number of concurrent rollback operations
-    /// * `verify` - If true, verify binary hash after restoration
+    /// * `verify` - If true, verify the recorded binary hash before switching
     /// * `ctx` - Output context for progress display
     ///
     /// # Returns
@@ -347,53 +341,24 @@ impl RollbackManager {
             "Starting parallel rollback operation"
         );
 
-        // Phase 1: Look up backups sequentially (fast, no I/O)
-        // This avoids capturing `self` in async closures
+        // A registered backup is the binary saved before deployment. It is
+        // available even for a worker's first recorded deployment; requiring
+        // two successful history rows incorrectly made that rollback unusable.
+        // Read one registry snapshot for the complete operation.
+        let registry = self.load_registry()?;
         type RollbackTask<'a> = (usize, &'a WorkerConfig, Option<(WorkerBackup, String)>);
         let mut rollback_tasks: Vec<RollbackTask<'_>> = Vec::with_capacity(workers.len());
 
         for (idx, worker) in workers.iter().enumerate() {
-            let worker_id = &worker.id.0;
-
-            // Determine target version
-            let target_version = match to_version {
-                Some(v) => v.to_string(),
-                None => match self.history.get_previous_version(worker_id) {
-                    Ok(Some(v)) => v,
-                    Ok(None) => {
-                        warn!(worker = %worker_id, "No previous version found for rollback");
-                        rollback_tasks.push((idx, worker, None));
-                        continue;
-                    }
-                    Err(e) => {
-                        error!(worker = %worker_id, error = %e, "Failed to get previous version");
-                        rollback_tasks.push((idx, worker, None));
-                        continue;
-                    }
-                },
-            };
-
-            // Look up backup for this version
-            let backup = match self.get_backup(worker_id, &target_version) {
-                Some(b) => b,
-                None => {
-                    // Try getting the latest backup if specific version not found
-                    match self.get_latest_backup(worker_id) {
-                        Some(b) if b.version == target_version => b,
-                        _ => {
-                            error!(
-                                worker = %worker_id,
-                                version = %target_version,
-                                "No backup found for target version"
-                            );
-                            rollback_tasks.push((idx, worker, None));
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            rollback_tasks.push((idx, worker, Some((backup, target_version))));
+            let backup = select_backup(&registry, &worker.id.0, to_version).cloned();
+            rollback_tasks.push((
+                idx,
+                worker,
+                backup.map(|backup| {
+                    let target_version = normalize_version(&backup.version).to_string();
+                    (backup, target_version)
+                }),
+            ));
         }
 
         let completed = Arc::new(AtomicUsize::new(0));
@@ -541,32 +506,15 @@ impl RollbackManager {
         }
     }
 
-    /// Restore a worker from backup.
-    ///
-    /// This function:
-    /// 1. Copies the backup binary back to the main rch-wkr location
-    /// 2. Sets executable permissions on the restored binary
-    /// 3. Optionally verifies the hash matches the recorded value
-    ///
-    /// # Arguments
-    ///
-    /// * `backup` - The backup record containing remote path and hash
-    /// * `worker` - The worker configuration for SSH connection
-    /// * `verify_hash` - If true, verify the restored binary matches the recorded hash
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - SSH connection fails
-    /// - The backup file doesn't exist on the worker
-    /// - File copy or permission setting fails
-    /// - Hash verification fails (when verify_hash is true)
+    /// Restore a worker from backup, checking the exact version before the
+    /// atomic switch. Active per-command worker processes are left running.
     pub async fn restore_backup(&self, backup: &WorkerBackup, worker: &WorkerConfig) -> Result<()> {
         self.restore_backup_with_verification(backup, worker, false)
             .await
     }
 
-    /// Restore a worker from backup with optional hash verification.
+    /// Restore using the same transaction as fleet rollback. A requested hash
+    /// check requires a known digest and a successful remote SHA-256 operation.
     pub async fn restore_backup_with_verification(
         &self,
         backup: &WorkerBackup,
@@ -574,108 +522,7 @@ impl RollbackManager {
         verify_hash: bool,
     ) -> Result<()> {
         let ssh = SshExecutor::with_timeout(worker, ROLLBACK_TIMEOUT);
-        let worker_id = &worker.id.0;
-        let remote_backup_path = backup.remote_path.to_string_lossy();
-
-        info!(
-            worker = %worker_id,
-            backup_path = %remote_backup_path,
-            version = %backup.version,
-            "Restoring worker from backup"
-        );
-
-        // Step 1: Verify backup exists on remote
-        let check_cmd = format!("test -f {}", remote_backup_path);
-        let check_result = ssh
-            .run_command(&check_cmd)
-            .await
-            .context("Failed to check if backup exists")?;
-
-        if !check_result.success() {
-            return Err(FleetError::NoBackupAvailable {
-                worker_id: worker_id.to_string(),
-            }
-            .into());
-        }
-
-        debug!(
-            worker = %worker_id,
-            backup_path = %remote_backup_path,
-            "Backup file exists, proceeding with restore"
-        );
-
-        // Step 2: Copy backup to main binary location
-        // Use cp with --preserve to maintain permissions and timestamps
-        let restore_cmd = format!(
-            "cp --preserve=mode,timestamps {} {}",
-            remote_backup_path, REMOTE_RCH_PATH
-        );
-        let restore_result = ssh
-            .run_command(&restore_cmd)
-            .await
-            .context("Failed to copy backup to main location")?;
-
-        if !restore_result.success() {
-            return Err(FleetError::RollbackFailed {
-                worker_id: worker_id.to_string(),
-                reason: format!("cp command failed: {}", restore_result.stderr.trim()),
-            }
-            .into());
-        }
-
-        // Step 3: Ensure executable permissions (redundant with --preserve but safe)
-        ssh.set_executable(REMOTE_RCH_PATH)
-            .await
-            .context("Failed to set executable permissions on restored binary")?;
-
-        info!(
-            worker = %worker_id,
-            version = %backup.version,
-            "Binary restored successfully"
-        );
-
-        // Step 4: Optionally verify hash
-        if verify_hash && backup.binary_hash != "unknown" {
-            debug!(
-                worker = %worker_id,
-                expected_hash = %backup.binary_hash,
-                "Verifying restored binary hash"
-            );
-
-            let hash_cmd = format!("sha256sum {} | cut -d' ' -f1", REMOTE_RCH_PATH);
-            let hash_result = ssh
-                .run_command(&hash_cmd)
-                .await
-                .context("Failed to compute hash of restored binary")?;
-
-            if !hash_result.success() {
-                warn!(
-                    worker = %worker_id,
-                    stderr = %hash_result.stderr.trim(),
-                    "Hash verification command failed, skipping verification"
-                );
-            } else {
-                let actual_hash = hash_result.stdout.trim();
-                if actual_hash != backup.binary_hash {
-                    return Err(FleetError::RollbackFailed {
-                        worker_id: worker_id.to_string(),
-                        reason: format!(
-                            "hash mismatch: expected {}, got {}",
-                            backup.binary_hash, actual_hash
-                        ),
-                    }
-                    .into());
-                }
-
-                info!(
-                    worker = %worker_id,
-                    hash = %actual_hash,
-                    "Hash verification passed"
-                );
-            }
-        }
-
-        Ok(())
+        restore_with_runner(worker, backup, &backup.version, verify_hash, &ssh).await
     }
 }
 
@@ -737,16 +584,8 @@ fn record_rollback_audit(
     }
 }
 
-/// Execute a rollback for a single worker.
-///
-/// This is a standalone function (not a method) to allow capture in async closures
-/// without borrowing `self`.
-///
-/// Performs the complete rollback workflow:
-/// 1. Gracefully stop running rch-wkr
-/// 2. Restore the backup binary
-/// 3. Verify the restored version
-/// 4. Restart rch-wkr
+/// Running rch-wkr instances are per-command helpers, not a service. Replacing
+/// their executable by rename lets active jobs finish on their original inode.
 async fn execute_single_rollback(
     worker: &WorkerConfig,
     backup: &WorkerBackup,
@@ -756,7 +595,6 @@ async fn execute_single_rollback(
 ) -> RollbackResult {
     let style = ctx.theme();
     let worker_id = &worker.id.0;
-
     if !ctx.is_json() {
         println!(
             "  {} Rolling back {} to v{}...",
@@ -766,219 +604,194 @@ async fn execute_single_rollback(
         );
     }
 
-    let ssh = SshExecutor::new(worker);
-
-    // Step 1: Gracefully stop running rch-wkr (if any)
-    debug!(worker = %worker_id, "Stopping rch-wkr before rollback");
-    if let Err(e) = ssh
-        .run_command("pkill -TERM rch-wkr 2>/dev/null || true")
-        .await
-    {
-        // Log but don't fail - process might not be running
-        debug!(worker = %worker_id, error = %e, "pkill returned error (process may not be running)");
-    }
-    // Allow brief time for graceful shutdown
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Step 2: Restore the backup via SSH
-    let remote_backup_path = backup.remote_path.to_string_lossy();
-
-    // Verify backup exists
-    let check_cmd = format!("test -f {}", remote_backup_path);
-    match ssh.run_command(&check_cmd).await {
-        Ok(result) if result.success() => {
-            debug!(worker = %worker_id, "Backup file exists, proceeding with restore");
-        }
-        Ok(_) => {
-            error!(worker = %worker_id, path = %remote_backup_path, "Backup file does not exist");
-            if !ctx.is_json() {
-                println!(
-                    "  {} {} rollback failed: backup file not found",
-                    StatusIndicator::Error.display(style),
-                    style.highlight(worker_id)
-                );
-            }
-            return RollbackResult {
-                worker_id: worker_id.clone(),
-                success: false,
-                rolled_back_to: None,
-                error: Some(format!(
-                    "Backup file {} not found on worker",
-                    remote_backup_path
-                )),
-            };
-        }
-        Err(e) => {
-            error!(worker = %worker_id, error = %e, "Failed to check backup file");
-            if !ctx.is_json() {
-                println!(
-                    "  {} {} rollback failed: {}",
-                    StatusIndicator::Error.display(style),
-                    style.highlight(worker_id),
-                    e
-                );
-            }
-            return RollbackResult {
-                worker_id: worker_id.clone(),
-                success: false,
-                rolled_back_to: None,
-                error: Some(format!("SSH error checking backup: {}", e)),
-            };
-        }
-    }
-
-    // Copy backup to main binary location
-    let restore_cmd = format!(
-        "cp --preserve=mode,timestamps {} {}",
-        remote_backup_path, REMOTE_RCH_PATH
-    );
-    match ssh.run_command(&restore_cmd).await {
-        Ok(result) if result.success() => {
-            debug!(worker = %worker_id, "Binary restored from backup");
-        }
-        Ok(result) => {
-            error!(worker = %worker_id, stderr = %result.stderr.trim(), "Failed to copy backup");
-            if !ctx.is_json() {
-                println!(
-                    "  {} {} rollback failed: {}",
-                    StatusIndicator::Error.display(style),
-                    style.highlight(worker_id),
-                    result.stderr.trim()
-                );
-            }
-            return RollbackResult {
-                worker_id: worker_id.clone(),
-                success: false,
-                rolled_back_to: None,
-                error: Some(format!("Failed to copy backup: {}", result.stderr.trim())),
-            };
-        }
-        Err(e) => {
-            error!(worker = %worker_id, error = %e, "SSH error during restore");
-            if !ctx.is_json() {
-                println!(
-                    "  {} {} rollback failed: {}",
-                    StatusIndicator::Error.display(style),
-                    style.highlight(worker_id),
-                    e
-                );
-            }
-            return RollbackResult {
-                worker_id: worker_id.clone(),
-                success: false,
-                rolled_back_to: None,
-                error: Some(e.to_string()),
-            };
-        }
-    }
-
-    // Ensure executable permissions
-    if let Err(e) = ssh.set_executable(REMOTE_RCH_PATH).await {
-        warn!(worker = %worker_id, error = %e, "Failed to set executable permissions");
-    }
-
-    info!(worker = %worker_id, version = %target_version, "Binary restored successfully");
-
-    // Step 3: Optionally verify hash
-    if verify && backup.binary_hash != "unknown" {
-        debug!(worker = %worker_id, expected_hash = %backup.binary_hash, "Verifying restored binary hash");
-
-        let hash_cmd = format!("sha256sum {} | cut -d' ' -f1", REMOTE_RCH_PATH);
-        match ssh.run_command(&hash_cmd).await {
-            Ok(result) if result.success() => {
-                let actual_hash = result.stdout.trim();
-                if actual_hash != backup.binary_hash {
-                    warn!(
-                        worker = %worker_id,
-                        expected = %backup.binary_hash,
-                        actual = %actual_hash,
-                        "Hash mismatch after restore (continuing anyway)"
-                    );
-                } else {
-                    info!(worker = %worker_id, hash = %actual_hash, "Hash verification passed");
-                }
-            }
-            Ok(result) => {
-                warn!(worker = %worker_id, stderr = %result.stderr.trim(), "Hash verification command failed");
-            }
-            Err(e) => {
-                warn!(worker = %worker_id, error = %e, "Could not verify hash after restore");
-            }
-        }
-    }
-
-    // Step 4: Verify the restored version
-    debug!(worker = %worker_id, version = %target_version, "Verifying restored version");
-    match ssh
-        .run_command(&format!("{} --version", REMOTE_RCH_PATH))
-        .await
-    {
-        Ok(output) if output.success() => {
-            let reported_version = output.stdout.trim();
-            if !reported_version.contains(target_version) {
-                warn!(
-                    worker = %worker_id,
-                    expected = %target_version,
-                    reported = %reported_version,
-                    "Version mismatch after rollback (may be OK if format differs)"
-                );
-            } else {
-                debug!(
-                    worker = %worker_id,
-                    version = %reported_version,
-                    "Post-rollback version check passed"
-                );
-            }
-        }
-        Ok(output) => {
-            warn!(
-                worker = %worker_id,
-                stderr = %output.stderr.trim(),
-                "Version check failed after rollback"
+    let ssh = SshExecutor::with_timeout(worker, ROLLBACK_TIMEOUT);
+    let result = execute_rollback_with_runner(worker, backup, target_version, verify, &ssh).await;
+    if !ctx.is_json() {
+        if result.success {
+            println!(
+                "  {} {} rolled back to v{}",
+                StatusIndicator::Success.display(style),
+                style.highlight(worker_id),
+                target_version
+            );
+        } else {
+            println!(
+                "  {} {} rollback failed: {}",
+                StatusIndicator::Error.display(style),
+                style.highlight(worker_id),
+                result.error.as_deref().unwrap_or("unconfirmed rollback")
             );
         }
-        Err(e) => {
-            warn!(worker = %worker_id, error = %e, "Could not verify version after rollback");
-        }
     }
+    result
+}
 
-    // Step 5: Restart rch-wkr (best-effort)
-    debug!(worker = %worker_id, "Restarting rch-wkr after rollback");
-    if let Err(e) = ssh
-        .run_command(&format!(
-            "nohup {} serve >/dev/null 2>&1 &",
-            REMOTE_RCH_PATH
-        ))
-        .await
-    {
-        warn!(
-            worker = %worker_id,
-            error = %e,
-            "Failed to restart rch-wkr (may need manual intervention)"
-        );
+fn normalize_version(version: &str) -> &str {
+    version.strip_prefix('v').unwrap_or(version)
+}
+
+fn select_backup<'a>(
+    registry: &'a [WorkerBackup],
+    worker_id: &str,
+    version: Option<&str>,
+) -> Option<&'a WorkerBackup> {
+    registry
+        .iter()
+        .filter(|backup| {
+            backup.worker_id == worker_id
+                && version.is_none_or(|version| {
+                    normalize_version(&backup.version) == normalize_version(version)
+                })
+        })
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+}
+
+async fn execute_rollback_with_runner<R: CommandRunner>(
+    worker: &WorkerConfig,
+    backup: &WorkerBackup,
+    target_version: &str,
+    verify: bool,
+    runner: &R,
+) -> RollbackResult {
+    let outcome = restore_with_runner(worker, backup, target_version, verify, runner).await;
+    match outcome {
+        Ok(()) => RollbackResult {
+            worker_id: worker.id.0.clone(),
+            success: true,
+            rolled_back_to: Some(normalize_version(target_version).to_string()),
+            error: None,
+        },
+        Err(error) => RollbackResult {
+            worker_id: worker.id.0.clone(),
+            success: false,
+            rolled_back_to: None,
+            error: Some(format!("{error:#}")),
+        },
     }
+}
 
-    if !ctx.is_json() {
-        println!(
-            "  {} {} rolled back to v{}",
-            StatusIndicator::Success.display(style),
-            style.highlight(worker_id),
-            target_version
-        );
-    }
-
-    info!(
-        worker = %worker_id,
-        version = %target_version,
-        "Rollback successful"
+/// One transport command owns staging, validation and the atomic switch. An
+/// interrupted response is unconfirmed, never a fabricated rollback success.
+async fn restore_with_runner<R: CommandRunner>(
+    worker: &WorkerConfig,
+    backup: &WorkerBackup,
+    target_version: &str,
+    verify: bool,
+    runner: &R,
+) -> Result<()> {
+    anyhow::ensure!(
+        backup.worker_id == worker.id.0,
+        "backup belongs to another worker"
     );
+    anyhow::ensure!(
+        normalize_version(&backup.version) == normalize_version(target_version),
+        "backup version differs from requested rollback version"
+    );
+    let command = rollback_command(backup, REMOTE_RCH_PATH, verify)?;
+    let output = runner.run_command(&command).await.context(
+        "remote rollback result is unconfirmed; inspect the installed worker version before retrying",
+    )?;
+    anyhow::ensure!(
+        output.success(),
+        "rollback command failed (exit {}): {}",
+        output.exit_code,
+        output.stderr.trim()
+    );
+    let receipt = format!("RCH_ROLLBACK_OK {}", normalize_version(target_version));
+    anyhow::ensure!(
+        output.stdout.trim() == receipt,
+        "rollback completion receipt missing or invalid; inspect the installed worker version before retrying"
+    );
+    info!(worker = %worker.id, version = %target_version, "Verified rollback completed");
+    Ok(())
+}
 
-    RollbackResult {
-        worker_id: worker_id.clone(),
-        success: true,
-        rolled_back_to: Some(target_version.to_string()),
-        error: None,
-    }
+/// Build the transaction exercised by both the SSH path and native shell tests.
+/// Rejected staging files and the original backup are retained for diagnosis.
+fn rollback_command(backup: &WorkerBackup, destination: &str, verify: bool) -> Result<String> {
+    let version = normalize_version(&backup.version);
+    anyhow::ensure!(
+        !version.is_empty()
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte)),
+        "invalid rollback version"
+    );
+    let source = backup
+        .remote_path
+        .to_str()
+        .context("backup path is not UTF-8")?;
+    anyhow::ensure!(
+        source.starts_with('/') || source.starts_with("~/"),
+        "backup path must be absolute or relative to the worker home"
+    );
+    let source = shell_escape_path_with_home(source).context("invalid backup path")?;
+    let destination = shell_escape_path_with_home(destination).context("invalid installed path")?;
+    let expected_hash = if verify {
+        anyhow::ensure!(
+            backup.binary_hash.len() == 64
+                && backup
+                    .binary_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "verified rollback requires a recorded SHA-256 digest"
+        );
+        backup.binary_hash.to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    let version = shell_escape_value(version).context("invalid rollback version")?;
+    Ok(format!(
+        r#"set -efu
+rch_backup={source}
+rch_destination={destination}
+rch_expected_version={version}
+rch_expected_hash='{expected_hash}'
+rch_stage=
+rch_rollback_fail() {{
+    printf 'RCH rollback refused: %s\n' "$1" >&2
+    if [ -n "$rch_stage" ]; then
+        printf 'Staged backup retained at %s\n' "$rch_stage" >&2
+    fi
+    exit 1
+}}
+[ -f "$rch_backup" ] && [ ! -L "$rch_backup" ] || rch_rollback_fail 'backup is missing or not a regular file'
+[ -d "${{rch_destination%/*}}" ] || rch_rollback_fail 'installed binary directory is missing'
+[ ! -L "$rch_destination" ] || rch_rollback_fail 'installed binary is a symlink'
+if [ -e "$rch_destination" ] && [ ! -f "$rch_destination" ]; then
+    rch_rollback_fail 'installed binary is not a regular file'
+fi
+rch_stage=$(mktemp "${{rch_destination}}.rollback.XXXXXXXX") || rch_rollback_fail 'cannot create staging file'
+cp "$rch_backup" "$rch_stage" || rch_rollback_fail 'cannot copy backup to staging file'
+chmod 0755 "$rch_stage" || rch_rollback_fail 'cannot make staged backup executable'
+if [ -n "$rch_expected_hash" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+        rch_hash_output=$(sha256sum < "$rch_stage") || rch_rollback_fail 'SHA-256 command failed'
+    elif command -v shasum >/dev/null 2>&1; then
+        rch_hash_output=$(shasum -a 256 < "$rch_stage") || rch_rollback_fail 'SHA-256 command failed'
+    else
+        rch_rollback_fail 'no SHA-256 utility is available'
+    fi
+    rch_actual_hash=${{rch_hash_output%% *}}
+    [ "$rch_actual_hash" = "$rch_expected_hash" ] || rch_rollback_fail 'backup SHA-256 does not match recorded digest'
+fi
+rch_version_output=$("$rch_stage" --version) || rch_rollback_fail 'staged binary cannot report its version'
+set -- $rch_version_output
+[ "$#" -ge 2 ] && [ "$1" = rch-wkr ] || rch_rollback_fail 'staged binary reported an invalid version'
+rch_actual_version=${{2#v}}
+[ "$rch_actual_version" = "$rch_expected_version" ] || rch_rollback_fail 'staged binary version differs from requested version'
+[ ! -L "$rch_destination" ] || rch_rollback_fail 'installed binary changed to a symlink'
+if [ -e "$rch_destination" ] && [ ! -f "$rch_destination" ]; then
+    rch_rollback_fail 'installed binary changed to a non-regular file'
+fi
+mv -f "$rch_stage" "$rch_destination" || rch_rollback_fail 'atomic binary switch failed'
+if [ ! -f "$rch_destination" ] || [ -L "$rch_destination" ] || [ -e "$rch_stage" ] || [ -L "$rch_stage" ]; then
+    printf 'RCH rollback result is unconfirmed: installed path changed during switch\n' >&2
+    exit 1
+fi
+printf 'RCH_ROLLBACK_OK %s\n' "$rch_expected_version"
+"#
+    ))
 }
 
 #[cfg(test)]
@@ -1920,281 +1733,432 @@ mod tests {
         assert!(results.iter().all(|r| !r.success));
     }
 
-    // ========================
-    // MockSshExecutor-based Tests
-    // These test the actual SSH execution logic using mocks
-    // ========================
+    // Production rollback orchestration, with only its transport substituted.
+    #[tokio::test]
+    async fn rollback_requires_a_matching_completion_receipt() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
 
-    /// Execute rollback with MockSshExecutor for testing.
-    /// This mirrors execute_single_rollback but uses the mock.
-    #[cfg(test)]
-    async fn execute_rollback_with_mock(
-        worker: &WorkerConfig,
-        backup: &WorkerBackup,
-        target_version: &str,
-        verify: bool,
-        mock: &crate::fleet::ssh::MockSshExecutor,
-    ) -> RollbackResult {
-        let worker_id = &worker.id.0;
+        let worker = mock_worker("worker1");
+        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, &"a".repeat(64));
+        for (stdout, success) in [
+            ("RCH_ROLLBACK_OK 0.9.0\n", true),
+            ("", false),
+            ("rch-wkr 0.9.0", false),
+            ("RCH_ROLLBACK_OK 0.9.00", false),
+            ("RCH_ROLLBACK_OK 0.9.0\nunexpected", false),
+        ] {
+            let transport =
+                MockSshExecutor::new().with_command("set -efu", MockCommandResult::ok(stdout));
+            let result =
+                execute_rollback_with_runner(&worker, &backup, "v0.9.0", true, &transport).await;
+            assert_eq!(result.success, success, "{stdout:?}: {result:?}");
+            assert_eq!(result.rolled_back_to.as_deref(), success.then_some("0.9.0"));
+        }
+    }
 
-        // Step 1: Graceful stop (pkill)
-        if let Err(e) = mock
-            .run_command("pkill -TERM rch-wkr 2>/dev/null || true")
-            .await
-        {
-            debug!(worker = %worker_id, error = %e, "pkill returned error (expected)");
+    #[tokio::test]
+    async fn rollback_remote_errors_never_report_success() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+
+        let worker = mock_worker("worker1");
+        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "unknown");
+        for transport in [
+            MockSshExecutor::unreachable(),
+            MockSshExecutor::new().with_command(
+                "set -efu",
+                MockCommandResult::err(1, "backup SHA-256 does not match recorded digest"),
+            ),
+        ] {
+            let result =
+                execute_rollback_with_runner(&worker, &backup, "0.9.0", false, &transport).await;
+            assert!(!result.success);
+            assert!(result.rolled_back_to.is_none());
+            assert!(result.error.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_validates_worker_version_path_and_requested_digest_before_ssh() {
+        use crate::fleet::ssh::MockSshExecutor;
+
+        let worker = mock_worker("worker1");
+        let transport = MockSshExecutor::unreachable();
+        let good = mock_backup_with_hash("worker1", "0.9.0", 1000, &"a".repeat(64));
+        let mut cases = Vec::new();
+        let mut other_worker = good.clone();
+        other_worker.worker_id = "worker2".to_string();
+        cases.push((other_worker, "another worker"));
+        let mut other_version = good.clone();
+        other_version.version = "0.9.00".to_string();
+        cases.push((other_version, "differs from requested"));
+        let mut relative = good.clone();
+        relative.remote_path = PathBuf::from("-rf");
+        cases.push((relative, "path must be absolute"));
+        let mut control = good.clone();
+        control.remote_path = PathBuf::from("/tmp/backup\ncommand");
+        cases.push((control, "invalid backup path"));
+        let non_hex_digest = "x".repeat(64);
+        for hash in ["unknown", "", "abc123", non_hex_digest.as_str()] {
+            let mut backup = good.clone();
+            backup.binary_hash = hash.to_string();
+            cases.push((backup, "recorded SHA-256"));
         }
 
-        // Step 2: Verify backup exists
-        let remote_backup_path = backup.remote_path.to_string_lossy();
-        let check_cmd = format!("test -f {}", remote_backup_path);
-        match mock.run_command(&check_cmd).await {
-            Ok(result) if result.success() => {}
-            Ok(_) => {
-                return RollbackResult {
-                    worker_id: worker_id.clone(),
-                    success: false,
-                    rolled_back_to: None,
-                    error: Some(format!(
-                        "Backup file {} not found on worker",
-                        remote_backup_path
-                    )),
-                };
-            }
-            Err(e) => {
-                return RollbackResult {
-                    worker_id: worker_id.clone(),
-                    success: false,
-                    rolled_back_to: None,
-                    error: Some(format!("SSH error checking backup: {}", e)),
-                };
-            }
+        for (backup, expected) in cases {
+            let result =
+                execute_rollback_with_runner(&worker, &backup, "0.9.0", true, &transport).await;
+            assert!(!result.success);
+            let error = result.error.unwrap();
+            assert!(error.contains(expected), "{expected}: {error}");
+            assert!(
+                !error.contains("unconfirmed"),
+                "must fail before the SSH transport"
+            );
         }
+    }
 
-        // Step 3: Copy backup to main location
-        let restore_cmd = format!(
-            "cp --preserve=mode,timestamps {} {}",
-            remote_backup_path, REMOTE_RCH_PATH
+    #[tokio::test]
+    async fn rollback_allows_unknown_digest_only_without_requested_verification() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+
+        let worker = mock_worker("worker1");
+        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "unknown");
+        let transport = MockSshExecutor::new().with_command(
+            "set -efu",
+            MockCommandResult::ok("RCH_ROLLBACK_OK 0.9.0\n"),
         );
-        match mock.run_command(&restore_cmd).await {
-            Ok(result) if result.success() => {}
-            Ok(result) => {
-                return RollbackResult {
-                    worker_id: worker_id.clone(),
-                    success: false,
-                    rolled_back_to: None,
-                    error: Some(format!("Failed to copy backup: {}", result.stderr.trim())),
-                };
-            }
-            Err(e) => {
-                return RollbackResult {
-                    worker_id: worker_id.clone(),
-                    success: false,
-                    rolled_back_to: None,
-                    error: Some(e.to_string()),
-                };
-            }
+        let result =
+            execute_rollback_with_runner(&worker, &backup, "0.9.0", false, &transport).await;
+        assert!(result.success, "{result:?}");
+    }
+
+    #[test]
+    fn rollback_selects_latest_registered_backup_without_requiring_deployment_history() {
+        let older = mock_backup_with_hash("worker1", "0.9.0", 1, "old");
+        let newer = mock_backup_with_hash("worker1", "0.9.0", 2, "new");
+        let latest = mock_backup_with_hash("worker1", "1.0.0", 3, "latest");
+        let other_worker = mock_backup_with_hash("worker2", "2.0.0", 4, "other");
+        let registry = [older, newer, latest, other_worker];
+        assert_eq!(
+            select_backup(&registry, "worker1", None).unwrap().binary_hash,
+            "latest"
+        );
+        assert_eq!(
+            select_backup(&registry, "worker1", Some("v0.9.0"))
+                .unwrap()
+                .binary_hash,
+            "new"
+        );
+        assert!(select_backup(&registry, "missing", None).is_none());
+        assert!(select_backup(&registry, "worker1", Some("9.0")).is_none());
+    }
+
+    /// Native filesystem/process tests execute the exact generated production
+    /// transaction. The executable fixtures model version replies, not a live
+    /// fleet deployment or a real release artifact.
+    #[cfg(unix)]
+    mod native_rollback {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use std::process::{Command, Output};
+
+        const OLD_BINARY: &[u8] = b"previously installed worker bytes\n";
+        const GOOD_BACKUP: &str = "#!/bin/sh\nprintf 'rch-wkr 0.9.0 (fixture)\\n'\n";
+
+        struct Fixture {
+            root: tempfile::TempDir,
+            backup: WorkerBackup,
+            source: PathBuf,
+            destination: PathBuf,
+            source_bytes: Vec<u8>,
         }
 
-        // Step 4: Set executable permissions
-        let _ = mock
-            .run_command(&format!("chmod +x {}", REMOTE_RCH_PATH))
-            .await;
+        impl Fixture {
+            fn new(body: &str) -> Self {
+                let root = tempfile::tempdir().unwrap();
+                let source = root.path().join("backup ' $literal;file");
+                let bin = root.path().join("binary directory");
+                std::fs::create_dir(&bin).unwrap();
+                let destination = bin.join("rch-wkr");
+                std::fs::write(&source, body).unwrap();
+                std::fs::write(&destination, OLD_BINARY).unwrap();
+                let mut backup =
+                    mock_backup_with_hash("worker1", "0.9.0", 1, &sha256(body.as_bytes()));
+                backup.remote_path = source.clone();
+                Self {
+                    root,
+                    backup,
+                    source,
+                    destination,
+                    source_bytes: body.as_bytes().to_vec(),
+                }
+            }
 
-        // Step 5: Verify hash (if enabled and hash is known)
-        if verify && backup.binary_hash != "unknown" {
-            let hash_cmd = format!("sha256sum {} | cut -d' ' -f1", REMOTE_RCH_PATH);
-            match mock.run_command(&hash_cmd).await {
-                Ok(result) if result.success() => {
-                    let actual_hash = result.stdout.trim();
-                    if actual_hash != backup.binary_hash {
-                        return RollbackResult {
-                            worker_id: worker_id.clone(),
-                            success: false,
-                            rolled_back_to: Some(target_version.to_string()),
-                            error: Some(format!(
-                                "Hash mismatch: expected {}, got {}",
-                                backup.binary_hash, actual_hash
-                            )),
-                        };
+            fn run(&self, verify: bool, tools: Option<&Path>) -> Output {
+                let script = rollback_command(
+                    &self.backup,
+                    self.destination.to_str().unwrap(),
+                    verify,
+                )
+                .unwrap();
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", &script]);
+                if let Some(tools) = tools {
+                    command.env("PATH", tools);
+                }
+                command.output().unwrap()
+            }
+
+            fn assert_preserved(&self, output: &Output) {
+                assert!(!output.status.success(), "unexpected success: {output:?}");
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("RCH_ROLLBACK_OK"));
+                assert_eq!(std::fs::read(&self.destination).unwrap(), OLD_BINARY);
+                assert_eq!(std::fs::read(&self.source).unwrap(), self.source_bytes);
+            }
+
+            fn tools(&self, broken: Option<&str>) -> PathBuf {
+                let directory = self.root.path().join("tools");
+                std::fs::create_dir(&directory).unwrap();
+                for name in ["cp", "chmod", "mktemp", "mv"] {
+                    let target = directory.join(name);
+                    if broken == Some(name) {
+                        std::fs::write(&target, "#!/bin/sh\nexit 23\n").unwrap();
+                        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                            .unwrap();
+                    } else {
+                        std::os::unix::fs::symlink(which::which(name).unwrap(), target).unwrap();
                     }
                 }
-                Ok(_) | Err(_) => {
-                    // Hash check failed but we continue
-                }
+                directory
             }
         }
 
-        // Step 6: Verify version
-        let version_cmd = format!("{} --version", REMOTE_RCH_PATH);
-        let _ = mock.run_command(&version_cmd).await;
-
-        // Step 7: Restart service
-        let restart_cmd = format!("nohup {} serve >/dev/null 2>&1 &", REMOTE_RCH_PATH);
-        let _ = mock.run_command(&restart_cmd).await;
-
-        RollbackResult {
-            worker_id: worker_id.clone(),
-            success: true,
-            rolled_back_to: Some(target_version.to_string()),
-            error: None,
+        fn sha256(bytes: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write as _;
+            let mut text = String::with_capacity(64);
+            for byte in Sha256::digest(bytes) {
+                write!(&mut text, "{byte:02x}").unwrap();
+            }
+            text
         }
-    }
 
-    #[tokio::test]
-    async fn test_rollback_success_with_mock() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
-
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "abc123");
-
-        // Note: mock returns just the hash since the real command uses `| cut -d' ' -f1`
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            .with_command("cp --preserve", MockCommandResult::ok(""))
-            .with_command("chmod", MockCommandResult::ok(""))
-            .with_command("sha256sum", MockCommandResult::ok("abc123"))
-            .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
-            .with_command("nohup", MockCommandResult::ok(""));
-
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", true, &mock).await;
-
-        assert!(result.success);
-        assert_eq!(result.rolled_back_to, Some("0.9.0".to_string()));
-        assert!(result.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_rollback_hash_mismatch_with_mock() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
-
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "expected_hash");
-
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            .with_command("cp --preserve", MockCommandResult::ok(""))
-            .with_command("chmod", MockCommandResult::ok(""))
-            // Hash mismatch!
-            .with_command("sha256sum", MockCommandResult::ok("different_hash  /path"));
-
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", true, &mock).await;
-
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Hash mismatch"));
-    }
-
-    #[tokio::test]
-    async fn test_rollback_unknown_hash_skips_verification_with_mock() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
-
-        let worker = mock_worker("worker1");
-        // Hash is "unknown" - should skip verification
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "unknown");
-
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            .with_command("cp --preserve", MockCommandResult::ok(""))
-            .with_command("chmod", MockCommandResult::ok(""))
-            // Would mismatch if checked, but should be ignored
-            .with_command("sha256sum", MockCommandResult::ok("any_hash  /path"))
-            .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
-            .with_command("nohup", MockCommandResult::ok(""));
-
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", true, &mock).await;
-
-        // Should succeed because hash="unknown" skips verification
-        assert!(result.success);
-        assert!(result.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_rollback_backup_file_missing_with_mock() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
-
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "abc123");
-
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            // test -f returns non-zero (file doesn't exist)
-            .with_command("test -f", MockCommandResult::err(1, ""));
-
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", true, &mock).await;
-
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn test_rollback_cp_fails_with_mock() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
-
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "abc123");
-
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            // cp fails
-            .with_command(
-                "cp --preserve",
-                MockCommandResult::err(1, "Permission denied"),
+        #[test]
+        fn rollback_installs_verified_bytes_and_preserves_backup() {
+            let fixture = Fixture::new(GOOD_BACKUP);
+            let output = fixture.run(true, None);
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"RCH_ROLLBACK_OK 0.9.0\n");
+            assert_eq!(
+                std::fs::read(&fixture.destination).unwrap(),
+                fixture.source_bytes
             );
+            assert_eq!(std::fs::read(&fixture.source).unwrap(), fixture.source_bytes);
+            assert_eq!(
+                std::fs::metadata(&fixture.destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+            let executed = Command::new(&fixture.destination)
+                .arg("--version")
+                .output()
+                .unwrap();
+            assert!(executed.status.success());
+            assert_eq!(executed.stdout, b"rch-wkr 0.9.0 (fixture)\n");
+        }
 
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", true, &mock).await;
+        #[test]
+        fn rollback_rejects_hash_mismatch_before_executing_backup() {
+            let mut fixture = Fixture::new(
+                "#!/bin/sh\n: > \"${0%/*}/executed\"\nprintf 'rch-wkr 0.9.0\\n'\n",
+            );
+            fixture.backup.binary_hash = "0".repeat(64);
+            let output = fixture.run(true, None);
+            fixture.assert_preserved(&output);
+            assert!(String::from_utf8_lossy(&output.stderr).contains("SHA-256 does not match"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Staged backup retained"));
+            assert!(
+                !fixture
+                    .destination
+                    .parent()
+                    .unwrap()
+                    .join("executed")
+                    .exists()
+            );
+        }
 
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Permission denied"));
-    }
+        #[test]
+        fn rollback_rejects_missing_and_failed_hash_utilities() {
+            for broken in [false, true] {
+                let fixture = Fixture::new(GOOD_BACKUP);
+                let tools = fixture.tools(None);
+                if broken {
+                    let hasher = tools.join("sha256sum");
+                    std::fs::write(&hasher, "#!/bin/sh\nexit 23\n").unwrap();
+                    std::fs::set_permissions(&hasher, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                let output = fixture.run(true, Some(&tools));
+                fixture.assert_preserved(&output);
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    error.contains(if broken {
+                        "SHA-256 command failed"
+                    } else {
+                        "no SHA-256 utility"
+                    }),
+                    "{error}"
+                );
+            }
+        }
 
-    #[tokio::test]
-    async fn test_rollback_verifies_hash_when_enabled() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        #[test]
+        fn rollback_copy_chmod_and_switch_failures_preserve_installed_binary() {
+            for broken in ["cp", "chmod", "mv"] {
+                let fixture = Fixture::new(GOOD_BACKUP);
+                let tools = fixture.tools(Some(broken));
+                let output = fixture.run(false, Some(&tools));
+                fixture.assert_preserved(&output);
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("Staged backup retained")
+                );
+            }
+        }
 
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "correct_hash");
+        #[test]
+        fn rollback_rejects_wrong_unexecutable_and_failed_version_replies() {
+            for body in [
+                "#!/bin/sh\nprintf 'rch-wkr 0.9.00\\n'\n",
+                "#!/bin/sh\nprintf 'different-tool 0.9.0\\n'\n",
+                "#!/bin/sh\nprintf 'rch-wkr version 0.9.0\\n'\n",
+                "#!/bin/sh\nprintf 'rch-wkr 0.9.0\\n'\nexit 7\n",
+                "this is not an executable\n",
+            ] {
+                let fixture = Fixture::new(body);
+                let output = fixture.run(false, None);
+                fixture.assert_preserved(&output);
+                assert!(String::from_utf8_lossy(&output.stderr).contains("version"));
+            }
+        }
 
-        // Note: mock returns just the hash since the real command uses `| cut -d' ' -f1`
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            .with_command("cp --preserve", MockCommandResult::ok(""))
-            .with_command("chmod", MockCommandResult::ok(""))
-            .with_command("sha256sum", MockCommandResult::ok("correct_hash"))
-            .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
-            .with_command("nohup", MockCommandResult::ok(""));
+        #[test]
+        fn rollback_missing_backup_and_symlink_paths_preserve_existing_bytes() {
+            for variant in ["missing", "source_link", "destination_link"] {
+                let mut fixture = Fixture::new(GOOD_BACKUP);
+                match variant {
+                    "missing" => fixture.backup.remote_path = fixture.root.path().join("absent"),
+                    "source_link" => {
+                        let link = fixture.root.path().join("backup-link");
+                        std::os::unix::fs::symlink(&fixture.source, &link).unwrap();
+                        fixture.backup.remote_path = link;
+                    }
+                    "destination_link" => {
+                        let saved = fixture.root.path().join("saved-current");
+                        std::fs::rename(&fixture.destination, &saved).unwrap();
+                        std::os::unix::fs::symlink(&saved, &fixture.destination).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let output = fixture.run(false, None);
+                fixture.assert_preserved(&output);
+            }
+        }
 
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", true, &mock).await;
+        #[test]
+        fn rollback_rejects_directory_destination_without_moving_bytes_inside() {
+            let fixture = Fixture::new(GOOD_BACKUP);
+            let saved = fixture.root.path().join("saved-current");
+            std::fs::rename(&fixture.destination, &saved).unwrap();
+            std::fs::create_dir(&fixture.destination).unwrap();
+            let output = fixture.run(false, None);
+            assert!(!output.status.success(), "{output:?}");
+            assert_eq!(std::fs::read(&saved).unwrap(), OLD_BINARY);
+            assert_eq!(std::fs::read_dir(&fixture.destination).unwrap().count(), 0);
+            assert_eq!(std::fs::read(&fixture.source).unwrap(), fixture.source_bytes);
+        }
 
-        assert!(result.success);
-        assert!(result.error.is_none());
-    }
+        #[test]
+        fn rollback_rejects_a_successful_move_that_leaves_staging_unconsumed() {
+            let fixture = Fixture::new(GOOD_BACKUP);
+            let tools = fixture.tools(Some("mv"));
+            std::fs::write(tools.join("mv"), "#!/bin/sh\nexit 0\n").unwrap();
+            let output = fixture.run(false, Some(&tools));
+            fixture.assert_preserved(&output);
+            assert!(String::from_utf8_lossy(&output.stderr).contains("unconfirmed"));
+        }
 
-    #[tokio::test]
-    async fn test_rollback_skips_hash_when_disabled() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        #[test]
+        fn rollback_never_reports_success_when_destination_becomes_a_directory_during_mv() {
+            let fixture = Fixture::new(GOOD_BACKUP);
+            let tools = fixture.tools(Some("mv"));
+            let saved = fixture.root.path().join("saved-current");
+            let real_mv = which::which("mv").unwrap();
+            let real_mkdir = which::which("mkdir").unwrap();
+            let real_mv = shell_escape_path_with_home(real_mv.to_str().unwrap()).unwrap();
+            let real_mkdir = shell_escape_path_with_home(real_mkdir.to_str().unwrap()).unwrap();
+            let saved_arg = shell_escape_path_with_home(saved.to_str().unwrap()).unwrap();
+            // Simulate another actor replacing the destination between the
+            // final type check and mv. POSIX mv then succeeds by moving the
+            // stage inside that directory; it must not produce a receipt.
+            std::fs::write(
+                tools.join("mv"),
+                format!(
+                    "#!/bin/sh\nset -eu\n[ \"$#\" -eq 3 ]\n\
+                     {real_mv} \"$3\" {saved_arg}\n\
+                     {real_mkdir} \"$3\"\n\
+                     exec {real_mv} \"$@\"\n"
+                ),
+            )
+            .unwrap();
+            let output = fixture.run(false, Some(&tools));
+            assert!(!output.status.success(), "{output:?}");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("RCH_ROLLBACK_OK"));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("unconfirmed"));
+            assert_eq!(std::fs::read(saved).unwrap(), OLD_BINARY);
+            assert_eq!(std::fs::read(&fixture.source).unwrap(), fixture.source_bytes);
+            let entries: Vec<_> = std::fs::read_dir(&fixture.destination)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(std::fs::read(&entries[0]).unwrap(), fixture.source_bytes);
+        }
 
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "expected_hash");
+        struct RunningHelper(std::process::Child);
 
-        // Mock doesn't provide sha256sum result - would fail if hash check runs
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            .with_command("cp --preserve", MockCommandResult::ok(""))
-            .with_command("chmod", MockCommandResult::ok(""))
-            .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
-            .with_command("nohup", MockCommandResult::ok(""));
+        impl Drop for RunningHelper {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
 
-        // verify=false
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", false, &mock).await;
-
-        // Should succeed because verification is disabled
-        assert!(result.success);
+        #[test]
+        fn rollback_replaces_a_running_executable_without_terminating_its_process() {
+            let fixture = Fixture::new(GOOD_BACKUP);
+            std::fs::copy(which::which("sleep").unwrap(), &fixture.destination).unwrap();
+            let mut helper = RunningHelper(
+                Command::new(&fixture.destination)
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            );
+            assert!(helper.0.try_wait().unwrap().is_none());
+            let output = fixture.run(true, None);
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                helper.0.try_wait().unwrap().is_none(),
+                "active worker was stopped"
+            );
+            assert_eq!(
+                std::fs::read(&fixture.destination).unwrap(),
+                fixture.source_bytes
+            );
+        }
     }
 
     // ========================
@@ -2249,69 +2213,6 @@ mod tests {
     }
 
     // ========================
-    // Graceful Shutdown Order Test
-    // ========================
-
-    #[tokio::test]
-    async fn test_rollback_graceful_shutdown_order() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
-        use std::sync::{Arc, Mutex};
-
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "abc123");
-
-        // Track command order (variables intentionally unused - Arc/Mutex kept for future extension)
-        let _call_order = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        // Note: mock returns just the hash since the real command uses `| cut -d' ' -f1`
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            .with_command("cp --preserve", MockCommandResult::ok(""))
-            .with_command("chmod", MockCommandResult::ok(""))
-            .with_command("sha256sum", MockCommandResult::ok("abc123"))
-            .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
-            .with_command("nohup", MockCommandResult::ok(""));
-
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", true, &mock).await;
-
-        // Rollback should succeed
-        assert!(result.success);
-
-        // The execute_rollback_with_mock function calls pkill before cp before nohup
-        // This is verified by the function's sequential execution order
-        // (pkill -> test -f -> cp -> chmod -> sha256sum -> version -> nohup)
-    }
-
-    // ========================
-    // Service Restart Verification
-    // ========================
-
-    #[tokio::test]
-    async fn test_rollback_restarts_service() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
-
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "unknown");
-
-        // Mock all commands as successful
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            .with_command("cp --preserve", MockCommandResult::ok(""))
-            .with_command("chmod", MockCommandResult::ok(""))
-            .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
-            // nohup with serve mode is expected
-            .with_command("nohup", MockCommandResult::ok(""));
-
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", false, &mock).await;
-
-        // Service restart is part of the successful flow
-        assert!(result.success);
-        assert_eq!(result.rolled_back_to, Some("0.9.0".to_string()));
-    }
-
-    // ========================
     // Multiple Workers Parallel Test
     // ========================
 
@@ -2351,35 +2252,5 @@ mod tests {
                 expected_id
             );
         }
-    }
-
-    // ========================
-    // Version Mismatch Warning Test
-    // ========================
-
-    #[tokio::test]
-    async fn test_rollback_continues_on_version_mismatch_warning() {
-        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
-
-        let worker = mock_worker("worker1");
-        let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "unknown");
-
-        // Version check returns different format but rollback should still succeed
-        let mock = MockSshExecutor::new()
-            .with_command("pkill", MockCommandResult::ok(""))
-            .with_command("test -f", MockCommandResult::ok(""))
-            .with_command("cp --preserve", MockCommandResult::ok(""))
-            .with_command("chmod", MockCommandResult::ok(""))
-            // Version reports different format
-            .with_command(
-                "--version",
-                MockCommandResult::ok("rch-wkr version 0.9.0-dev"),
-            )
-            .with_command("nohup", MockCommandResult::ok(""));
-
-        let result = execute_rollback_with_mock(&worker, &backup, "0.9.0", false, &mock).await;
-
-        // Should still succeed (version mismatch is just a warning)
-        assert!(result.success);
     }
 }

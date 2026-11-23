@@ -391,32 +391,19 @@ pub async fn rollback(
 
     let style = ctx.theme();
 
-    // Load workers configuration
+    // Resolve targets before confirmation or acquiring the fleet lock. An
+    // empty configured fleet or an unmatched worker selector is a failure.
     let workers = load_workers_from_config()?;
-    if workers.is_empty() {
-        if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::<()>::err(
-                "fleet rollback",
-                ApiError::new(ErrorCode::ConfigNotFound, "No workers configured."),
-            ));
-        } else {
-            println!(
-                "{} No workers configured.",
-                StatusIndicator::Error.display(style)
-            );
+    let target_workers = match rollback_targets(&workers, worker.as_deref()) {
+        Ok(workers) => workers,
+        Err(error) => {
+            if ctx.is_json() {
+                let _ = ctx.json(&ApiResponse::<()>::err("fleet rollback", error));
+            } else {
+                println!("{} {}", StatusIndicator::Error.display(style), error);
+            }
+            return Err(crate::doctor::DoctorExit(1).into());
         }
-        return Ok(());
-    }
-
-    // Filter to target workers
-    let target_workers: Vec<_> = if let Some(ref ids) = worker {
-        let ids: Vec<&str> = ids.split(',').map(|s| s.trim()).collect();
-        workers
-            .iter()
-            .filter(|w| ids.iter().any(|id| w.id.0 == *id))
-            .collect()
-    } else {
-        workers.iter().collect()
     };
 
     if !ctx.is_json() {
@@ -523,8 +510,9 @@ pub async fn rollback(
         )
         .await?;
 
+    let response = rollback_response(&results);
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("fleet rollback", &results));
+        let _ = ctx.json(&response);
     } else {
         let success_count = results.iter().filter(|r| r.success).count();
         let fail_count = results.len() - success_count;
@@ -541,7 +529,68 @@ pub async fn rollback(
         );
     }
 
+    if !response.success {
+        return Err(crate::doctor::DoctorExit(1).into());
+    }
     Ok(())
+}
+
+fn rollback_targets<'a>(
+    workers: &'a [rch_common::WorkerConfig],
+    requested: Option<&str>,
+) -> std::result::Result<Vec<&'a rch_common::WorkerConfig>, ApiError> {
+    if workers.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::ConfigNotFound,
+            "No workers configured.",
+        ));
+    }
+    let targets: Vec<_> = match requested {
+        Some(ids) => {
+            let ids: Vec<_> = ids.split(',').map(str::trim).collect();
+            for id in &ids {
+                if id.is_empty() || !workers.iter().any(|worker| worker.id.0 == *id) {
+                    return Err(ApiError::new(
+                        ErrorCode::ConfigInvalidWorker,
+                        format!("Worker '{}' not found", id),
+                    ));
+                }
+            }
+            workers
+                .iter()
+                .filter(|worker| ids.iter().any(|id| worker.id.0 == *id))
+                .collect()
+        }
+        None => workers.iter().collect(),
+    };
+    if targets.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::ConfigInvalidWorker,
+            format!("Worker(s) '{}' not found", requested.unwrap_or_default()),
+        ));
+    }
+    Ok(targets)
+}
+
+fn rollback_response(
+    results: &[rollback::RollbackResult],
+) -> ApiResponse<&[rollback::RollbackResult]> {
+    let mut response = ApiResponse::ok("fleet rollback", results);
+    let failed = results.iter().filter(|result| !result.success).count();
+    if failed > 0 {
+        // Keep every worker's outcome, including successes in a partial
+        // rollback, while making the envelope agree with the command's exit.
+        response.success = false;
+        response.error = Some(ApiError::new(
+            ErrorCode::WorkerStateError,
+            format!(
+                "Rollback failed for {} of {} worker(s). See per-worker results.",
+                failed,
+                results.len()
+            ),
+        ));
+    }
+    response
 }
 
 /// Show fleet deployment status.
@@ -1253,15 +1302,103 @@ mod tests {
         assert_is_api_response(&value);
     }
 
+    #[test]
+    fn rollback_response_reports_partial_failure_without_losing_worker_outcomes() {
+        let succeeded = rollback::RollbackResult {
+            worker_id: "healthy".to_string(),
+            success: true,
+            rolled_back_to: Some("0.9.0".to_string()),
+            error: None,
+        };
+        let failed = rollback::RollbackResult {
+            worker_id: "unreachable".to_string(),
+            success: false,
+            rolled_back_to: None,
+            error: Some("remote rollback result is unconfirmed".to_string()),
+        };
+        let results = [succeeded.clone(), failed];
+        let response = rollback_response(&results);
+        assert!(
+            !response.success,
+            "partial failure must produce a failure exit"
+        );
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            ApiError::from_code(ErrorCode::WorkerStateError).code
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["data"][0]["worker_id"], "healthy");
+        assert_eq!(json["data"][0]["rolled_back_to"], "0.9.0");
+        assert_eq!(json["data"][1]["success"], false);
+        assert_eq!(
+            json["data"][1]["error"],
+            results[1].error.as_deref().unwrap()
+        );
+
+        let successful_results = [succeeded];
+        let success = rollback_response(&successful_results);
+        assert!(success.success);
+        assert!(success.error.is_none());
+        assert_eq!(success.data.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rollback_target_selection_rejects_empty_and_unmatched_fleets() {
+        let worker = |id: &str| rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new(id),
+            host: format!("mock://{id}.local"),
+            user: "testuser".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+            tools: vec![],
+        };
+        let no_workers = rollback_targets(&[], None).unwrap_err();
+        assert_eq!(
+            no_workers.code,
+            ApiError::from_code(ErrorCode::ConfigNotFound).code
+        );
+        let workers = [worker("one"), worker("two")];
+        for selector in ["missing", "", " , ", "one,missing", "one,", ",two"] {
+            let error = rollback_targets(&workers, Some(selector)).unwrap_err();
+            assert_eq!(
+                error.code,
+                ApiError::from_code(ErrorCode::ConfigInvalidWorker).code
+            );
+        }
+        let selected = rollback_targets(&workers, Some(" two , one ")).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|worker| worker.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!(rollback_targets(&workers, None).unwrap().len(), 2);
+        assert_eq!(rollback_targets(&workers, Some("one,one")).unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn rollback_dry_run_emits_json_response() {
         let (ctx, stdout) = json_ctx();
-        rollback(&ctx, None, None, 2, false, true, true)
-            .await
-            .unwrap();
+        let result = rollback(&ctx, None, None, 2, false, true, true).await;
 
         let value = parse_json_output(&stdout);
         assert_is_api_response(&value);
+        if value["success"] == false {
+            let error = result.unwrap_err();
+            assert!(error.downcast_ref::<crate::doctor::DoctorExit>().is_some());
+            assert_eq!(
+                value["error"]["code"],
+                ApiError::from_code(ErrorCode::ConfigNotFound).code
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(value["data"]["dry_run"], true);
+            assert!(value["data"]["worker_count"].as_u64().unwrap() > 0);
+        }
     }
 
     #[tokio::test]
@@ -1330,9 +1467,20 @@ mod tests {
         .await
         .unwrap();
 
-        rollback(&ctx, None, None, 2, false, true, true)
-            .await
-            .unwrap();
+        // These smoke checks use the host's configuration. An empty fleet
+        // is now an explicit rollback error even in dry-run mode.
+        let configured_workers = load_workers_from_config().unwrap();
+        let rollback_result = rollback(&ctx, None, None, 2, false, true, true).await;
+        if configured_workers.is_empty() {
+            assert!(
+                rollback_result
+                    .unwrap_err()
+                    .downcast_ref::<crate::doctor::DoctorExit>()
+                    .is_some()
+            );
+        } else {
+            rollback_result.unwrap();
+        }
         status(&ctx, Some("definitely-missing-worker".to_string()), false)
             .await
             .unwrap();
