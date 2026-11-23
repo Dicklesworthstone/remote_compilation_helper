@@ -896,8 +896,9 @@ fn load_canonical_intent(root: PathBuf, override_state: Option<&OsStr>) -> Resul
     let argv = record["prepared_build_argv"].as_array().ok_or(Refused(
         "canonical operation changed its fixed prepared-build contract",
     ))?;
+    let live_stderr = argv.get(3).and_then(Value::as_str) == Some("--live-stderr");
     require(
-        argv.len() == 9
+        argv.len() == 9 + usize::from(live_stderr)
             && argv.iter().all(|arg| {
                 arg.as_str().is_some_and(|arg| {
                     !arg.is_empty() && arg.chars().count() <= 4096 && !arg.contains('\0')
@@ -905,29 +906,32 @@ fn load_canonical_intent(root: PathBuf, override_state: Option<&OsStr>) -> Resul
             }),
         "canonical operation changed its fixed prepared-build contract",
     )?;
+    // The optional presentation flag is not worker identity or execution
+    // authority. Recovery still uses only the original request and result.
+    let peer = &argv[3 + usize::from(live_stderr)..];
     require(
         argv[1] == "--worker-build-tls"
             && argv[2] == "--replay-diagnostics"
-            && argv[6]
+            && peer[3]
                 == root
                     .join("bundle")
                     .to_str()
                     .ok_or(Refused("paths must be UTF-8"))?
-            && argv[7]
+            && peer[4]
                 == root
                     .join("delivery")
                     .to_str()
                     .ok_or(Refused("paths must be UTF-8"))?
-            && argv[8]
+            && peer[5]
                 == root
                     .join("outputs")
                     .to_str()
                     .ok_or(Refused("paths must be UTF-8"))?,
         "canonical operation changed its fixed prepared-build contract",
     )?;
-    let listen = listener(string(&argv[3], "missing recorded worker listener")?)?;
-    let worker = string(&argv[4], "invalid recorded worker identity")?;
-    let pin = string(&argv[5], "invalid recorded worker SPKI pin")?;
+    let listen = listener(string(&peer[0], "missing recorded worker listener")?)?;
+    let worker = string(&peer[1], "invalid recorded worker identity")?;
+    let pin = string(&peer[2], "invalid recorded worker SPKI pin")?;
     worker_identity(worker, pin)?;
     let state = canonical_state(&record, &root, override_state, [listen, worker, pin])?;
     let bundle_fd = rustix::fs::openat(&root_fd, "bundle", directory_flags(), Mode::empty())?;

@@ -556,6 +556,45 @@ fn legacy_canonical_state_is_explicit_and_recorded_state_cannot_be_replaced() {
 }
 
 #[test]
+fn direct_live_stderr_intent_recovers_only_the_recorded_request() {
+    let fixture = Fixture::canonical(false);
+    rewrite_json(&fixture.record, |record| {
+        record["prepared_build_argv"]
+            .as_array_mut()
+            .unwrap()
+            .insert(3, json!("--live-stderr"));
+    });
+    let output = fixture
+        .operation("--resume-to", &fixture.root.join("recovered live result"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(37), "{output:?}");
+    let report = fixture.report();
+    assert_eq!(report["argv"][0], "--worker-exec-tls");
+    assert_eq!(report["argv"][1], "--resume");
+    assert!(
+        !report["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|argument| matches!(
+                argument.as_str(),
+                Some("--worker-build-tls" | "--live-stderr" | "--prepare-from")
+            ))
+    );
+    for index in [2, 4, 9] {
+        let fixture = Fixture::canonical(false);
+        rewrite_json(&fixture.record, |record| {
+            record["prepared_build_argv"]
+                .as_array_mut()
+                .unwrap()
+                .insert(index, json!("--live-stderr"));
+        });
+        fixture.refused(fixture.command().output().unwrap());
+    }
+}
+
+#[test]
 fn corrupted_authority_identity_and_request_records_never_start_transport() {
     let live_changes: [fn(&mut Value); 12] = [
         |record| record["reexecute"] = true.into(),
@@ -1179,7 +1218,7 @@ fn native_worker_submission_records_feed_native_recovery_without_resubmission() 
         ("daemon", true),
         ("pool", true),
     ] {
-        worker_submission_recovers(placement, captured_input);
+        worker_submission_recovers(placement, captured_input, false);
     }
 }
 
@@ -1187,10 +1226,16 @@ fn native_worker_submission_records_feed_native_recovery_without_resubmission() 
 fn native_worker_captured_stdin_direct_submission_recovers_without_resubmission() {
     // The direct route requires no Unix listener, allowing real frontend and
     // recovery processes to run on hosts that prohibit socket creation.
-    worker_submission_recovers("direct", true);
+    worker_submission_recovers("direct", true, false);
 }
 
-fn worker_submission_recovers(placement: &str, captured_input: bool) {
+#[test]
+fn native_direct_live_stderr_submission_preserves_recovery_without_resubmission() {
+    worker_submission_recovers("direct", false, true);
+    worker_submission_recovers("direct", true, true);
+}
+
+fn worker_submission_recovers(placement: &str, captured_input: bool, direct_live: bool) {
     let root = tempfile::Builder::new()
         .prefix("rwrec-")
         .tempdir()
@@ -1255,6 +1300,8 @@ fn worker_submission_recovers(placement: &str, captured_input: bool) {
     if placement != "direct" {
         profile["daemon_socket"] = json!(socket);
         profile["live_stderr"] = true.into();
+    } else if direct_live {
+        profile["live_stderr"] = true.into();
     }
     let profile_path = root.join("profile.json");
     new_file(&profile_path, &serde_json::to_vec(&profile).unwrap(), 0o600);
@@ -1295,6 +1342,14 @@ fn worker_submission_recovers(placement: &str, captured_input: bool) {
     let metadata: Value = serde_json::from_slice(&before).unwrap();
     assert_eq!(metadata["automatic_retry"], false);
     assert_eq!(metadata["publication_authorized"], false);
+    if direct_live {
+        assert_eq!(submission["argv"][0], "--worker-build-tls");
+        assert_eq!(submission["argv"][1], "--replay-diagnostics");
+        assert_eq!(submission["argv"][2], "--live-stderr");
+        assert_eq!(metadata["prepared_build_argv"][3], "--live-stderr");
+        assert!(metadata.get("job_id").is_none());
+        assert!(specification.get("live_stderr").is_none());
+    }
 
     // Recovery must use only retained ownership. Moving the original
     // inputs keeps them intact while proving neither frontend recaptures.

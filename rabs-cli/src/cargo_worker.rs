@@ -316,10 +316,6 @@ pub(super) fn validate_profile(
             )?;
         }
     }
-    require(
-        !profile.contains_key("live_stderr") || profile.contains_key("daemon_socket"),
-        "worker live_stderr requires an explicit daemon_socket",
-    )?;
     if let Some(grant) = profile.get("jobserver_grant") {
         require(
             grant
@@ -955,7 +951,7 @@ mod tests {
             ("version", json!("canonical-compile-local-v1")),
             ("unknown", json!(true)),
             ("incremental", json!(1)),
-            ("live_stderr", json!(false)),
+            ("live_stderr", json!("true")),
             ("jobserver_grant", json!(true)),
             ("jobserver_grant", json!(0)),
             ("jobserver_grant", json!(4097)),
@@ -997,6 +993,21 @@ mod tests {
             let mut options = options(&["run"]);
             options.input = Some(input);
             assert!(validate_profile(&baseline, &options).is_err());
+        }
+        assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn direct_live_stderr_is_presentation_only_and_accepts_explicit_false() {
+        let (root, baseline) = filesystem_profile();
+        let options = options(&["build"]);
+        let original = specification(&baseline, &options).unwrap();
+        for selected in [false, true] {
+            let mut profile = baseline.clone();
+            set(&mut profile, "live_stderr", json!(selected));
+            validate_profile(&profile, &options).unwrap();
+            assert!(profile.get("daemon_socket").is_none());
+            assert_eq!(specification(&profile, &options).unwrap(), original);
         }
         assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
     }

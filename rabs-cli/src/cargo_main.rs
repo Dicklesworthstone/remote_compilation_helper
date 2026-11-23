@@ -67,7 +67,7 @@ operation.json and an optional pool.json for rabs-recover. Worker stdin defaults
 to EOF. --stdin-file selects a captured source-relative regular file of at most
 16 MiB for run, executing test or bench; inherited stdin remains unavailable.
 The worker must support source-file-stdin-v1. Profiles may select incremental
-state, jobserver_grant and daemon live_stderr. TLS credentials remain in the
+state, jobserver_grant and live_stderr. TLS credentials remain in the
 local driver environment.
 
 Profiles select toolchain_root or toolchain: rustup. A leading +TOOLCHAIN requires

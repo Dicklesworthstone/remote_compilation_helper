@@ -223,7 +223,8 @@ existing `cargo rabs --rabs-canonical` launcher accepts this profile as well.
 
 With `daemon_socket`, the native frontend submits one durable job to the
 existing daemon. An ordered `workers` array selects the existing pool placement
-path and requires that socket. `live_stderr` is available for daemon-owned jobs.
+path and requires that socket. `live_stderr` is available for both daemon-owned
+jobs and direct pinned TLS worker builds.
 The frontend retains `spec.json`, `operation.json` and, for a pool, `pool.json`
 under a fresh private operation directory. Allocation intent stays
 `request_id: "allocate"` until the native execution owner assigns the request.
@@ -463,7 +464,7 @@ RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-wait JOB_ID
 RABS_SOCKET_PATH=/home/builder/.cache/rch/rabsd.sock rabsd --job-cancel JOB_ID
 ```
 
-To see stderr progress while a daemon-backed canonical build runs, add this
+To see stderr progress while a canonical worker build runs, add this
 Boolean field to its profile:
 
 ```json
@@ -471,7 +472,8 @@ Boolean field to its profile:
 ```
 
 The launcher selects `rabsd --job-build --live-stderr --prepare-from ...` for
-either a single worker or a worker pool. The native client displays a contiguous
+daemon-owned jobs, or `rabsd --worker-build-tls --replay-diagnostics --live-stderr
+--prepare-from ...` for a direct worker. The native client displays a contiguous
 stderr prefix in bounded chunks, then verifies the bytes already shown against
 the final transcript before printing the remaining stderr. A gap in the live
 preview stops early presentation; the verified result supplies the unseen
@@ -490,13 +492,23 @@ client a second time. Regular-file writes retain their original offset and
 append semantics; kernel-blocked filesystem operations are not a hard real-time
 deadline guarantee.
 
-`live_stderr` accepts only `true` or `false` and requires an explicit, valid
-`daemon_socket`, even when set to `false`. Direct worker profiles and local
-canonical profiles refuse this field before preparation. Omission or `false`
-retains ordinary completed-result replay. The selected mode is presentation
+`live_stderr` accepts only `true` or `false`. Local canonical profiles refuse
+this field before preparation. Omission or `false` retains ordinary
+completed-result replay. The selected mode is presentation
 intent in `operation.json`; it is not copied into the worker command, its
 environment or the Cargo artifact contract. An older daemon without the native
 whole-Cargo diagnostics capability refuses an explicit live request.
+
+A direct live client owns its execution thread until completion. The transport
+only updates fixed-size preview buffers; console writes cannot stall pipe
+draining, lease renewal or result delivery. A signal, console failure or elapsed
+presentation deadline requests cancellation and joins the normal authenticated
+cleanup without launching another build. Its retained delivery remains available
+for explicit recovery. Both direct and daemon clients verify the exact stderr
+prefix before exposing final stdout or the remaining stderr.
+Direct `--live-stderr` currently requires a Linux client for bounded console
+writes and cancellation. Other client platforms refuse it before preparation
+or dispatch; their ordinary completed-result mode remains available.
 
 The ordinary recovery frontend also recognizes a saved daemon operation:
 
