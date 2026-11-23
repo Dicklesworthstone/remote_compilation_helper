@@ -143,6 +143,66 @@ fn recovery_without_a_reserve_preserves_stdin_and_creates_no_reserve() {
 }
 
 #[test]
+fn expanded_recovery_scripts_preserve_literal_bytes_stdin_and_exit_status() {
+    let fixture = Fixture::new();
+    // The packed wrapper fits exec, but the expanded program exceeds the
+    // Linux per-argument limit. Its value crosses chunk boundaries inside
+    // quoted text; none of its metacharacters may be evaluated as shell code.
+    let literal = "é ' \" $HOME $(exit 91) `exit 92` \\ * ?\n".repeat(4200);
+    let script = format!(
+        "set -eu\n[ \"$#\" -eq 0 ] && [ \"$0\" = sh ] || exit 93\n\
+         [ -z \"${{rch_reserve_program+x}}${{rch_reserve_chunk+x}}\" ] || exit 94\n\
+         printf '%s' '{}'\ncat\nexit 37\n",
+        literal.replace('\'', "'\\''"),
+    );
+    assert!(script.len() > 128 * 1024);
+    let output = run(
+        &recovery_command(fixture.registry(), &script),
+        b"original stdin\n",
+    );
+    assert_eq!(output.status.code(), Some(37), "{}", stderr(&output));
+    assert_eq!(
+        output.stdout,
+        format!("{literal}original stdin\n").as_bytes()
+    );
+    assert!(output.stderr.is_empty(), "{}", stderr(&output));
+    assert!(
+        !fixture.registry.exists(),
+        "ordinary recovery created a reserve"
+    );
+}
+
+#[test]
+fn expanded_reserved_payload_runs_without_spooling_or_losing_its_lease() {
+    let fixture = Fixture::new();
+    let ready = run(&readiness_command(fixture.registry()), b"");
+    assert!(ready.status.success(), "{}", stderr(&ready));
+    let identity = std::fs::metadata(fixture.reserve()).unwrap();
+    let script = format!(
+        "{}\nset -eu\n\
+         [ \"$RCH_RECOVERY_RESERVE_MODE\" = shared ] || exit 95\n\
+         [ -n \"$RCH_RECOVERY_RESERVE_FD\" ] || exit 96\n\
+         [ -z \"${{MSYS_NO_PATHCONV-}}${{MSYS2_ARG_CONV_EXCL-}}\" ] || exit 97\n\
+         cat\n",
+        "# source-authority and observer protocol\n".repeat(5000),
+    );
+    assert!(script.len() > 128 * 1024);
+    // The reserve is already funded, so this finite recovery must need no
+    // regular-file writes. Both the shell and worker inherit RLIMIT_FSIZE=0.
+    let wrapper = format!(
+        "ulimit -f 0; {}",
+        recovery_command(fixture.registry(), &script),
+    );
+    let output = run(&wrapper, b"leased recovery\n");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(output.stdout, b"leased recovery\n");
+    assert!(output.stderr.is_empty(), "{}", stderr(&output));
+    let after = std::fs::metadata(fixture.reserve()).unwrap();
+    assert_eq!(after.ino(), identity.ino());
+    assert_eq!(after.len(), CAPACITY);
+}
+
+#[test]
 fn recovery_refuses_a_partial_reserve_without_running_its_payload() {
     let fixture = Fixture::new();
     let private = fixture.registry.join(".recovery-v1");

@@ -16,7 +16,9 @@
 //! Operations: `probe`; `ready <registry>`; `admit|recover <registry> <payload>`;
 //! `gc <registry> <payload> <reconcile>`; and the GC shell callbacks
 //! `bind|settle <registry> <claim-name>`. Payloads are packed shell text that
-//! runs (`sh -c`) in place of this process while it holds the lease.
+//! runs in place of this process while it holds the lease. On POSIX workers,
+//! bounded argument chunks keep the expanded script out of a single exec
+//! argument without consuming the transaction's stdin or temporary storage.
 
 use rch_common::recovery_reserve::{PRESSURE_EXIT, PROBE_REPLY, UNSAFE_EXIT};
 
@@ -98,6 +100,42 @@ fn payload(arguments: &[String], index: usize) -> Result<String, Failure> {
 /// Variables the wrapper sets only so Git for Windows passes this binary its
 /// arguments verbatim. The payload never inherits them.
 const WRAPPER_ONLY_ENV: [&str; 2] = ["MSYS_NO_PATHCONV", "MSYS2_ARG_CONV_EXCL"];
+
+/// Compression bounds the transport argument, not the expanded shell program.
+/// A source closure or GC observer can exceed Linux's per-string exec limit
+/// even though its packed argument is tiny. Reassemble bounded literal chunks
+/// inside the same shell, before evaluating any of the transaction. This keeps
+/// the process identity, inherited reserve/activity descriptors and original
+/// stdin intact, and needs neither a spool file nor a detached pipe writer.
+#[cfg(unix)]
+fn payload_shell(script: &str) -> std::process::Command {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const CHUNK_BYTES: usize = 32 * 1024;
+    const BOOTSTRAP: &str = "unset rch_reserve_program rch_reserve_chunk\n\
+        rch_reserve_program=\n\
+        for rch_reserve_chunk do\n\
+            rch_reserve_program=$rch_reserve_program$rch_reserve_chunk\n\
+        done\n\
+        set --\n\
+        eval \"unset rch_reserve_program rch_reserve_chunk
+$rch_reserve_program\"";
+
+    let mut command = std::process::Command::new("sh");
+    // An explicit $0 retains sh -c's ordinary identity. Clearing the chunk
+    // arguments above also retains the payload's original empty $@.
+    command.args(["-c", BOOTSTRAP, "sh"]);
+    command.args(
+        script
+            .as_bytes()
+            .chunks(CHUNK_BYTES)
+            .map(std::ffi::OsStr::from_bytes),
+    );
+    for name in WRAPPER_ONLY_ENV {
+        command.env_remove(name);
+    }
+    command
+}
 
 /// Canonical JSON exactly as the original header writer produced it (sorted
 /// keys, `,`/`:` separators, ASCII-only `\uXXXX` escaping). Existing header
@@ -187,9 +225,7 @@ fn is_generation(epoch: &str) -> bool {
 
 #[cfg(unix)]
 mod imp {
-    use super::{
-        Failure, WRAPPER_ONLY_ENV, canonical, claim_digest, is_generation, payload, unsafe_,
-    };
+    use super::{Failure, canonical, claim_digest, is_generation, payload, payload_shell, unsafe_};
     use rustix::fd::{AsFd, OwnedFd};
     use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
     use serde_json::{Value, json};
@@ -976,11 +1012,7 @@ mod imp {
         }
 
         fn shell(&self, script: &str) -> std::process::Command {
-            let mut command = std::process::Command::new("sh");
-            command.arg("-c").arg(script);
-            for name in WRAPPER_ONLY_ENV {
-                command.env_remove(name);
-            }
+            let mut command = payload_shell(script);
             for (name, value) in &self.environment {
                 command.env(name, value);
             }
@@ -1217,12 +1249,7 @@ mod imp {
                     return Err(Failure::Os(error));
                 }
                 let script = payload(arguments, 2)?;
-                let mut command = std::process::Command::new("sh");
-                command.arg("-c").arg(script);
-                for name in WRAPPER_ONLY_ENV {
-                    command.env_remove(name);
-                }
-                return Err(Failure::Os(command.exec()));
+                return Err(Failure::Os(payload_shell(&script).exec()));
             }
             Err(other) => return Err(other),
         };
