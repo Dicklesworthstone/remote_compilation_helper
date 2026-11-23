@@ -312,5 +312,8 @@ async fn acquire_stream(
     }))
 }
 
+// daemon_ipc.rs loads this file through #[path], so a bare `mod tests;` would
+// resolve to daemon_ipc/tests.rs; name the sibling directory explicitly.
 #[cfg(test)]
+#[path = "ssh_transport/tests.rs"]
 mod tests;

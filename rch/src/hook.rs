@@ -5117,7 +5117,7 @@ pub async fn run_exec(
         );
         let destination = result_dest
             .as_deref()
-            .map(recovery::JobResultDestination::resolve)
+            .map(transfer_orchestration::recovery::JobResultDestination::resolve)
             .transpose()?;
         if let Some(destination) = destination.as_ref() {
             destination.verify_separate_from(&std::env::current_dir()?)?;
