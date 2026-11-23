@@ -376,7 +376,7 @@ pub fn run_service_profile(
         config.max_roots,
         config.jobs_per_root,
     )?;
-    let admissions = OperationAdmissions::new(config.max_roots, config.max_queued_roots);
+    let admissions = OperationAdmissions::new_peer_fair(config.max_roots, config.max_queued_roots);
     let operations = match runtime
         .coord
         .authority()
@@ -807,7 +807,7 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
         .ok_or_else(|| invalid("remote operation admission deadline overflow"))?;
     // Keep this permit through input custody, execution, final delivery and
     // every error/drop path. It is separate from the existing Cargo root token.
-    let admission = acquire_operation(wire, admissions, stopped, queue_deadline, || {
+    let admission = acquire_operation(wire, admissions, edge_pin, stopped, queue_deadline, || {
         runtime.healthy()
     })
     .await?;
@@ -1051,18 +1051,21 @@ async fn serve_attached<S: AsyncRead + AsyncWrite + Unpin>(
     deliver_result(wire, operation, stopped, delivery_deadline, &cancelled).await
 }
 
-/// One authenticated declaration owns a FIFO ticket, never an input tree or
-/// Cargo process, until admitted. Each poll receives exactly Queued or Ready;
-/// Ready is sent by the caller only after its receivers have been created.
+/// One authenticated declaration owns a ticket in its peer's FIFO, never an
+/// input tree or Cargo process, until admitted. Peers take equal fair turns;
+/// requests cannot choose a different tenant from their authenticated TLS pin.
+/// Each poll receives exactly Queued or Ready; Ready is sent by the caller
+/// only after its receivers have been created.
 async fn acquire_operation<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     admissions: &Arc<OperationAdmissions>,
+    authenticated_pin: [u8; 32],
     stopped: &AtomicBool,
     deadline: Instant,
     healthy: impl Fn() -> bool,
 ) -> io::Result<AdmittedOperation> {
     checkpoint(stopped, deadline)?;
-    let mut waiting = admissions.enqueue()?;
+    let mut waiting = admissions.enqueue_for_peer(authenticated_pin)?;
     loop {
         checkpoint(stopped, deadline)?;
         if !healthy() {
@@ -3491,7 +3494,7 @@ mod tests {
 
     #[test]
     fn immediate_remote_admission_holds_capacity_until_owner_drop() {
-        let admissions = OperationAdmissions::new(1, 0);
+        let admissions = OperationAdmissions::new_peer_fair(1, 0);
         let peer = AdmissionPeer::new(Vec::new());
         let output = Arc::clone(&peer.output);
         let mut wire = Wire::new(peer);
@@ -3499,6 +3502,7 @@ mod tests {
         let admitted = ready(acquire_operation(
             &mut wire,
             &admissions,
+            [1; 32],
             &stopped,
             Instant::now() + Duration::from_secs(1),
             || true,
@@ -3506,30 +3510,43 @@ mod tests {
         .unwrap();
         assert!(messages(&output).is_empty());
         assert!(matches!(
-            admissions.enqueue(),
+            admissions.enqueue_for_peer([1; 32]),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock
         ));
         drop(admitted);
-        drop(admissions.enqueue().unwrap().try_start().unwrap().unwrap());
+        drop(
+            admissions
+                .enqueue_for_peer([1; 32])
+                .unwrap()
+                .try_start()
+                .unwrap()
+                .unwrap(),
+        );
     }
 
     #[test]
     fn remote_poll_admission_preserves_fifo_and_cannot_be_barged() {
-        let admissions = OperationAdmissions::new(1, 2);
-        let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+        let admissions = OperationAdmissions::new_peer_fair(1, 2);
+        let active = admissions
+            .enqueue_for_peer([1; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
         let tail = Arc::new(Mutex::new(None));
         let queued_tail = Arc::clone(&tail);
         let peer_admissions = Arc::clone(&admissions);
         let mut peer = AdmissionPeer::new(record(&Message::Poll {}));
         let output = Arc::clone(&peer.output);
         peer.before_read = Some(Box::new(move || {
-            *queued_tail.lock().unwrap() = Some(peer_admissions.enqueue().unwrap());
+            *queued_tail.lock().unwrap() = Some(peer_admissions.enqueue_for_peer([1; 32]).unwrap());
             drop(active);
         }));
         let mut wire = Wire::new(peer);
         let admitted = ready(acquire_operation(
             &mut wire,
             &admissions,
+            [1; 32],
             &AtomicBool::new(false),
             Instant::now() + Duration::from_secs(1),
             || true,
@@ -3538,11 +3555,66 @@ mod tests {
         assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
         let mut tail = tail.lock().unwrap().take().unwrap();
         assert!(tail.try_start().unwrap().is_none());
-        let mut newcomer = admissions.enqueue().unwrap();
+        let mut newcomer = admissions.enqueue_for_peer([1; 32]).unwrap();
         drop(admitted);
         assert!(newcomer.try_start().unwrap().is_none());
         drop(tail.try_start().unwrap().unwrap());
         drop(newcomer.try_start().unwrap().unwrap());
+    }
+
+    #[test]
+    fn authenticated_remote_peer_gets_a_turn_before_an_earlier_peers_burst_drains() {
+        let admissions = OperationAdmissions::new_peer_fair(1, 4);
+        let active = admissions
+            .enqueue_for_peer([1; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let mut first = admissions.enqueue_for_peer([1; 32]).unwrap();
+        let tail = Arc::new(Mutex::new(admissions.enqueue_for_peer([1; 32]).unwrap()));
+        let child_tail = Arc::clone(&tail);
+        let peer_admissions = Arc::clone(&admissions);
+        let mut peer = AdmissionPeer::new(record(&Message::Poll {}));
+        let output = Arc::clone(&peer.output);
+        peer.before_read = Some(Box::new(move || {
+            // The second peer has joined through the actual network admission
+            // path. A queued connection from the first peer is cancelled; its
+            // other tickets and the second peer's fair turn must survive.
+            drop(peer_admissions.enqueue_for_peer([1; 32]).unwrap());
+            drop(active);
+            drop(first.try_start().unwrap().unwrap());
+            assert!(
+                child_tail.lock().unwrap().try_start().unwrap().is_none(),
+                "the first peer's burst bypassed the waiting remote peer"
+            );
+        }));
+        let mut wire = Wire::new(peer);
+        let admitted = ready(acquire_operation(
+            &mut wire,
+            &admissions,
+            [2; 32],
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(1),
+            || true,
+        ))
+        .unwrap();
+        assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
+        let mut next_remote = admissions.enqueue_for_peer([2; 32]).unwrap();
+        assert!(tail.lock().unwrap().try_start().unwrap().is_none());
+        drop(admitted);
+        assert!(next_remote.try_start().unwrap().is_none());
+        drop(tail.lock().unwrap().try_start().unwrap().unwrap());
+        drop(next_remote.try_start().unwrap().unwrap());
+        // Both peers drained; repeated admissions retain no abandoned slot.
+        drop(
+            admissions
+                .enqueue_for_peer([3; 32])
+                .unwrap()
+                .try_start()
+                .unwrap()
+                .unwrap(),
+        );
     }
 
     #[test]
@@ -3559,14 +3631,20 @@ mod tests {
             ),
             (b"not-json\n".to_vec(), io::ErrorKind::InvalidData),
         ] {
-            let admissions = OperationAdmissions::new(1, 1);
-            let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+            let admissions = OperationAdmissions::new_peer_fair(1, 1);
+            let active = admissions
+                .enqueue_for_peer([1; 32])
+                .unwrap()
+                .try_start()
+                .unwrap()
+                .unwrap();
             let peer = AdmissionPeer::new(input);
             let output = Arc::clone(&peer.output);
             let mut wire = Wire::new(peer);
             let error = ready(acquire_operation(
                 &mut wire,
                 &admissions,
+                [2; 32],
                 &AtomicBool::new(false),
                 Instant::now() + Duration::from_secs(1),
                 || true,
@@ -3575,7 +3653,7 @@ mod tests {
             .expect("waiting client was not admitted");
             assert_eq!(error.kind(), expected);
             assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
-            let mut successor = admissions.enqueue().unwrap();
+            let mut successor = admissions.enqueue_for_peer([3; 32]).unwrap();
             assert!(successor.try_start().unwrap().is_none());
             drop(active);
             drop(successor.try_start().unwrap().unwrap());
@@ -3584,15 +3662,21 @@ mod tests {
 
     #[test]
     fn remote_queue_refuses_overflow_expiry_and_unhealthy_runtime_before_grant() {
-        let admissions = OperationAdmissions::new(1, 1);
-        let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
-        let waiting = admissions.enqueue().unwrap();
+        let admissions = OperationAdmissions::new_peer_fair(1, 1);
+        let active = admissions
+            .enqueue_for_peer([1; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let waiting = admissions.enqueue_for_peer([1; 32]).unwrap();
         let peer = AdmissionPeer::new(Vec::new());
         let output = Arc::clone(&peer.output);
         let mut wire = Wire::new(peer);
         let error = ready(acquire_operation(
             &mut wire,
             &admissions,
+            [2; 32],
             &AtomicBool::new(false),
             Instant::now() + Duration::from_secs(1),
             || true,
@@ -3621,6 +3705,7 @@ mod tests {
             let error = ready(acquire_operation(
                 &mut wire,
                 &admissions,
+                [2; 32],
                 &AtomicBool::new(cancelled),
                 Instant::now() + budget,
                 || healthy,
@@ -3628,14 +3713,26 @@ mod tests {
             .err()
             .unwrap();
             assert_eq!(error.kind(), expected);
-            drop(admissions.enqueue().unwrap().try_start().unwrap().unwrap());
+            drop(
+                admissions
+                    .enqueue_for_peer([3; 32])
+                    .unwrap()
+                    .try_start()
+                    .unwrap()
+                    .unwrap(),
+            );
         }
     }
 
     #[test]
     fn queued_remote_runtime_failure_cannot_take_a_newly_freed_slot() {
-        let admissions = OperationAdmissions::new(1, 1);
-        let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+        let admissions = OperationAdmissions::new_peer_fair(1, 1);
+        let active = admissions
+            .enqueue_for_peer([1; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
         let healthy = Arc::new(AtomicBool::new(true));
         let peer_health = Arc::clone(&healthy);
         let mut peer = AdmissionPeer::new(record(&Message::Poll {}));
@@ -3648,6 +3745,7 @@ mod tests {
         let error = ready(acquire_operation(
             &mut wire,
             &admissions,
+            [2; 32],
             &AtomicBool::new(false),
             Instant::now() + Duration::from_secs(1),
             || healthy.load(Ordering::Acquire),
@@ -3656,7 +3754,14 @@ mod tests {
         .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
-        drop(admissions.enqueue().unwrap().try_start().unwrap().unwrap());
+        drop(
+            admissions
+                .enqueue_for_peer([3; 32])
+                .unwrap()
+                .try_start()
+                .unwrap()
+                .unwrap(),
+        );
     }
 
     #[test]
@@ -3667,8 +3772,13 @@ mod tests {
             block_on_top_level(&runtime, async move {
                 handle
                     .spawn(async move {
-                        let admissions = OperationAdmissions::new(1, 1);
-                        let active = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
+                        let admissions = OperationAdmissions::new_peer_fair(1, 1);
+                        let active = admissions
+                            .enqueue_for_peer([1; 32])
+                            .unwrap()
+                            .try_start()
+                            .unwrap()
+                            .unwrap();
                         let stopped = Arc::new(AtomicBool::new(false));
                         let mut peer = AdmissionPeer::new(Vec::new());
                         peer.eof = false;
@@ -3700,6 +3810,7 @@ mod tests {
                             acquire_operation(
                                 &mut wire,
                                 &admissions,
+                                [2; 32],
                                 &stopped,
                                 Instant::now() + budget,
                                 || true,
@@ -3721,7 +3832,7 @@ mod tests {
                             }
                         );
                         assert_eq!(messages(&output), vec![json!({"kind":"queued"})]);
-                        let mut successor = admissions.enqueue().unwrap();
+                        let mut successor = admissions.enqueue_for_peer([3; 32]).unwrap();
                         assert!(successor.try_start().unwrap().is_none());
                         drop(active);
                         drop(successor.try_start().unwrap().unwrap());

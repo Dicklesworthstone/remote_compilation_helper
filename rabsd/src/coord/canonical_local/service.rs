@@ -18,11 +18,13 @@ use asupersync::signal::ShutdownController;
 use rabs_protocol::canonical_service::{
     Header, Kind, MAX_CHUNK_BYTES, MAX_FAILURE_BYTES, MAX_PROFILE_BYTES, ResponseState,
 };
+use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
 use rabs_sandbox::socket_endpoint::EndpointLease;
+use rabs_scheduler::fairness::{FairQueue, TenantKey};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -258,22 +260,119 @@ struct AdmissionState {
     next_ticket: u64,
     waiting: VecDeque<u64>,
     active: usize,
+    peers: Option<PeerAdmissions>,
+}
+
+/// One fair turn represents the head of a peer's FIFO, not its whole burst.
+/// Cancellation of a head leaves its successor in the same turn; cancellation
+/// of its last ticket withdraws that turn without charging unstarted work.
+/// The remote listener admits only configured TLS pins (at most 256), so the
+/// fair queue's retained service history is bounded by that allowlist.
+struct PeerAdmissions {
+    turns: FairQueue,
+    waiting: BTreeMap<String, VecDeque<u64>>,
+}
+
+impl PeerAdmissions {
+    fn new() -> Self {
+        Self {
+            // Equal one-root turns need no estimated-cost or deadline override.
+            // Operation deadlines remain enforced by each waiting connection.
+            turns: FairQueue::new(u64::MAX, 0),
+            waiting: BTreeMap::new(),
+        }
+    }
+
+    fn tenant(peer: &str) -> TenantKey {
+        TenantKey {
+            agent: peer.to_owned(),
+            project: "canonical-roots".into(),
+            ci: false,
+        }
+    }
+
+    fn enqueue(&mut self, peer: &str, ticket: u64) {
+        let waiting = self.waiting.entry(peer.to_owned()).or_default();
+        if waiting.is_empty() {
+            self.turns
+                .enqueue(Self::tenant(peer), peer, 1, ticket, None);
+        }
+        waiting.push_back(ticket);
+    }
+
+    fn next(&self, now: u64) -> Option<u64> {
+        let turn = self.turns.peek(now)?;
+        self.waiting.get(&turn.label)?.front().copied()
+    }
+
+    fn start(&mut self, peer: &str, ticket: u64, now: u64) {
+        let turn = self.turns.dequeue(now).expect("selected peer turn exists");
+        debug_assert_eq!(turn.label, peer);
+        let waiting = self
+            .waiting
+            .get_mut(peer)
+            .expect("selected peer has tickets");
+        let admitted = waiting.pop_front();
+        debug_assert_eq!(admitted, Some(ticket));
+        if waiting.is_empty() {
+            self.waiting.remove(peer);
+        } else {
+            self.turns.enqueue(Self::tenant(peer), peer, 1, now, None);
+        }
+    }
+
+    fn cancel(&mut self, peer: &str, ticket: u64) {
+        let Some(waiting) = self.waiting.get_mut(peer) else {
+            return;
+        };
+        waiting.retain(|queued| *queued != ticket);
+        if waiting.is_empty() {
+            self.waiting.remove(peer);
+            let _ = self.turns.cancel(&Self::tenant(peer), peer);
+        }
+    }
 }
 
 impl OperationAdmissions {
     pub(super) fn new(maximum: usize, queued: usize) -> Arc<Self> {
+        Self::with_peers(maximum, queued, None)
+    }
+
+    pub(super) fn new_peer_fair(maximum: usize, queued: usize) -> Arc<Self> {
+        Self::with_peers(maximum, queued, Some(PeerAdmissions::new()))
+    }
+
+    fn with_peers(maximum: usize, queued: usize, peers: Option<PeerAdmissions>) -> Arc<Self> {
         Arc::new(Self {
             maximum,
             capacity: maximum + queued,
-            state: Mutex::new(AdmissionState::default()),
+            state: Mutex::new(AdmissionState {
+                peers,
+                ..AdmissionState::default()
+            }),
         })
     }
 
     pub(super) fn enqueue(self: &Arc<Self>) -> io::Result<WaitingOperation> {
+        self.enqueue_inner(None)
+    }
+
+    pub(super) fn enqueue_for_peer(
+        self: &Arc<Self>,
+        authenticated_pin: [u8; 32],
+    ) -> io::Result<WaitingOperation> {
+        self.enqueue_inner(Some(encode_hex(&authenticated_pin)))
+    }
+
+    fn enqueue_inner(self: &Arc<Self>, peer: Option<String>) -> io::Result<WaitingOperation> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| io::Error::other("canonical operation admission lock poisoned"))?;
+        require(
+            state.peers.is_some() == peer.is_some(),
+            "canonical operation admission identity does not match its service",
+        )?;
         if state.active + state.waiting.len() >= self.capacity {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -285,10 +384,14 @@ impl OperationAdmissions {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("canonical operation admission sequence exhausted"))?;
         let ticket = state.next_ticket;
+        if let (Some(peers), Some(peer)) = (&mut state.peers, &peer) {
+            peers.enqueue(peer, ticket);
+        }
         state.waiting.push_back(ticket);
         Ok(WaitingOperation {
             admissions: Arc::clone(self),
             ticket,
+            peer,
             queued: true,
         })
     }
@@ -348,6 +451,7 @@ impl OperationAdmissions {
 pub(super) struct WaitingOperation {
     admissions: Arc<OperationAdmissions>,
     ticket: u64,
+    peer: Option<String>,
     queued: bool,
 }
 
@@ -358,13 +462,21 @@ impl WaitingOperation {
             .state
             .lock()
             .map_err(|_| io::Error::other("canonical operation admission lock poisoned"))?;
-        if !self.queued
-            || state.active >= self.admissions.maximum
-            || state.waiting.front() != Some(&self.ticket)
+        let now = state.next_ticket;
+        let selected = state
+            .peers
+            .as_ref()
+            .map_or_else(|| state.waiting.front().copied(), |peers| peers.next(now));
+        if !self.queued || state.active >= self.admissions.maximum || selected != Some(self.ticket)
         {
             return Ok(None);
         }
-        state.waiting.pop_front();
+        if let (Some(peers), Some(peer)) = (&mut state.peers, &self.peer) {
+            peers.start(peer, self.ticket, now);
+            state.waiting.retain(|ticket| *ticket != self.ticket);
+        } else {
+            state.waiting.pop_front();
+        }
         state.active += 1;
         self.queued = false;
         Ok(Some(AdmittedOperation(Arc::clone(&self.admissions))))
@@ -374,12 +486,15 @@ impl WaitingOperation {
 impl Drop for WaitingOperation {
     fn drop(&mut self) {
         if self.queued {
-            self.admissions
+            let mut state = self
+                .admissions
                 .state
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .waiting
-                .retain(|ticket| *ticket != self.ticket);
+                .unwrap_or_else(|error| error.into_inner());
+            state.waiting.retain(|ticket| *ticket != self.ticket);
+            if let (Some(peers), Some(peer)) = (&mut state.peers, &self.peer) {
+                peers.cancel(peer, self.ticket);
+            }
         }
     }
 }
@@ -1610,6 +1725,146 @@ mod tests {
         let state = admissions.state.lock().unwrap();
         assert_eq!(state.active, 0);
         assert!(state.waiting.is_empty());
+    }
+
+    #[test]
+    fn admission_mode_rejects_missing_or_unexpected_peer_identity_without_taking_capacity() {
+        for peer_fair in [false, true] {
+            let admissions = if peer_fair {
+                OperationAdmissions::new_peer_fair(1, 0)
+            } else {
+                OperationAdmissions::new(1, 0)
+            };
+            let wrong_mode = if peer_fair {
+                admissions.enqueue()
+            } else {
+                admissions.enqueue_for_peer([1; 32])
+            };
+            assert!(
+                matches!(wrong_mode, Err(error) if error.kind() == io::ErrorKind::InvalidInput)
+            );
+            {
+                let state = admissions.state.lock().unwrap();
+                assert_eq!(state.next_ticket, 0);
+                assert_eq!(state.active, 0);
+                assert!(state.waiting.is_empty());
+            }
+            let mut admitted = if peer_fair {
+                admissions.enqueue_for_peer([1; 32]).unwrap()
+            } else {
+                admissions.enqueue().unwrap()
+            };
+            drop(
+                admitted
+                    .try_start()
+                    .unwrap()
+                    .expect("rejected identity consumed capacity"),
+            );
+            let state = admissions.state.lock().unwrap();
+            assert_eq!(state.active, 0);
+            assert!(state.waiting.is_empty());
+        }
+    }
+
+    #[test]
+    fn peer_fair_admission_interleaves_bursts_with_bounded_capacity_and_peer_fifo() {
+        let admissions = OperationAdmissions::new_peer_fair(1, 12);
+        let blocker = admissions
+            .enqueue_for_peer([0; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let mut peers: Vec<VecDeque<WaitingOperation>> = (1..=3)
+            .map(|peer| {
+                (0..4)
+                    .map(|_| admissions.enqueue_for_peer([peer; 32]).unwrap())
+                    .collect()
+            })
+            .collect();
+        assert!(matches!(
+            admissions.enqueue_for_peer([4; 32]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(blocker);
+        for turn in 0..12 {
+            let chosen = turn % peers.len();
+            for (peer, waiting) in peers.iter_mut().enumerate() {
+                if peer != chosen
+                    && let Some(head) = waiting.front_mut()
+                {
+                    assert!(
+                        head.try_start().unwrap().is_none(),
+                        "peer {peer} barged turn {turn}"
+                    );
+                }
+                if let Some(tail) = waiting.get_mut(1) {
+                    assert!(
+                        tail.try_start().unwrap().is_none(),
+                        "same-peer FIFO was bypassed"
+                    );
+                }
+            }
+            let mut head = peers[chosen].pop_front().unwrap();
+            let active = head.try_start().unwrap().expect("peer lost its fair turn");
+            assert!(head.try_start().unwrap().is_none());
+            for waiting in &mut peers {
+                if let Some(head) = waiting.front_mut() {
+                    assert!(
+                        head.try_start().unwrap().is_none(),
+                        "active capacity was exceeded"
+                    );
+                }
+            }
+            drop(active);
+        }
+        let state = admissions.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert!(state.waiting.is_empty());
+        let peers = state.peers.as_ref().unwrap();
+        assert!(peers.waiting.is_empty());
+        assert!(peers.turns.peek(state.next_ticket).is_none());
+    }
+
+    #[test]
+    fn cancelled_peer_heads_and_empty_turns_preserve_other_demand_without_virtual_debt() {
+        let admissions = OperationAdmissions::new_peer_fair(1, 4);
+        let active = admissions
+            .enqueue_for_peer([1; 32])
+            .unwrap()
+            .try_start()
+            .unwrap()
+            .unwrap();
+        let cancelled_head = admissions.enqueue_for_peer([1; 32]).unwrap();
+        let mut successor = admissions.enqueue_for_peer([1; 32]).unwrap();
+        let mut other = admissions.enqueue_for_peer([3; 32]).unwrap();
+        for _ in 0..64 {
+            let cancelled_peer = admissions.enqueue_for_peer([2; 32]).unwrap();
+            assert!(matches!(
+                admissions.enqueue_for_peer([4; 32]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ));
+            drop(cancelled_peer);
+        }
+        drop(cancelled_head);
+        let mut returned = admissions.enqueue_for_peer([2; 32]).unwrap();
+        assert!(returned.try_start().unwrap().is_none());
+        drop(active);
+        assert!(other.try_start().unwrap().is_none());
+        drop(successor.try_start().unwrap().unwrap());
+        let mut followup = admissions.enqueue_for_peer([1; 32]).unwrap();
+        assert!(followup.try_start().unwrap().is_none());
+        drop(other.try_start().unwrap().unwrap());
+        assert!(
+            followup.try_start().unwrap().is_none(),
+            "cancelled turns charged returning peer"
+        );
+        drop(returned.try_start().unwrap().unwrap());
+        drop(followup.try_start().unwrap().unwrap());
+        let state = admissions.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert!(state.waiting.is_empty());
+        assert!(state.peers.as_ref().unwrap().waiting.is_empty());
     }
 
     #[test]

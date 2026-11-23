@@ -156,8 +156,39 @@ impl FairQueue {
         });
     }
 
-    /// Dequeue under the override + fairness rules.
-    pub fn dequeue(&mut self, now: u64) -> Option<FairItem> {
+    /// Inspect the next item without consuming its fair turn. A polled owner
+    /// can check whether its work is eligible before taking execution custody.
+    #[must_use]
+    pub fn peek(&self, now: u64) -> Option<&FairItem> {
+        self.selected(now)
+            .map(|(position, _)| &self.items[position])
+    }
+
+    /// Cancel one exact tenant/label pair without consuming a service turn.
+    /// Already queued items retain their admission-time charges. When a
+    /// tenant's last queued item leaves, a later enqueue starts from service
+    /// actually consumed, not from abandoned reservations.
+    pub fn cancel(&mut self, tenant: &TenantKey, label: &str) -> Option<FairItem> {
+        let position = self
+            .items
+            .iter()
+            .position(|item| &item.tenant == tenant && item.label == label)?;
+        let item = self.items.remove(position);
+        let retained_finish = self
+            .items
+            .iter()
+            .filter(|item| &item.tenant == tenant)
+            .map(|item| item.virtual_finish)
+            .max()
+            .unwrap_or(0)
+            .max(self.virtual_time_of(tenant));
+        if let Some((_, stamped)) = self.last_stamped.iter_mut().find(|(key, _)| key == tenant) {
+            *stamped = retained_finish;
+        }
+        Some(item)
+    }
+
+    fn selected(&self, now: u64) -> Option<(usize, u128)> {
         if self.items.is_empty() {
             return None;
         }
@@ -190,7 +221,12 @@ impl FairQueue {
             .map(|(p, _)| p)
             .expect("nonempty");
         let fair_finish = self.items[fair_pos].virtual_finish;
-        let pos = urgent.unwrap_or(fair_pos);
+        Some((urgent.unwrap_or(fair_pos), fair_finish))
+    }
+
+    /// Dequeue under the override + fairness rules.
+    pub fn dequeue(&mut self, now: u64) -> Option<FairItem> {
+        let (pos, fair_finish) = self.selected(now)?;
         let item = self.items.remove(pos);
         // Consume the charge fixed at admission, even for override winners.
         // Recomputing cost at the current weight would reprice pending work.
@@ -214,6 +250,53 @@ mod tests {
             project: "proj".into(),
             ci,
         }
+    }
+
+    #[test]
+    fn inspection_selects_the_same_turn_without_charging_or_reordering_it() {
+        for (starvation_bound, deadline, now) in [(u64::MAX, Some(1), 1), (5, None, 10)] {
+            let mut q = FairQueue::new(starvation_bound, 10);
+            q.enqueue(tenant("priority", false), "priority", 1_000, 0, deadline);
+            q.enqueue(tenant("ordinary", false), "ordinary", 1, now, None);
+            let before = q.clone();
+            for _ in 0..16 {
+                assert_eq!(q.peek(now).unwrap().label, "priority");
+            }
+            assert_eq!(q, before);
+            assert_eq!(q.dequeue(now).unwrap().label, "priority");
+            assert_eq!(q.peek(now).unwrap().label, "ordinary");
+            assert_eq!(q.dequeue(now).unwrap().label, "ordinary");
+            assert!(q.peek(now).is_none());
+        }
+    }
+
+    #[test]
+    fn cancelling_exact_reservations_does_not_spend_turns_or_create_idle_credit() {
+        let mut q = FairQueue::new(u64::MAX, 0);
+        let first = tenant("first", false);
+        let second = tenant("second", false);
+        q.enqueue(first.clone(), "same-label", 1, 0, None);
+        q.enqueue(second.clone(), "same-label", 1, 1, None);
+        assert_eq!(q.cancel(&second, "same-label").unwrap().tenant, second);
+        assert!(q.cancel(&second, "same-label").is_none());
+        assert_eq!(q.dequeue(1).unwrap().tenant, first);
+
+        for tick in 2..66 {
+            q.enqueue(second.clone(), "abandoned", 1, tick, None);
+            assert!(q.cancel(&second, "abandoned").is_some());
+        }
+        q.enqueue(first.clone(), "first-next", 1, 66, None);
+        q.enqueue(second.clone(), "second-next", 1, 67, None);
+        let a = q.dequeue(67).unwrap();
+        assert_eq!(a.label, "first-next");
+        q.enqueue(first, "first-followup", 1, 68, None);
+        let b = q.dequeue(68).unwrap();
+        assert_eq!(b.label, "second-next");
+        assert_eq!(
+            a.virtual_finish, b.virtual_finish,
+            "no cancelled-turn debt or idle credit"
+        );
+        assert_eq!(q.dequeue(68).unwrap().label, "first-followup");
     }
 
     #[test]
