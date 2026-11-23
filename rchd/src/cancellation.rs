@@ -468,6 +468,9 @@ impl Default for CancellationConfig {
 /// events do not permanently inflate a worker's cancellation debt.
 #[derive(Debug, Clone, Default)]
 struct WorkerCancelStats {
+    /// One admitted build is one incident, even when its cleanup needs retries.
+    /// The admission timestamp distinguishes reused IDs in imported history.
+    incidents: HashMap<(u64, String), CancellationIncident>,
     /// Recent cancellation timestamps (within window).
     recent_cancellations: Vec<Instant>,
     /// Recent escalation timestamps (within window).
@@ -478,7 +481,93 @@ struct WorkerCancelStats {
     total_builds: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CancellationIncident {
+    last_evidence_at: Instant,
+    escalation_count: u32,
+    cleanup_failed: bool,
+}
+
 const DEBT_WINDOW: Duration = Duration::from_secs(300); // 5 minutes
+
+impl WorkerCancelStats {
+    fn prune_events(&mut self, now: Instant) {
+        for events in [
+            &mut self.recent_cancellations,
+            &mut self.recent_escalations,
+            &mut self.recent_cleanup_failures,
+        ] {
+            events.retain(|at| now.saturating_duration_since(*at) < DEBT_WINDOW);
+        }
+    }
+
+    fn record(
+        &mut self,
+        history: &crate::history::BuildHistory,
+        record: &CancellationRecord,
+        started_at: &str,
+        now: Instant,
+    ) {
+        self.prune_events(now);
+        // Keep an expired incident while the same build still owns capacity.
+        // Otherwise a retry after a quiet five-minute window would revive old
+        // debt. Finished incidents expire on the next record, bounding this
+        // map by live ownership plus recent evidence, even without a selector.
+        self.incidents.retain(|(id, started), incident| {
+            // Finalization may just have removed this build from history.
+            // Its successful last retry must not recreate an expired event.
+            (*id == record.build_id && started == started_at)
+                || now.saturating_duration_since(incident.last_evidence_at) < DEBT_WINDOW
+                || history.active_build(*id).is_some_and(|build| {
+                    build.worker_id == record.worker_id && build.started_at == *started
+                })
+        });
+        let incident = self
+            .incidents
+            .entry((record.build_id, started_at.to_owned()))
+            .or_insert_with(|| {
+                self.recent_cancellations.push(now);
+                CancellationIncident {
+                    last_evidence_at: now,
+                    escalation_count: 0,
+                    cleanup_failed: false,
+                }
+            });
+
+        // A stronger escalation or the first cleanup failure remains new
+        // evidence. Repeating the same failed attempt neither multiplies the
+        // evidence nor refreshes its original debt window.
+        if record.escalation_count > incident.escalation_count {
+            for _ in incident.escalation_count..record.escalation_count {
+                self.recent_escalations.push(now);
+            }
+            incident.escalation_count = record.escalation_count;
+            incident.last_evidence_at = now;
+        }
+        if !record.cleanup_ok && !incident.cleanup_failed {
+            self.recent_cleanup_failures.push(now);
+            incident.cleanup_failed = true;
+            incident.last_evidence_at = now;
+        }
+    }
+
+    fn debt(&mut self, now: Instant) -> f64 {
+        self.prune_events(now);
+
+        // Rate component: distinct cancellations per 5-minute window.
+        // 5+ cancellations in 5 minutes → full rate debt.
+        let rate_debt = (self.recent_cancellations.len() as f64 / 5.0).min(1.0);
+
+        // Escalation component: 0.2 per newly observed escalation.
+        let escalation_debt = (self.recent_escalations.len() as f64 * 0.2).min(0.6);
+
+        // Cleanup failure component: 0.3 per incident's first failed cleanup.
+        let cleanup_debt = (self.recent_cleanup_failures.len() as f64 * 0.3).min(0.6);
+
+        // Weighted combination, capped at 1.0.
+        (rate_debt * 0.4 + escalation_debt * 0.3 + cleanup_debt * 0.3).clamp(0.0, 1.0)
+    }
+}
 
 // ── Orchestrator ─────────────────────────────────────────────────────────
 
@@ -699,7 +788,9 @@ impl CancellationOrchestrator {
             // Keep finalization in this same task. Caller cancellation after
             // confirmation must not lose its slot-release/history owner.
             owner.run_cleanup(&context, &mut record).await;
-            owner.record_cancellation_stats(&record).await;
+            owner
+                .record_cancellation_stats(&context.history, &record, &current.started_at)
+                .await;
             let missing_endpoint = remote_cancellation_required(&record)
                 && cancellation_transport_endpoint(&record).is_none();
 
@@ -1496,19 +1587,15 @@ impl CancellationOrchestrator {
     }
 
     /// Record cancellation stats for a worker (for debt computation).
-    async fn record_cancellation_stats(&self, record: &CancellationRecord) {
+    async fn record_cancellation_stats(
+        &self,
+        history: &crate::history::BuildHistory,
+        record: &CancellationRecord,
+        started_at: &str,
+    ) {
         let mut stats = self.worker_stats.write().await;
         let entry = stats.entry(record.worker_id.clone()).or_default();
-
-        let now = Instant::now();
-        entry.recent_cancellations.push(now);
-
-        for _ in 0..record.escalation_count {
-            entry.recent_escalations.push(now);
-        }
-        if !record.cleanup_ok {
-            entry.recent_cleanup_failures.push(now);
-        }
+        entry.record(history, record, started_at, Instant::now());
     }
 
     /// Compute cancellation debt for a worker (0.0 = clean, 1.0 = saturated).
@@ -1520,35 +1607,7 @@ impl CancellationOrchestrator {
             return 0.0; // No cancellation history → no debt.
         };
 
-        // Prune all counters outside the window. Compare ages rather than
-        // constructing a cutoff Instant, because `Instant::now() - Duration`
-        // panics if the result would precede the monotonic clock's origin
-        // (fresh-boot scenario on Linux where `Instant::now()` < DEBT_WINDOW).
-        let now = Instant::now();
-        entry
-            .recent_cancellations
-            .retain(|t| now.saturating_duration_since(*t) < DEBT_WINDOW);
-        entry
-            .recent_escalations
-            .retain(|t| now.saturating_duration_since(*t) < DEBT_WINDOW);
-        entry
-            .recent_cleanup_failures
-            .retain(|t| now.saturating_duration_since(*t) < DEBT_WINDOW);
-
-        let recent_count = entry.recent_cancellations.len() as f64;
-
-        // Rate component: cancellations per 5-minute window, normalized.
-        // 5+ cancellations in 5 minutes → full rate debt.
-        let rate_debt = (recent_count / 5.0).min(1.0);
-
-        // Escalation component: 0.2 per recent escalation.
-        let escalation_debt = (entry.recent_escalations.len() as f64 * 0.2).min(0.6);
-
-        // Cleanup failure component: 0.3 per recent failed cleanup.
-        let cleanup_debt = (entry.recent_cleanup_failures.len() as f64 * 0.3).min(0.6);
-
-        // Weighted combination, capped at 1.0.
-        (rate_debt * 0.4 + escalation_debt * 0.3 + cleanup_debt * 0.3).clamp(0.0, 1.0)
+        entry.debt(Instant::now())
     }
 
     /// Get active (in-flight) cancellation records.
@@ -3612,6 +3671,176 @@ wait
 
         let debt = orch.cancellation_debt("w1").await;
         assert!((debt - 1.0).abs() < f64::EPSILON || debt <= 1.0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_retries_do_not_degrade_an_otherwise_healthy_worker() {
+        use crate::reliability::{ReliabilityAggregator, ReliabilityConfig, WorkerHealthState};
+
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("retry-debt");
+        pool.add_worker(rch_common::WorkerConfig {
+            id: worker_id.clone(),
+            total_slots: 8,
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        assert!(worker.reserve_slots(5).await);
+        let history = Arc::new(BuildHistory::new(100));
+        let first = history.start_active_build(
+            "retry-project".into(),
+            worker_id.to_string(),
+            "cargo test".into(),
+            0,
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+        let ctx = make_test_context(pool, history.clone());
+        // Exercise the real cancellation/finalization path without starting
+        // signals or transport. An expired attempt retains all reservations.
+        let orch = Arc::new(CancellationOrchestrator::new(
+            CancellationConfig {
+                cleanup_timeout: Duration::ZERO,
+                ..test_config()
+            },
+            test_events(),
+        ));
+        let mut reliability = ReliabilityAggregator::new(ReliabilityConfig::default());
+        reliability.set_cancellation(orch.clone());
+        for _ in 0..20 {
+            let response = orch
+                .cancel_build(&ctx, first.id, CancelReason::StuckDetector, false)
+                .await;
+            assert_eq!(response.status, "failed");
+            assert_eq!(response.slots_released, 0);
+            let assessment = reliability.evaluate(&worker, worker_id.as_str()).await;
+            assert!((assessment.signals.cancellation_debt - 0.17).abs() < 1e-12);
+            assert_eq!(assessment.health_state, WorkerHealthState::Healthy);
+            assert_eq!(assessment.penalty, 0.0);
+            assert!(!assessment.hard_exclude);
+        }
+        assert_eq!(worker.used_slots(), 5);
+        assert!(history.active_build(first.id).is_some());
+        assert!(history.recent(10).is_empty());
+
+        // Different failed builds are independent evidence. Deduplication
+        // must not suppress the default reliability penalty for that pattern.
+        for index in 1..5 {
+            let build = history.start_active_build(
+                format!("other-project-{index}"),
+                worker_id.to_string(),
+                "cargo test".into(),
+                0,
+                1,
+                rch_common::BuildLocation::Remote,
+            );
+            let response = orch
+                .cancel_build(&ctx, build.id, CancelReason::StuckDetector, false)
+                .await;
+            assert_eq!(response.status, "failed");
+            assert_eq!(response.slots_released, 0);
+        }
+        let assessment = reliability.evaluate(&worker, worker_id.as_str()).await;
+        assert!((assessment.signals.cancellation_debt - 0.58).abs() < 1e-12);
+        assert_eq!(assessment.health_state, WorkerHealthState::Degraded);
+        assert!(assessment.penalty >= ReliabilityConfig::default().degraded_penalty_floor);
+        assert_eq!(worker.used_slots(), 5);
+        assert_eq!(history.active_builds().len(), 5);
+    }
+
+    #[test]
+    fn cancellation_incident_debt_expires_without_rearming_on_old_retries() {
+        let history = BuildHistory::new(100);
+        let build = history.start_active_build(
+            "retry-project".into(),
+            "w1".into(),
+            "cargo test".into(),
+            0,
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+        let mut record = test_record(CancellationState::Failed, 1, true);
+        record.build_id = build.id;
+        record.cleanup_ok = false;
+        let now = Instant::now();
+        let mut stats = WorkerCancelStats::default();
+        stats.record(&history, &record, &build.started_at, now);
+        assert!((stats.debt(now) - 0.23).abs() < 1e-12);
+
+        let last_moment = now + DEBT_WINDOW - Duration::from_millis(1);
+        stats.record(&history, &record, &build.started_at, last_moment);
+        assert!((stats.debt(last_moment) - 0.23).abs() < 1e-12);
+        assert_eq!(stats.debt(now + DEBT_WINDOW), 0.0);
+        let later = now + DEBT_WINDOW + Duration::from_secs(60);
+        stats.record(&history, &record, &build.started_at, later);
+        assert_eq!(stats.debt(later), 0.0);
+        assert_eq!(stats.incidents.len(), 1);
+
+        // A genuinely stronger escalation is fresh evidence; a repeated or
+        // weaker attempt still cannot restore the earlier rate/failure debt.
+        record.escalation_count = 2;
+        stats.record(&history, &record, &build.started_at, later);
+        assert!((stats.debt(later) - 0.06).abs() < 1e-12);
+        record.escalation_count = 1;
+        stats.record(&history, &record, &build.started_at, later);
+        assert!((stats.debt(later) - 0.06).abs() < 1e-12);
+
+        // A newly admitted incarnation is distinct even if imported history
+        // reuses a numeric build ID. Its first failure must still be counted.
+        let replacement_start = "2026-11-23T12:00:01Z";
+        record.escalation_count = 0;
+        stats.record(&history, &record, replacement_start, later);
+        assert!((stats.debt(later) - 0.23).abs() < 1e-12);
+        assert_eq!(stats.incidents.len(), 2);
+
+        history
+            .finish_active_build(build.id, 130, None, None, None)
+            .unwrap();
+        let expired = later + DEBT_WINDOW;
+        record.state = CancellationState::Completed;
+        record.cleanup_ok = true;
+        stats.record(&history, &record, &build.started_at, expired);
+        assert_eq!(stats.debt(expired), 0.0);
+        assert_eq!(stats.incidents.len(), 1);
+
+        // No stale selector read is needed for storage to stay bounded: a
+        // fresh incident prunes old events and inactive identities itself.
+        record.build_id += 1;
+        record.state = CancellationState::Failed;
+        record.cleanup_ok = false;
+        stats.record(&history, &record, replacement_start, expired);
+        assert_eq!(stats.incidents.len(), 1);
+        assert_eq!(stats.recent_cancellations.len(), 1);
+        assert_eq!(stats.recent_cleanup_failures.len(), 1);
+        assert!(stats.recent_escalations.is_empty());
+        assert!((stats.debt(expired) - 0.17).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cancellation_first_cleanup_failure_remains_fresh_evidence() {
+        let history = BuildHistory::new(100);
+        let build = history.start_active_build(
+            "retry-project".into(),
+            "w1".into(),
+            "cargo test".into(),
+            0,
+            1,
+            rch_common::BuildLocation::Remote,
+        );
+        let mut record = test_record(CancellationState::Failed, 0, false);
+        record.build_id = build.id;
+        let mut stats = WorkerCancelStats::default();
+        let now = Instant::now();
+        stats.record(&history, &record, &build.started_at, now);
+        assert!((stats.debt(now) - 0.08).abs() < 1e-12);
+
+        let later = now + DEBT_WINDOW;
+        record.cleanup_ok = false;
+        stats.record(&history, &record, &build.started_at, later);
+        assert!((stats.debt(later) - 0.09).abs() < 1e-12);
+        stats.record(&history, &record, &build.started_at, later);
+        assert!((stats.debt(later) - 0.09).abs() < 1e-12);
     }
 
     // 6. CancellationConfig defaults are sensible
@@ -6850,8 +7079,8 @@ fi
                     orch.worker_stats.read().await[id.as_str()]
                         .recent_cancellations
                         .len(),
-                    2,
-                    "duplicate waits must not create extra cancellation attempts"
+                    1,
+                    "a dropped wait and its retry still describe one build incident"
                 );
             }
         }
