@@ -2662,7 +2662,10 @@ wait
         pending.state = rch_common::job_identity::JobLifecycleState::Queued;
         pending.phase = "selection_pending".into();
         std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
-        assert!(eligible(&build), "pending admission without a path remains safe");
+        assert!(
+            eligible(&build),
+            "pending admission without a path remains safe"
+        );
         assert!(
             !eligible(&record_reported),
             "a journal without admission IDs cannot claim a reported process-record path"

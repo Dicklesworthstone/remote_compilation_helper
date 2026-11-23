@@ -5664,9 +5664,9 @@ mod tests {
             CommittedDependencyPolicy, CommittedWorkspaceDependency,
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
             plan_generated_terminal_workspace_metadata, plan_generated_workspace_dag_library,
-            plan_mixed_workspace_library,
-            plan_terminal_workspace_metadata, remote_committed_dependency_key,
-            remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
+            plan_mixed_workspace_library, plan_terminal_workspace_metadata,
+            remote_committed_dependency_key, remote_committed_workspace_metadata_key,
+            remote_committed_workspace_rlib_key,
         };
         use rabs_key::live_dependency::{
             DependencyDirectoryFact, DependencySourceKind, ExternFact, LiveRustcRequest,

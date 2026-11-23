@@ -85,7 +85,11 @@ impl SourceClaimRootsInventory {
         if self.roots.len() > SOURCE_CLAIM_ROOTS_MAX_ROOTS {
             return Err("source-claim roots inventory exceeds the root limit".into());
         }
-        if self.roots.iter().any(|root| !is_safe_source_claim_root(root)) {
+        if self
+            .roots
+            .iter()
+            .any(|root| !is_safe_source_claim_root(root))
+        {
             return Err(
                 "source-claim roots inventory contains an unsafe or non-normalized path".into(),
             );
@@ -99,7 +103,9 @@ impl SourceClaimRootsInventory {
 
 /// Decode one complete worker response. A malformed or oversized response is
 /// not an empty inventory and must be reported by the caller.
-pub fn parse_source_claim_roots_inventory(stdout: &str) -> Result<SourceClaimRootsInventory, String> {
+pub fn parse_source_claim_roots_inventory(
+    stdout: &str,
+) -> Result<SourceClaimRootsInventory, String> {
     if stdout.len() > SOURCE_CLAIM_ROOTS_MAX_BYTES {
         return Err("source-claim roots inventory exceeds the byte limit".into());
     }
@@ -652,7 +658,8 @@ mod tests {
         };
         assert!(too_many.validate().is_err());
         assert!(
-            parse_source_claim_roots_inventory(&" ".repeat(SOURCE_CLAIM_ROOTS_MAX_BYTES + 1)).is_err()
+            parse_source_claim_roots_inventory(&" ".repeat(SOURCE_CLAIM_ROOTS_MAX_BYTES + 1))
+                .is_err()
         );
         let empty =
             parse_source_claim_roots_inventory(r#"{"schema_version":1,"roots":[]}"#).unwrap();

@@ -221,10 +221,17 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
                 );
                 if let Some((path, hash)) = &phase.pending {
                     assert_eq!(path, &relative(published));
-                    assert_eq!(hash, &blake3::hash(bytes(published).as_bytes()).to_hex().to_string());
+                    assert_eq!(
+                        hash,
+                        &blake3::hash(bytes(published).as_bytes())
+                            .to_hex()
+                            .to_string()
+                    );
                     assert_eq!(
                         phase.baseline[path],
-                        blake3::hash(predecessor(published).as_bytes()).to_hex().to_string()
+                        blake3::hash(predecessor(published).as_bytes())
+                            .to_hex()
+                            .to_string()
                     );
                 }
                 anyhow::ensure!(published != 23, "interruption after 23 durable outputs");
@@ -238,7 +245,11 @@ async fn legacy_baselines_shrink_at_real_durable_publication_boundaries() {
     for index in 0..64 {
         assert_eq!(
             std::fs::read_to_string(local.join(relative(index))).unwrap(),
-            if index < 23 { bytes(index) } else { predecessor(index) },
+            if index < 23 {
+                bytes(index)
+            } else {
+                predecessor(index)
+            },
             "publication changed the wrong output at {index}"
         );
     }

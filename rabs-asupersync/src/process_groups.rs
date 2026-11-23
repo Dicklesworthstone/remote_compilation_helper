@@ -1067,8 +1067,8 @@ mod tests {
                 123,
                 "123 (rustc) Z 456 123 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1",
             )
-                .unwrap()
-                .is_none()
+            .unwrap()
+            .is_none()
         );
         for invalid in [
             "123 (rustc) S 456",
@@ -1076,7 +1076,9 @@ mod tests {
             "123 (rustc S 456 123 0",
         ] {
             assert_eq!(
-                group_member_from_stat(123, 123, invalid).unwrap_err().kind(),
+                group_member_from_stat(123, 123, invalid)
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::InvalidData
             );
         }
@@ -1105,7 +1107,9 @@ mod tests {
             "123 (compiler) Z 456 123",
         ] {
             assert_eq!(
-                group_member_from_stat(123, 123, unknown).unwrap_err().kind(),
+                group_member_from_stat(123, 123, unknown)
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::InvalidData,
                 "{unknown}"
             );
@@ -1181,7 +1185,9 @@ mod tests {
         assert!(members_from_proc_at(123, root.path()).unwrap().is_empty());
         for invalid in [0, 1, u32::MAX] {
             assert_eq!(
-                members_from_proc_at(invalid, root.path()).unwrap_err().kind(),
+                members_from_proc_at(invalid, root.path())
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::InvalidInput
             );
         }

@@ -1384,7 +1384,8 @@ mod tests {
         let bytes = write_output(&nested.join("artifact"), 64 * 1024);
         fs::hard_link(nested.join("artifact"), target.join("alias")).unwrap();
         fs::hard_link(nested.join("artifact"), source.join("alias")).unwrap();
-        let target_only = measure_outputs(&[target.clone()], &target, None, 100, || {}).unwrap();
+        let target_only =
+            measure_outputs(std::slice::from_ref(&target), &target, None, 100, || {}).unwrap();
         let forward = measure_outputs(
             &[source.clone(), nested.clone(), target.clone()],
             &target,
@@ -1434,7 +1435,7 @@ mod tests {
         let (root, target) = tree();
         let alias = root.path().join("alias");
         symlink(&target, &alias).unwrap();
-        assert!(Scanner::new(&alias, &[alias.clone()], &[], None, "boot").is_err());
+        assert!(Scanner::new(&alias, std::slice::from_ref(&alias), &[], None, "boot").is_err());
         let value = scanner(&target, &[]);
         fs::rename(&target, root.path().join("retained-target")).unwrap();
         fs::create_dir(&target).unwrap();
@@ -1495,7 +1496,7 @@ mod tests {
         fs::create_dir(&source).unwrap();
         let retained = target.join("retained");
         write_output(&retained, 128 * 1024);
-        let value = scanner(&target, &[source.clone()]);
+        let value = scanner(&target, std::slice::from_ref(&source));
         fs::rename(&retained, root.path().join("retained-outside")).unwrap();
         let added = write_output(&target.join("new"), 64 * 1024);
         fs::hard_link(target.join("new"), source.join("new-alias")).unwrap();
@@ -1562,7 +1563,7 @@ mod tests {
         write_output(&retained, 128 * 1024);
         let incomplete = Scanner::with_limits(
             &target,
-            &[target.clone()],
+            std::slice::from_ref(&target),
             &[],
             None,
             "boot",
@@ -1677,7 +1678,7 @@ mod tests {
         write_output(&retained, 128 * 1024);
         let source_bytes = write_output(&source.join("input"), 64 * 1024);
         fs::hard_link(&retained, source.join("pool-alias")).unwrap();
-        let value = scanner(&target, &[source.clone()]);
+        let value = scanner(&target, std::slice::from_ref(&source));
         let mut accounting = Accounting::new(MIB, 0, &value, None, false).unwrap();
         let warm = policy(&accounting);
         accounting.require_warm_pool(Some(&warm)).unwrap();
@@ -1869,7 +1870,7 @@ mod tests {
         assert_eq!(cache_walk_status(&roots, 4).unwrap(), CacheWalk::TooLarge);
         let bounded = Scanner::with_limits(
             &target,
-            &[target.clone()],
+            std::slice::from_ref(&target),
             &[],
             Some(&plan),
             "boot",
@@ -1878,11 +1879,11 @@ mod tests {
             100,
         )
         .unwrap();
-        assert_eq!(bounded.outputs, [target.clone()]);
+        assert_eq!(bounded.outputs, std::slice::from_ref(&target));
         assert!(roots.iter().all(|path| bounded.paths.contains(path)));
         let walked = Scanner::with_limits(
             &target,
-            &[target.clone()],
+            std::slice::from_ref(&target),
             &[],
             Some(&plan),
             "boot",
@@ -1961,7 +1962,7 @@ mod tests {
         let cache_bytes = write_output(&registry.join("retained"), 64 * 1024);
         let value = Scanner::with_limits(
             &target,
-            &[target.clone()],
+            std::slice::from_ref(&target),
             &[],
             Some(&plan),
             "boot",
@@ -1990,8 +1991,14 @@ mod tests {
         let (root, target) = tree();
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();
-        let value =
-            Scanner::new(&target, &[target.clone()], &[source.clone()], None, "boot").unwrap();
+        let value = Scanner::new(
+            &target,
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&source),
+            None,
+            "boot",
+        )
+        .unwrap();
         assert!(value.paths.contains(&source));
         let (samples, sampled_at) = value.sample().unwrap();
         assert_eq!(value.devices, samples.keys().copied().collect());

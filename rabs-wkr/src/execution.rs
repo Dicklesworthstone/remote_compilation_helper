@@ -686,8 +686,8 @@ impl ExecutionTask {
         timeout: Duration,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
-        let control = ExecutionControl::new(timeout)
-            .map_err(|error| unstarted_launch(request_id, error))?;
+        let control =
+            ExecutionControl::new(timeout).map_err(|error| unstarted_launch(request_id, error))?;
         Self::spawn_controlled(request_id, control, None, execute)
     }
 
@@ -699,8 +699,8 @@ impl ExecutionTask {
         artifacts: ArtifactPlan,
         execute: impl FnOnce(ExecutionControl) -> ExecResult + Send + 'static,
     ) -> io::Result<Self> {
-        let control = ExecutionControl::new(timeout)
-            .map_err(|error| unstarted_launch(request_id, error))?;
+        let control =
+            ExecutionControl::new(timeout).map_err(|error| unstarted_launch(request_id, error))?;
         control
             .request_artifacts(artifacts)
             .map_err(|error| unstarted_launch(request_id, error))?;
@@ -858,8 +858,7 @@ impl ExecutionTask {
     pub fn unstarted_execution(&self) -> Option<UnstartedExecution> {
         (self.completed
             && self.unstarted
-            && self.control.execution_phase.load(Ordering::Acquire)
-                == EXECUTION_PROVEN_UNSTARTED)
+            && self.control.execution_phase.load(Ordering::Acquire) == EXECUTION_PROVEN_UNSTARTED)
             .then_some(UnstartedExecution {
                 request_id: self.request_id,
             })

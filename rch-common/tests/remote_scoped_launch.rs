@@ -465,10 +465,9 @@ rch_scope_launch_supervise "$RCH_RESULT_TEST_ROOT/receipt" 0 RCH_RESULT_TEST_DEA
                 let error = String::from_utf8_lossy(&output.stderr);
                 assert!(!error.contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"));
                 assert!(!error.contains("RCH_RESULT_TEST_DEADLINE"));
-                let result = std::fs::read_to_string(
-                    directory.path().join("receipt.supervisor.v1/result"),
-                )
-                .unwrap();
+                let result =
+                    std::fs::read_to_string(directory.path().join("receipt.supervisor.v1/result"))
+                        .unwrap();
                 assert!(result.starts_with("RCH_SCOPED_RESULT_V1:4242:"));
                 assert!(result.ends_with(&format!(":{status}\n")));
             }
@@ -524,7 +523,12 @@ rch_scope_launch_supervise "$RCH_RESULT_TEST_ROOT/receipt" 0 RCH_RESULT_TEST_DEA
                 let error = String::from_utf8_lossy(&output.stderr);
                 assert!(error.contains("RCH_SCOPED_COMPLETION_UNCONFIRMED"));
                 assert!(error.contains("reason=exited,admitted=1"));
-                assert!(directory.path().join("receipt.supervisor.v1/result").is_file());
+                assert!(
+                    directory
+                        .path()
+                        .join("receipt.supervisor.v1/result")
+                        .is_file()
+                );
             }
         }
     }

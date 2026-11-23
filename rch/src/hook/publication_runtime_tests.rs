@@ -100,7 +100,8 @@ fn assert_acknowledged(session: &RecoverySession) {
     let recipe = serde_json::to_value(&session.recipe).unwrap();
     let snapshot = session.writer.snapshot().recovery.unwrap();
     assert_eq!(session.recipe.storage_value().unwrap(), snapshot);
-    let cached = decode_recipe_value(snapshot, session.writer.recovery_ownership.as_deref()).unwrap();
+    let cached =
+        decode_recipe_value(snapshot, session.writer.recovery_ownership.as_deref()).unwrap();
     assert_eq!(recipe, serde_json::to_value(cached).unwrap());
     assert_eq!(recipe, serde_json::to_value(disk_recipe(session)).unwrap());
 }

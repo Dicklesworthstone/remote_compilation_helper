@@ -79,7 +79,10 @@ async fn panic_with_failed_replay_cannot_remigrate_or_forget_committed_progress(
         assert_eq!(session.writer.snapshot(), snapshot);
         assert_eq!(std::fs::read(&session.writer.path).unwrap(), lease_bytes);
         assert_eq!(std::fs::read(&retained).unwrap(), retained_bytes);
-        assert_eq!(std::fs::metadata(&owned_output).unwrap().ino(), output_inode);
+        assert_eq!(
+            std::fs::metadata(&owned_output).unwrap().ino(),
+            output_inode
+        );
         assert_eq!(
             std::fs::read_dir(session.writer.path.parent().unwrap())
                 .unwrap()

@@ -989,7 +989,9 @@ fn validate_discovery_roots(bases: &[String]) -> Result<Vec<&str>, String> {
     let mut bytes = 0usize;
     for base in bases {
         if !is_safe_reap_base(base)
-            || base[1..].split('/').any(|part| part.is_empty() || part == ".")
+            || base[1..]
+                .split('/')
+                .any(|part| part.is_empty() || part == ".")
         {
             return Err(format!("unsafe GC scan root {base:?}"));
         }
@@ -5492,9 +5494,15 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         assert!(reports[0].skipped.is_none());
         assert_eq!(reports[1].requested.as_deref(), Some("/missing/source"));
         assert!(reports[1].resolved.is_none());
-        assert_eq!(reports[1].skipped.as_deref(), Some("/missing/source missing"));
+        assert_eq!(
+            reports[1].skipped.as_deref(),
+            Some("/missing/source missing")
+        );
         assert_eq!(reports[2].requested.as_deref(), Some("/dp/project"));
-        assert_eq!(reports[2].resolved.as_deref(), Some("/data/projects/project"));
+        assert_eq!(
+            reports[2].resolved.as_deref(),
+            Some("/data/projects/project")
+        );
         assert!(reports[2].skipped.is_none());
         assert!(
             reports
@@ -5561,7 +5569,13 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         let expected: std::collections::BTreeSet<_> =
             [&configured_pool, &off_root_pool, &temporary_pool]
                 .into_iter()
-                .map(|path| std::fs::canonicalize(path).unwrap().to_str().unwrap().to_string())
+                .map(|path| {
+                    std::fs::canonicalize(path)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
                 .collect();
         assert_eq!(listed, expected, "{stdout}");
         assert_eq!(entries.len(), 3, "aliases and temp overlap must dedup");
@@ -5626,13 +5640,16 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         assert_eq!(entries.len(), 1, "{stdout}");
         assert_eq!(
             entries[0].path,
-            std::fs::canonicalize(&target)
-                .unwrap()
-                .to_str()
-                .unwrap()
+            std::fs::canonicalize(&target).unwrap().to_str().unwrap()
         );
-        assert!(nested.is_dir(), "managed target discovery must prune its contents");
-        assert_eq!(std::fs::read(target.join("artifact.o")).unwrap(), b"preserved");
+        assert!(
+            nested.is_dir(),
+            "managed target discovery must prune its contents"
+        );
+        assert_eq!(
+            std::fs::read(target.join("artifact.o")).unwrap(),
+            b"preserved"
+        );
     }
 
     #[cfg(unix)]

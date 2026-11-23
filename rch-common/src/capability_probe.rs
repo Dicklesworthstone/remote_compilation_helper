@@ -1522,12 +1522,18 @@ esac
         let facts = parse_capability_probe(&String::from_utf8(output.stdout).unwrap());
         assert_eq!(facts.tools_present, ["gcc"]);
         assert_eq!(facts.native_tools.present, ["cc"]);
-        assert_eq!(facts.native_tools.missing_reason("gcc"), Some("probe_failed"));
+        assert_eq!(
+            facts.native_tools.missing_reason("gcc"),
+            Some("probe_failed")
+        );
         assert_eq!(
             facts.native_tools.missing_reason("clang"),
             Some("probe_failed")
         );
-        assert_eq!(facts.native_tools.absent.len(), NATIVE_BUILD_TOOLS.len() - 1);
+        assert_eq!(
+            facts.native_tools.absent.len(),
+            NATIVE_BUILD_TOOLS.len() - 1
+        );
         assert!(facts.native_tools.pending.is_empty());
 
         let mut required = CapabilityRequirement {

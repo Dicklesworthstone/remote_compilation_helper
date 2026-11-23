@@ -784,7 +784,8 @@ mod tests {
         capabilities.tools_present.push("approved-sdk".into());
         assert!(ExecutionRequirements::new(&request).capabilities_satisfied(&capabilities));
 
-        request.command = Some("CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cc -c source.c".into());
+        request.command =
+            Some("CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cc -c source.c".into());
         capabilities.native_tools.present.clear();
         assert_eq!(
             ExecutionRequirements::new(&request)

@@ -70,8 +70,8 @@ pub(super) fn literal_word(input: &str) -> Option<(String, &str)> {
         match ch {
             '\'' | '"' => quote = Some(ch),
             ' ' | '\t' => return Some((value, &input[offset..])),
-            '$' | '\u{60}' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?' | '['
-            | ']' | '{' | '}' | '#' | '~' => return None,
+            '$' | '\u{60}' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | ']'
+            | '{' | '}' | '#' | '~' => return None,
             _ => value.push(ch),
         }
     }
@@ -263,7 +263,10 @@ fn control_tool_in(name: &str, path: Option<&OsStr>, workdir: &Path) -> Result<s
         // PATH entries (including an empty entry) belong to the requested
         // workdir, before any env -C in the invocation changes that directory.
         let directory = workdir.join(directory);
-        for leaf in [name.to_owned(), format!("{name}{}", std::env::consts::EXE_SUFFIX)] {
+        for leaf in [
+            name.to_owned(),
+            format!("{name}{}", std::env::consts::EXE_SUFFIX),
+        ] {
             let candidate = directory.join(&leaf);
             let Ok(metadata) = candidate.metadata() else {
                 continue;
@@ -545,7 +548,10 @@ mod tests {
                 super::super::quote_shell_argument(restricted.to_str().unwrap()),
             );
             let invocation = Invocation::parse(&source).unwrap();
-            assert_eq!(invocation.working_directory(fixture.path()).unwrap(), project);
+            assert_eq!(
+                invocation.working_directory(fixture.path()).unwrap(),
+                project
+            );
             let selector = selector_command(
                 &worker,
                 fixture.path(),
@@ -566,7 +572,12 @@ mod tests {
                 .as_std_mut()
                 .spawn()
                 .unwrap();
-            child.stdin.take().unwrap().write_all(b"workload input\n").unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"workload input\n")
+                .unwrap();
             let output = child.wait_with_output().unwrap();
             assert_eq!(output.status.code(), Some(27), "{output:?}");
             assert!(output.stdout.is_empty(), "{output:?}");

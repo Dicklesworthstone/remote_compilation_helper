@@ -139,7 +139,10 @@ fn runtime_for_head(command: &str) -> RequiredRuntime {
     let Some((program, mut remaining)) = prepared::literal_word(command) else {
         return RequiredRuntime::None;
     };
-    let Some(program) = Path::new(&program).file_name().and_then(|name| name.to_str()) else {
+    let Some(program) = Path::new(&program)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
         return RequiredRuntime::None;
     };
     let mut arguments = Vec::new();
@@ -512,8 +515,8 @@ pub async fn execute_with_disk_budget(
     }
 
     // br-4998x: pre-execution hook for Bun/Node projects.
-    let invocation = prepared::Invocation::parse(command)
-        .filter(prepared::Invocation::is_relocatable);
+    let invocation =
+        prepared::Invocation::parse(command).filter(prepared::Invocation::is_relocatable);
     let runtime = invocation
         .as_ref()
         .map(|invocation| invocation.runtime)
@@ -521,7 +524,9 @@ pub async fn execute_with_disk_budget(
     let prefixed = invocation.as_ref().filter(|invocation| {
         invocation.is_prefixed() && matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node)
     });
-    if disk_budget.is_some() && prefixed.is_some_and(|invocation| !invocation.preserves_disk_scope()) {
+    if disk_budget.is_some()
+        && prefixed.is_some_and(|invocation| !invocation.preserves_disk_scope())
+    {
         eprintln_best_effort(
             "rch-wkr: environment prefix clears or overrides the admitted CARGO_TARGET_DIR/TMPDIR/TMP/TEMP paths; preserve those paths when using a disk budget; the command was not run",
         );
@@ -912,13 +917,10 @@ mod tests {
             "env TMPDIR=/outside npm test",
             "env CARGO_TARGET_DIR=/outside npm test",
         ] {
-            let error = execute_with_disk_budget(
-                directory.path().to_str().unwrap(),
-                command,
-                budget,
-            )
-            .await
-            .unwrap_err();
+            let error =
+                execute_with_disk_budget(directory.path().to_str().unwrap(), command, budget)
+                    .await
+                    .unwrap_err();
             assert_eq!(
                 error.downcast_ref::<CommandFailed>().unwrap().exit_code,
                 EXIT_PREPARE_FAILED,

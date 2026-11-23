@@ -109,7 +109,10 @@ async fn torn_tail_forks_before_resuming_the_exact_pending_predecessor() {
         recovered.recipe.phases[0].baseline.get(&relative(0)),
         Some(&prior)
     );
-    assert_eq!(std::fs::read(&destination).unwrap(), b"original predecessor");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"original predecessor"
+    );
     recovered.publish("docs").await.unwrap();
     assert_ne!(journal_path(&recovered), original);
     assert_eq!(std::fs::read(&original).unwrap(), retained);
@@ -158,7 +161,10 @@ async fn durable_seal_recovers_a_lost_final_lease_write_without_republication() 
     let mut recovered = reload(&session);
     assert!(recovered.recipe.phases[0].complete);
     recovered.publish("docs").await.unwrap();
-    assert_eq!(std::fs::read(&destination).unwrap(), b"later build's output");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"later build's output"
+    );
     recovered.returned(0).unwrap();
     assert_acknowledged(&recovered);
     assert_eq!(recovered.recipe.phases[0].published.len(), 3);

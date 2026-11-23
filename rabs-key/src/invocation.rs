@@ -703,7 +703,11 @@ mod tests {
         for (flag, first, other) in [
             ("--crate-name", "first", "last"),
             ("--edition", "2018", "2021"),
-            ("--target", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"),
+            (
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+            ),
             ("--out-dir", "/first", "/last"),
         ] {
             for last in [first, other] {

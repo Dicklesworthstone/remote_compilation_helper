@@ -326,7 +326,9 @@ mod unix {
             Path::new(path).is_absolute(),
             "source-claim registry must be absolute"
         );
-        let (parent_path, name) = path.rsplit_once('/').context("invalid source-claim registry")?;
+        let (parent_path, name) = path
+            .rsplit_once('/')
+            .context("invalid source-claim registry")?;
         ensure!(
             !parent_path.is_empty() && !name.is_empty(),
             "invalid source-claim registry"
@@ -376,8 +378,7 @@ mod unix {
             same_inode(&named_parent, &rustix::fs::fstat(&parent)?),
             "source-claim inventory parent changed"
         );
-        let named_lock =
-            rustix::fs::statat(&registry, "metadata.lock", AtFlags::SYMLINK_NOFOLLOW)?;
+        let named_lock = rustix::fs::statat(&registry, "metadata.lock", AtFlags::SYMLINK_NOFOLLOW)?;
         ensure!(
             same_record(&lock_before, &named_lock),
             "source-claim inventory metadata lock changed"
@@ -483,14 +484,11 @@ mod unix {
             ];
             expected.sort();
             assert_eq!(result.roots, expected);
-            assert!(!result.roots.contains(
-                &fixture
-                    .source
-                    .parent()
-                    .unwrap()
-                    .display()
-                    .to_string()
-            ));
+            assert!(
+                !result
+                    .roots
+                    .contains(&fixture.source.parent().unwrap().display().to_string())
+            );
         }
 
         #[test]
@@ -562,9 +560,7 @@ mod unix {
             fixture.claim("released", "ab01", &[&fixture.source]);
             let lock = fs::File::open(fixture.registry.join("metadata.lock")).unwrap();
             rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
-            assert!(
-                format!("{:#}", fixture.inventory().unwrap_err()).contains("lock is busy")
-            );
+            assert!(format!("{:#}", fixture.inventory().unwrap_err()).contains("lock is busy"));
             drop(lock);
             let old = fixture.registry.join("released-old");
             fs::rename(fixture.registry.join("released"), &old).unwrap();
@@ -591,12 +587,7 @@ mod unix {
                 },
             ] {
                 assert!(
-                    inventory_with(
-                        &[fixture.registry.to_str().unwrap()],
-                        budget,
-                        |_| {}
-                    )
-                    .is_err()
+                    inventory_with(&[fixture.registry.to_str().unwrap()], budget, |_| {}).is_err()
                 );
             }
             let error = inventory_with(
@@ -621,11 +612,8 @@ mod unix {
                 |_| {
                     fs::rename(&fixture.registry, &retained).unwrap();
                     fs::create_dir(&fixture.registry).unwrap();
-                    fs::set_permissions(
-                        &fixture.registry,
-                        fs::Permissions::from_mode(0o700),
-                    )
-                    .unwrap();
+                    fs::set_permissions(&fixture.registry, fs::Permissions::from_mode(0o700))
+                        .unwrap();
                 },
             )
             .unwrap_err();

@@ -213,8 +213,8 @@ fn merge_source_inventory_roots(
         result.exit_code,
         result.stderr.trim()
     );
-    let inventory = gc_roots::parse_source_claim_roots_inventory(&result.stdout)
-        .map_err(anyhow::Error::msg)?;
+    let inventory =
+        gc_roots::parse_source_claim_roots_inventory(&result.stdout).map_err(anyhow::Error::msg)?;
     roots
         .extend_source_claim_roots(&inventory)
         .map_err(anyhow::Error::msg)?;
@@ -1204,12 +1204,10 @@ mod tests {
 
     #[test]
     fn source_inventory_errors_never_grant_partial_supplemental_scope() {
-        let configured = StaleTargetReaper::new(
-            WorkerPool::new(),
-            StaleTargetReapConfig::default(),
-        )
-        .scan_roots()
-        .unwrap();
+        let configured =
+            StaleTargetReaper::new(WorkerPool::new(), StaleTargetReapConfig::default())
+                .scan_roots()
+                .unwrap();
         let valid = r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a"]}"#;
         let failed = source_inventory_result(valid, 2);
         let error = merge_source_inventory_roots(configured.clone(), &failed).unwrap_err();
@@ -1217,11 +1215,26 @@ mod tests {
         assert!(error.to_string().contains("worker inventory unavailable"));
 
         let responses = [
-            ("truncated", r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a"]"#),
-            ("unsafe later root", r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a","/private/tmp/../etc"]}"#),
-            ("unknown version", r#"{"schema_version":2,"roots":["/private/tmp/rch-work/mirror-a"]}"#),
-            ("unknown field", r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a"],"partial":true}"#),
-            ("extra output", r#"{"schema_version":1,"roots":[]}{"schema_version":1,"roots":[]}"#),
+            (
+                "truncated",
+                r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a"]"#,
+            ),
+            (
+                "unsafe later root",
+                r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a","/private/tmp/../etc"]}"#,
+            ),
+            (
+                "unknown version",
+                r#"{"schema_version":2,"roots":["/private/tmp/rch-work/mirror-a"]}"#,
+            ),
+            (
+                "unknown field",
+                r#"{"schema_version":1,"roots":["/private/tmp/rch-work/mirror-a"],"partial":true}"#,
+            ),
+            (
+                "extra output",
+                r#"{"schema_version":1,"roots":[]}{"schema_version":1,"roots":[]}"#,
+            ),
         ];
         for (case, stdout) in responses {
             let result = source_inventory_result(stdout, 0);
@@ -1276,11 +1289,9 @@ mod tests {
         };
         let stdout = serde_json::to_string(&inventory).unwrap();
         assert!(stdout.len() < gc_roots::SOURCE_CLAIM_ROOTS_MAX_BYTES);
-        let combined = merge_source_inventory_roots(
-            configured.clone(),
-            &source_inventory_result(&stdout, 0),
-        )
-        .unwrap();
+        let combined =
+            merge_source_inventory_roots(configured.clone(), &source_inventory_result(&stdout, 0))
+                .unwrap();
         assert_eq!(combined.scan_bases().len(), 402);
         let build = |roots: &GcRootSet| {
             stale_target_reap::worker_sweep_command_for_roots_under_pressure(
@@ -1391,7 +1402,10 @@ mod tests {
                 .expect("sweep metrics")
                 .removed;
         }
-        assert!(!stale.exists(), "explicit extra roots must actually be swept");
+        assert!(
+            !stale.exists(),
+            "explicit extra roots must actually be swept"
+        );
         assert!(
             fresh.exists(),
             "the existing idle floor must protect fresh targets"

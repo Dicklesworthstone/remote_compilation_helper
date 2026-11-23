@@ -2935,7 +2935,9 @@ enum FallbackDaemonFixture {
     Stale,
     RestartDisappears,
     UnconfirmedSelection,
-    TransferSkipped { completion_exit: Option<i32> },
+    TransferSkipped {
+        completion_exit: Option<i32>,
+    },
     MockCompletedJob {
         exit_code: i32,
         stderr: &'static str,
@@ -4060,7 +4062,13 @@ fn completed_jobs_preserve_signal_exits_and_result_collection_without_replay() {
             false,
             false,
             true,
-            &["--job", "--result-dir=reports", "--", "gate-fixture", "--mutation"],
+            &[
+                "--job",
+                "--result-dir=reports",
+                "--",
+                "gate-fixture",
+                "--mutation",
+            ],
             FallbackDaemonFixture::MockCompletedJob { exit_code, stderr },
         );
         let context = format!("job exit {exit_code}: stderr={}", run.stderr);
@@ -4109,8 +4117,7 @@ fn completed_jobs_preserve_signal_exits_and_result_collection_without_replay() {
         assert!(lease.terminal_acknowledged, "{lease:?}; {context}");
         assert_eq!(lease.phase, "finished", "{lease:?}; {context}");
         assert_eq!(
-            envelope["admission"]["terminal_acknowledged"],
-            true,
+            envelope["admission"]["terminal_acknowledged"], true,
             "{context}"
         );
     }
