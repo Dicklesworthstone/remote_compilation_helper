@@ -2591,6 +2591,18 @@ pub struct GoTestInvocation {
     pub packages: Vec<String>,
 }
 
+/// A running Go test whose sole declared file is a coverage profile. Keep
+/// this distinct from `-c`: test failure can still produce a useful report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoCoverageInvocation {
+    /// One explicit project-relative report file, with its original option index.
+    pub output: GoBuildOutput,
+    /// Validated test/build options, excluding only the coverage destination.
+    pub test_flags: Vec<String>,
+    /// One contiguous package list; an empty list selects the invocation directory.
+    pub packages: Vec<String>,
+}
+
 fn go_output_path(path: &str) -> bool {
     !path.is_empty()
         && path != "-"
@@ -2799,6 +2811,78 @@ pub fn go_test_invocation(command: &str) -> Option<GoTestInvocation> {
     })
 }
 
+/// Parse coverage tests without admitting other output modes, arbitrary test
+/// arguments, fuzzing or executable wrappers. As with `go test -c`, recognized
+/// flags may surround one contiguous package list, and option values are data.
+#[must_use]
+pub fn go_coverage_invocation(command: &str) -> Option<GoCoverageInvocation> {
+    let normalized = normalize_command(command);
+    let words = literal_flag_words(&normalized)?;
+    let mut args = words.iter().copied().enumerate().peekable();
+    if args.next()?.1 != "go" || args.next()?.1 != "test" {
+        return None;
+    }
+    let mut output = None;
+    let mut test_flags = Vec::new();
+    let mut packages = Vec::new();
+    let mut packages_finished = false;
+    while let Some((option_index, argument)) = args.next() {
+        if !argument.starts_with('-') {
+            if packages_finished {
+                return None;
+            }
+            packages.push(argument.to_owned());
+            continue;
+        }
+        packages_finished |= !packages.is_empty();
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument, None), |(flag, value)| (flag, Some(value)));
+        if flag == "-coverprofile" {
+            let path = inline.or_else(|| args.next().map(|(_, value)| value))?;
+            if !go_output_path(path)
+                || output
+                    .replace(GoBuildOutput {
+                        path: path.to_owned(),
+                        option_index,
+                    })
+                    .is_some()
+            {
+                return None;
+            }
+            continue;
+        }
+        match flag {
+            "-run" | "-skip" | "-count" | "-timeout" | "-parallel" | "-bench" | "-benchtime"
+            | "-shuffle" | "-cpu" | "-list" | "-vet" => {
+                if inline
+                    .or_else(|| args.next().map(|(_, value)| value))?
+                    .is_empty()
+                {
+                    return None;
+                }
+            }
+            "-benchmem" | "-json" | "-failfast" | "-short" | "-fullpath" => {
+                if inline.is_some_and(|value| !matches!(value, "true" | "false")) {
+                    return None;
+                }
+            }
+            _ => go_build_flag(flag, inline, &mut args)?,
+        }
+        let next_index = args.peek().map_or(words.len(), |(index, _)| *index);
+        test_flags.extend(
+            words[option_index..next_index]
+                .iter()
+                .map(|argument| (*argument).to_owned()),
+        );
+    }
+    Some(GoCoverageInvocation {
+        output: output?,
+        test_flags,
+        packages,
+    })
+}
+
 /// Plan the explicit file output of a supported Go build. An implicit build
 /// has no static output contract, even when its arguments permit discovery.
 #[must_use]
@@ -2838,6 +2922,19 @@ fn classify_go(cmd: &str) -> Classification {
             Classification::compilation(CompilationKind::GoBuild, 0.95, "go build command")
         }
         "test" => {
+            if go_coverage_invocation(cmd).is_some() {
+                return if cfg!(unix) {
+                    Classification::compilation(
+                        CompilationKind::GoTest,
+                        0.95,
+                        "go test with exact coverage report delivery",
+                    )
+                } else {
+                    Classification::not_compilation(
+                        "Go output delivery requires a Unix dispatcher and worker",
+                    )
+                };
+            }
             if go_test_invocation(cmd).is_some() {
                 return if cfg!(unix) {
                     Classification::compilation(
@@ -9402,6 +9499,60 @@ mod tests_go_and_typescript {
     }
 
     #[test]
+    fn go_coverage_tests_plan_one_report_and_preserve_argument_values() {
+        for command in [
+            "go test -coverprofile=coverage.out ./...",
+            "go test -coverprofile 'reports/coverage file.out' -race -count=1 ./...",
+            "go test ./pkg ./other -coverprofile coverage.out -run TestSelected",
+            "go test -coverprofile coverage.out -run '-cpuprofile=not-an-output' ./pkg",
+            "env GOFLAGS= go test -coverprofile coverage.out",
+        ] {
+            let invocation = go_coverage_invocation(command).expect(command);
+            assert!(!invocation.output.path.is_empty());
+            assert_eq!(
+                kind_of(command),
+                cfg!(unix).then_some(CompilationKind::GoTest),
+                "{command}"
+            );
+            assert!(
+                go_test_invocation(command).is_none(),
+                "coverage must run tests"
+            );
+        }
+        let invocation = go_coverage_invocation(
+            "go test -tags -run ./first ./second -coverprofile=coverage.out -count 2",
+        )
+        .unwrap();
+        assert_eq!(invocation.packages, ["./first", "./second"]);
+        assert_eq!(invocation.test_flags, ["-tags", "-run", "-count", "2"]);
+        assert_eq!(invocation.output.path, "coverage.out");
+        for command in [
+            "go test -coverprofile=coverage.out -c",
+            "go test -coverprofile=coverage.out -o test.bin",
+            "go test -coverprofile=coverage.out -coverprofile second.out",
+            "go test -coverprofile ../coverage.out",
+            "go test -coverprofile /tmp/coverage.out",
+            "go test -coverprofile reports/../coverage.out",
+            "go test -coverprofile reports/",
+            "go test -coverprofile ''",
+            "go test -coverprofile",
+            "go test -coverprofile=coverage.out -outputdir reports",
+            "go test -coverprofile=coverage.out -cpuprofile=cpu.out",
+            "go test -coverprofile=coverage.out -exec wrapper",
+            "go test -coverprofile=coverage.out -fuzz FuzzInput",
+            "go test -coverprofile=coverage.out ./first -run TestOne ./second",
+            "go test -coverprofile=coverage.out -args -custom",
+            "go test -coverprofile=$OUTPUT",
+            "go test -coverprofile=coverage.out *.go",
+            "go test -coverprofile=coverage.out > diagnostics",
+        ] {
+            assert!(go_coverage_invocation(command).is_none(), "{command}");
+            assert_eq!(kind_of(command), None, "{command}");
+        }
+        assert!(go_coverage_invocation("go test -run -coverprofile ./pkg").is_none());
+    }
+
+    #[test]
     fn go_test_binary_profile_and_exec_outputs_stay_local() {
         for command in [
             "go test -exec sudo ./pkg",
@@ -9409,7 +9560,6 @@ mod tests_go_and_typescript {
             "go test -o test.bin ./pkg",
             "go test -o=test.bin ./pkg",
             "go test '-o=test binary' ./pkg",
-            "go test -coverprofile=coverage.out ./pkg",
             "go test -cpuprofile cpu.out ./pkg",
             "go test -memprofile=mem.out ./pkg",
             "go test -blockprofile=block.out ./pkg",

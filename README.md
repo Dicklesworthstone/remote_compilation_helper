@@ -49,7 +49,7 @@ RCH currently recognizes and can offload:
 | Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
 | Bun/TypeScript | `bun test`, `bun typecheck` |
 | TypeScript | `tsc --noEmit`, `npx tsc --noEmit` |
-| Go | `go build`, `go build -o <file>`, ordinary `go test`, `go test -c`, `go test -c -o <file>`, `go vet` |
+| Go | `go build`, `go build -o <file>`, ordinary `go test`, `go test -c`, `go test -c -o <file>`, `go test -coverprofile <file>`, `go vet` |
 | C/C++ | `gcc`, `g++`, `clang`, `clang++` |
 | Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 | Nix | `nix build`, `nix-build`, `nix flake check`, `nix develop -c <cmd>`, `nix shell -c <cmd>` |
@@ -96,6 +96,17 @@ selections spanning multiple packages stay local. Compilation never runs the
 test binary. The binary uses the same fresh-file publication and collection-only
 recovery as `go build`, and its caches and temporary files stay outside the
 selected source tree.
+
+Coverage tests also run remotely: for example,
+`go test -coverprofile=reports/coverage.out -race ./...`. The report must be a
+project-relative file with an existing parent directory on the caller.
+Both separated and equals flag spellings are supported, including common test
+controls and multiple packages. RCH returns only the fresh report from that
+invocation, including when tests fail, while preserving Go's exit status and
+diagnostics. If Go exits before producing a report, the caller's previous file
+remains unchanged. Interrupted delivery can resume through the existing job
+recovery command without rerunning the tests.
+
 Package discovery for implicit builds and compile-only tests requires Go 1.18
 or newer. Go modules and workspaces preserve the invocation directory while
 uploading the complete admitted source root. RCH asks the caller's Go executable
@@ -121,7 +132,7 @@ module/overlay files, and unbounded command forms remain unsupported. Workspace
 vendoring is supported when it does not combine with local replacements:
 Go records those replacement spellings in `vendor/modules.txt`, so that
 combination is refused rather than changing its resolution. Test profiling, fuzz corpora, and
-output-producing test execution (`-coverprofile`, `-cpuprofile`, `-trace`, `-fuzz`,
+output-producing test execution (`-cpuprofile`, `-trace`, `-fuzz`,
 `-o` without `-c`, and related `-test.*` forms)
 stay local. Strict remote mode refuses unsupported forms instead of executing
 them locally.

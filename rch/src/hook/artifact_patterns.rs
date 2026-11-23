@@ -57,11 +57,13 @@ pub(super) fn artifact_delivery_kind(
     if command.is_some_and(|command| cargo_build_only_test(kind, command)) {
         Some(CompilationKind::CargoBuild)
     } else if kind == Some(CompilationKind::GoTest)
-        && command
-            .is_some_and(|command| rch_common::patterns::go_test_invocation(command).is_some())
+        && command.is_some_and(|command| {
+            rch_common::patterns::go_test_invocation(command).is_some()
+                || rch_common::patterns::go_coverage_invocation(command).is_some()
+        })
     {
-        // Compile-only Go tests promise one caller-owned executable. Persist
-        // the same required-file delivery policy as other direct Go builds;
+        // Compile-only tests and coverage runs promise one caller-owned file.
+        // Persist the same required-file policy as other direct Go builds;
         // the execution kind still controls admission and test time budgets.
         Some(CompilationKind::GoBuild)
     } else {

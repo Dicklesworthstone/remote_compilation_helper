@@ -17,7 +17,7 @@ mod go_build;
 #[cfg(test)]
 pub(in crate::hook) use go_build::validate_go_build_output;
 pub(in crate::hook) use go_build::{
-    discover_go_source, go_build_execution_command, go_source_execution_command,
+    GoCoverageCapture, discover_go_source, go_build_execution_command, go_source_execution_command,
     validate_go_build_output_in_source, verify_go_source_selection,
 };
 
@@ -134,7 +134,11 @@ pub(crate) fn native_output_contract(
         }
         rch_common::CompilationKind::GoBuild if posix_defaults => go_output_contract(command),
         rch_common::CompilationKind::GoTest if posix_defaults => {
-            rch_common::patterns::go_test_invocation(command)?;
+            if rch_common::patterns::go_test_invocation(command).is_none()
+                && rch_common::patterns::go_coverage_invocation(command).is_none()
+            {
+                return None;
+            }
             go_output_contract(command)
         }
         rch_common::CompilationKind::Rustc if posix_defaults => {
@@ -170,7 +174,11 @@ pub(super) fn patterns(
             go_output_contract(command)?.patterns().ok()
         }
         (Some(rch_common::CompilationKind::GoTest), Some(command)) => {
-            rch_common::patterns::go_test_invocation(command)?;
+            if rch_common::patterns::go_test_invocation(command).is_none()
+                && rch_common::patterns::go_coverage_invocation(command).is_none()
+            {
+                return None;
+            }
             go_output_contract(command)?.patterns().ok()
         }
         _ => None,
@@ -1255,6 +1263,29 @@ fn c_family_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn go_coverage_selects_only_the_named_report_with_cargo_target_forwarding() {
+        use rch_common::CompilationKind;
+
+        let kind = Some(CompilationKind::GoTest);
+        let command = "go test -coverprofile='target/coverage [part]*.out' ./...";
+        let contract = native_output_contract(kind, command, NativeOutputPlatform::Posix).unwrap();
+        assert_eq!(
+            contract.required_files,
+            BTreeSet::from([PathBuf::from("target/coverage [part]*.out")])
+        );
+        assert_eq!(
+            super::super::artifact_delivery_kind(kind, Some(command)),
+            Some(CompilationKind::GoBuild)
+        );
+        assert_eq!(
+            super::super::get_project_artifact_patterns(kind, Some(command), true),
+            contract.patterns().unwrap()
+        );
+        assert!(super::super::get_custom_target_artifact_patterns(kind, Some(command)).is_empty());
+        assert!(native_output_contract(kind, command, NativeOutputPlatform::Unspecified).is_none());
+    }
 
     #[test]
     fn go_outputs_are_exact_required_project_files() {

@@ -30,6 +30,127 @@ const IMPLICIT_TEST_PACKAGE_FORMAT: &str = "{{.ImportPath}}{{\"\\n\"}}{{.Name}}{
 enum GoCompileMode {
     Build,
     Test,
+    Coverage,
+}
+
+/// Read from the completed supervisor stderr log. A failed compiler may
+/// produce no report; a failing test may produce one. Neither a pre-existing
+/// file nor the bounded streaming preview establishes this attempt's result.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::hook) struct GoCoverageCapture {
+    token: String,
+    outcome: Option<GoCoverageOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum GoCoverageOutcome {
+    Present { exit: i32 },
+    Absent { exit: i32 },
+    Rejected { exit: i32, reason: String },
+}
+
+impl GoCoverageCapture {
+    pub(in crate::hook) fn validate(&self, exit: Option<i32>) -> Result<()> {
+        ensure!(
+            self.token.len() == 32
+                && self
+                    .token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "invalid Go coverage attempt token"
+        );
+        if let Some(outcome) = &self.outcome {
+            let observed_exit = match outcome {
+                GoCoverageOutcome::Present { exit }
+                | GoCoverageOutcome::Absent { exit }
+                | GoCoverageOutcome::Rejected { exit, .. } => *exit,
+            };
+            ensure!(
+                exit == Some(observed_exit)
+                    && (0..=255).contains(&observed_exit)
+                    && (!matches!(outcome, GoCoverageOutcome::Absent { .. }) || observed_exit != 0),
+                "Go coverage outcome contradicts command completion"
+            );
+            if let GoCoverageOutcome::Rejected { reason, .. } = outcome {
+                ensure!(
+                    !reason.is_empty() && reason.len() <= 4096,
+                    "invalid Go coverage rejection"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::hook) fn present(&self) -> Option<bool> {
+        match &self.outcome {
+            Some(GoCoverageOutcome::Present { .. }) => Some(true),
+            Some(GoCoverageOutcome::Absent { .. }) => Some(false),
+            _ => None,
+        }
+    }
+
+    pub(in crate::hook) fn rejection(&self) -> Option<&str> {
+        match &self.outcome {
+            Some(GoCoverageOutcome::Rejected { reason, .. }) => Some(reason),
+            _ => None,
+        }
+    }
+
+    pub(in crate::hook) fn reject(&mut self, exit: i32, reason: &str) -> Result<()> {
+        ensure!(
+            self.outcome.is_none(),
+            "Go coverage already has a completed outcome"
+        );
+        self.outcome = Some(GoCoverageOutcome::Rejected {
+            exit,
+            reason: reason.chars().take(1024).collect(),
+        });
+        self.validate(Some(exit))
+    }
+
+    pub(in crate::hook) fn suppress_line(&self, line: &str) -> bool {
+        line.starts_with(&format!("RCH_GO_COVERAGE_V1 {} ", self.token))
+    }
+
+    pub(in crate::hook) fn accept(&mut self, stderr: &[u8], exit: i32) -> Result<()> {
+        self.validate(Some(exit))?;
+        ensure!(
+            self.rejection().is_none(),
+            "Go coverage was already rejected"
+        );
+        let prefix = format!("RCH_GO_COVERAGE_V1 {} ", self.token);
+        let mut receipts = stderr
+            .split_inclusive(|byte| *byte == b'\n')
+            .filter(|line| line.starts_with(prefix.as_bytes()));
+        let receipt = receipts
+            .next()
+            .context("Go coverage outcome is unavailable")?;
+        ensure!(receipts.next().is_none(), "ambiguous Go coverage outcomes");
+        let present = if receipt == format!("{prefix}{exit} present\n").as_bytes() {
+            true
+        } else {
+            ensure!(
+                receipt == format!("{prefix}{exit} absent\n").as_bytes() && exit != 0,
+                "invalid Go coverage outcome"
+            );
+            false
+        };
+        let outcome = if present {
+            GoCoverageOutcome::Present { exit }
+        } else {
+            GoCoverageOutcome::Absent { exit }
+        };
+        ensure!(
+            self.outcome
+                .as_ref()
+                .is_none_or(|previous| previous == &outcome),
+            "Go coverage outcome changed after collection"
+        );
+        self.outcome = Some(outcome);
+        Ok(())
+    }
 }
 
 pub(super) struct GoCompileInvocation {
@@ -654,16 +775,28 @@ async fn local_workspace_environment(
 /// A private external directory serves both the Go workspace copy/sums and
 /// the fresh output stage. Its fixed filenames are removed by the same owned
 /// process on success, build failure, or signal; none are source inputs.
-fn build_temporary_directory(source_ancestors: usize) -> String {
+fn build_temporary_directory(
+    source_ancestors: usize,
+    coverage: Option<&GoCoverageCapture>,
+) -> String {
     let source = ancestor_path(source_ancestors);
+    let report = coverage.map_or_else(String::new, |capture| {
+        format!(
+            "printf \"\\nRCH_GO_COVERAGE_V1 {} %s %s\\n\" \
+             \"$rch_go_final_status\" \"$rch_go_report_state\" >&2 || exit 113; ",
+            capture.token
+        )
+    });
     format!(
-        "rch_go_root=$(CDPATH= cd -P {source} && pwd -P) || exit 113; \
-         rch_go_build=$(mktemp -d \"${{TMPDIR:-/tmp}}/rch-go-build.XXXXXXXXXX\") || exit 113; \
-         rch_go_stage=; \
-         trap 'rm -f \"$rch_go_build/output\" \"$rch_go_build/selection.work\" \
-           \"$rch_go_build/selection.work.sum\" \"$rch_go_build/vendor\"; rmdir \"$rch_go_build\"; \
-           if [ -n \"$rch_go_stage\" ]; then rm -f \"$rch_go_stage/output\"; rmdir \"$rch_go_stage\"; fi' EXIT; \
+        "rch_go_build=; rch_go_stage=; rch_go_report_state=absent; \
+         trap 'rch_go_final_status=$?; if [ -n \"$rch_go_build\" ]; then \
+           rm -f \"$rch_go_build/output\" \"$rch_go_build/selection.work\" \
+           \"$rch_go_build/selection.work.sum\" \"$rch_go_build/vendor\"; rmdir \"$rch_go_build\"; fi; \
+           if [ -n \"$rch_go_stage\" ]; then rm -f \"$rch_go_stage/output\"; rmdir \"$rch_go_stage\"; fi; {report}' EXIT; \
          trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+         rch_go_root=$(CDPATH= cd -P {source} && pwd -P) || exit 113; \
+         rch_go_created=$(mktemp -d \"${{TMPDIR:-/tmp}}/rch-go-build.XXXXXXXXXX\") || exit 113; \
+         rch_go_build=$rch_go_created; \
          rch_go_build_root=$(cd \"$rch_go_build\" && pwd -P) || exit 113; \
          case \"$rch_go_build_root/\" in \"${{rch_go_root%/}}/\"*) \
            printf '%s\\n' 'RCH: Go build temporary directory must be outside the source root' >&2; exit 113;; esac; "
@@ -688,7 +821,7 @@ pub(in crate::hook) fn go_source_execution_command(
         command,
         format!(
             "{runtime}{}{}export GOWORK=off; {}{}\"$rch_go\" \"$@\"",
-            build_temporary_directory(depth),
+            build_temporary_directory(depth, None),
             capture_function(),
             module_cache_check(depth),
             guard.worker_setup(),
@@ -913,11 +1046,16 @@ pub(in crate::hook) struct GoBuildEnvironment {
     test_package: Option<TestPackageWitness>,
     source_ancestors: usize,
     source: Option<GoSourceGuard>,
+    coverage: Option<GoCoverageCapture>,
 }
 
 impl GoBuildEnvironment {
     pub(in crate::hook) fn output_contract(&self) -> NativeOutputContract {
         self.output.clone()
+    }
+
+    pub(in crate::hook) fn coverage_capture(&self) -> Option<GoCoverageCapture> {
+        self.coverage.clone()
     }
 }
 
@@ -931,12 +1069,19 @@ pub(super) fn invocation(command: &str) -> Option<GoCompileInvocation> {
             build_flags: invocation.build_flags,
             packages: invocation.packages,
         })
-    } else {
-        let invocation = rch_common::patterns::go_test_invocation(&plain)?;
+    } else if let Some(invocation) = rch_common::patterns::go_test_invocation(&plain) {
         Some(GoCompileInvocation {
             mode: GoCompileMode::Test,
             output: invocation.output,
             build_flags: invocation.build_flags,
+            packages: invocation.packages,
+        })
+    } else {
+        let invocation = rch_common::patterns::go_coverage_invocation(&plain)?;
+        Some(GoCompileInvocation {
+            mode: GoCompileMode::Coverage,
+            output: Some(invocation.output),
+            build_flags: invocation.test_flags,
             packages: invocation.packages,
         })
     }
@@ -1079,7 +1224,7 @@ fn package_query(invocation: &GoCompileInvocation, workspace: bool) -> String {
         match invocation.mode {
             GoCompileMode::Build => PACKAGE_FORMAT,
             GoCompileMode::Test if implicit_test => IMPLICIT_TEST_PACKAGE_FORMAT,
-            GoCompileMode::Test => TEST_PACKAGE_FORMAT,
+            GoCompileMode::Test | GoCompileMode::Coverage => TEST_PACKAGE_FORMAT,
         }
         .to_owned(),
     ]);
@@ -1396,6 +1541,17 @@ pub(in crate::hook) async fn validate_go_build_output_in_source(
         (output, Some(witness))
     };
     validate_destination(project_root, &output)?;
+    if invocation.mode == GoCompileMode::Coverage {
+        let parent = output
+            .required_files
+            .first()
+            .and_then(|path| path.parent())
+            .context("Go coverage output has no parent")?;
+        ensure!(
+            project_root.join(parent).is_dir(),
+            "Go coverage output parent does not exist"
+        );
+    }
     let environment = GoBuildEnvironment {
         mode: invocation.mode,
         settings,
@@ -1406,6 +1562,10 @@ pub(in crate::hook) async fn validate_go_build_output_in_source(
         source: source_plan
             .map(|plan| GoSourceGuard::new(plan, project_root))
             .transpose()?,
+        coverage: (invocation.mode == GoCompileMode::Coverage).then(|| GoCoverageCapture {
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            outcome: None,
+        }),
     };
     ensure!(
         go_build_execution_command(command, &environment, None).is_some(),
@@ -1465,8 +1625,15 @@ pub(in crate::hook) fn go_build_execution_command(
     if invocation.mode != environment.mode
         || (invocation.mode == GoCompileMode::Test) != environment.test_package.is_some()
         || (invocation.mode == GoCompileMode::Test && environment.implicit.is_some())
+        || (invocation.mode == GoCompileMode::Coverage) != environment.coverage.is_some()
     {
         return None;
+    }
+    if let Some(capture) = &environment.coverage {
+        capture.validate(None).ok()?;
+        if capture.present().is_some() || capture.rejection().is_some() {
+            return None;
+        }
     }
     match (&invocation.output, &environment.implicit) {
         (Some(selection), None)
@@ -1548,8 +1715,9 @@ pub(in crate::hook) fn go_build_execution_command(
         ""
     };
     let subcommand = match invocation.mode {
-        GoCompileMode::Build => "build",
-        GoCompileMode::Test => "test -c",
+        GoCompileMode::Build => "build -o",
+        GoCompileMode::Test => "test -c -o",
+        GoCompileMode::Coverage => "test -coverprofile",
     };
     let parent = shell_escape::escape(format!("./{}", output.parent()?.to_str()?).into());
     // These values come from the pipeline's exact granted runtime placement.
@@ -1558,15 +1726,22 @@ pub(in crate::hook) fn go_build_execution_command(
     // applies its outer environment. Compiler selection and settings remain
     // unchanged, and the actual build keeps its managed cache enabled.
     let runtime = managed_runtime_assignments(managed_runtime)?;
-    let temporary = build_temporary_directory(environment.source_ancestors);
+    let temporary =
+        build_temporary_directory(environment.source_ancestors, environment.coverage.as_ref());
+    let failed_command = if environment.coverage.is_some() {
+        // Early compiler failures may have no report. The exit trap records
+        // that fact and the caller's previous output remains untouched.
+        "if [ \"$rch_go_status\" -ne 0 ] && [ ! -e \"$rch_go_build/output\" ] && [ ! -L \"$rch_go_build/output\" ]; then exit \"$rch_go_status\"; fi; "
+    } else {
+        "if [ \"$rch_go_status\" -ne 0 ]; then exit \"$rch_go_status\"; fi; "
+    };
     let script = format!(
-        "{runtime}rch_go_check_output() {{ {path_checks} return 0; }}; \
+        "{runtime}{temporary}rch_go_check_output() {{ {path_checks} return 0; }}; \
          rch_go_check_output || exit 113; \
-         {temporary}\
          {preflight}\
-         {build_environment}\"$rch_go\" {subcommand} -o \"$rch_go_build/output\" \"$@\"; \
+         {build_environment}\"$rch_go\" {subcommand} \"$rch_go_build/output\" \"$@\"; \
          rch_go_status=$?; \
-         if [ \"$rch_go_status\" -ne 0 ]; then exit \"$rch_go_status\"; fi; \
+         {failed_command}\
          if [ -L \"$rch_go_build/output\" ] || [ ! -f \"$rch_go_build/output\" ]; then \
            printf '%s\\n' 'RCH: Go build succeeded without its required output file' >&2; exit 113; fi; \
          rch_go_parent={parent}; \
@@ -1576,7 +1751,8 @@ pub(in crate::hook) fn go_build_execution_command(
          rch_go_stage=$(mktemp -d \"$rch_go_parent/.rch-go-output.XXXXXXXXXX\") || exit 113; \
          cp -p \"$rch_go_build/output\" \"$rch_go_stage/output\" || exit 113; \
          rch_go_check_output || exit 113; \
-         mv -f \"$rch_go_stage/output\" {output_text} || exit 113"
+         mv -f \"$rch_go_stage/output\" {output_text} || exit 113; \
+         rch_go_report_state=present; exit \"$rch_go_status\""
     );
     let mut args = invocation.build_flags;
     args.extend(invocation.packages);
@@ -1587,11 +1763,160 @@ pub(in crate::hook) fn go_build_execution_command(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn go_coverage_early_refusals_record_absence_before_compiler_start() {
+        for failure in ["output-parent", "temporary-directory"] {
+            let base = tempfile::tempdir().unwrap();
+            let source = base.path().join("source");
+            let runtime = base.path().join("runtime");
+            std::fs::create_dir(&source).unwrap();
+            if failure == "output-parent" {
+                std::fs::write(source.join("reports"), b"parent sentinel").unwrap();
+                std::fs::create_dir(&runtime).unwrap();
+            } else {
+                std::fs::create_dir(source.join("reports")).unwrap();
+                std::fs::write(&runtime, b"temporary-parent sentinel").unwrap();
+            }
+            let capture = GoCoverageCapture {
+                token: "a".repeat(32),
+                outcome: None,
+            };
+            let environment = GoBuildEnvironment {
+                mode: GoCompileMode::Coverage,
+                // Rejection must precede compiler/environment observation.
+                settings: "{}".into(),
+                output: NativeOutputContract::from_paths(["reports/coverage.out".into()]).unwrap(),
+                implicit: None,
+                test_package: None,
+                source_ancestors: 0,
+                source: None,
+                coverage: Some(capture.clone()),
+            };
+            let guarded = go_build_execution_command(
+                "go test -coverprofile reports/coverage.out .",
+                &environment,
+                None,
+            )
+            .unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &guarded])
+                .current_dir(&source)
+                .env("TMPDIR", &runtime)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(113), "{failure}: {output:?}");
+            let mut capture = capture;
+            capture.accept(&output.stderr, 113).unwrap();
+            assert_eq!(capture.present(), Some(false));
+            assert!(
+                output.stdout.is_empty(),
+                "compiler must not run: {output:?}"
+            );
+            assert!(!source.join("reports/coverage.out").exists());
+            if failure == "output-parent" {
+                assert_eq!(
+                    std::fs::read(source.join("reports")).unwrap(),
+                    b"parent sentinel"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(&runtime).unwrap(),
+                    b"temporary-parent sentinel"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_output_cleanup_preserves_status_and_sigkill_cannot_forge_a_receipt() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let source = base.path().join("source");
+        let runtime = base.path().join("runtime");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&runtime).unwrap();
+        for shell in ["/bin/sh", "/bin/bash"] {
+            for exit in [0, 23, 101] {
+                let script = format!("{}exit {exit}", build_temporary_directory(0, None));
+                let output = std::process::Command::new(shell)
+                    .args(["-c", &script])
+                    .current_dir(&source)
+                    .env("TMPDIR", &runtime)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(exit), "{shell}: {output:?}");
+                assert!(
+                    output.stdout.is_empty() && output.stderr.is_empty(),
+                    "{output:?}"
+                );
+            }
+        }
+        let mut capture = GoCoverageCapture {
+            token: "a".repeat(32),
+            outcome: None,
+        };
+        let script = format!(
+            "{}kill -KILL $$",
+            build_temporary_directory(0, Some(&capture))
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .current_dir(&source)
+            .env("TMPDIR", &runtime)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.signal(), Some(9), "{output:?}");
+        assert!(capture.accept(&output.stderr, 137).is_err());
+        assert_eq!(capture.present(), None);
+    }
+
+    #[test]
+    fn coverage_outcomes_require_one_complete_same_attempt_record() {
+        let capture = GoCoverageCapture {
+            token: "a".repeat(32),
+            outcome: None,
+        };
+        let present = format!("RCH_GO_COVERAGE_V1 {} 1 present\n", capture.token);
+        let absent = format!("RCH_GO_COVERAGE_V1 {} 1 absent\n", capture.token);
+        for bad in [
+            Vec::new(),
+            present.trim_end().as_bytes().to_vec(),
+            present.replace(" 1 ", " 0 ").into_bytes(),
+            present
+                .replace(&capture.token, &"b".repeat(32))
+                .into_bytes(),
+            format!("{present}{present}").into_bytes(),
+            format!("{present}{absent}").into_bytes(),
+        ] {
+            let mut rejected = capture.clone();
+            assert!(rejected.accept(&bad, 1).is_err());
+            assert_eq!(rejected.present(), None);
+        }
+        let mut ready = capture.clone();
+        ready
+            .accept(
+                format!("arbitrary test diagnostics\n{present}").as_bytes(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(ready.present(), Some(true));
+        assert!(ready.accept(absent.as_bytes(), 1).is_err());
+        assert!(ready.validate(Some(0)).is_err());
+        let mut missing = capture;
+        missing.accept(absent.as_bytes(), 1).unwrap();
+        assert_eq!(missing.present(), Some(false));
+        assert!(missing.validate(Some(0)).is_err());
+    }
+
     #[test]
     fn source_argument_grammar_preserves_build_values_and_bounds_test_controls() {
         for command in [
             "go build -tags -run ./cmd/server",
             "go test -run TestSelected -count=1 ./...",
+            "go test -coverprofile coverage.out ./...",
             "go test ./... -race -timeout 2m",
             "go test -c -p=1 ./server",
             "go vet -tags=selected ./...",
@@ -1601,7 +1926,6 @@ mod tests {
         for command in [
             "go test -modfile other.mod ./...",
             "go test -overlay=outside.json ./...",
-            "go test -coverprofile coverage.out ./...",
             "go test -exec ./wrapper ./...",
             "go test ./... -args ./outside",
             "go vet -vettool ../tool ./...",

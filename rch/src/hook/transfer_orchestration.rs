@@ -1349,7 +1349,8 @@ async fn execute_remote_compilation_inner(
     }
 
     let go_test_output = kind == Some(CompilationKind::GoTest)
-        && rch_common::patterns::go_test_invocation(command).is_some();
+        && (rch_common::patterns::go_test_invocation(command).is_some()
+            || rch_common::patterns::go_coverage_invocation(command).is_some());
     let go_build_environment = if kind == Some(CompilationKind::GoBuild) || go_test_output {
         anyhow::ensure!(
             !worker_is_windows
@@ -2898,10 +2899,13 @@ async fn execute_remote_compilation_inner(
             .require_fresh_job_results(request)?;
     }
     if let Some(environment) = go_build_environment.as_ref() {
-        recovery_session
+        let session = recovery_session
             .as_mut()
-            .context("Go executable delivery has no admitted recovery session")?
-            .require_go_outputs(environment.output_contract())?;
+            .context("Go output delivery has no admitted recovery session")?;
+        session.require_go_outputs(environment.output_contract())?;
+        if let Some(capture) = environment.coverage_capture() {
+            session.require_go_coverage(capture)?;
+        }
     }
     if kind == Some(CompilationKind::Rustc)
         && let Some(session) = recovery_session.as_mut()
@@ -3330,6 +3334,9 @@ async fn execute_remote_compilation_inner(
         .map(BuildHeartbeatLoop::shared_state);
     let mut suppress_telemetry = false;
     let defer_cargo_stdout = reporter.cargo_json_stdout;
+    let go_coverage_stderr = go_build_environment
+        .as_ref()
+        .and_then(|environment| environment.coverage_capture());
 
     pipeline.ensure_prepared_execution_time()?;
     if let Some(session) = recovery_session.as_mut() {
@@ -3406,6 +3413,14 @@ async fn execute_remote_compilation_inner(
             }
             if line.trim_end_matches(['\r', '\n']) == process_setup_marker {
                 // ubs:ignore[rust.security.constant-time-compare] — attempt setup sentinel display filter; guarded completion receipts remain independently required.
+                return;
+            }
+            if go_coverage_stderr
+                .as_ref()
+                .is_some_and(|capture| capture.suppress_line(line))
+            {
+                // Display filtering only. Collection trusts the complete,
+                // completion-bound supervisor log after writer settlement.
                 return;
             }
             if let Some(state) = heartbeat_state_stderr.as_ref() {
@@ -3648,6 +3663,24 @@ async fn execute_remote_compilation_inner(
     let mut artifacts_result: Option<SyncResult> = None;
     let mut artifacts_failed = false;
     let mut cargo_evidence_terminal = false;
+    let mut go_evidence_terminal = false;
+    let go_coverage_present = if let Some(session) = recovery_session.as_mut() {
+        match session.collect_go_coverage(&pipeline, &worker_config).await {
+            Ok(present) => present,
+            Err(error) if error.is::<recovery::GoCoverageEvidenceRejected>() => {
+                artifacts_failed = true;
+                go_evidence_terminal = true;
+                eprintln!(
+                    "[RCH] Go coverage evidence was rejected: {error:#}; no report published \
+                     (exit {EXIT_ARTIFACT_TRANSFER_FAILED})"
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        false
+    };
     if reporter.cargo_json_stdout {
         recovery_session
             .as_mut()
@@ -3749,7 +3782,7 @@ async fn execute_remote_compilation_inner(
         kind_has_enumerable_output_contract(artifact_kind) && !foreign_artifact_gate_disabled();
     let mut platform_rejected = false;
     // Step 3: Retrieve artifacts
-    if result.success() && !artifacts_failed {
+    if (result.success() || go_coverage_present) && !artifacts_failed {
         if let Some(loop_ref) = heartbeat_loop.as_ref() {
             loop_ref.update_phase(
                 BuildHeartbeatPhase::SyncDown,
@@ -4331,6 +4364,15 @@ async fn execute_remote_compilation_inner(
             worker_config.id, result.exit_code, EXIT_ARTIFACT_TRANSFER_FAILED
         );
         EXIT_ARTIFACT_TRANSFER_FAILED
+    } else if go_evidence_terminal {
+        EXIT_ARTIFACT_TRANSFER_FAILED
+    } else if go_coverage_present && artifacts_failed {
+        eprintln!(
+            "[RCH] Go tests on {} exited {} but their fresh coverage report could not be \
+             published; use jobs recover for this attempt (exit {EXIT_ARTIFACT_TRANSFER_FAILED}).",
+            worker_config.id, result.exit_code,
+        );
+        EXIT_ARTIFACT_TRANSFER_FAILED
     } else if result.success() && platform_rejected {
         // The preflight already reported E327 and left local outputs untouched.
         // Do not replace it with a connectivity diagnosis.
@@ -4452,7 +4494,7 @@ async fn execute_remote_compilation_inner(
     };
     let retrieval_complete = retrieval_reached_terminal_decision(
         artifacts_failed,
-        cargo_evidence_terminal,
+        cargo_evidence_terminal || go_evidence_terminal,
         platform_rejected,
         result_dir_failures.is_empty(),
     );

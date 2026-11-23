@@ -1,7 +1,7 @@
 //! Durable source ownership and identity-bound collection. Never replays a command.
 use super::super::artifact_patterns::build_system::{BuildSystemOutputDiscovery, merge_patterns};
 use super::super::artifact_patterns::direct_compiler::{
-    NativeOutputContract, NativeOutputPlatform, native_output_contract,
+    GoCoverageCapture, NativeOutputContract, NativeOutputPlatform, native_output_contract,
 };
 use super::super::artifact_patterns::{cargo_retrieval_exclusions_apply, cargo_retrieval_patterns};
 use super::super::cargo_output_contract::{
@@ -94,6 +94,11 @@ pub(crate) struct RecoveryRecipe {
     /// files, never recursive authority over an arbitrary build directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     build_system_output_capture: Option<BuildSystemOutputCapture>,
+    /// A running Go test can publish coverage even when its exit is nonzero.
+    /// Persist same-attempt presence before collecting; absence never selects
+    /// an old file still present in the worker source tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    go_coverage_capture: Option<GoCoverageCapture>,
     /// A required source-qualified dependency phase must be accepted before
     /// execution. Recovery retains this binding but never reconstructs a
     /// source receipt from post-workload files or ordinary delivery success.
@@ -787,6 +792,38 @@ impl RecoveryRecipe {
         Ok(())
     }
 
+    fn validate_go_coverage_contract(&self) -> anyhow::Result<()> {
+        let Some(capture) = &self.go_coverage_capture else {
+            return Ok(());
+        };
+        capture.validate(self.exit_code)?;
+        anyhow::ensure!(
+            self.prepared
+                && self.kind == Some(CompilationKind::GoBuild)
+                && self.cargo_output_capture.is_none()
+                && self.build_system_output_capture.is_none(),
+            "Go coverage cannot replace another output contract"
+        );
+        self.validate_go_output_contract()?;
+        let phase = self
+            .phases
+            .iter()
+            .find(|phase| phase.name == "project")
+            .context("Go coverage has no publication phase")?;
+        anyhow::ensure!(
+            ((capture.present().is_none() && capture.rejection().is_none())
+                || self.execution_started)
+                && (capture.rejection().is_none()
+                    || self
+                        .returned
+                        .is_none_or(|exit| exit == EXIT_ARTIFACT_TRANSFER_FAILED))
+                && (capture.present() == Some(true)
+                    || (!phase.complete && phase.pending.is_none() && phase.published.is_empty())),
+            "Go coverage publication lacks confirmed fresh report evidence"
+        );
+        Ok(())
+    }
+
     fn caller_local_source_root(&self) -> &Path {
         self.caller_json_local_source_root
             .as_deref()
@@ -813,6 +850,12 @@ impl RecoveryRecipe {
 
     fn retain_failed_delivery_evidence(&self) -> bool {
         result_recovery::has_missing_results(self)
+            || (self.go_coverage_capture.as_ref().is_some_and(|capture| {
+                capture.present() == Some(true) || capture.rejection().is_some()
+            }) && self
+                .phases
+                .iter()
+                .any(|phase| phase.name == "project" && !phase.complete))
             || (self.exit_code == Some(0)
                 && self
                     .build_system_output_capture
@@ -1099,6 +1142,13 @@ pub(crate) struct RecoverySession {
 #[derive(Debug, thiserror::Error)]
 #[error("invalid Cargo executable evidence: {0:#}")]
 pub(super) struct CargoOutputContractRejected(anyhow::Error);
+
+/// A completed immutable log cannot establish a usable coverage report.
+/// Retain the evidence and finish delivery as failed; retrying this receipt
+/// cannot repair it. Transport and local journal errors remain retryable.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid Go coverage evidence: {0:#}")]
+pub(super) struct GoCoverageEvidenceRejected(anyhow::Error);
 
 fn fingerprint(path: &Path) -> anyhow::Result<Option<String>> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -1777,6 +1827,7 @@ impl RecoverySession {
             package_archive: false,
             cargo_output_capture: None,
             build_system_output_capture: None,
+            go_coverage_capture: None,
             prepared_dependencies: None,
             cargo_stdout: None,
             cargo_stderr: None,
@@ -2002,6 +2053,7 @@ impl RecoverySession {
                     resolved: false,
                     graph_available: false,
                 }),
+            go_coverage_capture: None,
             prepared_dependencies: None,
             cargo_stdout: None,
             cargo_stderr: None,
@@ -3007,6 +3059,116 @@ impl RecoverySession {
         self.persist_next_recipe(next)
     }
 
+    pub(crate) fn require_go_coverage(&mut self, capture: GoCoverageCapture) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe.prepared
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && self.recipe.exit_code.is_none()
+                && !self.recipe.sources_released
+                && !self.recipe.retired
+                && capture.present().is_none()
+                && capture.rejection().is_none()
+                && self
+                    .recipe
+                    .go_coverage_capture
+                    .as_ref()
+                    .is_none_or(|previous| previous == &capture),
+            "Go coverage binding requires an unconsumed output session"
+        );
+        let mut next = self.recipe.clone();
+        next.go_coverage_capture = Some(capture);
+        next.validate_go_coverage_contract()?;
+        self.persist_next_recipe(next)
+    }
+
+    fn accept_go_coverage(&mut self, stderr: &[u8]) -> anyhow::Result<bool> {
+        if let Some(reason) = self
+            .recipe
+            .go_coverage_capture
+            .as_ref()
+            .and_then(GoCoverageCapture::rejection)
+        {
+            return Err(GoCoverageEvidenceRejected(anyhow::anyhow!(reason.to_owned())).into());
+        }
+        let exit = self
+            .recipe
+            .exit_code
+            .context("Go coverage has no confirmed completion")?;
+        let mut next = self.recipe.clone();
+        let capture = next
+            .go_coverage_capture
+            .as_mut()
+            .context("Go coverage was not admitted")?;
+        if let Err(error) = capture.accept(stderr, exit) {
+            return self.reject_go_coverage(error);
+        }
+        let present = capture
+            .present()
+            .context("Go coverage outcome remains unknown")?;
+        next.validate_go_coverage_contract()?;
+        self.persist_next_recipe(next)?;
+        Ok(present)
+    }
+
+    fn reject_go_coverage(&mut self, error: anyhow::Error) -> anyhow::Result<bool> {
+        let exit = self
+            .recipe
+            .exit_code
+            .context("Go coverage has no confirmed completion")?;
+        let mut next = self.recipe.clone();
+        next.go_coverage_capture
+            .as_mut()
+            .context("Go coverage was not admitted")?
+            .reject(exit, &format!("{error:#}"))?;
+        next.validate_go_coverage_contract()?;
+        self.persist_next_recipe(next)?;
+        Err(GoCoverageEvidenceRejected(error).into())
+    }
+
+    pub(crate) async fn collect_go_coverage(
+        &mut self,
+        pipeline: &TransferPipeline,
+        worker: &WorkerConfig,
+    ) -> anyhow::Result<bool> {
+        let Some(capture) = &self.recipe.go_coverage_capture else {
+            return Ok(false);
+        };
+        if let Some(reason) = capture.rejection() {
+            self.recipe.validate_go_coverage_contract()?;
+            return Err(GoCoverageEvidenceRejected(anyhow::anyhow!(reason.to_owned())).into());
+        }
+        if let Some(present) = capture.present() {
+            self.recipe.validate_go_coverage_contract()?;
+            return Ok(present);
+        }
+        let exit = self
+            .recipe
+            .exit_code
+            .context("Go coverage has no confirmed completion")?;
+        let remote = self
+            .recipe
+            .phases
+            .iter()
+            .find(|phase| phase.name == "project")
+            .context("Go coverage has no executed source root")?
+            .remote
+            .clone();
+        let stderr = match pipeline
+            .clone()
+            .with_remote_path_override(remote)
+            .read_cargo_stderr_evidence(worker, exit)
+            .await
+        {
+            Ok(stderr) => stderr,
+            Err(error) if error.is::<crate::transfer::CargoArtifactEvidenceRejected>() => {
+                return self.reject_go_coverage(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.accept_go_coverage(&stderr)
+    }
+
     /// Install compiler-resolved Rust/C/C++ outputs before execution. Replacing
     /// broad fallback globs makes every native output and sidecar mandatory,
     /// even if Cargo target settings are present in the caller's environment.
@@ -3061,6 +3223,15 @@ impl RecoverySession {
     }
 
     fn verify_native_outputs(&self, index: usize) -> anyhow::Result<()> {
+        if self.recipe.phases[index].name == "project"
+            && let Some(capture) = &self.recipe.go_coverage_capture
+        {
+            capture.validate(self.recipe.exit_code)?;
+            anyhow::ensure!(
+                capture.present() == Some(true),
+                "Go coverage publication requires this attempt's confirmed fresh report"
+            );
+        }
         if let Some(contract) = &self.recipe.phases[index].native_outputs {
             contract.verify_staged(&self.stage(index))?;
         }
@@ -3261,6 +3432,7 @@ impl RecoverySession {
         if self.recipe.kind == Some(CompilationKind::GoBuild) {
             self.recipe.validate_go_output_contract()?;
         }
+        self.recipe.validate_go_coverage_contract()?;
         let mut next_recipe = self.recipe.clone();
         next_recipe.execution_started = true;
         self.persist_next_recipe(next_recipe)
@@ -3732,6 +3904,31 @@ impl RecoverySession {
         Ok(())
     }
     pub(crate) fn returned(&mut self, exit: i32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recipe
+                .go_coverage_capture
+                .as_ref()
+                .is_none_or(|capture| capture.rejection().is_none())
+                || exit == EXIT_ARTIFACT_TRANSFER_FAILED,
+            "rejected Go coverage evidence must remain a delivery failure"
+        );
+        anyhow::ensure!(
+            exit == EXIT_ARTIFACT_TRANSFER_FAILED
+                || self
+                    .recipe
+                    .go_coverage_capture
+                    .as_ref()
+                    .is_none_or(|capture| {
+                        capture.present() != Some(true)
+                            || self
+                                .recipe
+                                .phases
+                                .iter()
+                                .filter(|phase| phase.name == "project")
+                                .all(|phase| phase.complete)
+                    }),
+            "Go test failure cannot acknowledge an undelivered coverage report"
+        );
         anyhow::ensure!(
             exit != 0
                 || self
@@ -4918,6 +5115,7 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
     if recipe.kind == Some(CompilationKind::GoBuild) && recipe.execution_started {
         recipe.validate_go_output_contract()?;
     }
+    recipe.validate_go_coverage_contract()?;
     for phase in &recipe.phases {
         if let Some(contract) = &phase.native_outputs {
             anyhow::ensure!(
@@ -5646,6 +5844,20 @@ async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow:
     let base = base.with_source_authority_in(session.recipe.identity.clone(), namespace)?;
     session.completed(exit)?;
     let command_exit = exit;
+    let mut rejected_go_coverage = false;
+    let go_coverage_present = match session.collect_go_coverage(&base, &worker).await {
+        Ok(present) => present,
+        Err(error) if error.is::<GoCoverageEvidenceRejected>() => {
+            eprintln!(
+                "[RCH] recovered Go coverage evidence was rejected: {error:#}; \
+                 no report published (exit {EXIT_ARTIFACT_TRANSFER_FAILED})"
+            );
+            rejected_go_coverage = true;
+            exit = EXIT_ARTIFACT_TRANSFER_FAILED;
+            false
+        }
+        Err(error) => return Err(error),
+    };
     // A failed graph probe must not withhold separately declared reports.
     // Publish those phases below, then retain this retryable discovery error
     // before retirement can release the source grant or completion receipt.
@@ -5748,7 +5960,10 @@ async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow:
     for index in 0..session.recipe.phases.len() {
         let phase = session.recipe.phases[index].clone();
         if phase.complete
-            || ((command_exit != 0 || rejected_cargo_evidence || build_output_error.is_some())
+            || (((command_exit != 0 && !(go_coverage_present && phase.name == "project"))
+                || rejected_go_coverage
+                || rejected_cargo_evidence
+                || build_output_error.is_some())
                 && phase.result_dir.is_none())
         {
             continue;
@@ -10205,6 +10420,329 @@ func TestValue(t *testing.T) {{
             assert_eq!(output.status.code(), Some(1), "{output:?}");
             assert!(String::from_utf8_lossy(&output.stderr).contains("UndefinedFixtureSymbol"));
             assert_eq!(go_fixture_tree(root), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_coverage_reports_preserve_success_failure_absence_and_restarted_publication() {
+        use super::super::artifact_patterns::direct_compiler::{
+            go_build_execution_command, validate_go_build_output,
+        };
+        use tokio::process::Command;
+
+        let _guard = test_guard!();
+        let relative = "target/coverage [part]*.out";
+        let old = b"previous coverage must not stand in for this attempt\n";
+        for case in ["pass", "test-failure", "compile-failure", "invalid-count"] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let remote = base.join("worker");
+            let direct = base.join("ordinary-go");
+            let unrelated_target = base.join("unrelated-cargo-target");
+            std::fs::create_dir_all(&unrelated_target).unwrap();
+            std::fs::write(unrelated_target.join("sentinel"), b"other output").unwrap();
+            for root in [&local, &remote, &direct] {
+                std::fs::create_dir_all(root.join("target")).unwrap();
+                std::fs::write(root.join(relative), old).unwrap();
+                std::fs::write(
+                    root.join("go.mod"),
+                    b"module fixture.invalid/coverage\n\ngo 1.20\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join("add.go"),
+                    b"package coverage\nfunc Add(a, b int) int { return a+b }\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join("add_test.go"),
+                    b"package coverage\nimport (\"testing\"; \"os\")\nfunc TestAdd(t *testing.T) { if Add(1,2) != 3 || os.Getenv(\"RCH_GO_TEST_FAILURE\") == \"1\" { t.Fatal(\"intentional coverage failure\") } }\n",
+                ).unwrap();
+                if case == "compile-failure" {
+                    std::fs::write(
+                        root.join("broken.go"),
+                        b"package coverage\nfunc Broken() { UndefinedCoverageFixtureSymbol() }\n",
+                    )
+                    .unwrap();
+                }
+            }
+            std::fs::write(
+                remote.join("target/coverage p-decoy.out"),
+                b"unselected report",
+            )
+            .unwrap();
+            let count = if case == "invalid-count" {
+                "not-an-integer"
+            } else {
+                "1"
+            };
+            let environment = if case == "test-failure" {
+                vec!["RCH_GO_TEST_FAILURE=1"]
+            } else {
+                vec!["RCH_GO_TEST_FAILURE="]
+            };
+            let command = go_fixture_command(
+                "go",
+                &[
+                    "test",
+                    "-p=1",
+                    "-count",
+                    count,
+                    "-coverprofile",
+                    relative,
+                    ".",
+                ],
+                &environment,
+            );
+            assert_eq!(
+                rch_common::classify_command(&command).kind,
+                Some(CompilationKind::GoTest)
+            );
+            let planned = validate_go_build_output(&command, &local, &local)
+                .await
+                .unwrap();
+            let mut ordinary = Command::new("sh");
+            ordinary.args(["-c", &command]).current_dir(&direct);
+            let ordinary = run_go_fixture(&mut ordinary).await;
+            let expected_exit = ordinary.status.code().unwrap();
+            assert_eq!(expected_exit == 0, case == "pass", "{case}: {ordinary:?}");
+            let expected_report = std::fs::read(direct.join(relative)).unwrap();
+            let expected_present = expected_report != old;
+            assert_eq!(
+                expected_present,
+                case != "invalid-count",
+                "{case}: {ordinary:?}"
+            );
+
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "coverage-fixture".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(remote.to_str().unwrap());
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                Some(&unrelated_target),
+                Some(CompilationKind::GoTest),
+                &command,
+                &[],
+                identity,
+            )
+            .unwrap();
+            session
+                .require_go_outputs(planned.output_contract())
+                .unwrap();
+            session
+                .require_go_coverage(planned.coverage_capture().unwrap())
+                .unwrap();
+            assert_eq!(session.recipe.phases.len(), 1);
+            session.starting_execution().unwrap();
+            let guarded = go_build_execution_command(&command, &planned, None).unwrap();
+            let mut execution = Command::new("sh");
+            execution.args(["-c", &guarded]).current_dir(&remote);
+            let output = run_go_fixture(&mut execution).await;
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "{case}: {output:?}"
+            );
+            if case == "test-failure" {
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("intentional coverage failure")
+                );
+            }
+            if case == "compile-failure" {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("UndefinedCoverageFixtureSymbol")
+                );
+            }
+            session.completed(expected_exit).unwrap();
+            let mut session = reload_publication(&session);
+            let stage = session.staging_pipeline("project", &pipeline).unwrap();
+            std::fs::create_dir_all(session.stage(0).join("target")).unwrap();
+            std::fs::write(session.stage(0).join(relative), old).unwrap();
+            let journal = std::fs::read(&writer.path).unwrap();
+            assert!(
+                session.publish("project").await.is_err(),
+                "unproven old stage: {case}"
+            );
+            assert_eq!(std::fs::read(&writer.path).unwrap(), journal);
+            assert_eq!(std::fs::read(local.join(relative)).unwrap(), old);
+            assert_eq!(
+                session.accept_go_coverage(&output.stderr).unwrap(),
+                expected_present
+            );
+            let mut session = reload_publication(&session);
+            // Once journaled, a restart needs no compiler, receipt replay or SSH.
+            assert_eq!(
+                session
+                    .collect_go_coverage(&pipeline, &worker)
+                    .await
+                    .unwrap(),
+                expected_present
+            );
+            if expected_present {
+                assert!(
+                    session.returned(expected_exit).is_err(),
+                    "report must be delivered on failure too"
+                );
+                let patterns = session.cargo_artifact_patterns("project").unwrap();
+                let mut rsync =
+                    stage.local_artifact_retrieval_for_test(&worker, &remote, &patterns);
+                let transfer = run_go_fixture(&mut rsync).await;
+                assert!(transfer.status.success(), "{case}: {transfer:?}");
+                assert!(
+                    !session
+                        .stage(0)
+                        .join("target/coverage p-decoy.out")
+                        .exists()
+                );
+                session.publish("project").await.unwrap();
+                assert_eq!(
+                    std::fs::read(local.join(relative)).unwrap(),
+                    expected_report,
+                    "{case}"
+                );
+            } else {
+                assert!(
+                    session.publish("project").await.is_err(),
+                    "absence cannot publish stale bytes"
+                );
+                assert_eq!(std::fs::read(local.join(relative)).unwrap(), old);
+                assert_eq!(std::fs::read(remote.join(relative)).unwrap(), old);
+            }
+            session.returned(expected_exit).unwrap();
+            let session = reload_publication(&session);
+            assert_eq!(session.recipe.exit_code, Some(expected_exit));
+            assert_eq!(session.recipe.returned, Some(expected_exit));
+            assert_eq!(session.recipe.phases[0].complete, expected_present);
+            assert_eq!(
+                std::fs::read(unrelated_target.join("sentinel")).unwrap(),
+                b"other output"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_coverage_rejected_receipts_are_terminal_and_retain_evidence_after_restart() {
+        let _guard = test_guard!();
+        let token = "a".repeat(32);
+        for (exit, bad_log) in [
+            (137, Vec::new()),
+            (
+                1,
+                format!("RCH_GO_COVERAGE_V1 {} 1 present\n", "b".repeat(32)).into_bytes(),
+            ),
+            (
+                0,
+                format!("RCH_GO_COVERAGE_V1 {token} 0 absent\n").into_bytes(),
+            ),
+            (
+                1,
+                format!(
+                    "RCH_GO_COVERAGE_V1 {token} 1 present\nRCH_GO_COVERAGE_V1 {token} 1 absent\n"
+                )
+                .into_bytes(),
+            ),
+        ] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let local = writer.path.parent().unwrap().join("checkout");
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::write(local.join("coverage.out"), b"old caller report").unwrap();
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "rejected-coverage".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override("/data/projects/coverage");
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                None,
+                Some(CompilationKind::GoTest),
+                "go test -coverprofile coverage.out .",
+                &[],
+                identity,
+            )
+            .unwrap();
+            let capture: GoCoverageCapture = serde_json::from_value(serde_json::json!({
+                "token": token, "outcome": null,
+            }))
+            .unwrap();
+            session.require_go_coverage(capture).unwrap();
+            session.starting_execution().unwrap();
+            session.completed(exit).unwrap();
+            session.staging_pipeline("project", &pipeline).unwrap();
+            std::fs::write(
+                session.stage(0).join("coverage.out"),
+                b"unproven staged report",
+            )
+            .unwrap();
+            let error = session.accept_go_coverage(&bad_log).unwrap_err();
+            assert!(error.is::<GoCoverageEvidenceRejected>(), "{error:#}");
+            let mut session = reload_publication(&session);
+            let rejected = std::fs::read(&writer.path).unwrap();
+            let valid_later = format!("RCH_GO_COVERAGE_V1 {token} {exit} present\n");
+            assert!(
+                session
+                    .accept_go_coverage(valid_later.as_bytes())
+                    .unwrap_err()
+                    .is::<GoCoverageEvidenceRejected>()
+            );
+            // A rejected immutable log never triggers another worker request.
+            assert!(
+                session
+                    .collect_go_coverage(&pipeline, &worker)
+                    .await
+                    .unwrap_err()
+                    .is::<GoCoverageEvidenceRejected>()
+            );
+            assert!(session.publish("project").await.is_err());
+            assert!(session.returned(exit).is_err());
+            assert_eq!(std::fs::read(&writer.path).unwrap(), rejected);
+            assert_eq!(
+                std::fs::read(local.join("coverage.out")).unwrap(),
+                b"old caller report"
+            );
+            assert!(session.retain_failed_delivery_evidence());
+            session.returned(EXIT_ARTIFACT_TRANSFER_FAILED).unwrap();
+            // Model the separately fenced source-release checkpoint, then
+            // prove delivery can retire without resolving an impossible log.
+            session.sources_released().unwrap();
+            session.retired().unwrap();
+            let session = reload_publication(&session);
+            assert!(session.recipe.retired);
+            assert_eq!(session.recipe.exit_code, Some(exit));
+            assert_eq!(session.recipe.returned, Some(EXIT_ARTIFACT_TRANSFER_FAILED));
+            assert!(session.retain_failed_delivery_evidence());
+            assert_eq!(
+                std::fs::read(session.stage(0).join("coverage.out")).unwrap(),
+                b"unproven staged report"
+            );
         }
     }
 
