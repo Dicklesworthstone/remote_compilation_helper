@@ -6939,18 +6939,29 @@ mod tests {
             baseline_pool: retained,
             final_pool: retained,
         };
-        let encoded = urlencoding_encode(&serde_json::to_string(&observation).unwrap());
         let ApiRequest::SelectWorker { request, .. } = parse_request(
             "GET /select-worker?project=warm-api&command=cargo%20check&cores=1&worker=warm-worker&runtime=none&disk_observation_version=1",
         ).unwrap() else {
             panic!("expected warm-capable selection");
         };
-        for index in 0..2 {
+        for index in 0..3 {
+            // Establish a genuine cold footprint first; subsequent matching
+            // nonempty baselines qualify the separate incremental allowance.
+            let measured = if index == 0 {
+                crate::headroom::cold_footprint_observation(81)
+            } else {
+                observation
+            };
+            let encoded = urlencoding_encode(&serde_json::to_string(&measured).unwrap());
             set_test_build_disk(&ctx.pool, "warm-worker", 200.0).await;
             let owner = format!("warm-api-{index}");
+            let mut invocation = request.clone();
+            if index == 0 {
+                invocation.disk_headroom_gib = 102;
+            }
             let selected = handle_select_worker_with_wrapper(
                 &ctx,
-                request.clone(),
+                invocation,
                 false,
                 None,
                 Some(owner.clone()),
@@ -6978,12 +6989,12 @@ mod tests {
             let ApiRequest::ReleaseWorker(receipt) = parse_request(&line).unwrap() else {
                 panic!("expected measured completion");
             };
-            assert_eq!(receipt.disk_observation, Some(observation));
+            assert_eq!(receipt.disk_observation, Some(measured));
             assert!(parse_request(&format!("{line}&disk_observation={encoded}")).is_err());
             handle_release_worker(&ctx, *receipt).await.unwrap();
         }
-        // The old total requires 102 + 10 GiB. A matched warm proof permits
-        // 3 + 10 GiB on this fresh low-capacity observation instead.
+        // The measured cold build requires 102 + 10 GiB. A matched warm proof
+        // permits 3 + 10 GiB on this fresh low-capacity observation instead.
         set_test_build_disk(&ctx.pool, "warm-worker", 40.0).await;
         let preview = handle_select_worker_dry_run(&ctx, &request).await;
         let budget = preview.worker.unwrap().disk_budget.unwrap();
@@ -7101,8 +7112,10 @@ mod tests {
             .await;
             assert_eq!(heartbeat.status, "ok");
 
+            let observation = crate::headroom::cold_footprint_observation(peak_gib);
+            let encoded = urlencoding_encode(&serde_json::to_string(&observation).unwrap());
             let ApiRequest::ReleaseWorker(receipt) = parse_request(&format!(
-                "POST /release-worker?worker=spare&build_id={build_id}&local_wrapper_id={owner}&exit_code={exit_code}&disk_peak_output_bytes={}",
+                "POST /release-worker?worker=spare&build_id={build_id}&local_wrapper_id={owner}&exit_code={exit_code}&disk_peak_output_bytes={}&disk_observation={encoded}",
                 peak_gib * gib,
             ))
             .unwrap() else {

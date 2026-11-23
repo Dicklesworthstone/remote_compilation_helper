@@ -1063,8 +1063,9 @@ impl BuildHistory {
         }
     }
 
-    /// Exact complete output can establish a small requirement. Broader command
-    /// families and legacy df deltas may raise the cold prior, never lower it.
+    /// Exact successful empty-baseline output can establish a small requirement.
+    /// Broader families, warmed runs and legacy df deltas may raise the cold
+    /// prior, never lower it without a separate retained-pool condition.
     pub(crate) fn learned_footprint_gib(&self, project_id: &str, command: &str) -> Option<f64> {
         let now = Utc::now().timestamp();
         let cold = cold_build_footprint_gib(command).unwrap_or(16.0);
@@ -1072,8 +1073,9 @@ impl BuildHistory {
         let family_key = family_footprint_key(project_id, command);
         let legacy_key = legacy_footprint_key(project_id, command);
         let book = self.footprints.lock().unwrap_or_else(|e| e.into_inner());
-        let estimate = book
-            .admission_estimate_gib(&exact_key, now, cold)
+        let exact = book.admission_estimate_gib(&exact_key, now, cold);
+        let estimate = exact
+            .filter(|_| book.has_complete_observation(&exact_key, now))
             .or_else(|| {
                 let mut family = book.estimate_gib(&family_key, now);
                 if rch_common::BuildDiskBudget::has_wide_scope(command)
@@ -1082,7 +1084,13 @@ impl BuildHistory {
                 {
                     family = Some(family.map_or(unscoped, |growth| growth.max(unscoped)));
                 }
-                family.map(|growth| growth.max(cold))
+                // A warmed or partial exact observation is only a lower bound.
+                // It cannot overrule larger applicable family evidence.
+                exact
+                    .into_iter()
+                    .chain(family)
+                    .reduce(f64::max)
+                    .map(|growth| growth.max(cold))
             });
         let legacy = book
             .estimate_gib(&legacy_key, now)
@@ -1137,13 +1145,13 @@ impl BuildHistory {
             .sum()
     }
 
-    /// Total output remains exact-command cold evidence. Family estimates use
-    /// attributed additions when available, so unrelated artifacts retained
-    /// in a shared pool cannot inflate every command's cold fallback. They
-    /// remain lower bounds and cannot reduce the conservative cold prior.
-    /// Conditional warm observations require a successful retained-pool anchor.
-    /// Filesystem deltas alone can be deflated by concurrent cleanup even when
-    /// this daemon owns the worker's only job, so they remain incomplete lower bounds.
+    /// Attribute allocations to this invocation, never to the retained pool's
+    /// entire history. Only a successful observation with an empty baseline
+    /// establishes complete cold evidence; warmed runs retain the cold prior
+    /// unless a separate, exact retained-pool proof qualifies a warm allowance.
+    /// Total-only receipts cannot establish either kind of evidence. Unshared
+    /// filesystem deltas remain incomplete lower bounds because concurrent
+    /// cleanup can hide growth even when this daemon owns the worker's only job.
     fn learn_footprint(
         &self,
         state: &ActiveBuildState,
@@ -1165,7 +1173,8 @@ impl BuildHistory {
                     .worker_endpoint
                     .as_ref()
                     .is_none_or(|endpoint| !endpoint.source_was_retargeted())
-                && disk_peak_output_bytes.is_some_and(|peak| observation.valid_for_peak(peak))
+                && disk_peak_output_bytes
+                    .is_some_and(|peak| peak > 0 && observation.valid_for_peak(peak))
         });
         if let Some(endpoint) = state.worker_endpoint.as_ref() {
             let key = warm_footprint_key(
@@ -1188,35 +1197,32 @@ impl BuildHistory {
             }
             return;
         }
-        let measured_output = disk_peak_output_bytes
-            .filter(|bytes| *bytes > 0)
-            .map(|bytes| (bytes as f64 / rch_common::BuildDiskBudget::GIB as f64).max(1.0));
-        let growth = match measured_output {
-            Some(output) => Some(output),
+        let measured_growth = observation.map(|observation| {
+            (observation.additional_bytes() as f64 / rch_common::BuildDiskBudget::GIB as f64)
+                .max(1.0)
+        });
+        let growth = match measured_growth {
+            Some(growth) => Some(growth),
             None if !state.disk_shared => state
                 .disk_free_start_gib
                 .zip(state.disk_free_min_gib)
                 .map(|(start, min)| start.saturating_sub(min) as f64),
             None => None,
         };
-        let complete = exit_code == 0 && measured_output.is_some();
+        let complete = exit_code == 0
+            && observation.is_some_and(|observation| observation.baseline_output_bytes == 0);
         if let Some(growth) = growth {
             let exact_key = footprint_key(&state.project_id, &state.command);
             let family_key = family_footprint_key(&state.project_id, &state.command);
-            let family_growth = observation.map_or(growth, |observation| {
-                (observation.additional_bytes() as f64 / rch_common::BuildDiskBudget::GIB as f64)
-                    .max(1.0)
-            });
             changed |= book.record(&exact_key, growth, now, complete);
-            changed |= book.record(&family_key, family_growth, now, false);
+            changed |= book.record(&family_key, growth, now, false);
             debug!(
                 build_id = state.id,
                 project = %state.project_id,
                 worker = %state.worker_id,
                 growth_gib = growth,
-                family_growth_gib = family_growth,
                 complete,
-                "learned remote build cold disk footprint"
+                "learned attributed remote build disk allocation"
             );
         }
         if changed {
@@ -3537,6 +3543,7 @@ impl Default for BuildHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::headroom::cold_footprint_observation as cold_test_observation;
     use rch_common::{WorkerId, test_guard};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4430,14 +4437,15 @@ mod tests {
     #[tokio::test]
     async fn scoped_family_history_keeps_old_pool_totals_out_of_new_narrow_commands() {
         const GIB: u64 = rch_common::BuildDiskBudget::GIB;
-        let history = Arc::new(BuildHistory::new(20));
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("history.jsonl");
         let endpoint = warm_test_endpoint().await;
         let project = "franken_engine-5d919732";
         let narrow = warm_test_request(project, "cargo test -p engine --test narrow");
         let wide = warm_test_request(project, "cargo test --workspace --all-targets");
         let now = Utc::now().timestamp();
         {
-            let mut book = history.footprints.lock().unwrap();
+            let mut book = FootprintBook::default();
             // Version 2 did not record scope. A five-day-old retained-pool
             // total survives even seven newer, smaller observations.
             let old_key = r#"[2,"franken_engine-5d919732","family","CargoTest"]"#;
@@ -4446,7 +4454,26 @@ mod tests {
                 book.record(old_key, growth, now - 3600, false);
             }
             assert_eq!(book.estimate_gib(old_key, now), Some(81.0));
+            // The same exact command already has a misleading "complete"
+            // pooled total, and the first scoped family format accepted these
+            // totals too. Neither may block admission after a daemon restart.
+            let old_exact = serde_json::to_string(&(
+                2_u8,
+                project,
+                narrow.command.as_deref().unwrap(),
+            ))
+            .unwrap();
+            let old_scoped = r#"[3,"franken_engine-5d919732","family","CargoTest",false]"#;
+            book.record(&old_exact, 81.0, now - 3600, true);
+            book.record(old_scoped, 82.0, now - 3600, false);
+            book.persist(&footprint_path(&path)).unwrap();
         }
+        let history = Arc::new(BuildHistory::load_from_file(&path, 20).unwrap());
+        assert_eq!(
+            history.learned_footprint_gib(project, narrow.command.as_deref().unwrap()),
+            None,
+            "ambiguous legacy totals must not require new successful runs to retire"
+        );
         let selector = crate::daemon_worker_selector(
             &rch_common::RchConfig::default(),
             Arc::clone(&history),
@@ -4459,6 +4486,27 @@ mod tests {
         };
         assert_eq!(budget(&narrow).max_growth_bytes, 30 * GIB);
         assert!(budget(&narrow).warm_policy.is_none());
+        assert_eq!(budget(&wide).max_growth_bytes, 102 * GIB);
+        let admitted = warm_test_admit(
+            &history,
+            &endpoint,
+            &narrow,
+            budget(&narrow),
+            "legacy-same-command",
+            60.0,
+        )
+        .expect("the same narrow command is admitted before any new successful run");
+        assert_eq!(history.reserved_disk_headroom_gib(&admitted.worker_id), 30);
+        finish_owned(&history, &admitted, 130);
+
+        // A small warmed exact observation does not prove that a wide job
+        // fits cold, so the applicable historical wide bound must survive.
+        history.footprints.lock().unwrap().record(
+            &footprint_key(project, wide.command.as_deref().unwrap()),
+            2.0,
+            now,
+            false,
+        );
         assert_eq!(budget(&wide).max_growth_bytes, 102 * GIB);
 
         // Exact successful cold evidence still overrides broad family data;
@@ -4522,9 +4570,45 @@ mod tests {
         );
         assert_eq!(
             history.learned_footprint_gib("pooled", request.command.as_deref().unwrap()),
-            Some(80.0),
-            "exact cold evidence remains available for an empty worker"
+            Some(24.0),
+            "a nonempty baseline proves growth, not the full cost on an empty worker"
         );
+        let repeated_budget = selector
+            .build_disk_budget_for_endpoint(&request, &endpoint)
+            .unwrap();
+        assert_eq!(repeated_budget.max_growth_bytes, 30 * GIB);
+        assert!(repeated_budget.warm_policy.is_none());
+        let repeated = warm_test_admit(
+            &history,
+            &endpoint,
+            &request,
+            repeated_budget,
+            "pool-observer-repeated",
+            60.0,
+        )
+        .unwrap();
+        let repeated_observation = rch_common::BuildDiskObservation {
+            baseline_output_bytes: 80 * GIB,
+            baseline_pool: after,
+            final_pool: after,
+            ..observation
+        };
+        warm_test_complete(&history, &repeated, 82, Some(repeated_observation), 0);
+        let qualified = selector
+            .build_disk_budget_for_endpoint(&request, &endpoint)
+            .unwrap();
+        assert_eq!(qualified.max_growth_bytes, 4 * GIB);
+        let condition = qualified.warm_policy.unwrap();
+        assert_eq!(condition.cold_growth_bytes, 30 * GIB);
+        assert_eq!(condition.pools[0], Some(after));
+        let mut empty_worker = endpoint.clone();
+        empty_worker.config.host = "empty-worker".into();
+        let empty_budget = selector
+            .build_disk_budget_for_endpoint(&request, &empty_worker)
+            .unwrap();
+        assert_eq!(empty_budget.max_growth_bytes, 30 * GIB);
+        assert!(empty_budget.warm_policy.is_none());
+
         let next = warm_test_request("pooled", "cargo test -p core --test second");
         let next_budget = selector
             .build_disk_budget_for_endpoint(&next, &endpoint)
@@ -4574,6 +4658,16 @@ mod tests {
                 .max_growth_bytes,
             53 * GIB
         );
+        assert_eq!(
+            history.learned_footprint_gib("pooled", request.command.as_deref().unwrap()),
+            Some(42.0),
+            "small warmed exact evidence cannot hide larger attributed family growth"
+        );
+        let empty_budget = selector
+            .build_disk_budget_for_endpoint(&request, &empty_worker)
+            .unwrap();
+        assert_eq!(empty_budget.max_growth_bytes, 53 * GIB);
+        assert!(empty_budget.warm_policy.is_none());
     }
 
     #[tokio::test]
@@ -4595,18 +4689,26 @@ mod tests {
             min_free_bytes: 0,
             warm_policy: None,
         };
-        // Seed receipts in the legacy format through actual owned completion.
+        // Seed genuine cold measurements through actual owned completion.
+        // A total-only receipt cannot prove that these bytes were allocated
+        // by this command rather than already retained in a shared pool.
         for (index, request) in requests.iter().enumerate() {
             let state = warm_test_admit(
                 &history,
                 &endpoint,
                 request,
                 unguarded_fixture,
-                &format!("legacy-{index}"),
+                &format!("cold-measurement-{index}"),
                 220.0,
             )
             .unwrap();
-            warm_test_complete(&history, &state, total_peaks[index], None, 0);
+            warm_test_complete(
+                &history,
+                &state,
+                total_peaks[index],
+                Some(cold_test_observation(total_peaks[index])),
+                0,
+            );
         }
         let cold_budgets = requests.each_ref().map(|request| {
             let budget = selector
@@ -4614,7 +4716,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 budget.warm_policy, None,
-                "legacy totals cannot qualify a pool"
+                "a cold measurement alone cannot qualify a warm pool"
             );
             budget
         });
@@ -4793,6 +4895,26 @@ mod tests {
         let request = warm_test_request("recovered-warm", "cargo check");
         let config = rch_common::RchConfig::default();
         let selector = crate::daemon_worker_selector(&config, Arc::clone(&history), None);
+        let cold_measurement = warm_test_admit(
+            &history,
+            &endpoint,
+            &request,
+            rch_common::BuildDiskBudget {
+                max_growth_bytes: 102 * rch_common::BuildDiskBudget::GIB,
+                min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+                warm_policy: None,
+            },
+            "recovery-cold-measurement",
+            220.0,
+        )
+        .unwrap();
+        warm_test_complete(
+            &history,
+            &cold_measurement,
+            81,
+            Some(cold_test_observation(81)),
+            0,
+        );
         for index in 0..2 {
             let budget = selector
                 .build_disk_budget_for_endpoint(&request, &endpoint)
@@ -5133,7 +5255,8 @@ mod tests {
         );
         assert_eq!(
             history.learned_footprint_gib("overlap-a", "cargo check"),
-            Some(101.0)
+            Some(20.0),
+            "failed additional growth survives; the retained pool is not new allocation"
         );
     }
 
@@ -5250,7 +5373,50 @@ mod tests {
     }
 
     #[test]
-    fn attributed_total_output_is_required_to_lower_cold_build_estimates() {
+    fn total_only_or_invalid_receipts_cannot_repopulate_attributed_footprints() {
+        let history = BuildHistory::new(20);
+        let valid = cold_test_observation(80);
+        let invalid_version = rch_common::BuildDiskObservation {
+            version: rch_common::BuildDiskObservation::VERSION + 1,
+            ..valid
+        };
+        let invalid_baseline = rch_common::BuildDiskObservation {
+            baseline_output_bytes: 81 * rch_common::BuildDiskBudget::GIB,
+            ..valid
+        };
+        let invalid_pool = rch_common::BuildDiskObservation {
+            final_pool: rch_common::BuildDiskPool {
+                identity: [9; 32],
+                ..valid.final_pool
+            },
+            ..valid
+        };
+        for (project, observation) in [
+            ("total-only", None),
+            ("invalid-version", Some(invalid_version)),
+            ("invalid-baseline", Some(invalid_baseline)),
+            ("invalid-pool", Some(invalid_pool)),
+        ] {
+            let state = disk_budget_admit(&history, project, "w", 0, 200.0).unwrap();
+            warm_test_complete(&history, &state, 80, observation, 0);
+            assert_eq!(
+                history.learned_footprint_gib(project, "cargo test"),
+                None,
+                "{project} must fall back to the cold prior"
+            );
+            assert_eq!(
+                history.footprints.lock().unwrap().estimate_gib(
+                    &family_footprint_key(project, "cargo test"),
+                    Utc::now().timestamp()
+                ),
+                None,
+                "unattributed totals must not poison related commands either"
+            );
+        }
+    }
+
+    #[test]
+    fn attributed_empty_baseline_is_required_to_lower_cold_build_estimates() {
         let history = BuildHistory::new(20);
         let measured = |state: &ActiveBuildState, gib: u64, exit_code| {
             history
@@ -5260,6 +5426,7 @@ mod tests {
                     state.local_wrapper_id.as_deref(),
                     BuildCompletion {
                         disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+                        disk_observation: Some(cold_test_observation(gib)),
                         ..disk_budget_completion(exit_code)
                     },
                 )
@@ -5346,6 +5513,7 @@ mod tests {
         let state = disk_budget_admit(&history, "numpy", "w", 0, 100.0).unwrap();
         let completion = |gib| BuildCompletion {
             disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
+            disk_observation: Some(cold_test_observation(gib)),
             ..disk_budget_completion(0)
         };
         assert!(

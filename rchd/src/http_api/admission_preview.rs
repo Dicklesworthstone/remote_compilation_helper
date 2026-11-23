@@ -860,7 +860,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
-                        disk_observation: None,
+                        disk_observation: Some(crate::headroom::cold_footprint_observation(gib)),
                         timing: None,
                         cancellation: None,
                     },

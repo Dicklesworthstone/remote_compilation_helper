@@ -8458,14 +8458,14 @@ mod tests {
                     duration_ms: None,
                     bytes_transferred: None,
                     disk_peak_output_bytes: Some(64 * rch_common::BuildDiskBudget::GIB),
-                    disk_observation: None,
+                    disk_observation: Some(crate::headroom::cold_footprint_observation(64)),
                     timing: None,
                     cancellation: None,
                 },
             )
             .unwrap();
         assert_eq!(
-            history.learned_footprint_gib(&request.project, "cargo build"),
+            history.learned_footprint_gib(&request.project, "cargo build --workspace"),
             Some(64.0)
         );
 
@@ -8562,7 +8562,7 @@ mod tests {
                         duration_ms: None,
                         bytes_transferred: None,
                         disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
-                        disk_observation: None,
+                        disk_observation: Some(crate::headroom::cold_footprint_observation(gib)),
                         timing: None,
                         cancellation: None,
                     },

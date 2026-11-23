@@ -393,8 +393,12 @@ const FOOTPRINT_MIN_GROWTH_GIB: f64 = 1.0;
 
 /// Exact command options and profile settings affect output size. A small
 /// package check must not establish the budget for a full workspace test.
+/// Version 3 admits only attributed allocation: version 2's pooled totals
+/// cannot distinguish a cold build from artifacts left by unrelated commands.
+/// Ignoring them restores the conservative prior immediately, without making
+/// an already-starved command run successfully before it can be admitted.
 pub fn footprint_key(project_id: &str, command: &str) -> String {
-    serde_json::to_string(&(2_u8, footprint_project(project_id), command.trim()))
+    serde_json::to_string(&(3_u8, footprint_project(project_id), command.trim()))
         .expect("string tuple serializes")
 }
 
@@ -414,12 +418,15 @@ fn footprint_project(project_id: &str) -> &str {
     }
 }
 
+/// Version 3 separated scopes but still accepted ambiguous total-only
+/// receipts. Version 4 shares only attributed allocation and incomplete df
+/// lower bounds, never the historical contents of a retained pool.
 pub fn family_footprint_key(project_id: &str, command: &str) -> String {
     let kind = rch_common::classify_command(command)
         .kind
         .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
     serde_json::to_string(&(
-        3_u8,
+        4_u8,
         footprint_project(project_id),
         "family",
         kind,
@@ -472,9 +479,11 @@ pub fn cold_build_footprint_gib(command: &str) -> Option<f64> {
 struct FootprintSample {
     growth_gib: f64,
     observed_unix: i64,
-    /// A complete, successful attributed observation. Total-output samples
-    /// establish cold evidence; incremental samples live in a separate pool
-    /// entry and only apply with its verified retained-pool condition.
+    /// For exact entries, only a successful attributed observation with an
+    /// empty output baseline establishes complete cold evidence. Family and
+    /// nonempty-baseline entries remain incomplete lower bounds. Pool entries
+    /// use this flag for successful incremental evidence under their separate
+    /// verified retained-pool condition.
     #[serde(default)]
     complete: bool,
 }
@@ -709,14 +718,17 @@ impl FootprintBook {
             .reduce(f64::max)
     }
 
+    pub fn has_complete_observation(&self, key: &str, now_unix: i64) -> bool {
+        self.entries.get(key).is_some_and(|samples| {
+            samples
+                .iter()
+                .any(|sample| sample.complete && sample.valid_at(now_unix))
+        })
+    }
+
     pub fn admission_estimate_gib(&self, key: &str, now_unix: i64, cold_gib: f64) -> Option<f64> {
         let high_water = self.estimate_gib(key, now_unix)?;
-        let complete = self
-            .entries
-            .get(key)?
-            .iter()
-            .any(|sample| sample.complete && sample.valid_at(now_unix));
-        Some(if complete {
+        Some(if self.has_complete_observation(key, now_unix) {
             high_water
         } else {
             high_water.max(cold_gib)
@@ -749,6 +761,30 @@ pub fn footprint_requirement_gib(footprint_gib: f64) -> f64 {
 // =========================================================================
 // Tests
 // =========================================================================
+
+/// An attributed cold receipt for history, selection and API tests. A bare
+/// total cannot prove that this invocation allocated an existing pool's bytes.
+#[cfg(test)]
+pub(crate) fn cold_footprint_observation(total_peak_gib: u64) -> BuildDiskObservation {
+    let peak = total_peak_gib * rch_common::BuildDiskBudget::GIB;
+    let baseline = BuildDiskPool {
+        identity: [1; 32],
+        state: [1; 32],
+        retained_bytes: 0,
+    };
+    BuildDiskObservation {
+        version: BuildDiskObservation::VERSION,
+        baseline_output_bytes: 0,
+        peak_added_output_bytes: peak,
+        peak_free_drop_bytes: peak,
+        baseline_pool: baseline,
+        final_pool: BuildDiskPool {
+            state: [2; 32],
+            retained_bytes: peak,
+            ..baseline
+        },
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1216,6 +1252,14 @@ mod tests {
         assert_ne!(
             footprint_key("fgdb", "cargo test --profile release"),
             footprint_key("fgdb", "cargo test")
+        );
+        assert_eq!(
+            footprint_key("fgdb", "cargo test"),
+            r#"[3,"fgdb","cargo test"]"#
+        );
+        assert_eq!(
+            family_footprint_key("fgdb", "cargo test"),
+            r#"[4,"fgdb","family","CargoTest",false]"#
         );
         assert_ne!(
             family_footprint_key("fgdb", "cargo test --all-features"),

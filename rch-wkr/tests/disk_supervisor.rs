@@ -489,6 +489,10 @@ fn admission_refuses_before_start_and_receipt_ownership_cannot_be_reused() {
 #[test]
 fn excess_growth_stops_the_writer_and_retains_artifacts() {
     let fixture = Fixture::new();
+    // A large retained pool neither consumes the new allocation allowance nor
+    // hides a new writer exceeding it after footprint estimates are corrected.
+    let retained = fixture.target.join("retained-output");
+    fs::write(&retained, vec![0x5a_u8; 8 * MIB as usize]).unwrap();
     let (path, child) = fixture.shell(
         MIB,
         0,
@@ -500,7 +504,9 @@ fn excess_growth_stops_the_writer_and_retains_artifacts() {
     let failure = receipt(&path, MARKER);
     assert_eq!(failure["reason"], "growth");
     assert_eq!(failure["started"], true);
+    assert_eq!(failure["max_growth_bytes"], MIB);
     assert!(failure["growth_bytes"].as_u64().unwrap() >= 4 * MIB);
+    assert_eq!(fs::metadata(retained).unwrap().len(), 8 * MIB);
     assert_eq!(
         fs::metadata(fixture.target.join("large-output"))
             .unwrap()
