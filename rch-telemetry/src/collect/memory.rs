@@ -200,33 +200,62 @@ impl MemoryPressureStall {
     /// full avg10=0.00 avg60=0.00 avg300=0.00 total=0
     /// ```
     pub fn parse(content: &str) -> Option<Self> {
-        let mut result = Self::default();
-
+        let mut some = None;
+        let mut full = None;
         for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
+            let mut parts = line.split_whitespace();
+            let Some(prefix) = parts.next() else {
                 continue;
-            }
-
-            let prefix = parts[0];
-            for part in &parts[1..] {
-                if let Some((key, value)) = part.split_once('=')
-                    && let Ok(v) = value.parse::<f64>()
-                {
-                    match (prefix, key) {
-                        ("some", "avg10") => result.some_avg10 = v,
-                        ("some", "avg60") => result.some_avg60 = v,
-                        ("some", "avg300") => result.some_avg300 = v,
-                        ("full", "avg10") => result.full_avg10 = v,
-                        ("full", "avg60") => result.full_avg60 = v,
-                        ("full", "avg300") => result.full_avg300 = v,
-                        _ => {}
+            };
+            let destination = match prefix {
+                "some" => &mut some,
+                "full" => &mut full,
+                _ => continue,
+            };
+            let mut averages = [None; 3];
+            let mut total = None;
+            for part in parts {
+                let (key, value) = part.split_once('=')?;
+                let index = match key {
+                    "avg10" => 0,
+                    "avg60" => 1,
+                    "avg300" => 2,
+                    "total" => {
+                        if total.replace(value.parse::<u64>().ok()?).is_some() {
+                            return None;
+                        }
+                        continue;
                     }
+                    _ => continue,
+                };
+                let value = value.parse::<f64>().ok()?;
+                if !value.is_finite()
+                    || !(0.0..=100.0).contains(&value)
+                    || averages[index].replace(value).is_some()
+                {
+                    return None;
                 }
             }
+            // Missing/malformed PSI is not evidence of an idle worker. In
+            // particular, never default a truncated record to zero stalls.
+            let [Some(avg10), Some(avg60), Some(avg300)] = averages else {
+                return None;
+            };
+            total?;
+            if destination.replace([avg10, avg60, avg300]).is_some() {
+                return None;
+            }
         }
-
-        Some(result)
+        let [some_avg10, some_avg60, some_avg300] = some?;
+        let [full_avg10, full_avg60, full_avg300] = full?;
+        Some(Self {
+            some_avg10,
+            some_avg60,
+            some_avg300,
+            full_avg10,
+            full_avg60,
+            full_avg300,
+        })
     }
 
     /// Admission-pressure equivalent (0-100 scale) of a sustained memory stall:
@@ -270,19 +299,71 @@ pub struct MemoryTelemetry {
 }
 
 impl MemoryTelemetry {
-    /// Memory pressure for admission decisions: the utilization score, raised
-    /// by sustained PSI stall when the worker reports it.
+    /// Memory pressure for admission decisions, raised by sustained PSI stall.
     ///
     /// The utilization score alone misses a worker thrashing on swap with RAM
     /// that still looks "available": vmi1264463 (8 cores, 30 GB) sat at memory
     /// PSI some 20-30% for a day with a score of ~78 (58% used + full swap),
     /// under the 80/92 gates, so every dispatcher kept admitting to it.
+    /// Conversely, swap residency can outlast the pressure that caused it:
+    /// ts1 had 36-53 GiB available with zero PSI but was refused at ~92 solely
+    /// because of old swap pages (bd-g7r56). Only a complete stall-free sample
+    /// with substantial physical headroom may omit that swap penalty. RAM and
+    /// dirty-page pressure, raw telemetry, and the daemon's freshness gate stay
+    /// intact; this method does not turn an old sample into admission evidence.
     pub fn admission_pressure(&self) -> f64 {
         let stall = self
             .psi
             .as_ref()
             .map_or(0.0, MemoryPressureStall::stall_pressure);
-        self.pressure_score.max(stall)
+        self.pressure_without_idle_swap().max(stall)
+    }
+
+    fn pressure_without_idle_swap(&self) -> f64 {
+        // An absolute floor protects smaller workers even when their usage
+        // percentage looks similar to a large, recovered host. Zero across
+        // all three PSI windows also rules out a recent or ongoing stall.
+        const MIN_AVAILABLE_GIB: f64 = 16.0;
+        let idle = self.psi.as_ref().is_some_and(|psi| {
+            [
+                psi.some_avg10,
+                psi.some_avg60,
+                psi.some_avg300,
+                psi.full_avg10,
+                psi.full_avg60,
+                psi.full_avg300,
+            ]
+            .iter()
+            .all(|value| *value == 0.0)
+        });
+        if !idle
+            || !self.total_gb.is_finite()
+            || !self.available_gb.is_finite()
+            || self.available_gb < MIN_AVAILABLE_GIB
+            || self.available_gb > self.total_gb
+            || !self.swap_used_gb.is_finite()
+            || self.swap_used_gb <= 0.0
+            || !self.dirty_mb.is_finite()
+            || self.dirty_mb < 0.0
+            || !(0.0..=100.0).contains(&self.used_percent)
+            || !(0.0..=100.0).contains(&self.pressure_score)
+        {
+            return self.pressure_score;
+        }
+
+        // Use the more conservative RAM reading if independently reported
+        // fields disagree. Preserve the exact dirty-page term used by
+        // MemoryInfo::pressure_score, including its cap.
+        let ram = self
+            .used_percent
+            .max((1.0 - self.available_gb / self.total_gb) * 100.0);
+        let without_swap = (ram + (self.dirty_mb / 1024.0 * 5.0).min(10.0)).min(100.0);
+        if self.pressure_score < without_swap || self.pressure_score > without_swap + 20.0 {
+            // The known utilization score can add at most twenty swap
+            // points. An inconsistent/unknown score must not earn relief.
+            return self.pressure_score;
+        }
+        without_swap
     }
 
     /// Collect memory telemetry from the system.
@@ -856,6 +937,35 @@ full avg10=0.20 avg60=0.15 avg300=0.05 total=5678"#;
     }
 
     #[test]
+    fn psi_requires_complete_unambiguous_finite_samples() {
+        let some = "some avg10=0.00 avg60=0.00 avg300=0.00 total=12345";
+        let full = "full avg10=0.00 avg60=0.00 avg300=0.00 total=5678";
+        let complete = format!("{some}\n{full}\n");
+        assert!(MemoryPressureStall::parse(&complete).is_some());
+        for incomplete in [
+            String::new(),
+            "unavailable".to_string(),
+            some.to_string(),
+            full.to_string(),
+            format!("{complete}{some}\n"),
+            format!("{some}\nfull avg10=0 avg60=0 total=0"),
+            format!("{some}\nfull avg10=0 avg60=0 avg300=0"),
+            format!("{some}\nfull avg10=0 avg60=0 avg300=0 total=0 total=1"),
+            format!("{some}\nfull avg10=0 avg10=20 avg60=0 avg300=0 total=0"),
+            format!("{some}\nfull avg10=0 avg60=0 avg300=0 total=unknown"),
+        ] {
+            assert!(
+                MemoryPressureStall::parse(&incomplete).is_none(),
+                "{incomplete:?}"
+            );
+        }
+        for invalid in ["NaN", "inf", "-inf", "-0.1", "100.1", "unknown"] {
+            let sample = format!("{some}\nfull avg10={invalid} avg60=0 avg300=0 total=0");
+            assert!(MemoryPressureStall::parse(&sample).is_none(), "{sample}");
+        }
+    }
+
+    #[test]
     fn test_telemetry_from_info() {
         init_test_logging();
         info!("TEST START: test_telemetry_from_info");
@@ -1072,7 +1182,7 @@ Pages purgeable:                          25000.\n";
         assert!(utilization < 92.0);
         // No PSI (old kernel / non-Linux): unchanged.
         assert_eq!(mem.admission_pressure(), utilization);
-        // Healthy PSI never lowers or raises the score.
+        // Low but nonzero PSI never lowers the utilization score.
         mem.psi = MemoryPressureStall::parse(
             "some avg10=0 avg60=0.13 avg300=0 total=0\nfull avg10=0 avg60=0.13 avg300=0 total=0",
         );
@@ -1082,5 +1192,167 @@ Pages purgeable:                          25000.\n";
             "some avg10=30 avg60=24.58 avg300=20 total=0\nfull avg10=14 avg60=12 avg300=9 total=0",
         );
         assert_eq!(mem.admission_pressure(), 92.0);
+    }
+
+    fn fleet_memory(
+        total_gib: u64,
+        available_gib: u64,
+        swap_total_gib: u64,
+        swap_used_gib: u64,
+        dirty_gib: u64,
+    ) -> MemoryTelemetry {
+        const GIB_IN_KIB: u64 = 1024 * 1024;
+        MemoryTelemetry::from_info(
+            &MemoryInfo {
+                total_kb: total_gib * GIB_IN_KIB,
+                free_kb: available_gib * GIB_IN_KIB,
+                available_kb: available_gib * GIB_IN_KIB,
+                buffers_kb: 0,
+                cached_kb: 0,
+                swap_total_kb: swap_total_gib * GIB_IN_KIB,
+                swap_free_kb: (swap_total_gib - swap_used_gib) * GIB_IN_KIB,
+                dirty_kb: dirty_gib * GIB_IN_KIB,
+                writeback_kb: 0,
+            },
+            MemoryPressureStall::parse(
+                "some avg10=0 avg60=0 avg300=0 total=12345\nfull avg10=0 avg60=0 avg300=0 total=5678",
+            ),
+        )
+    }
+
+    /// Incident-shaped fixtures, not a live-fleet qualification: the large
+    /// recovered host gains admission while the small squeezed host does not.
+    #[test]
+    fn idle_swap_residue_no_longer_zeros_a_recovered_large_worker() {
+        let ts1 = fleet_memory(215, 36, 71, 33, 0);
+        let raw = ts1.pressure_score;
+        assert!(raw >= 92.0, "incident must reproduce the old critical gate");
+        assert!((80.0..92.0).contains(&ts1.admission_pressure()));
+        assert_eq!(ts1.pressure_score, raw, "retain the raw residency score");
+
+        let recovered_ts1 = fleet_memory(215, 53, 71, 33, 0);
+        assert!(recovered_ts1.admission_pressure() < 80.0);
+
+        for (available, swap_used) in [(5, 26), (8, 20)] {
+            let hz2 = fleet_memory(30, available, 48, swap_used, 0);
+            assert_eq!(hz2.admission_pressure(), hz2.pressure_score);
+        }
+        assert!(fleet_memory(30, 5, 48, 26, 0).admission_pressure() >= 92.0);
+    }
+
+    #[test]
+    fn idle_swap_relief_preserves_ram_dirty_and_stall_pressure() {
+        let dirty = fleet_memory(215, 36, 71, 33, 2);
+        assert!(
+            dirty.admission_pressure() >= 92.0,
+            "dirty memory still gates"
+        );
+        let low_ram = fleet_memory(256, 16, 32, 16, 0);
+        assert!(
+            low_ram.admission_pressure() >= 92.0,
+            "RAM usage still gates"
+        );
+
+        // At the absolute headroom boundary, small-host pressure is retained
+        // until the full 16 GiB is actually available.
+        let below_floor = fleet_memory(64, 15, 8, 8, 0);
+        assert_eq!(below_floor.admission_pressure(), below_floor.pressure_score);
+        let at_floor = fleet_memory(64, 16, 8, 8, 0);
+        assert!(at_floor.admission_pressure() < 80.0);
+
+        let mut ts1 = fleet_memory(215, 36, 71, 33, 0);
+        ts1.psi = None;
+        assert_eq!(ts1.admission_pressure(), ts1.pressure_score);
+        for window in 0..6 {
+            let mut psi = MemoryPressureStall::default();
+            match window {
+                0 => psi.some_avg10 = 0.01,
+                1 => psi.some_avg60 = 0.01,
+                2 => psi.some_avg300 = 0.01,
+                3 => psi.full_avg10 = 0.01,
+                4 => psi.full_avg60 = 0.01,
+                _ => psi.full_avg300 = 0.01,
+            }
+            ts1.psi = Some(psi);
+            assert_eq!(
+                ts1.admission_pressure(),
+                ts1.pressure_score,
+                "window {window}"
+            );
+        }
+
+        let mut thrashing = fleet_memory(215, 53, 71, 33, 0);
+        thrashing.psi = MemoryPressureStall::parse(
+            "some avg10=30 avg60=24.58 avg300=20 total=12345\nfull avg10=14 avg60=12 avg300=9 total=5678",
+        );
+        assert_eq!(thrashing.admission_pressure(), 92.0);
+    }
+
+    #[test]
+    fn idle_swap_relief_requires_valid_supported_memory_evidence() {
+        let ts1 = fleet_memory(215, 36, 71, 33, 0);
+        for invalid in [
+            MemoryTelemetry {
+                total_gb: f64::NAN,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                total_gb: 0.0,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                available_gb: f64::INFINITY,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                available_gb: 216.0,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                used_percent: f64::NAN,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                swap_used_gb: 0.0,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                swap_used_gb: -1.0,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                swap_used_gb: f64::NAN,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                dirty_mb: f64::NAN,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                dirty_mb: -1.0,
+                ..ts1.clone()
+            },
+            MemoryTelemetry {
+                psi: Some(MemoryPressureStall {
+                    some_avg10: f64::NAN,
+                    ..MemoryPressureStall::default()
+                }),
+                ..ts1.clone()
+            },
+            // This score cannot be explained by the known RAM/dirty/swap
+            // formula, so its extra pressure must not be guessed away.
+            MemoryTelemetry {
+                total_gb: 64.0,
+                available_gb: 32.0,
+                used_percent: 50.0,
+                ..ts1.clone()
+            },
+        ] {
+            assert_eq!(
+                invalid.admission_pressure(),
+                invalid.pressure_score,
+                "{invalid:?}"
+            );
+        }
     }
 }

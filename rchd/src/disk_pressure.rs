@@ -1335,7 +1335,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::disk::{DiskMetrics, DiskTelemetry};
-    use rch_telemetry::collect::memory::{MemoryPressureStall, MemoryTelemetry};
+    use rch_telemetry::collect::memory::{MemoryInfo, MemoryPressureStall, MemoryTelemetry};
     use rch_telemetry::protocol::{TelemetrySource, WorkerTelemetry};
 
     #[test]
@@ -2571,6 +2571,118 @@ mod tests {
         let result = evaluate_pressure_policy(&caps, Some(&telemetry), &cfg);
         assert_eq!(result.state, PressureState::Warning);
         assert_eq!(result.reason_code, "memory_pressure_warning");
+    }
+
+    fn swap_resident_telemetry(age_secs: i64) -> ReceivedTelemetry {
+        let mut received = test_received_telemetry(20.0, 0.0, age_secs);
+        // bd-g7r56: ts1's lower observed headroom (215 GiB RAM, 36 GiB
+        // available, 33/71 GiB swap) crossed 92 without any memory stalls.
+        received.telemetry.memory = MemoryTelemetry::from_info(
+            &MemoryInfo {
+                total_kb: 215 * 1_048_576,
+                free_kb: 36 * 1_048_576,
+                available_kb: 36 * 1_048_576,
+                buffers_kb: 0,
+                cached_kb: 0,
+                swap_total_kb: 71 * 1_048_576,
+                swap_free_kb: 38 * 1_048_576,
+                dirty_kb: 0,
+                writeback_kb: 0,
+            },
+            MemoryPressureStall::parse(
+                "some avg10=0 avg60=0 avg300=0 total=12345\nfull avg10=0 avg60=0 avg300=0 total=5678",
+            ),
+        );
+        received
+    }
+
+    #[tokio::test]
+    async fn idle_swap_headroom_restores_reservations_without_admitting_active_pressure() {
+        let caps = test_capabilities(80.0, 200.0);
+        let policy = DiskPressurePolicyConfig::default();
+        let worker = WorkerState::new(rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("swap-residue"),
+            host: "worker".to_string(),
+            user: "builder".to_string(),
+            identity_file: "/test/key".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: Vec::new(),
+            tools: Vec::new(),
+        });
+        worker.set_status(rch_common::WorkerStatus::Healthy).await;
+        let recovered = swap_resident_telemetry(5);
+        assert!(recovered.telemetry.memory.pressure_score >= 92.0);
+
+        let mut unknown = recovered.clone();
+        unknown.telemetry.memory.psi = None;
+        let assessment = evaluate_pressure_policy(&caps, Some(&unknown), &policy);
+        assert_eq!(assessment.state, PressureState::Critical);
+        worker.set_pressure_assessment(assessment).await;
+        assert!(
+            !worker.reserve_slots(1).await,
+            "missing PSI is not recovery"
+        );
+        assert_eq!(worker.used_slots(), 0);
+
+        let assessment = evaluate_pressure_policy(&caps, Some(&recovered), &policy);
+        assert_eq!(assessment.state, PressureState::Warning);
+        assert_eq!(assessment.reason_code, "memory_pressure_warning");
+        assert!(assessment.telemetry_fresh);
+        worker.set_pressure_assessment(assessment).await;
+        assert!(
+            worker.reserve_slots(1).await,
+            "recovered capacity is usable"
+        );
+        worker.release_slots(1).await;
+
+        let mut stalled = recovered.clone();
+        stalled.telemetry.memory.psi.as_mut().unwrap().some_avg10 = 0.01;
+        let mut dirty = recovered.clone();
+        dirty.telemetry.memory.dirty_mb = 2048.0;
+        dirty.telemetry.memory.pressure_score = 100.0;
+        let mut low_ram = recovered.clone();
+        low_ram.telemetry.memory.available_gb = 8.0;
+        low_ram.telemetry.memory.used_percent = 96.0;
+        low_ram.telemetry.memory.pressure_score = 100.0;
+        for (reason, sample) in [
+            ("new stalls", stalled),
+            ("dirty RAM", dirty),
+            ("low RAM", low_ram),
+        ] {
+            let assessment = evaluate_pressure_policy(&caps, Some(&sample), &policy);
+            assert_eq!(assessment.state, PressureState::Critical, "{reason}");
+            worker.set_pressure_assessment(assessment).await;
+            assert!(!worker.reserve_slots(1).await, "{reason}");
+            assert_eq!(worker.used_slots(), 0, "{reason}");
+        }
+    }
+
+    #[test]
+    fn idle_swap_headroom_does_not_refresh_old_memory_evidence_or_bypass_disk_pressure() {
+        let caps = test_capabilities(80.0, 200.0);
+        let policy = DiskPressurePolicyConfig::default();
+        let stale = swap_resident_telemetry(600);
+        let assessment = evaluate_pressure_policy(&caps, Some(&stale), &policy);
+        assert!(!assessment.telemetry_fresh);
+        assert_eq!(assessment.state, PressureState::TelemetryGap);
+        assert_eq!(assessment.reason_code, "telemetry_unavailable");
+
+        let fresh = swap_resident_telemetry(0);
+        let mut assessment = evaluate_pressure_policy(&caps, Some(&fresh), &policy);
+        let received_at = current_unix_ms() - 600_000;
+        assessment.telemetry_received_at_unix_ms = Some(received_at);
+        let refreshed = refresh_pressure_policy(&caps, &assessment, &policy);
+        assert!(!refreshed.telemetry_fresh);
+        assert_eq!(refreshed.state, PressureState::TelemetryGap);
+        assert_eq!(refreshed.telemetry_received_at_unix_ms, Some(received_at));
+
+        for sample in [&fresh, &stale] {
+            let disk_full =
+                evaluate_pressure_policy(&test_capabilities(4.0, 200.0), Some(sample), &policy);
+            assert_eq!(disk_full.state, PressureState::Critical);
+            assert!(disk_full.reason_code.starts_with("disk_"));
+        }
     }
 
     /// A worker thrashing on swap with RAM that still looks "available" must be
