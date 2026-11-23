@@ -472,6 +472,7 @@ mod tests {
                 &pipe,
                 &stderr,
                 &deadline,
+                &std::sync::atomic::AtomicBool::new(false),
                 |mut output, _stderr| {
                     follow(
                         ID,

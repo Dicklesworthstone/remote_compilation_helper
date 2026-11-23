@@ -680,6 +680,42 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn both_console_streams_preserve_direct_client_cancellation() {
+        for stdout_stalls in [false, true] {
+            with_full_pipe(move |pipe| {
+                let ordinary = tempfile::tempfile().unwrap();
+                let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(30));
+                let stopped = AtomicBool::new(false);
+                let (stdout, stderr) = if stdout_stalls {
+                    (&pipe, &ordinary)
+                } else {
+                    (&ordinary, &pipe)
+                };
+                let error = client_console_to(
+                    stdout,
+                    stderr,
+                    &deadline,
+                    &stopped,
+                    |stdout, stderr| {
+                        // The console already owns both descriptors when the
+                        // direct client's signal bridge revokes its writes.
+                        stopped.store(true, Ordering::Release);
+                        if stdout_stalls {
+                            stdout.write_all(b"verified final stdout")
+                        } else {
+                            stderr.write_all(b"live stderr")
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                assert_eq!(ordinary.metadata().unwrap().len(), 0);
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn a_failed_client_can_report_to_the_same_full_stderr_without_hanging_again() {
         with_full_pipe(|pipe| {
             report_client_error_to(

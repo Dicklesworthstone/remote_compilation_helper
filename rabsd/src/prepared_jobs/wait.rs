@@ -2,6 +2,7 @@
 //! Exiting this client does NOT cancel the job, resume an uncertain execution,
 //! acknowledge worker results, or submit another command.
 
+use super::follow::Completion;
 use super::{
     CLIENT_BUDGET, COMPLETION_BUDGET, ClientDeadline, exchange_until, invalid, remaining,
     report_client_error, with_client_console,
@@ -9,7 +10,7 @@ use super::{
 use asupersync::net::unix::UnixStream;
 use rabsd::coord::prepared_operation::PreparedCompletion;
 use serde_json::{Value, json};
-use std::io;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -45,12 +46,6 @@ fn arguments(args: &[String]) -> Result<(&str, Duration, bool), &'static str> {
         return Err("wait timeout must be between 1 and 86400 seconds");
     }
     Ok((id, Duration::from_secs(seconds), live_stderr))
-}
-
-#[derive(Debug)]
-enum Completion {
-    CancelledBeforeStart,
-    Ready(Box<PreparedCompletion>),
 }
 
 pub(super) fn fingerprint(status: &Value, id: &str) -> io::Result<String> {
@@ -168,10 +163,14 @@ fn follow(
                 {
                     return Err(invalid("inconsistent pre-execution cancellation"));
                 }
-                return Ok(Completion::CancelledBeforeStart);
+                return Ok(Completion::CancelledBeforeStart {
+                    status: status.clone(),
+                });
             }
             Some("completed" | "cancelled") => {
-                if status["execution_may_have_run"] != true {
+                if status["execution_may_have_run"] != true
+                    || !status["attempt"].as_u64().is_some_and(|attempt| attempt > 0)
+                {
                     return Err(invalid("terminal job lacks executed-result evidence"));
                 }
                 let reply = exchange(
@@ -180,7 +179,11 @@ fn follow(
                     until.min(Instant::now() + COMPLETION_BUDGET),
                 )?;
                 remaining(until)?;
-                if reply["kind"] != "prepared-completion" || reply["operation_id"] != id {
+                if reply["kind"] != "prepared-completion"
+                    || reply["operation_id"] != id
+                    || reply["publication_authorized"] != false
+                    || reply["reexecute"] != false
+                {
                     return Err(invalid(
                         "daemon could not verify the job's complete local delivery",
                     ));
@@ -188,10 +191,67 @@ fn follow(
                 let proof: PreparedCompletion =
                     serde_json::from_value(reply["completion"].clone())?;
                 matches_status(&proof, status, id, &digest)?;
-                return Ok(Completion::Ready(Box::new(proof)));
+                return Ok(Completion::Ready {
+                    status: status.clone(),
+                    proof: Box::new(proof),
+                });
             }
             _ => return Err(invalid("unknown job state; refusing completion replay")),
         }
+    }
+}
+
+fn deliver(
+    id: &str,
+    deadline: &ClientDeadline,
+    mut exchange: impl FnMut(&Value, Instant) -> io::Result<Value>,
+    sleep: impl FnMut(Duration),
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    exposed: &mut bool,
+) -> io::Result<i32> {
+    let mut exchange = |request: &Value, request_deadline: Instant| {
+        let reply = exchange(request, request_deadline.min(deadline.get()))?;
+        if request["kind"] == "prepared-status"
+            && matches!(
+                reply["operation"]["state"].as_str(),
+                Some("completed" | "cancelled")
+            )
+        {
+            deadline.complete();
+        }
+        Ok(reply)
+    };
+    let completion = follow(id, deadline.get(), &mut exchange, sleep)?;
+    let until = deadline.complete();
+    let (status, proof) = match completion {
+        Completion::CancelledBeforeStart { status } => (status, None),
+        Completion::Ready { status, proof } => (status, Some(proof)),
+    };
+    let snapshot = proof
+        .as_ref()
+        .map(|proof| proof.snapshot(until))
+        .transpose()?;
+    remaining(until)?;
+    // Snapshot verification can outlive a concurrent recovery or a changed
+    // attempt. Match the same terminal owner again before exposing any Cargo
+    // readiness events, just as live-stderr and NDJSON followers do.
+    let reply = exchange(
+        &json!({"kind":"prepared-status", "operation_id":id}),
+        until.min(Instant::now() + CLIENT_BUDGET),
+    )?;
+    remaining(until)?;
+    super::follow::final_status(&status, &reply, id, proof.as_deref())?;
+    match (proof, snapshot) {
+        (Some(proof), Some(snapshot)) => {
+            // A failed or partial console write may already be visible. Once
+            // this frontier is crossed, never replay or perform fallback.
+            *exposed = true;
+            snapshot.emit(stdout, stderr, until)?;
+            Ok(i32::from(proof.exit_code))
+        }
+        (None, None) => Ok(130),
+        _ => Err(invalid("job completion lacks its verified snapshot")),
     }
 }
 
@@ -212,42 +272,20 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .map_err(|error| io::Error::other(format!("job wait runtime: {error:?}")))?;
-        let completion = follow(
+        deliver(
             id,
-            deadline.get(),
+            &deadline,
             |request, request_deadline| {
-                let reply = rabs_asupersync::daemon_runtime::block_on_top_level(
+                rabs_asupersync::daemon_runtime::block_on_top_level(
                     &runtime,
-                    exchange_until(
-                        UnixStream::connect(socket),
-                        request,
-                        request_deadline.min(deadline.get()),
-                    ),
-                )?;
-                if request["kind"] == "prepared-status"
-                    && matches!(
-                        reply["operation"]["state"].as_str(),
-                        Some("completed" | "cancelled")
-                    )
-                {
-                    deadline.complete();
-                }
-                Ok(reply)
+                    exchange_until(UnixStream::connect(socket), request, request_deadline),
+                )
             },
             std::thread::sleep,
-        )?;
-        let proof = match completion {
-            Completion::CancelledBeforeStart => return Ok(130),
-            Completion::Ready(proof) => *proof,
-        };
-        let until = deadline.complete();
-        let snapshot = proof.snapshot(until)?;
-        remaining(until)?;
-        // A failed or partial console write may already be visible. Once this
-        // frontier is crossed, never repeat diagnostics or perform fallback.
-        exposed = true;
-        snapshot.emit(&mut stdout, &mut stderr, until)?;
-        Ok(i32::from(proof.exit_code))
+            &mut stdout,
+            &mut stderr,
+            &mut exposed,
+        )
     });
     match result {
         Ok(code) => code,
@@ -272,7 +310,7 @@ mod tests {
     }
     fn status(state: &str) -> Value {
         json!({"kind":"prepared-operation", "operation":{
-            "id":ID,"request_sha256":"ab".repeat(32),"state":state,
+            "id":ID,"request_sha256":"ab".repeat(32),"state":state,"attempt":1,
             "request_id":7,"worker":"worker","worker_spki_sha256":"01".repeat(32),
             "delivery":"/delivery","exit_code":1,"stop_reason":null,
             "outputs_installed":false,"execution_may_have_run":true,
@@ -437,7 +475,7 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        assert!(matches!(done, Completion::CancelledBeforeStart));
+        assert!(matches!(done, Completion::CancelledBeforeStart { .. }));
         assert_eq!(calls, 1);
     }
 
@@ -514,7 +552,8 @@ mod tests {
                         "request_sha256":"ab".repeat(32)})
                         );
                         Ok(
-                            json!({"kind":"prepared-completion", "operation_id":ID, "completion":supplied}),
+                            json!({"kind":"prepared-completion", "operation_id":ID, "completion":supplied,
+                                "publication_authorized":false, "reexecute":false}),
                         )
                     }
                 },
@@ -524,12 +563,149 @@ mod tests {
             if change.is_some() {
                 assert!(result.is_err());
             } else {
-                let Completion::Ready(actual) = result.unwrap() else {
+                let Completion::Ready { proof: actual, .. } = result.unwrap() else {
                     panic!("lost compiler result")
                 };
                 assert_eq!(*actual, proof);
                 assert_eq!(actual.exit_code, 1);
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_wait_rechecks_terminal_owner_before_emitting_either_stream() {
+        // Share the live follower's real private receipt/diagnostic fixture.
+        // Only the daemon exchange is scripted; snapshot verification and
+        // console delivery run through the production path.
+        use super::super::live::tests::verified_delivery::{delivered_status, fixture};
+
+        for mutation in [
+            None,
+            Some("lost-status"),
+            Some("attempt"),
+            Some("state"),
+            Some("request_sha256"),
+            Some("worker"),
+            Some("request_id"),
+            Some("delivery"),
+            Some("exit_code"),
+            Some("outputs_installed"),
+        ] {
+            let (_owner, proof) = fixture();
+            let expected_stdout = std::fs::read(proof.delivery.join("diagnostics/stdout")).unwrap();
+            let expected_stderr = std::fs::read(proof.delivery.join("diagnostics/stderr")).unwrap();
+            let terminal = delivered_status(&proof, "completed");
+            let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(2));
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let mut exposed = false;
+            let mut queries = Vec::new();
+            let result = deliver(
+                ID,
+                &deadline,
+                |query, _| {
+                    queries.push(query["kind"].as_str().unwrap().to_owned());
+                    match queries.len() {
+                        1 => Ok(terminal.clone()),
+                        2 => Ok(json!({
+                            "kind":"prepared-completion", "operation_id":ID,
+                            "completion":proof, "publication_authorized":false, "reexecute":false,
+                        })),
+                        3 => {
+                            let mut current = terminal.clone();
+                            match mutation {
+                                None => {}
+                                Some("lost-status") => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "lost final status",
+                                    ));
+                                }
+                                Some(field) => {
+                                    current["operation"][field] = match field {
+                                        "attempt" => json!(2),
+                                        "state" => json!("running"),
+                                        "request_sha256" => json!("ff".repeat(32)),
+                                        "worker" => json!("other-worker"),
+                                        "request_id" => json!(8),
+                                        "delivery" => json!("/other-delivery"),
+                                        "exit_code" => json!(1),
+                                        "outputs_installed" => json!(false),
+                                        _ => unreachable!(),
+                                    };
+                                }
+                            }
+                            Ok(current)
+                        }
+                        _ => panic!("wait retried after its completion boundary"),
+                    }
+                },
+                |_| panic!("a terminal wait cannot poll"),
+                &mut stdout,
+                &mut stderr,
+                &mut exposed,
+            );
+            assert_eq!(
+                queries,
+                ["prepared-status", "prepared-completion", "prepared-status"],
+                "{mutation:?}"
+            );
+            if mutation.is_none() {
+                assert_eq!(result.unwrap(), 0);
+                assert!(exposed);
+                assert_eq!(stdout, expected_stdout);
+                assert_eq!(stderr, expected_stderr);
+            } else {
+                assert!(result.is_err(), "{mutation:?}");
+                assert!(!exposed, "{mutation:?}");
+                assert!(stdout.is_empty(), "{mutation:?}");
+                assert!(stderr.is_empty(), "{mutation:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_wait_rechecks_the_same_unexecuted_attempt() {
+        for changed in [false, true] {
+            let mut terminal = status("cancelled");
+            terminal["operation"]["attempt"] = json!(0);
+            terminal["operation"]["execution_may_have_run"] = json!(false);
+            terminal["operation"]["exit_code"] = json!(130);
+            terminal["operation"]["cancel_requested"] = json!(true);
+            terminal["operation"]["stop_reason"] = json!("cancelled");
+            let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(2));
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let mut exposed = false;
+            let mut calls = 0;
+            let result = deliver(
+                ID,
+                &deadline,
+                |query, _| {
+                    calls += 1;
+                    assert_eq!(query["kind"], "prepared-status");
+                    assert!(calls <= 2);
+                    let mut current = terminal.clone();
+                    if changed && calls == 2 {
+                        current["operation"]["state"] = json!("running");
+                        current["operation"]["attempt"] = json!(1);
+                        current["operation"]["execution_may_have_run"] = json!(true);
+                    }
+                    Ok(current)
+                },
+                |_| panic!("an unexecuted cancellation cannot poll"),
+                &mut stdout,
+                &mut stderr,
+                &mut exposed,
+            );
+            assert_eq!(calls, 2);
+            if changed {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), 130);
+            }
+            assert!(!exposed);
+            assert!(stdout.is_empty());
+            assert!(stderr.is_empty());
         }
     }
 }

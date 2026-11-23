@@ -10636,7 +10636,7 @@ fn generated_terminal_metadata_replay(committed: bool) {
         let stock_files = workspace_dag_metadata_files(&stock_target, &output, libraries);
         let mut families =
             BTreeSet::from([stock_target.parent().unwrap().parent().unwrap().to_owned()]);
-        let (mut worker, environment) = NativeWorker::start(root);
+        let (worker, environment) = NativeWorker::start(root);
         let mut previous: Option<BTreeMap<String, String>> = None;
         let mut executions = 0;
         for number in 1..=7 {

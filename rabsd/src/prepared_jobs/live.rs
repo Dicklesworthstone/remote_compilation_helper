@@ -245,7 +245,7 @@ pub(super) fn run(id: &str, budget: Duration, socket: &str) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::VecDeque;
 
@@ -498,6 +498,7 @@ mod tests {
                 &stdout,
                 &pipe,
                 &deadline,
+                &std::sync::atomic::AtomicBool::new(false),
                 |mut stdout, mut stderr| {
                     deliver(
                         ID,
@@ -532,7 +533,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    mod verified_delivery {
+    pub(in crate::prepared_jobs) mod verified_delivery {
         use super::*;
         use rabsd::coord::prepared_operation::PreparedCompletion;
         use std::fs;
@@ -555,7 +556,7 @@ mod tests {
         // This fixture scripts the trusted daemon boundary, not execution. Real
         // private receipt/diagnostic files still pass every production snapshot,
         // identity, complete-stream, prefix and final-status check in deliver.
-        fn fixture() -> (tempfile::TempDir, PreparedCompletion) {
+        pub(in crate::prepared_jobs) fn fixture() -> (tempfile::TempDir, PreparedCompletion) {
             let owner = tempfile::tempdir().unwrap();
             let delivery = owner.path().canonicalize().unwrap().join("delivery");
             fs::create_dir(&delivery).unwrap();
@@ -598,7 +599,10 @@ mod tests {
             (owner, proof)
         }
 
-        fn delivered_status(proof: &PreparedCompletion, state: &str) -> Value {
+        pub(in crate::prepared_jobs) fn delivered_status(
+            proof: &PreparedCompletion,
+            state: &str,
+        ) -> Value {
             let mut reply = status(state);
             reply["operation"]["delivery"] = json!(proof.delivery);
             reply["operation"]["exit_code"] = json!(proof.exit_code);
@@ -686,6 +690,7 @@ mod tests {
                     &pipe,
                     &stderr,
                     &deadline,
+                    &std::sync::atomic::AtomicBool::new(false),
                     |mut stdout, mut stderr| {
                         deliver(
                             ID,
