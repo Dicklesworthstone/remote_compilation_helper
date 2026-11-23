@@ -418,6 +418,23 @@ pub fn family_footprint_key(project_id: &str, command: &str) -> String {
     let kind = rch_common::classify_command(command)
         .kind
         .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
+    serde_json::to_string(&(
+        3_u8,
+        footprint_project(project_id),
+        "family",
+        kind,
+        rch_common::BuildDiskBudget::has_wide_scope(command),
+    ))
+    .expect("string tuple serializes")
+}
+
+/// Version 2 mixed narrow and workspace-wide jobs, and charged whole retained
+/// pools to each family. Preserve that upper bound for wide jobs, but do not
+/// attribute it to a new narrow command whose actual scope was never recorded.
+pub(crate) fn unscoped_family_footprint_key(project_id: &str, command: &str) -> String {
+    let kind = rch_common::classify_command(command)
+        .kind
+        .map_or_else(|| "other".to_string(), |kind| format!("{kind:?}"));
     serde_json::to_string(&(2_u8, footprint_project(project_id), "family", kind))
         .expect("string tuple serializes")
 }
@@ -1200,9 +1217,21 @@ mod tests {
             footprint_key("fgdb", "cargo test --profile release"),
             footprint_key("fgdb", "cargo test")
         );
-        assert_eq!(
+        assert_ne!(
             family_footprint_key("fgdb", "cargo test --all-features"),
             family_footprint_key("fgdb", "cargo test -p core")
+        );
+        assert_eq!(
+            family_footprint_key("fgdb", "cargo test --all-features"),
+            family_footprint_key("fgdb", "cargo test --workspace --all-targets")
+        );
+        assert_eq!(
+            family_footprint_key("fgdb", "cargo test -p core --test first"),
+            family_footprint_key("fgdb", "cargo test -p core --test second")
+        );
+        assert_ne!(
+            family_footprint_key("fgdb", "cargo test -p core"),
+            unscoped_family_footprint_key("fgdb", "cargo test -p core")
         );
     }
 

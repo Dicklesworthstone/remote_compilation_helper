@@ -858,16 +858,22 @@ pub struct BuildDiskBudget {
 impl BuildDiskBudget {
     pub const GIB: u64 = 1 << 30;
 
-    /// Conservative cold output estimates until this project and command have
-    /// successful, attributable worker measurements. Test workspaces have much
-    /// larger linker and incremental outputs than metadata-only checks.
-    pub fn cold_growth_gib(command: &str) -> Option<u32> {
-        let wide = command.split_whitespace().any(|arg| {
+    /// Keep learned command families aligned with the cold estimator's scope.
+    /// Workspace/all-target builds must not set a narrow package's prior.
+    pub fn has_wide_scope(command: &str) -> bool {
+        command.split_whitespace().any(|arg| {
             matches!(
                 arg,
                 "--workspace" | "--all" | "--all-targets" | "--all-features"
             )
-        });
+        })
+    }
+
+    /// Conservative cold output estimates until this project and command have
+    /// successful, attributable worker measurements. Test workspaces have much
+    /// larger linker and incremental outputs than metadata-only checks.
+    pub fn cold_growth_gib(command: &str) -> Option<u32> {
+        let wide = Self::has_wide_scope(command);
         Some(match crate::classify_command(command).kind? {
             CompilationKind::CargoTest
             | CompilationKind::CargoNextest
