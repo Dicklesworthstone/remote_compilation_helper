@@ -194,6 +194,7 @@ fn source_packages(command: &str) -> Option<Vec<String>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // One probe's full context; a struct would only rename it.
 async fn metadata_json(
     command: &str,
     invocation_root: &Path,
