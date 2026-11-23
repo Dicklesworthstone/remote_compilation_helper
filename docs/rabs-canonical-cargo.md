@@ -123,7 +123,8 @@ and the shared remote coordinator.
 | `--remote` | `canonical-compile-remote-v1` | Shared pinned-TLS coordinator |
 
 The canonical modes expose `build`, `check`, `clippy`, `doc`, `test`, `run`, and
-`bench`. The local and shared-coordinator modes support explicitly closed or
+`bench`. Local and remote canonical profiles also support `nextest run`, as
+described below. The local and shared-coordinator modes support explicitly closed or
 captured file input for executing `run`/`test`/`bench`. Worker execution uses
 closed stdin.
 
@@ -157,6 +158,65 @@ Cargo command replaces the saved command and selection; with no command, the
 profile's command and selection remain in effect. Arguments after Cargo's own
 `--` remain program or test arguments and are validated by the shared canonical
 command contract.
+
+### Run nextest with captured inputs
+
+`rabs-cargo --local` and `--remote` accept `nextest run`. The captured toolchain
+must contain an ordinary executable `bin/cargo-nextest` alongside `bin/cargo`
+and `bin/rustc`. The runner is included in the toolchain identity and is never
+discovered through the ambient `PATH`. A local profile's persistent service and
+the pinned remote canonical coordinator use the same execution path.
+
+```sh
+rabs-cargo --local LOCAL.json -- nextest run --workspace
+rabs-cargo --remote REMOTE.json -- nextest run -p core \
+  --cargo-profile release --profile ci --test-threads 1 \
+  -E 'test(roundtrip)' -- --exact
+rabs-cargo --local LOCAL.json -- nextest run --lib --no-run
+```
+
+Compilation and runner options remain distinct:
+
+| Intent | Command-line option | Profile selection field |
+|---|---|---|
+| Cargo compilation profile | `--cargo-profile NAME` or `--release` | `profile` or `release` |
+| Nextest configuration profile | `--profile NAME` | `runner_profile` |
+| Explicit test concurrency | `--test-threads N`, `--jobs N`, or `-jN` | `test_threads` |
+| Nextest filter expressions | Repeated `--filterset EXPR` or `-E EXPR` | `filtersets` |
+| One optional test-name filter | Positional filter | `test_filter` |
+| Emulated test-harness arguments | Arguments after `--` | `test_args` |
+
+The profile's `jobs` supplies nextest's independent `--build-jobs`; it is never
+passed as nextest's `--jobs`, which controls test concurrency. Omitting
+`test_threads` preserves nextest's project configuration, including serial test
+profiles. Explicit thread counts are bounded positive integers from 1 to 4096.
+Package, feature and target-kind selectors retain the shared canonical command
+bounds; nextest accepts at most one built-in compilation target. Doctests are
+not part of this command: use the existing `test --doc` path for them.
+
+The nonexecuting graph query uses captured Cargo `test --no-run` with the same
+compilation selectors. Runner profiles, filters, thread counts and harness
+arguments never narrow that graph or consume the driver's planning controls.
+The actual operation then executes captured nextest with its normal output and
+current exit status. It does not request Cargo's `--message-format=json` from
+nextest or interpret nextest results as Cargo artifact announcements.
+
+Every requested test run executes afresh, including after private target reuse.
+Tests, setup scripts and test-pass results receive no action-cache authority;
+the existing isolated dependency-compilation boundary still applies. The
+complete captured source and toolchain, including nextest itself, remain part
+of private target identity. `--no-run` compiles without running test bodies and
+delivers the completed target tree. Nextest defaults to closed stdin; executing
+tests may use the existing captured-input policy. Compilation-only requests
+cannot inherit or capture stdin.
+
+The direct `--worker` frontend rejects nextest before preparing an operation:
+its separate Cargo JSON artifact-delivery contract does not yet support this
+runner. Use `--local` or `--remote`. `nextest list`, arbitrary configuration
+overrides, user-selected manifests/output roots and machine-output overrides
+are outside this bounded frontend.
+
+### Input and toolchain selection
 
 `--stdin closed` selects EOF. `--stdin-file RELATIVE` selects an ordinary input
 file within the approved `source_root`; the native driver captures it with the
@@ -1435,8 +1495,9 @@ performance gates and the required canary/soak are not completed by this fronten
 ## Local canonical Cargo commands with dependency caching
 
 `rabsd --canonical-compile-local PROFILE.json` runs the captured native Cargo as
-`cargo check`, `cargo build`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo run` or
-`cargo bench`, always offline and locked, with the selected packages, features and targets
+`cargo check`, `cargo build`, `cargo clippy`, `cargo doc`, `cargo test`,
+`cargo nextest run`, `cargo run` or `cargo bench`, always offline and locked,
+with the selected packages, features and targets
 inside the canonical namespace and connects
 its rustc requests to an operation-owned coordinator. Eligible external registry,
 locked Git and verified directory-source libraries use the existing metadata

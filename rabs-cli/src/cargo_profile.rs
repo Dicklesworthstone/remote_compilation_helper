@@ -292,9 +292,11 @@ fn logical(
             command == CompilationCommand::Run
                 || (matches!(
                     command,
-                    CompilationCommand::Test | CompilationCommand::Bench
+                    CompilationCommand::Test
+                        | CompilationCommand::Bench
+                        | CompilationCommand::Nextest
                 ) && !selection.no_run),
-            "captured stdin_file requires run, test or bench execution",
+            "captured stdin_file requires run, test, nextest or bench execution",
         )?;
         require(
             value.as_str().is_some_and(relative_member),
@@ -352,7 +354,10 @@ fn logical(
     if matches!(command, CompilationCommand::Test | CompilationCommand::Doc) {
         environment.push(("RUSTDOC".into(), "/__rabs/toolchain/bin/rustdoc".into()));
     }
-    if command == CompilationCommand::Clippy {
+    if matches!(
+        command,
+        CompilationCommand::Clippy | CompilationCommand::Nextest
+    ) {
         environment.push(("CARGO".into(), "/__rabs/toolchain/bin/cargo".into()));
     }
     command_environment(profile.get("env"), environment, "/__rabs/workspace")?;
@@ -971,6 +976,9 @@ fn validate_profile(
     let mut tools = vec!["cargo", "rustc"];
     if command == CompilationCommand::Clippy {
         tools.extend(["cargo-clippy", "clippy-driver"]);
+    }
+    if command == CompilationCommand::Nextest {
+        tools.push("cargo-nextest");
     }
     if matches!(command, CompilationCommand::Test | CompilationCommand::Doc) {
         tools.push("rustdoc");

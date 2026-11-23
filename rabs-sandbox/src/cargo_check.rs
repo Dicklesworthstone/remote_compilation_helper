@@ -1,4 +1,5 @@
-//! Admission of the units Cargo selected for check, build, Clippy, doc, test, run or bench.
+//! Admission of the units Cargo selected for check, build, Clippy, doc, test,
+//! nextest, run or bench.
 //!
 //! `cargo metadata` describes packages, including optional and development
 //! dependencies that a particular command will never execute. Cargo's nightly
@@ -17,7 +18,7 @@
 //! packages, features or targets. A graph containing project executors requires
 //! closed per-action worker execution for dependency caching: project code can
 //! access the wrapper endpoint, so its claimed local completions are not trusted
-//! compiler evidence. Test, run and bench operations require the same boundary
+//! compiler evidence. Test, nextest, run and bench operations require the same boundary
 //! because their executables can reach that endpoint too. Unknown modes remain
 //! refused; program, test and benchmark outcomes are not cached.
 
@@ -436,6 +437,7 @@ pub fn validate_compilation_unit_graph(
     let mut project_executors = matches!(
         command,
         CompilationCommand::Test
+            | CompilationCommand::Nextest
             | CompilationCommand::Clippy
             | CompilationCommand::Doc
             | CompilationCommand::Run
@@ -457,7 +459,9 @@ pub fn validate_compilation_unit_graph(
                 CompilationCommand::Check | CompilationCommand::Clippy => {
                     matches!(mode, "check" | "build")
                 }
-                CompilationCommand::Build | CompilationCommand::Bench => {
+                CompilationCommand::Build
+                | CompilationCommand::Nextest
+                | CompilationCommand::Bench => {
                     matches!(mode, "build" | "test")
                 }
                 CompilationCommand::Test => matches!(mode, "build" | "test" | "doctest"),
@@ -1278,6 +1282,48 @@ mod tests {
             let build = validate_compilation_unit_graph(&graph, CompilationCommand::Build).unwrap();
             assert!(!build.requires_closed_dependency_execution());
         }
+    }
+
+    #[test]
+    fn nextest_graphs_keep_closed_authority_and_exclude_doctests_and_unrelated_modes() {
+        let mut graph = graph();
+        graph["units"][1]["mode"] = json!("build");
+        for mode in ["build", "test"] {
+            graph["units"][0]["mode"] = json!(mode);
+            let report =
+                validate_compilation_unit_graph(&graph, CompilationCommand::Nextest).unwrap();
+            assert!(report.requires_closed_dependency_execution());
+            assert!(!report.contains_doctests());
+            assert_eq!((report.units, report.packages, report.roots), (2, 2, 1));
+            assert_eq!(
+                report
+                    .workspace_units()
+                    .iter()
+                    .filter(|unit| unit.source_path() == "/__rabs/workspace/app/src/lib.rs")
+                    .count(),
+                usize::from(mode == "build"),
+                "a test executable must never acquire library cache authority"
+            );
+        }
+        for mode in [
+            "check",
+            "doctest",
+            "doc",
+            "run",
+            "run-custom-build",
+            "future-mode",
+        ] {
+            graph["units"][0]["mode"] = json!(mode);
+            assert!(
+                validate_compilation_unit_graph(&graph, CompilationCommand::Nextest).is_err(),
+                "{mode}"
+            );
+        }
+        let scripts = script_graph(CompilationCommand::Build);
+        let report =
+            validate_compilation_unit_graph(&scripts, CompilationCommand::Nextest).unwrap();
+        assert!(report.requires_closed_dependency_execution());
+        assert!(!report.contains_doctests());
     }
 
     #[test]

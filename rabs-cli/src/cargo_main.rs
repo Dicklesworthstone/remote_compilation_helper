@@ -52,12 +52,16 @@ wrapper opt-outs remain respected. Explicit CARGO_RABS_ROOT_* admission uses the
 matching rabs-cargo-root owner and cannot be bypassed by a cache setup failure.
 Cache preparation and readiness do not guarantee a cache hit or change serving gates.
 
-Canonical profile commands: check, build, clippy, doc, test, run, bench.
+Canonical profile commands: check, build, clippy, doc, test, nextest run, run, bench.
 Package, workspace, feature, target and profile selectors follow the command.
 Literal program/test/lint arguments follow its -- separator. Manifest, jobs,
 environment and physical roots remain explicit profile settings. With no
 command, retain the profile's command and selection. An explicit command
 replaces both, including an empty selection for ordinary Cargo defaults.
+Nextest requires captured bin/cargo-nextest and a local or remote profile.
+--cargo-profile selects compilation; --profile selects the nextest runner.
+Nextest --test-threads/--jobs/-j selects test concurrency; the profile's jobs
+controls compilation independently. Test bodies run on every invocation.
 
 Worker profiles require an explicit command and retain the existing direct-worker
 contract: one pinned TLS endpoint, or an ordered worker pool with daemon_socket.

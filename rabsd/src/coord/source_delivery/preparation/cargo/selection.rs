@@ -54,21 +54,28 @@ impl SelectedCommand {
             "build" => CompilationCommand::Build,
             "check" => CompilationCommand::Check,
             "test" => CompilationCommand::Test,
+            "nextest" if args.get(1) == Some(&"run") => CompilationCommand::Nextest,
             "clippy" => CompilationCommand::Clippy,
             "doc" => CompilationCommand::Doc,
             "run" => CompilationCommand::Run,
             "bench" => CompilationCommand::Bench,
             _ => {
                 return Err(invalid(
-                    "selected Cargo preparation supports build, check, test, clippy, doc, run and bench",
+                    "selected Cargo preparation supports build, check, test, nextest run, clippy, doc, run and bench",
                 ));
             }
         };
         let native = preparation == PreparationContext::CanonicalLocal;
         require(
+            command != CompilationCommand::Nextest || native,
+            "selected nextest requires the canonical driver and its build-job controls",
+        )?;
+        require(
             request["program"]
                 == if command == CompilationCommand::Clippy {
                     "/__rabs/toolchain/bin/cargo-clippy"
+                } else if command == CompilationCommand::Nextest {
+                    "/__rabs/toolchain/bin/cargo-nextest"
                 } else {
                     "/__rabs/toolchain/bin/cargo"
                 },
@@ -112,12 +119,15 @@ impl SelectedCommand {
                 "selected native Cargo preparation requires the driver's exact compiler controls",
             )?;
         }
-        if command == CompilationCommand::Clippy {
+        if matches!(
+            command,
+            CompilationCommand::Clippy | CompilationCommand::Nextest
+        ) {
             require(
                 inputs.get("CARGO").and_then(Value::as_str) == Some("/__rabs/toolchain/bin/cargo")
                     && inputs.get("RUSTC").and_then(Value::as_str)
                         == Some("/__rabs/toolchain/bin/rustc"),
-                "selected Clippy requires the exact canonical Cargo and rustc bindings",
+                "selected Clippy and nextest require the exact canonical Cargo and rustc bindings",
             )?;
         }
         if command == CompilationCommand::Doc {
@@ -139,7 +149,7 @@ impl SelectedCommand {
                     require(matches!(value, "0" | "1"), "invalid selected Cargo incremental policy")?;
                 } else if !(native
                     && matches!(name.as_str(), "CARGO_TARGET_DIR" | "RUSTC" | "RUSTDOC"))
-                    && !(command == CompilationCommand::Clippy
+                    && !(matches!(command, CompilationCommand::Clippy | CompilationCommand::Nextest)
                         && matches!(name.as_str(), "CARGO" | "RUSTC"))
                     && !(command == CompilationCommand::Doc
                         && matches!(name.as_str(), "RUSTDOC" | "RUSTC"))
@@ -162,7 +172,11 @@ impl SelectedCommand {
         let mut selection = CompilationSelection::default();
         let mut controls = BTreeSet::new();
         let mut jobs = None;
-        let mut at = 1;
+        let mut at = if command == CompilationCommand::Nextest {
+            2
+        } else {
+            1
+        };
         while at < args.len() {
             if args[at] == "--" {
                 if command == CompilationCommand::Clippy {
@@ -181,8 +195,9 @@ impl SelectedCommand {
                         CompilationCommand::Test
                             | CompilationCommand::Run
                             | CompilationCommand::Bench
-                    ) && !selection.no_run,
-                    "selected Cargo program arguments require test, run or bench execution",
+                            | CompilationCommand::Nextest
+                    ) && (!selection.no_run || command == CompilationCommand::Nextest),
+                    "selected Cargo program arguments require test, nextest, run or bench execution",
                 )?;
                 // The remaining bounded argv belongs to the program or harness,
                 // including option-looking values and literal control bytes.
@@ -193,7 +208,9 @@ impl SelectedCommand {
             if !args[at].starts_with('-')
                 && matches!(
                     command,
-                    CompilationCommand::Test | CompilationCommand::Bench
+                    CompilationCommand::Test
+                        | CompilationCommand::Bench
+                        | CompilationCommand::Nextest
                 )
             {
                 require(
@@ -210,7 +227,8 @@ impl SelectedCommand {
             match option {
                 "--package" | "-p" | "--exclude" | "--features" | "-F" | "--bin" | "--test"
                 | "--example" | "--bench" | "--target" | "--profile" | "--manifest-path"
-                | "--target-dir" | "--message-format" | "--color" | "--jobs" => {
+                | "--target-dir" | "--message-format" | "--color" | "--jobs"
+                | "--cargo-profile" | "--test-threads" | "--filterset" | "-E" | "--build-jobs" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -246,22 +264,57 @@ impl SelectedCommand {
                             )?;
                             selection.target.push(value.to_owned());
                         }
-                        "--profile" => {
+                        "--profile" if command == CompilationCommand::Nextest => {
+                            require(
+                                selection.runner_profile.is_none(),
+                                "duplicate nextest runner profile",
+                            )?;
+                            selection.runner_profile = Some(value.to_owned());
+                        }
+                        "--profile" | "--cargo-profile" => {
+                            require(
+                                option != "--cargo-profile"
+                                    || command == CompilationCommand::Nextest,
+                                "--cargo-profile requires nextest run",
+                            )?;
                             require(
                                 selection.profile.is_none(),
                                 "duplicate selected Cargo profile",
                             )?;
                             selection.profile = Some(value.to_owned());
                         }
-                        "--jobs" => {
+                        "--jobs" | "--build-jobs" => {
                             let count = value.parse::<u32>().ok().filter(|count| {
                                 (1..=4096).contains(count) && count.to_string() == value
                             });
                             require(
-                                native && jobs.is_none() && count.is_some(),
+                                native
+                                    && jobs.is_none()
+                                    && count.is_some()
+                                    && ((option == "--build-jobs")
+                                        == (command == CompilationCommand::Nextest)),
                                 "selected native Cargo jobs must be one integer between 1 and 4096",
                             )?;
                             jobs = count;
+                        }
+                        "--test-threads" => {
+                            let count = value.parse::<u32>().ok().filter(|count| {
+                                (1..=4096).contains(count) && count.to_string() == value
+                            });
+                            require(
+                                command == CompilationCommand::Nextest
+                                    && selection.test_threads.is_none()
+                                    && count.is_some(),
+                                "nextest test threads must be one integer between 1 and 4096",
+                            )?;
+                            selection.test_threads = count;
+                        }
+                        "--filterset" | "-E" => {
+                            require(
+                                command == CompilationCommand::Nextest,
+                                "filtersets require nextest run",
+                            )?;
+                            selection.filtersets.push(value.to_owned());
                         }
                         "--color" => require(
                             matches!(value, "auto" | "always" | "never"),
@@ -277,6 +330,8 @@ impl SelectedCommand {
                             require(
                                 value == expected
                                     && controls.insert(option)
+                                    && (option != "--message-format"
+                                        || command != CompilationCommand::Nextest)
                                     && (!native || option != "--target-dir"),
                                 "selected Cargo transport controls differ from execution",
                             )?;
@@ -317,9 +372,9 @@ impl SelectedCommand {
             at += 1;
         }
         require(
-            ["--manifest-path", "--message-format"]
-                .iter()
-                .all(|name| controls.contains(name))
+            controls.contains("--manifest-path")
+                && (command == CompilationCommand::Nextest
+                    || controls.contains("--message-format"))
                 && if native {
                     jobs.is_some()
                 } else {
@@ -330,7 +385,9 @@ impl SelectedCommand {
             "selected Cargo requires its exact locked offline transport controls",
         )?;
         require(
-            !selection.no_run || (!selection.doc && selection.test_filter.is_none()),
+            command == CompilationCommand::Nextest
+                || !selection.no_run
+                || (!selection.doc && selection.test_filter.is_none()),
             "selected Cargo filters and documentation tests require execution",
         )?;
         selection.cargo_arguments(command)?;
@@ -370,6 +427,10 @@ impl SelectedCommand {
                 &["rustdoc"],
                 "selected documentation requires a captured ordinary executable rustdoc",
             ),
+            CompilationCommand::Nextest => (
+                &["cargo-nextest"],
+                "selected nextest requires a captured ordinary executable cargo-nextest",
+            ),
             _ => return Ok(cargo.to_owned()),
         };
         let bin = cargo
@@ -403,6 +464,10 @@ impl SelectedCommand {
         let mut arguments = if self.command == CompilationCommand::Run {
             run_build_selection(&self.selection, metadata, package_id)?
                 .cargo_arguments(CompilationCommand::Build)?
+        } else if self.command == CompilationCommand::Nextest {
+            self.selection
+                .nextest_build_selection()?
+                .cargo_arguments(CompilationCommand::Test)?
         } else {
             self.selection.cargo_arguments(self.command)?
         };

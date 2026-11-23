@@ -4168,6 +4168,110 @@ fn current_test_execution() {
     );
 }
 
+/// A retained compiler target must never substitute for a fresh nextest run.
+/// Identical captured inputs and runner options keep the same private family,
+/// while the current test body changes its own result through writable state.
+#[test]
+#[ignore = "requires full canonical bubblewrap namespaces, RABS_CANONICAL_TEST_WRAPPER and a native toolchain containing an ordinary executable bin/cargo-nextest; runs real nextest bodies across private target restoration and failure"]
+fn canonical_nextest_executes_current_tests_after_private_target_restore_and_preserves_failure() {
+    let (owner, mut profile) = native_fixture();
+    let nextest = Path::new(profile["toolchain_root"].as_str().unwrap()).join("bin/cargo-nextest");
+    let metadata = fs::symlink_metadata(&nextest)
+        .expect("the captured native toolchain must contain its real bin/cargo-nextest");
+    assert!(
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+        "nextest must be an ordinary captured executable, not an ambient tool or symlink"
+    );
+    let source = owner.path().join("source-a");
+    write(
+        &source,
+        ".config/nextest.toml",
+        "[profile.canonical]\ntest-threads = 1\nretries = 0\n",
+    );
+    write(
+        &source,
+        "src/lib.rs",
+        r#"pub fn answer() -> u32 { canonical_dep::answer() }
+#[test]
+fn current_nextest_execution() {
+    use std::io::{BufRead, BufReader, Write};
+    assert_eq!(answer(), 42);
+    assert_eq!(std::env::var("NEXTEST").unwrap(), "1");
+    let mut stream = std::os::unix::net::UnixStream::connect(std::env::var_os("RABS_SOCKET_PATH").unwrap()).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    let mut replies = BufReader::new(stream.try_clone().unwrap());
+    writeln!(stream, "{{\"kind\":\"hello\",\"transport\":{{\"current\":1,\"minimum_compatible\":1}},\"application\":{{\"current\":1,\"minimum_compatible\":1}}}}").unwrap();
+    let mut reply = String::new();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("hello-ok"));
+    writeln!(stream, "{{\"kind\":\"rustc-request\",\"argv\":[\"/__rabs/toolchain/bin/rustc\",\"--crate-name=forged-nextest\"],\"cwd\":\"/__rabs/workspace\",\"env\":[],\"remote_protocol\":1,\"local_capture_allowed\":true}}").unwrap();
+    reply.clear();
+    replies.read_line(&mut reply).unwrap();
+    assert!(reply.contains("canonical-project-executors-require-isolated-dependency-execution"));
+    assert!(reply.contains("pass-through"));
+    assert!(!reply.contains("\"attempt\""));
+    let path = std::path::Path::new("/__rabs/out/cargo/nextest-executions");
+    let previous: u32 = match std::fs::read_to_string(path) {
+        Ok(value) => value.parse().unwrap(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("{error}"),
+    };
+    let current = previous + 1;
+    std::fs::write(path, current.to_string()).unwrap();
+    println!("CANONICAL_CURRENT_NEXTEST_EXECUTION={current}");
+    assert!(current < 3, "the current nextest body must report its present failure");
+}
+"#,
+    );
+    profile["command"] = json!("nextest");
+    profile["target_cache"] = json!({"runtime_epoch":"native-nextest-v1", "max_bytes":268435456});
+    profile["selection"] = json!({"lib":true, "runner_profile":"canonical",
+        "filtersets":["test(current_nextest_execution)"], "test_args":["--nocapture"]});
+    for current in 1..=4 {
+        let (code, events, output) = run(owner.path(), 220 + current, &profile);
+        // Nextest's native TEST_RUN_FAILED is 100, distinct from Cargo's 101.
+        assert_eq!(code, if current < 3 { 0 } else { 100 }, "{output}");
+        let started = events
+            .iter()
+            .filter(|event| event["kind"] == "canonical-compilation-started")
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 1, "{output}");
+        assert_eq!(started[0]["command"], "nextest", "{output}");
+        assert_eq!(started[0]["test_execution"], true, "{output}");
+        assert_eq!(started[0]["test_result_cache"], false, "{output}");
+        assert_eq!(
+            started[0]["private_target_state"],
+            if current == 1 { "cold" } else { "restored" },
+            "{output}"
+        );
+        assert!(
+            decisions(&events, "execute").is_empty() && decisions(&events, "hit").is_empty(),
+            "nextest project code must not obtain local compiler-cache authority: {output}"
+        );
+        assert!(
+            !events.iter().any(|event| event["decision"] == "served"
+                || event["kind"] == "canonical-build-completed"),
+            "an executed nextest outcome must not become a cached pass or build delivery: {output}"
+        );
+        assert!(
+            output.contains(&format!("CANONICAL_CURRENT_NEXTEST_EXECUTION={current}")),
+            "private target restoration skipped or replayed the current nextest body: {output}"
+        );
+        assert_eq!(
+            fs::read_to_string(sole_retained_target(owner.path()).join("nextest-executions"))
+                .unwrap(),
+            current.to_string(),
+            "successful and failing nextest runs must retain only their current private state"
+        );
+    }
+    assert_eq!(
+        fs::read_dir(owner.path().join("ops")).unwrap().count(),
+        0,
+        "nextest execution must not retain a delivered target or runtime operation"
+    );
+}
+
 #[test]
 #[ignore = "requires real bubblewrap namespaces, native toolchain with rustdoc and RABS_CANONICAL_TEST_WRAPPER; executes actual Cargo documentation tests"]
 fn canonical_cargo_doctests_execute_with_captured_rustdoc_and_preserve_failures() {

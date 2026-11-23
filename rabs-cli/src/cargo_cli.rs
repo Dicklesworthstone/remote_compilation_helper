@@ -158,6 +158,15 @@ pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
     if mode == Mode::Worker && selected.is_none() {
         return Err(invalid("worker profiles require an explicit Cargo command"));
     }
+    if mode == Mode::Worker
+        && selected
+            .as_ref()
+            .is_some_and(|(command, _)| *command == CompilationCommand::Nextest)
+    {
+        return Err(invalid(
+            "nextest requires a local or remote canonical profile; worker artifact delivery does not support nextest",
+        ));
+    }
     Ok(Invocation::Run(Box::new(Options {
         mode,
         profile,
@@ -183,12 +192,18 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
         "clippy" => CompilationCommand::Clippy,
         "doc" => CompilationCommand::Doc,
         "test" => CompilationCommand::Test,
+        "nextest" if arguments.get(1) == Some(&"run") => CompilationCommand::Nextest,
+        "nextest" => return Err(invalid("canonical nextest requires the run subcommand")),
         "run" => CompilationCommand::Run,
         "bench" => CompilationCommand::Bench,
         _ => return Err(invalid("unsupported canonical Cargo command")),
     };
     let mut selected = CompilationSelection::default();
-    let mut at = 1;
+    let mut at = if command == CompilationCommand::Nextest {
+        2
+    } else {
+        1
+    };
     while at < arguments.len() {
         let argument = arguments[at];
         if argument == "--" {
@@ -198,20 +213,30 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
                 .collect();
             match command {
                 CompilationCommand::Run => selected.run_args = tail,
-                CompilationCommand::Test | CompilationCommand::Bench => selected.test_args = tail,
+                CompilationCommand::Test
+                | CompilationCommand::Bench
+                | CompilationCommand::Nextest => {
+                    selected.test_args = tail;
+                }
                 CompilationCommand::Clippy => selected.lint_args = tail,
-                _ => return Err(invalid("argument tails require run, test, bench or clippy")),
+                _ => {
+                    return Err(invalid(
+                        "argument tails require run, test, nextest, bench or clippy",
+                    ));
+                }
             }
             break;
         }
         if !argument.starts_with('-')
             && matches!(
                 command,
-                CompilationCommand::Test | CompilationCommand::Bench
+                CompilationCommand::Test | CompilationCommand::Bench | CompilationCommand::Nextest
             )
         {
             if selected.test_filter.replace(argument.to_owned()).is_some() {
-                return Err(invalid("test or bench accepts only one name filter"));
+                return Err(invalid(
+                    "canonical test, nextest or bench accepts only one name filter",
+                ));
             }
             at += 1;
             continue;
@@ -220,7 +245,10 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
             .split_once('=')
             .map_or((argument, None), |(name, value)| (name, Some(value)));
         if inline.is_none()
-            && (argument.starts_with("-p") || argument.starts_with("-F"))
+            && (argument.starts_with("-p")
+                || argument.starts_with("-F")
+                || (command == CompilationCommand::Nextest
+                    && (argument.starts_with("-E") || argument.starts_with("-j"))))
             && argument.len() > 2
             && !argument.starts_with("--")
         {
@@ -264,6 +292,12 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
                     | "--bench"
                     | "--target"
                     | "--profile"
+                    | "--cargo-profile"
+                    | "--test-threads"
+                    | "--jobs"
+                    | "-j"
+                    | "--filterset"
+                    | "-E"
             ) {
                 return Err(invalid(
                     "unsupported Cargo selector; configure manifest, jobs and roots in the profile",
@@ -288,10 +322,35 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
                 "--example" => selected.example.push(value),
                 "--bench" => selected.bench.push(value),
                 "--target" => selected.target.push(value),
-                "--profile" => {
-                    if selected.profile.replace(value).is_some() {
-                        return Err(invalid("--profile may be selected only once"));
+                "--profile" if command == CompilationCommand::Nextest => {
+                    if selected.runner_profile.replace(value).is_some() {
+                        return Err(invalid("nextest --profile may be selected only once"));
                     }
+                }
+                "--profile" | "--cargo-profile" => {
+                    if option == "--cargo-profile" && command != CompilationCommand::Nextest {
+                        return Err(invalid("--cargo-profile requires nextest run"));
+                    }
+                    if selected.profile.replace(value).is_some() {
+                        return Err(invalid(
+                            "Cargo compilation profile may be selected only once",
+                        ));
+                    }
+                }
+                "--test-threads" | "--jobs" | "-j" if command == CompilationCommand::Nextest => {
+                    let count = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|count| (1..=4096).contains(count) && count.to_string() == value)
+                        .ok_or_else(|| {
+                            invalid("nextest test threads must be an integer between 1 and 4096")
+                        })?;
+                    if selected.test_threads.replace(count).is_some() {
+                        return Err(invalid("nextest test threads may be selected only once"));
+                    }
+                }
+                "--filterset" | "-E" if command == CompilationCommand::Nextest => {
+                    selected.filtersets.push(value);
                 }
                 _ => return Err(invalid("unknown Cargo selector")),
             }
@@ -337,6 +396,95 @@ mod tests {
         assert_eq!(selection.features, ["a,b"]);
         assert_eq!(selection.bin, ["app"]);
         assert_eq!(selection.run_args, ["", "--local", "a b", "α\nβ"]);
+    }
+
+    #[test]
+    fn nextest_keeps_compile_and_runner_selection_distinct() {
+        let Invocation::Run(options) = parse_strings(&[
+            "--remote",
+            "p.json",
+            "nextest",
+            "run",
+            "--workspace",
+            "--cargo-profile=release",
+            "--profile",
+            "ci",
+            "-Epackage(core)",
+            "--filterset",
+            "test(roundtrip)",
+            "-j1",
+            "roundtrip",
+            "--",
+            "--exact",
+        ])
+        .unwrap() else {
+            panic!("expected invocation");
+        };
+        let (command, selected) = options.selected.unwrap();
+        assert_eq!(command, CompilationCommand::Nextest);
+        assert_eq!(selected.profile.as_deref(), Some("release"));
+        assert_eq!(selected.runner_profile.as_deref(), Some("ci"));
+        assert_eq!(selected.test_threads, Some(1));
+        assert_eq!(selected.filtersets, ["package(core)", "test(roundtrip)"]);
+        assert_eq!(selected.test_filter.as_deref(), Some("roundtrip"));
+        assert_eq!(selected.test_args, ["--exact"]);
+        let build = selected
+            .nextest_build_selection()
+            .unwrap()
+            .cargo_arguments(CompilationCommand::Test)
+            .unwrap();
+        assert_eq!(
+            build,
+            ["test", "--workspace", "--no-run", "--profile", "release"]
+        );
+        assert_eq!(
+            selected.runtime_arguments(command).unwrap(),
+            ["--", "--exact"]
+        );
+    }
+
+    #[test]
+    fn nextest_refuses_unimplemented_routes_and_ambiguous_controls() {
+        for arguments in [
+            vec!["--worker", "p", "nextest", "run"],
+            vec!["--local", "p", "nextest"],
+            vec!["--local", "p", "nextest", "list"],
+            vec!["--local", "p", "nextest", "run", "--doc"],
+            vec!["--local", "p", "nextest", "run", "--build-jobs", "2"],
+            vec!["--local", "p", "nextest", "run", "--message-format", "json"],
+            vec![
+                "--local",
+                "p",
+                "nextest",
+                "run",
+                "--profile",
+                "ci",
+                "--profile",
+                "default",
+            ],
+            vec!["--local", "p", "nextest", "run", "-j1", "--jobs", "2"],
+            vec!["--local", "p", "nextest", "run", "--test-threads", "0"],
+            vec![
+                "--local",
+                "p",
+                "nextest",
+                "run",
+                "--test-threads",
+                "num-cpus",
+            ],
+            vec!["--local", "p", "test", "--cargo-profile", "release"],
+            vec!["--local", "p", "test", "--filterset", "all()"],
+            vec!["--local", "p", "build", "--test-threads", "1"],
+        ] {
+            assert!(parse_strings(&arguments).is_err(), "{arguments:?}");
+        }
+        for mode in ["--local", "--remote"] {
+            let Invocation::Run(options) = parse_strings(&[mode, "p", "nextest", "run"]).unwrap()
+            else {
+                panic!("expected invocation");
+            };
+            assert_eq!(options.selected.unwrap().1.test_threads, None);
+        }
     }
 
     #[test]

@@ -883,6 +883,62 @@ fn local_intent_is_retained_before_one_exec_and_original_edits_cannot_replace_it
 }
 
 #[test]
+fn nextest_validates_captured_runner_and_retains_local_and_remote_intent() {
+    for remote in [false, true] {
+        let fixture = Fixture::new();
+        fixture.refused(
+            fixture
+                .command(remote)
+                .args(["nextest", "run"])
+                .output()
+                .unwrap(),
+        );
+        new_file(
+            &fixture.toolchain.join("bin/cargo-nextest"),
+            b"unused captured runner fixture",
+            0o700,
+        );
+        let report = fixture.handed_off(
+            fixture
+                .command(remote)
+                .args([
+                    "nextest",
+                    "run",
+                    "--workspace",
+                    "--cargo-profile",
+                    "release",
+                    "--profile",
+                    "ci",
+                    "--test-threads",
+                    "1",
+                    "-E",
+                    "package(core)",
+                    "--",
+                    "--exact",
+                ])
+                .output()
+                .unwrap(),
+        );
+        let settings = if remote {
+            &report["profile"]["settings"]
+        } else {
+            &report["profile"]
+        };
+        assert_eq!(settings["command"], "nextest");
+        assert_eq!(settings["selection"]["profile"], "release");
+        assert_eq!(settings["selection"]["runner_profile"], "ci");
+        assert_eq!(settings["selection"]["test_threads"], 1);
+        assert_eq!(
+            settings["selection"]["filtersets"],
+            json!(["package(core)"])
+        );
+        assert_eq!(settings["selection"]["test_args"], json!(["--exact"]));
+        assert_eq!(settings["selection"]["packages"], json!([]));
+        assert_eq!(settings["jobs"], 2);
+    }
+}
+
+#[test]
 fn explicit_commands_replace_saved_selection_and_preserve_literal_runtime_tails() {
     for (arguments, command, field, tail) in [
         (

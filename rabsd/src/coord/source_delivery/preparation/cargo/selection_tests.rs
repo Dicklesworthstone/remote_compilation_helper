@@ -146,6 +146,91 @@ fn native_specification(profile: Value) -> Value {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn selected_native_nextest_plans_only_its_cargo_build_selection() {
+    let input = native_specification(native_profile(
+        "nextest",
+        json!({
+            "workspace":true, "features":["feature-a"], "profile":"release",
+            "runner_profile":"ci", "filtersets":["package(core)"],
+            "test_threads":1, "test_filter":"roundtrip", "test_args":["--exact"],
+        }),
+    ));
+    let selected =
+        SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::CanonicalLocal).unwrap();
+    assert_eq!(selected.command, CompilationCommand::Nextest);
+    assert_eq!(
+        selected.graph_arguments(&Value::Null, None).unwrap(),
+        [
+            "test",
+            "--workspace",
+            "--no-run",
+            "--features",
+            "feature-a",
+            "--profile",
+            "release",
+            "--jobs",
+            "2",
+        ]
+    );
+    assert!(selected.graph_tail_arguments().unwrap().is_empty());
+    assert!(
+        SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+    );
+
+    for (field, value) in [
+        ("program", json!("/__rabs/toolchain/bin/cargo")),
+        ("args", json!(["nextest", "list"])),
+    ] {
+        let mut changed = input.clone();
+        changed[field] = value;
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .is_err()
+        );
+    }
+    for (old, new) in [
+        ("--build-jobs", "--jobs"),
+        ("--locked", "--message-format=json"),
+    ] {
+        let mut changed = input.clone();
+        let arguments = changed["args"].as_array_mut().unwrap();
+        let at = arguments
+            .iter()
+            .position(|argument| argument == old)
+            .unwrap();
+        arguments[at] = json!(new);
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .is_err()
+        );
+    }
+    let mut changed = input.clone();
+    changed["command_context"]["env"]["CARGO"] = json!("cargo");
+    assert!(
+        SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal).is_err()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_nextest_requires_captured_runner_but_uses_cargo_for_graphs() {
+    use std::os::unix::fs::PermissionsExt;
+    let input = native_specification(native_profile("nextest", json!({})));
+    let selected =
+        SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::CanonicalLocal).unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let cargo = tools.path().join("cargo");
+    assert!(selected.graph_program(&cargo).is_err());
+    let runner = tools.path().join("cargo-nextest");
+    fs::write(&runner, "captured runner").unwrap();
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(selected.graph_program(&cargo).is_err());
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(selected.graph_program(&cargo).unwrap(), cargo);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn selected_native_commands_map_driver_controls_without_widening_public_requests() {
     for command in ["check", "build", "test", "clippy", "doc", "run", "bench"] {
         let selection = if command == "run" {

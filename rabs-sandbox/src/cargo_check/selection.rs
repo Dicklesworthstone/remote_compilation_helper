@@ -5,7 +5,8 @@
 //! output directory and job budget itself. Both the nonexecuting unit-graph
 //! query and the subsequent compilation use the same Cargo selection. Program,
 //! test/benchmark harness and Clippy lint arguments form separate tails after the driver's
-//! Cargo options.
+//! Cargo options. Nextest retains its runner selection separately from the
+//! Cargo test compilation used by its nonexecuting unit-graph query.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -18,7 +19,9 @@ const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 ///
 /// `Check` and `Build` compile without running the requested targets. `Test`
 /// also runs Cargo's selected tests and doctests unless `no_run` is selected;
-/// test outcomes are never action-cache results. `Run` executes the selected
+/// test outcomes are never action-cache results. `Nextest` runs the captured
+/// nextest runner against Cargo-built tests, without doctests or cached test
+/// outcomes. `Run` executes the selected
 /// binary/example, and `Bench` runs selected benchmarks unless `no_run` is set.
 /// Their bodies and outcomes are never cached. `Clippy` checks the selected
 /// targets with the captured lint driver, whose results are never rustc cache
@@ -33,6 +36,7 @@ pub enum CompilationCommand {
     Check,
     Build,
     Test,
+    Nextest,
     Clippy,
     Doc,
     Run,
@@ -58,6 +62,7 @@ impl CompilationCommand {
             Self::Check => "check",
             Self::Build => "build",
             Self::Test => "test",
+            Self::Nextest => "nextest",
             Self::Clippy => "clippy",
             Self::Doc => "doc",
             Self::Run => "run",
@@ -67,21 +72,23 @@ impl CompilationCommand {
 
     /// Resolve an optional input policy without changing an existing command's
     /// behavior. Only `run` and executing `bench` inherit input by default.
-    /// Executing `test` may explicitly inherit input while retaining EOF by
-    /// default. Nonexecuting commands and `--no-run` keep closed input.
+    /// Executing `test` or `nextest` may explicitly inherit input while retaining
+    /// EOF by default. Nonexecuting commands and `--no-run` keep closed input.
     pub fn stdin_policy(
         self,
         no_run: bool,
         requested: Option<CompilationStdin>,
     ) -> io::Result<CompilationStdin> {
-        let executes_with_input =
-            self == Self::Run || (matches!(self, Self::Test | Self::Bench) && !no_run);
+        let executes_with_input = self == Self::Run
+            || (matches!(self, Self::Test | Self::Nextest | Self::Bench) && !no_run);
         match requested {
             Some(CompilationStdin::Inherit) if !executes_with_input => Err(invalid(
-                "inherited stdin is supported only for run, test or bench execution",
+                "inherited stdin is supported only for run, test, nextest or bench execution",
             )),
             Some(policy) => Ok(policy),
-            None if executes_with_input && self != Self::Test => Ok(CompilationStdin::Inherit),
+            None if executes_with_input && !matches!(self, Self::Test | Self::Nextest) => {
+                Ok(CompilationStdin::Inherit)
+            }
             None => Ok(CompilationStdin::Closed),
         }
     }
@@ -119,7 +126,21 @@ pub struct CompilationSelection {
     /// Cargo's profile name, not profile settings. Cargo validates existence
     /// and inheritance in the captured workspace. The unit graph and actual
     /// compilation use the same value, including `test` and its development units.
+    /// Nextest receives this as `--cargo-profile`, distinct from its runner profile.
     pub profile: Option<String>,
+    /// Nextest's named runner profile from captured project configuration.
+    /// This does not select the Cargo compilation profile or grant result caching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_profile: Option<String>,
+    /// Explicit positive nextest parallelism. Omission preserves its configured
+    /// test concurrency, including deliberately serial profiles. Compilation
+    /// parallelism remains the driver's independent `--build-jobs` control.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_threads: Option<u32>,
+    /// Literal nextest filterset expressions. They select test execution only
+    /// and must never narrow the Cargo graph used for compiler input capture.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filtersets: Vec<String>,
     /// Select documentation tests, only for the `Test` command.
     pub doc: bool,
     /// Compile Cargo's test or benchmark executables without running them.
@@ -233,15 +254,49 @@ impl CompilationSelection {
         }
         if !matches!(
             command,
-            CompilationCommand::Test | CompilationCommand::Bench
+            CompilationCommand::Test | CompilationCommand::Nextest | CompilationCommand::Bench
         ) && (self.no_run
             || self.no_fail_fast
             || self.test_filter.is_some()
             || !self.test_args.is_empty())
         {
             return Err(invalid(
-                "harness selection requires the Cargo test or bench command",
+                "harness selection requires the Cargo test, nextest or bench command",
             ));
+        }
+        if command != CompilationCommand::Nextest
+            && (self.runner_profile.is_some()
+                || self.test_threads.is_some()
+                || !self.filtersets.is_empty())
+        {
+            return Err(invalid("runner selection requires the nextest command"));
+        }
+        if self
+            .runner_profile
+            .as_ref()
+            .is_some_and(|profile| !ordinary_name(profile))
+        {
+            return Err(invalid("invalid nextest runner profile name"));
+        }
+        if self
+            .test_threads
+            .is_some_and(|threads| !(1..=4096).contains(&threads))
+        {
+            return Err(invalid("nextest test threads must be between 1 and 4096"));
+        }
+        if self.filtersets.iter().any(|filter| {
+            filter.trim().is_empty()
+                || filter.len() > MAX_VALUE_BYTES
+                || filter.starts_with('-')
+                || filter.chars().any(char::is_control)
+        }) {
+            return Err(invalid("invalid nextest filterset expression"));
+        }
+        if command == CompilationCommand::Nextest && self.target.len() > 1 {
+            return Err(invalid("nextest selects at most one compilation target"));
+        }
+        if command == CompilationCommand::Nextest && self.no_run && self.no_fail_fast {
+            return Err(invalid("nextest --no-fail-fast requires test execution"));
         }
         if command != CompilationCommand::Run && !self.run_args.is_empty() {
             return Err(invalid("program arguments require the Cargo run command"));
@@ -332,6 +387,9 @@ impl CompilationSelection {
         ];
         let count = values.iter().map(|(_, values)| values.len()).sum::<usize>()
             + usize::from(self.profile.is_some())
+            + usize::from(self.runner_profile.is_some())
+            + usize::from(self.test_threads.is_some())
+            + self.filtersets.len()
             + usize::from(self.test_filter.is_some())
             + self.test_args.len()
             + self.run_args.len()
@@ -340,6 +398,9 @@ impl CompilationSelection {
             return Err(invalid("Cargo compilation selection has too many values"));
         }
         let mut args = vec![command.as_str().to_owned()];
+        if command == CompilationCommand::Nextest {
+            args.push("run".into());
+        }
         for (enabled, option) in [
             (self.workspace, "--workspace"),
             (self.all_features, "--all-features"),
@@ -375,8 +436,24 @@ impl CompilationSelection {
             }
         }
         if let Some(profile) = &self.profile {
-            args.push("--profile".into());
+            args.push(
+                if command == CompilationCommand::Nextest {
+                    "--cargo-profile"
+                } else {
+                    "--profile"
+                }
+                .into(),
+            );
             args.push(profile.clone());
+        }
+        if let Some(profile) = &self.runner_profile {
+            args.extend(["--profile".into(), profile.clone()]);
+        }
+        if let Some(threads) = self.test_threads {
+            args.extend(["--test-threads".into(), threads.to_string()]);
+        }
+        for filter in &self.filtersets {
+            args.extend(["--filterset".into(), filter.clone()]);
         }
         if let Some(filter) = &self.test_filter {
             if filter.len() > MAX_VALUE_BYTES
@@ -410,6 +487,26 @@ impl CompilationSelection {
             ));
         }
         Ok(args)
+    }
+
+    /// Derive the exact Cargo compilation selection used by `nextest run`.
+    ///
+    /// Nextest builds with `cargo test --no-run`; its runner profiles, filters,
+    /// concurrency and emulated harness arguments never select Cargo units.
+    /// The caller runs this selection with the captured Cargo executable and
+    /// `CompilationCommand::Test`, then validates the graph as `Nextest` so
+    /// project execution still requires the closed worker authority boundary.
+    pub fn nextest_build_selection(&self) -> io::Result<Self> {
+        self.cargo_arguments(CompilationCommand::Nextest)?;
+        let mut compilation = self.clone();
+        compilation.no_run = true;
+        compilation.no_fail_fast = false;
+        compilation.test_filter = None;
+        compilation.test_args.clear();
+        compilation.runner_profile = None;
+        compilation.test_threads = None;
+        compilation.filtersets.clear();
+        Ok(compilation)
     }
 
     /// Construct the program, harness or Clippy lint tail after validating the entire
@@ -451,6 +548,8 @@ mod tests {
             (CompilationCommand::Bench, true, Closed, false),
             (CompilationCommand::Test, false, Closed, true),
             (CompilationCommand::Test, true, Closed, false),
+            (CompilationCommand::Nextest, false, Closed, true),
+            (CompilationCommand::Nextest, true, Closed, false),
             (CompilationCommand::Check, false, Closed, false),
             (CompilationCommand::Build, false, Closed, false),
             (CompilationCommand::Clippy, false, Closed, false),
@@ -850,6 +949,7 @@ mod tests {
             ("check", CompilationCommand::Check),
             ("build", CompilationCommand::Build),
             ("test", CompilationCommand::Test),
+            ("nextest", CompilationCommand::Nextest),
             ("clippy", CompilationCommand::Clippy),
             ("doc", CompilationCommand::Doc),
             ("run", CompilationCommand::Run),
@@ -868,6 +968,296 @@ mod tests {
             json!({}),
         ] {
             assert!(serde_json::from_value::<CompilationCommand>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn nextest_separates_runner_selection_from_cargo_compilation_and_graph_planning() {
+        let selection = CompilationSelection {
+            workspace: true,
+            packages: vec!["app".into()],
+            features: vec!["fast".into()],
+            tests: true,
+            target: vec!["x86_64-unknown-linux-gnu".into()],
+            profile: Some("ci-build".into()),
+            runner_profile: Some("ci-runner".into()),
+            test_threads: Some(1),
+            filtersets: vec![
+                "package(app) & not(test(slow))".into(),
+                "test(/^db::/)".into(),
+            ],
+            no_fail_fast: true,
+            test_filter: Some("cache::".into()),
+            test_args: vec!["--exact".into(), "--nocapture".into()],
+            ..CompilationSelection::default()
+        };
+        let original = selection.clone();
+        assert_eq!(
+            selection
+                .cargo_arguments(CompilationCommand::Nextest)
+                .unwrap(),
+            [
+                "nextest",
+                "run",
+                "--workspace",
+                "--tests",
+                "--no-fail-fast",
+                "--package",
+                "app",
+                "--features",
+                "fast",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--cargo-profile",
+                "ci-build",
+                "--profile",
+                "ci-runner",
+                "--test-threads",
+                "1",
+                "--filterset",
+                "package(app) & not(test(slow))",
+                "--filterset",
+                "test(/^db::/)",
+                "cache::",
+            ]
+        );
+        assert_eq!(
+            selection
+                .runtime_arguments(CompilationCommand::Nextest)
+                .unwrap(),
+            ["--", "--exact", "--nocapture"]
+        );
+        let planned = selection.nextest_build_selection().unwrap();
+        assert_eq!(
+            planned.cargo_arguments(CompilationCommand::Test).unwrap(),
+            [
+                "test",
+                "--workspace",
+                "--tests",
+                "--no-run",
+                "--package",
+                "app",
+                "--features",
+                "fast",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--profile",
+                "ci-build",
+            ]
+        );
+        assert!(
+            planned
+                .runtime_arguments(CompilationCommand::Test)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            selection, original,
+            "planning must retain exact runner intent"
+        );
+    }
+
+    #[test]
+    fn nextest_defaults_preserve_configured_parallelism_and_existing_command_wire_fields() {
+        let selection = CompilationSelection::default();
+        assert_eq!(
+            selection
+                .cargo_arguments(CompilationCommand::Nextest)
+                .unwrap(),
+            ["nextest", "run"]
+        );
+        assert_eq!(
+            selection
+                .nextest_build_selection()
+                .unwrap()
+                .cargo_arguments(CompilationCommand::Test)
+                .unwrap(),
+            ["test", "--no-run"]
+        );
+        let encoded = serde_json::to_value(&selection).unwrap();
+        for field in ["runner_profile", "test_threads", "filtersets"] {
+            assert!(encoded.get(field).is_none(), "old commands gained {field}");
+        }
+        let selected: CompilationSelection = serde_json::from_value(json!({
+            "profile":"ci-build", "runner_profile":"ci-runner", "test_threads":1,
+            "filtersets":["test(serial)"]
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<CompilationSelection>(
+                serde_json::to_value(&selected).unwrap()
+            )
+            .unwrap(),
+            selected
+        );
+        for count in [1, 4096] {
+            let mut selected = selected.clone();
+            selected.test_threads = Some(count);
+            assert!(
+                selected
+                    .cargo_arguments(CompilationCommand::Nextest)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn nextest_runner_controls_cannot_select_other_commands_or_doctests() {
+        for selection in [
+            CompilationSelection {
+                runner_profile: Some("ci".into()),
+                ..Default::default()
+            },
+            CompilationSelection {
+                test_threads: Some(1),
+                ..Default::default()
+            },
+            CompilationSelection {
+                filtersets: vec!["all()".into()],
+                ..Default::default()
+            },
+        ] {
+            for command in [
+                CompilationCommand::Check,
+                CompilationCommand::Build,
+                CompilationCommand::Test,
+                CompilationCommand::Clippy,
+                CompilationCommand::Doc,
+                CompilationCommand::Run,
+                CompilationCommand::Bench,
+            ] {
+                assert!(selection.cargo_arguments(command).is_err(), "{command:?}");
+            }
+        }
+        for selection in [
+            CompilationSelection {
+                no_run: true,
+                no_fail_fast: true,
+                ..Default::default()
+            },
+            CompilationSelection {
+                doc: true,
+                ..Default::default()
+            },
+            CompilationSelection {
+                run_args: vec!["argument".into()],
+                ..Default::default()
+            },
+            CompilationSelection {
+                no_deps: true,
+                ..Default::default()
+            },
+            CompilationSelection {
+                lint_args: vec!["-Dwarnings".into()],
+                ..Default::default()
+            },
+            CompilationSelection {
+                target: vec![
+                    "x86_64-unknown-linux-gnu".into(),
+                    "aarch64-unknown-linux-gnu".into(),
+                ],
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                selection
+                    .cargo_arguments(CompilationCommand::Nextest)
+                    .is_err()
+            );
+            assert!(selection.nextest_build_selection().is_err());
+        }
+        let compilation_only = CompilationSelection {
+            no_run: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            compilation_only
+                .cargo_arguments(CompilationCommand::Nextest)
+                .unwrap(),
+            ["nextest", "run", "--no-run"]
+        );
+    }
+
+    #[test]
+    fn nextest_runner_values_and_harness_tail_share_one_bounded_argument_budget() {
+        for profile in [
+            "",
+            "../ci",
+            "--config",
+            "ci\n",
+            &"x".repeat(MAX_VALUE_BYTES + 1),
+        ] {
+            let selection = CompilationSelection {
+                runner_profile: Some(profile.into()),
+                ..Default::default()
+            };
+            assert!(
+                selection
+                    .cargo_arguments(CompilationCommand::Nextest)
+                    .is_err()
+            );
+        }
+        for threads in [0, 4097, u32::MAX] {
+            let selection = CompilationSelection {
+                test_threads: Some(threads),
+                ..Default::default()
+            };
+            assert!(
+                selection
+                    .cargo_arguments(CompilationCommand::Nextest)
+                    .is_err()
+            );
+        }
+        for filter in [
+            "",
+            "   ",
+            "--manifest-path=elsewhere",
+            "all()\n",
+            "test(\0)",
+            &"x".repeat(MAX_VALUE_BYTES + 1),
+        ] {
+            let selection = CompilationSelection {
+                filtersets: vec![filter.into()],
+                ..Default::default()
+            };
+            assert!(
+                selection
+                    .cargo_arguments(CompilationCommand::Nextest)
+                    .is_err()
+            );
+        }
+        let mut selection = CompilationSelection {
+            filtersets: vec!["all()".into(); MAX_VALUES - 2],
+            runner_profile: Some("ci".into()),
+            test_threads: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Nextest)
+                .is_ok()
+        );
+        selection.test_args.push("--nocapture".into());
+        assert!(
+            selection
+                .runtime_arguments(CompilationCommand::Nextest)
+                .is_err()
+        );
+        selection.test_args.clear();
+        selection.filtersets = vec!["x".repeat(MAX_VALUE_BYTES); 16];
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Nextest)
+                .is_err()
+        );
+        for value in [
+            json!({"runner_profile":true}),
+            json!({"test_threads":-1}),
+            json!({"test_threads":"num-cpus"}),
+            json!({"filtersets":"all()"}),
+            json!({"filtersets":[false]}),
+        ] {
+            assert!(serde_json::from_value::<CompilationSelection>(value).is_err());
         }
     }
 

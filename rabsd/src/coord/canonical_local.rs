@@ -1,13 +1,13 @@
 //! Local canonical Cargo execution connected to the coordinator's rustc cache.
 //!
-//! This explicit profile runs selected Cargo check, build, test, run, bench or Clippy offline and locked against
+//! This explicit profile runs selected Cargo check, build, test, nextest, run, bench or Clippy offline and locked against
 //! captured inputs and a captured toolchain. Cargo itself runs at canonical
 //! paths, so unit hashes and rustc arguments are stable across checkouts. A
 //! fresh operation-scoped socket admits only rustc requests; the persistent
 //! CAS and the ordinary daemon socket are never visible to the build.
 //!
 //! The selected Cargo unit graph identifies active build scripts and procedural
-//! macros. Their presence, or a test/run/bench/Clippy command, disables local compiler-result authority for the whole
+//! macros. Their presence, or a test/nextest/run/bench/Clippy command, disables local compiler-result authority for the whole
 //! operation; eligible dependency caching requires isolated workers. Pure check/build graphs
 //! retain the existing evidence-gated metadata lane; archive codegen requires an
 //! isolated worker. Selected workspace compilations can execute freshly on workers;
@@ -79,6 +79,7 @@ use target_state::{TargetCacheConfig, TargetState};
 const PROFILE_VERSION: &str = "canonical-compile-local-v1";
 const CARGO: &str = "/__rabs/toolchain/bin/cargo";
 const CARGO_CLIPPY: &str = "/__rabs/toolchain/bin/cargo-clippy";
+const CARGO_NEXTEST: &str = "/__rabs/toolchain/bin/cargo-nextest";
 const CLIPPY_DRIVER: &str = "/__rabs/toolchain/bin/clippy-driver";
 const RUSTC: &str = "/__rabs/toolchain/bin/rustc";
 const RUSTDOC: &str = "/__rabs/toolchain/bin/rustdoc";
@@ -890,8 +891,18 @@ impl Profile {
     fn program(&self) -> &'static str {
         if self.command == CompilationCommand::Clippy {
             CARGO_CLIPPY
+        } else if self.command == CompilationCommand::Nextest {
+            CARGO_NEXTEST
         } else {
             CARGO
+        }
+    }
+
+    fn graph_program(&self) -> &'static str {
+        if self.command == CompilationCommand::Nextest {
+            CARGO
+        } else {
+            self.program()
         }
     }
 
@@ -909,17 +920,27 @@ impl Profile {
             None if command == CompilationCommand::Check => {
                 vec!["check".into(), "--lib".into()]
             }
-            None => vec![command.as_str().into()],
+            None => CompilationSelection::default().cargo_arguments(command)?,
         };
         args.extend([
             "--offline".into(),
             "--locked".into(),
             "--manifest-path".into(),
             self.manifest_path(),
-            "--message-format=json".into(),
-            "--jobs".into(),
-            self.jobs.to_string(),
         ]);
+        if command == CompilationCommand::Nextest {
+            // Nextest's --jobs controls tests, not Cargo compilation, and its
+            // --message-format describes test reports, not Cargo artifacts.
+            // Preserve the captured runner configuration unless the selection
+            // explicitly supplies test_threads.
+            args.extend(["--build-jobs".into(), self.jobs.to_string()]);
+        } else {
+            args.extend([
+                "--message-format=json".into(),
+                "--jobs".into(),
+                self.jobs.to_string(),
+            ]);
+        }
         Ok(args)
     }
 
@@ -939,6 +960,13 @@ impl Profile {
                     invalid("Cargo run graph requires a resolved runnable target")
                 })?),
             )?
+        } else if self.command == CompilationCommand::Nextest {
+            let selection = self
+                .selection
+                .clone()
+                .unwrap_or_default()
+                .nextest_build_selection()?;
+            self.selected_prefix(CompilationCommand::Test, Some(&selection))?
         } else {
             self.compilation_prefix()?
         };
@@ -960,7 +988,7 @@ impl Profile {
     fn no_run(&self) -> bool {
         matches!(
             self.command,
-            CompilationCommand::Test | CompilationCommand::Bench
+            CompilationCommand::Test | CompilationCommand::Bench | CompilationCommand::Nextest
         ) && self
             .selection
             .as_ref()
@@ -974,9 +1002,11 @@ impl Profile {
                 self.command == CompilationCommand::Run
                     || (matches!(
                         self.command,
-                        CompilationCommand::Test | CompilationCommand::Bench
+                        CompilationCommand::Test
+                            | CompilationCommand::Bench
+                            | CompilationCommand::Nextest
                     ) && !self.no_run()),
-                "captured stdin_file is supported only for run, test or bench execution",
+                "captured stdin_file is supported only for run, test, nextest or bench execution",
             )?;
             require(
                 relative_member(path),
@@ -1035,7 +1065,10 @@ impl Profile {
         ) {
             environment.push(("RUSTDOC".into(), RUSTDOC.into()));
         }
-        if self.command == CompilationCommand::Clippy {
+        if matches!(
+            self.command,
+            CompilationCommand::Clippy | CompilationCommand::Nextest
+        ) {
             environment.push(("CARGO".into(), CARGO.into()));
         }
         environment.extend(
@@ -1580,6 +1613,16 @@ fn run_operation(
             )?;
         }
     }
+    if profile.command == CompilationCommand::Nextest {
+        let runner = paths
+            .physical(Path::new(CARGO_NEXTEST))
+            .map_err(io::Error::other)?;
+        let metadata = fs::symlink_metadata(runner)?;
+        require(
+            metadata.is_file() && metadata.mode() & 0o111 != 0,
+            "nextest requires captured ordinary executable bin/cargo-nextest",
+        )?;
+    }
     if profile.command == CompilationCommand::Doc {
         let rustdoc = paths
             .physical(Path::new(RUSTDOC))
@@ -1619,7 +1662,7 @@ fn run_operation(
     let planned = execute_controlled(
         &spec,
         &support,
-        profile.program(),
+        profile.graph_program(),
         &graph_args,
         CargoOutput::Capture {
             directory: owner.path().join("unit-graph-drain"),
@@ -1870,7 +1913,7 @@ fn run_operation(
         "cache_scope":"external-dependency-metadata-and-worker-rlib",
         "private_target_state":private_target_state,
         "restored_committed_outputs":restored_committed_outputs,
-        "test_execution":profile.command == CompilationCommand::Test && !profile.no_run(),
+        "test_execution":matches!(profile.command, CompilationCommand::Test | CompilationCommand::Nextest) && !profile.no_run(),
         "test_result_cache":false,
         "run_execution":profile.command == CompilationCommand::Run,
         "benchmark_execution":profile.command == CompilationCommand::Bench && !profile.no_run(),
@@ -2843,6 +2886,98 @@ mod tests {
             "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn nextest_uses_captured_runner_and_cargo_only_for_nonexecuting_graphs() {
+        let mut profile = application_environment_profile();
+        profile.command = CompilationCommand::Nextest;
+        profile.jobs = 3;
+        profile.selection = Some(CompilationSelection {
+            workspace: true,
+            profile: Some("release".into()),
+            runner_profile: Some("ci".into()),
+            test_threads: Some(1),
+            filtersets: vec!["package(core)".into()],
+            test_filter: Some("roundtrip".into()),
+            test_args: vec!["--exact".into()],
+            ..Default::default()
+        });
+        assert_eq!(profile.program(), CARGO_NEXTEST);
+        assert_eq!(profile.graph_program(), CARGO);
+        assert_eq!(
+            profile.compilation_args().unwrap(),
+            [
+                "nextest",
+                "run",
+                "--workspace",
+                "--cargo-profile",
+                "release",
+                "--profile",
+                "ci",
+                "--test-threads",
+                "1",
+                "--filterset",
+                "package(core)",
+                "roundtrip",
+                "--offline",
+                "--locked",
+                "--manifest-path",
+                "/__rabs/workspace/Cargo.toml",
+                "--build-jobs",
+                "3",
+                "--",
+                "--exact",
+            ]
+        );
+        assert_eq!(
+            profile.graph_args(None).unwrap(),
+            [
+                "test",
+                "--workspace",
+                "--no-run",
+                "--profile",
+                "release",
+                "--offline",
+                "--locked",
+                "--manifest-path",
+                "/__rabs/workspace/Cargo.toml",
+                "--message-format=json",
+                "--jobs",
+                "3",
+                "--unit-graph",
+                "-Z",
+                "unstable-options",
+            ]
+        );
+        let request = profile.source_specification().unwrap();
+        assert_eq!(request["program"], CARGO_NEXTEST);
+        assert_eq!(request["command_context"]["env"]["CARGO"], CARGO);
+        assert!(matches!(
+            profile.stdin_policy().unwrap(),
+            ProfileStdin::Closed
+        ));
+        profile.stdin_file = Some("fixtures/input".into());
+        assert!(matches!(
+            profile.stdin_policy().unwrap(),
+            ProfileStdin::Captured(_)
+        ));
+        profile.selection.as_mut().unwrap().no_run = true;
+        assert!(profile.no_run());
+        assert!(profile.stdin_policy().is_err());
+        profile.stdin_file = None;
+        profile.selection = None;
+        assert_eq!(
+            &profile.compilation_args().unwrap()[..2],
+            ["nextest", "run"]
+        );
+        assert!(
+            profile
+                .graph_args(None)
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--no-run")
+        );
     }
 
     #[test]

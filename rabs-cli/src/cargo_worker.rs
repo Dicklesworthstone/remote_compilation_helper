@@ -185,11 +185,16 @@ impl DaemonSocket {
 }
 
 fn selected(options: &Options) -> io::Result<(CompilationCommand, &CompilationSelection)> {
-    options
+    let (command, selection) = options
         .selected
         .as_ref()
         .map(|(command, selection)| (*command, selection))
-        .ok_or_else(|| invalid("worker profiles require an explicit Cargo command"))
+        .ok_or_else(|| invalid("worker profiles require an explicit Cargo command"))?;
+    require(
+        command != CompilationCommand::Nextest,
+        "nextest requires a local or remote canonical profile; worker artifact delivery does not support nextest",
+    )?;
+    Ok((command, selection))
 }
 
 fn manifest(profile: &Map<String, Value>) -> io::Result<&str> {
