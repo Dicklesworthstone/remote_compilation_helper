@@ -14407,9 +14407,9 @@ async fn test_hook_leaves_non_allowlisted_tool_local() {
 }
 
 fn configured_job_rewrite_fixture() -> rch_common::RchConfig {
-    let mut config = rch_common::RchConfig::default();
-    config.jobs = toml::from_str(
-        r#"
+    rch_common::RchConfig {
+        jobs: toml::from_str(
+            r#"
 intercept_enabled = true
 
 [[rules]]
@@ -14420,9 +14420,10 @@ result_dirs = ["mutants.out"]
 require_tools = ["cargo-mutants"]
 output_flag = "--output"
 "#,
-    )
-    .unwrap();
-    config
+        )
+        .unwrap(),
+        ..Default::default()
+    }
 }
 
 #[test]

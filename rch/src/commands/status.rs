@@ -5307,9 +5307,9 @@ mod tests {
     }
 
     fn configured_job_fixture() -> rch_common::RchConfig {
-        let mut config = rch_common::RchConfig::default();
-        config.jobs = toml::from_str(
-            r#"
+        rch_common::RchConfig {
+            jobs: toml::from_str(
+                r#"
 intercept_enabled = true
 required_tools = ["cargo-mutants", "llvm-cov"]
 
@@ -5321,9 +5321,10 @@ result_dirs = ["mutants.out"]
 require_tools = ["cargo-mutants"]
 output_flag = "--output"
 "#,
-        )
-        .unwrap();
-        config
+            )
+            .unwrap(),
+            ..Default::default()
+        }
     }
 
     #[test]

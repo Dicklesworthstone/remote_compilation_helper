@@ -54,7 +54,7 @@ async fn every_output_checkpoint_and_heartbeat_keeps_the_same_compact_recipe() {
                 }
                 lease_bytes = Some(bytes);
                 let count = observed.fetch_add(1, Ordering::Relaxed) + 1;
-                if count % 32 == 0 {
+                if count.is_multiple_of(32) {
                     writer.heartbeat("sync_down")?;
                     assert_eq!(writer.snapshot().recovery.as_ref(), recipe.as_ref());
                     lease_bytes = Some(std::fs::read(&writer.path)?);

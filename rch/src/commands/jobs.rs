@@ -3152,10 +3152,10 @@ mod tests {
                 .unwrap();
             stop_tx.send(()).unwrap();
             let queries = server.await.unwrap();
-            if case == "live" {
-                wrapper.kill().unwrap();
-                wrapper.wait().unwrap();
-            }
+            // Reap the live case's wrapper here; the others were reaped above, and a
+            // second kill/wait on a reaped child is a no-op (clippy::zombie_processes).
+            let _ = wrapper.kill();
+            wrapper.wait().unwrap();
             assert!(output.status.success(), "{case}: {output:?}");
             assert_eq!(
                 queries,
