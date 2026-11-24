@@ -560,6 +560,8 @@ fn main() {
                         std::process::exit(2);
                     }
                 };
+                use rabs_protocol::subscriber_interest::ChildTermination;
+
                 let path = std::path::Path::new(&args[1]);
                 let result = if remote_mode == "--canonical-compile-remote-service" {
                     rabsd::coord::canonical_local::remote_service::run_service_profile(
@@ -567,7 +569,7 @@ fn main() {
                         config.release_authorization,
                         config.build_identity,
                     )
-                    .map(|()| 0)
+                    .map(|()| ChildTermination::Exited(0))
                 } else {
                     rabsd::coord::canonical_local::remote_service::run_client_profile(
                         path,
@@ -575,18 +577,20 @@ fn main() {
                         config.build_identity,
                     )
                 };
-                let code = match result {
-                    Ok(code) => code,
+                let termination = match result {
+                    Ok(termination) => termination,
                     Err(error) => {
                         report_canonical_error(format_args!("rabsd {remote_mode}: {error}"));
-                        if error.kind() == std::io::ErrorKind::InvalidInput {
-                            2
-                        } else {
-                            1
-                        }
+                        ChildTermination::Exited(
+                            if error.kind() == std::io::ErrorKind::InvalidInput {
+                                2
+                            } else {
+                                1
+                            },
+                        )
                     }
                 };
-                std::process::exit(code);
+                rabsd::coord::canonical_local::exit_like(termination);
             }
             #[cfg(not(target_os = "linux"))]
             {

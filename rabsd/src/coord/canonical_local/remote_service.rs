@@ -35,6 +35,7 @@ use rabs_asupersync::daemon_runtime::block_on_top_level;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_edge_peer, runtime_transport_now};
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
+use rabs_protocol::subscriber_interest::ChildTermination;
 use rabs_sandbox::source_cache::MAX_SOURCE_CACHE_BYTES;
 use rabs_sandbox::source_transfer::{MAX_SOURCE_CHUNK, SourceFile, SourceReceiver};
 use rabs_sandbox::toolchain_dataset::{ToolchainIdentity, ToolchainLimits};
@@ -1080,15 +1081,15 @@ async fn serve_attached<S: AsyncRead + AsyncWrite + Unpin>(
     outcome.verify_before_delivery(&cancelled)?;
     checkpoint(stopped, delivery_deadline)?;
     wire.send(
-        &Message::BuildFinished {
-            exit_code: outcome.exit_code,
-            stdout_bytes: stdout_offset,
-            stderr_bytes: stderr_offset,
-            target: operation
+        &Message::build_finished(
+            outcome.termination,
+            stdout_offset,
+            stderr_offset,
+            operation
                 .target
                 .as_ref()
                 .map(|target| ArtifactDeclaration::from_native(target.manifest())),
-        },
+        )?,
         stopped,
         delivery_deadline,
     )
@@ -1408,7 +1409,7 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
         .ok_or_else(|| invalid("remote operation completed without its owner"))?;
     if let Some(target) = &operation.target {
         require(
-            outcome.exit_code == 0,
+            outcome.termination == ChildTermination::Exited(0),
             "failed compilation cannot publish a target",
         )?;
         let receipt = deliver_artifacts(
@@ -1455,9 +1456,7 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
     outcome.verify_before_delivery(cancelled)?;
     checkpoint(stopped, deadline)?;
     wire.send(
-        &Message::Complete {
-            exit_code: outcome.exit_code,
-        },
+        &Message::complete(outcome.termination)?,
         stopped,
         deadline,
     )
@@ -2088,8 +2087,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_delivery_requires_v12_wire_and_exact_build_identity() {
-        require_wire_identity("canonical-compile-remote-v12", "build-one", "build-one").unwrap();
+    fn remote_delivery_requires_v13_wire_and_exact_build_identity() {
+        require_wire_identity("canonical-compile-remote-v13", "build-one", "build-one").unwrap();
         for (version, identity) in [
             ("canonical-compile-remote-v1", "build-one"),
             ("canonical-compile-remote-v2", "build-one"),
@@ -2102,7 +2101,8 @@ mod tests {
             ("canonical-compile-remote-v9", "build-one"),
             ("canonical-compile-remote-v10", "build-one"),
             ("canonical-compile-remote-v11", "build-one"),
-            ("canonical-compile-remote-v12", "build-two"),
+            ("canonical-compile-remote-v12", "build-one"),
+            ("canonical-compile-remote-v13", "build-two"),
             ("", "build-one"),
         ] {
             assert_eq!(

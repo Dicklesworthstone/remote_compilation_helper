@@ -12,6 +12,7 @@ use rabs_asupersync::worker_transport::{MAX_JSON_RECORD, runtime_transport_now};
 use rabs_protocol::durable_ids::BuildOperationId;
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::reconnect::{ResumableToken, SubscriberId};
+use rabs_protocol::subscriber_interest::ChildTermination;
 use rabs_sandbox::artifact_tree::{
     MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, MAX_ARTIFACT_MANIFEST_BYTES,
 };
@@ -36,10 +37,10 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub(super) const VERSION: &str = "canonical-compile-remote-v1";
-/// v12 adds source-relative captured stdin for noninteractive execution.
-/// Reattachment retains the original input custody, diagnostic frontiers and
-/// artifact custody. Peers predating v12 refuse before admission.
-pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v12";
+/// v13 preserves native signal termination separately from ordinary exits.
+/// Completion and reattachment retain the same exact termination identity;
+/// peers predating v13 refuse before admission rather than flattening signals.
+pub(super) const WIRE_VERSION: &str = "canonical-compile-remote-v13";
 pub(super) const TOOLCHAIN_PAGE_FILES: usize = 64;
 /// Source declarations retain their existing file/path/byte limits. Paging
 /// removes only the requirement that every source path fit in the Hello frame.
@@ -1148,6 +1149,11 @@ pub(super) enum Message {
         stderr_bytes: u64,
         target: Option<ArtifactDeclaration>,
     },
+    BuildSignaled {
+        signal_number: i32,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    },
     ReceiveTarget {},
     ArtifactManifestPage {
         page: ArtifactPage,
@@ -1176,12 +1182,62 @@ pub(super) enum Message {
     Complete {
         exit_code: i32,
     },
+    CompleteSignaled {
+        signal_number: i32,
+    },
     Delivered {},
     Close {},
     Cancel {},
     Failure {
         message: String,
     },
+}
+
+/// Both canonical service transports use the same Linux native-status domain.
+/// An ordinary high exit is never interpreted as a signal; nonterminating
+/// signals cannot be accepted from a peer and later suspend the client.
+pub(super) fn validate_termination(termination: ChildTermination) -> io::Result<()> {
+    rabs_protocol::canonical_service::encode_termination(termination)
+        .map(|_| ())
+        .map_err(|_| invalid("invalid remote native termination"))
+}
+
+impl Message {
+    pub(super) fn build_finished(
+        termination: ChildTermination,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+        target: Option<ArtifactDeclaration>,
+    ) -> io::Result<Self> {
+        validate_termination(termination)?;
+        require(
+            termination == ChildTermination::Exited(0) || target.is_none(),
+            "failed remote operation cannot offer successful artifacts",
+        )?;
+        Ok(match termination {
+            ChildTermination::Exited(exit_code) => Self::BuildFinished {
+                exit_code,
+                stdout_bytes,
+                stderr_bytes,
+                target,
+            },
+            ChildTermination::Signaled { signal_number } => Self::BuildSignaled {
+                signal_number,
+                stdout_bytes,
+                stderr_bytes,
+            },
+        })
+    }
+
+    pub(super) fn complete(termination: ChildTermination) -> io::Result<Self> {
+        validate_termination(termination)?;
+        Ok(match termination {
+            ChildTermination::Exited(exit_code) => Self::Complete { exit_code },
+            ChildTermination::Signaled { signal_number } => Self::CompleteSignaled {
+                signal_number,
+            },
+        })
+    }
 }
 
 /// A fixed byte/frame deadline and a finite buffer belong to this connection.

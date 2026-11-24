@@ -1512,7 +1512,6 @@ struct OperationProvenance {
 }
 
 struct OperationOutcome {
-    exit_code: i32,
     /// Exact status of the supervised namespace launcher. A numeric status
     /// already produced by bubblewrap does not identify an inner Cargo signal.
     termination: ChildTermination,
@@ -2282,13 +2281,8 @@ fn run_operation_owned(
                 "canonical_target":TARGET, "target_directory":delivered}),
         )?;
     }
-    use std::os::unix::process::ExitStatusExt;
     Ok(OperationOutcome {
         termination: native_termination(compiled.status)?,
-        exit_code: compiled
-            .status
-            .code()
-            .unwrap_or_else(|| 128 + compiled.status.signal().unwrap_or(1)),
         retained_target: delivered,
         provenance: OperationProvenance {
             _source: source,

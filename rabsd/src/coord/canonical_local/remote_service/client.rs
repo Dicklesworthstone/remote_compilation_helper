@@ -9,7 +9,7 @@ use super::wire::{
     RESUME_GRACE, SOURCE_PAGE_FILES, SourceDeclaration, SourcePage, SourcePlan, SourcePrefixOffer,
     TOOLCHAIN_PAGE_FILES, Toolchain, ToolchainDisposition, ToolchainFilePage, ToolchainPrefixOffer,
     ToolchainResume, VERSION, WIRE_VERSION, Window, Wire, checkpoint, controlled_future,
-    decode_hex, digest, invalid, require,
+    decode_hex, digest, invalid, require, validate_termination,
 };
 use super::{
     DELIVERY_BUDGET, OUTPUT_TOTAL_BYTES, PROFILE_BYTES, TlsProfile, ordinary_directory, overlap,
@@ -31,6 +31,7 @@ use rabs_asupersync::worker_transport::{
 };
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::release_authorization::ReleaseAuthorizationMode;
+use rabs_protocol::subscriber_interest::ChildTermination;
 use rabs_sandbox::source_transfer::{
     ArtifactManifest, MAX_SOURCE_CHUNK, SourceCheckpointError, SourceManifest,
 };
@@ -261,7 +262,7 @@ pub fn run_client_profile(
     path: &Path,
     release_mode: ReleaseAuthorizationMode,
     build_identity: String,
-) -> io::Result<i32> {
+) -> io::Result<ChildTermination> {
     let (_, bytes) = read_stable(path, PROFILE_BYTES)?;
     let config = serde_json::from_slice::<ClientProfile>(&bytes)
         .map_err(|error| invalid(error.to_string()))?
@@ -879,7 +880,7 @@ struct TargetDelivery {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BuildCompletion {
-    exit_code: i32,
+    termination: ChildTermination,
     stdout_bytes: u64,
     stderr_bytes: u64,
     target: Option<ArtifactDeclaration>,
@@ -1079,14 +1080,14 @@ impl ClientDelivery {
     }
 
     fn completed(&mut self, completion: BuildCompletion) -> io::Result<()> {
+        validate_termination(completion.termination)?;
         require(
-            (0..=255).contains(&completion.exit_code)
-                && completion.stdout_bytes == self.stdout_offset
+            completion.stdout_bytes == self.stdout_offset
                 && completion.stderr_bytes == self.stderr_offset,
-            "remote completion has an invalid exit code or incomplete diagnostics",
+            "remote completion has incomplete diagnostics",
         )?;
         require(
-            completion.exit_code == 0 || completion.target.is_none(),
+            completion.termination == ChildTermination::Exited(0) || completion.target.is_none(),
             "failed remote operation offered successful artifacts",
         )?;
         if let Some(previous) = &self.completion {
@@ -1159,7 +1160,7 @@ impl<'a> ResumableClient<'a> {
         mut connect: C,
         stdout: &mut W,
         stderr: &mut E,
-    ) -> io::Result<i32>
+    ) -> io::Result<ChildTermination>
     where
         S: AsyncRead + AsyncWrite + Unpin,
         C: FnMut() -> F,
@@ -1212,7 +1213,7 @@ impl<'a> ResumableClient<'a> {
             )
             .await
             {
-                Ok(exit_code) => return Ok(exit_code),
+                Ok(termination) => return Ok(termination),
                 Err(error) if wire.can_resume_after(&error) => {
                     wire = match self.reconnect(&mut connect).await {
                         Ok(wire) => wire,
@@ -1334,8 +1335,8 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
     delivery: &mut ClientDelivery,
     stdout_writer: &mut impl Write,
     stderr_writer: &mut impl Write,
-) -> io::Result<i32> {
-    let (exit_code, target) = loop {
+) -> io::Result<ChildTermination> {
+    let (termination, target) = loop {
         let deadline = delivery.deadline();
         wire.send(&Message::Poll {}, stopped, deadline).await?;
         match wire.receive_until(stopped, deadline).await? {
@@ -1382,13 +1383,28 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
                 stderr_bytes,
                 target,
             } => {
+                let termination = ChildTermination::Exited(exit_code);
                 delivery.completed(BuildCompletion {
-                    exit_code,
+                    termination,
                     stdout_bytes,
                     stderr_bytes,
                     target: target.clone(),
                 })?;
-                break (exit_code, target);
+                break (termination, target);
+            }
+            Message::BuildSignaled {
+                signal_number,
+                stdout_bytes,
+                stderr_bytes,
+            } => {
+                let termination = ChildTermination::Signaled { signal_number };
+                delivery.completed(BuildCompletion {
+                    termination,
+                    stdout_bytes,
+                    stderr_bytes,
+                    target: None,
+                })?;
+                break (termination, None);
             }
             _ => {
                 return Err(invalid(
@@ -1413,17 +1429,21 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
         wire.send(&Message::Close {}, stopped, delivery_deadline)
             .await?;
     }
-    let Message::Complete {
-        exit_code: completed,
-    } = wire.receive_until(stopped, delivery_deadline).await?
-    else {
-        return Err(invalid(
-            "remote operation ended without its terminal completion receipt",
-        ));
+    let completed = match wire.receive_until(stopped, delivery_deadline).await? {
+        Message::Complete { exit_code } => ChildTermination::Exited(exit_code),
+        Message::CompleteSignaled { signal_number } => {
+            ChildTermination::Signaled { signal_number }
+        }
+        _ => {
+            return Err(invalid(
+                "remote operation ended without its terminal completion receipt",
+            ));
+        }
     };
+    validate_termination(completed)?;
     require(
-        completed == exit_code,
-        "remote terminal exit status changed",
+        completed == termination,
+        "remote terminal native status changed",
     )?;
     let presentation = delivery.prepare_stdout_presentation(
         config,
@@ -1447,16 +1467,23 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
             delivery_deadline.min(Instant::now() + Duration::from_secs(1)),
         )
         .await;
+    // Keep the conventional shell number in diagnostics while retaining the
+    // native signal separately. Only the typed outcome controls process exit.
+    let (exit_code, signal_number) = match termination {
+        ChildTermination::Exited(code) => (code, None),
+        ChildTermination::Signaled { signal_number } => (128 + signal_number, Some(signal_number)),
+    };
     // This locally chosen path is reported only after the final coordinator
     // receipt. Diagnostic JSON from Cargo never authorizes installation.
     report_status(
         json!({"kind":"canonical-remote-completed", "exit_code":exit_code,
+        "signal_number":signal_number,
         "target_root":delivery.target.installed.as_ref().map(|_| &config.output_destination),
         "coordinator":config.coordinator, "cargo_location":"coordinator"}),
         stopped,
         delivery_deadline,
     );
-    Ok(exit_code)
+    Ok(termination)
 }
 
 async fn receive_target<S: AsyncRead + AsyncWrite + Unpin>(
@@ -2311,7 +2338,7 @@ mod tests {
                     b"changed after the publication acknowledgment"
                 );
             } else {
-                assert_eq!(result.unwrap(), 0);
+                assert_eq!(result.unwrap(), ChildTermination::Exited(0));
                 assert_eq!(stdout, diagnostic);
                 assert_eq!(fs::read(destination.join("program")).unwrap(), bytes);
             }

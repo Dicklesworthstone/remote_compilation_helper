@@ -115,6 +115,248 @@ fn assert_resume(output: &Mutex<Vec<u8>>, stdout_offset: u64, stderr_offset: u64
 }
 
 #[test]
+fn remote_native_signal_and_ordinary_high_exit_remain_distinct_over_delivery() {
+    use crate::coord::canonical_local::native_termination;
+
+    for (script, expected) in [
+        ("exit 143", ChildTermination::Exited(143)),
+        ("exit 137", ChildTermination::Exited(137)),
+        (
+            "kill -TERM $$",
+            ChildTermination::Signaled { signal_number: 15 },
+        ),
+        (
+            "kill -KILL $$",
+            ChildTermination::Signaled { signal_number: 9 },
+        ),
+    ] {
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .status()
+            .unwrap();
+        let termination = native_termination(status).unwrap();
+        assert_eq!(termination, expected);
+        let directory = private();
+        let destination = directory.path().join("completed");
+        let config = delivery_config(&destination);
+        let stopped = AtomicBool::new(false);
+        let mut delivery = ClientDelivery::new(Instant::now() + Duration::from_secs(15));
+        let retained = b"final diagnostic\x00\xff\n";
+        // The production service constructors, serialization, decoder and
+        // client all carry the native launcher result; no shell-number guess.
+        let peer = RecoveryPeer::new(&[
+            Message::Progress {
+                stdout: diagnostic(0, retained),
+                stderr: diagnostic(0, b""),
+            },
+            Message::build_finished(termination, retained.len() as u64, 0, None).unwrap(),
+            Message::complete(termination).unwrap(),
+        ]);
+        let commands = peer.output();
+        let mut stdout = Vec::new();
+        assert_eq!(
+            native(receive_operation(
+                &mut Wire::new(peer),
+                &config,
+                &stopped,
+                &mut delivery,
+                &mut stdout,
+                &mut Vec::new(),
+            ))
+            .unwrap(),
+            expected
+        );
+        assert_eq!(stdout, retained);
+        assert!(delivery.stdout_published);
+        assert!(delivery.target.installed.is_none());
+        assert!(!destination.exists());
+        assert_eq!(kinds(&commands), ["poll", "poll", "close", "delivered"]);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn remote_reconnect_preserves_native_termination_without_shell_number_aliases() {
+    let signaled = ChildTermination::Signaled { signal_number: 15 };
+    let exited = ChildTermination::Exited(143);
+    for (original, resumed_termination) in [
+        (signaled, exited),
+        (signaled, ChildTermination::Signaled { signal_number: 9 }),
+        (signaled, signaled),
+        (exited, signaled),
+        (exited, exited),
+    ] {
+        let directory = private();
+        let destination = directory.path().join("completed");
+        let config = delivery_config(&destination);
+        let stopped = AtomicBool::new(false);
+        let mut client = client(&config, &stopped);
+        let retained = b"compiler interrupted\n";
+        let initial = RecoveryPeer::new(&[
+            Message::Accepted {},
+            Message::Progress {
+                stdout: diagnostic(0, retained),
+                stderr: diagnostic(0, b""),
+            },
+            Message::build_finished(original, retained.len() as u64, 0, None).unwrap(),
+        ]);
+        let resumed = RecoveryPeer::new(&[
+            Message::Accepted {},
+            Message::build_finished(resumed_termination, retained.len() as u64, 0, None)
+                .unwrap(),
+            Message::complete(resumed_termination).unwrap(),
+        ]);
+        let commands = resumed.output();
+        let mut peers = VecDeque::from([resumed]);
+        let mut stdout = Vec::new();
+        let result = native(client.complete(
+            Wire::new(initial),
+            || std::future::ready(Ok(peers.pop_front().expect("unexpected reconnect"))),
+            &mut stdout,
+            &mut Vec::new(),
+        ));
+        if resumed_termination == original {
+            assert_eq!(result.unwrap(), original);
+            assert_eq!(stdout, retained);
+            assert!(client.delivery.stdout_published);
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("result identity changed"));
+            assert!(stdout.is_empty());
+            assert!(!client.delivery.stdout_published);
+        }
+        assert_eq!(client.delivery.completion.as_ref().unwrap().termination, original);
+        assert_resume(&commands, retained.len() as u64, 0);
+        assert!(peers.is_empty());
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn remote_terminal_receipt_preserves_native_termination_before_stdout_publication() {
+    let signaled = ChildTermination::Signaled { signal_number: 15 };
+    let exited = ChildTermination::Exited(143);
+    for (original, terminal) in [
+        (signaled, exited),
+        (signaled, ChildTermination::Signaled { signal_number: 9 }),
+        (signaled, signaled),
+        (exited, signaled),
+        (exited, exited),
+    ] {
+        let directory = private();
+        let config = delivery_config(&directory.path().join("completed"));
+        let stopped = AtomicBool::new(false);
+        let mut delivery = ClientDelivery::new(Instant::now() + Duration::from_secs(15));
+        let retained = b"signaled Cargo output\n";
+        let mut wire = Wire::new(RecoveryPeer::new(&[
+            Message::Progress {
+                stdout: diagnostic(0, retained),
+                stderr: diagnostic(0, b""),
+            },
+            Message::build_finished(original, retained.len() as u64, 0, None).unwrap(),
+            Message::complete(terminal).unwrap(),
+        ]));
+        let mut stdout = Vec::new();
+        let result = native(receive_operation(
+            &mut wire,
+            &config,
+            &stopped,
+            &mut delivery,
+            &mut stdout,
+            &mut Vec::new(),
+        ));
+        if terminal == original {
+            assert_eq!(result.unwrap(), original);
+            assert_eq!(stdout, retained);
+            assert!(delivery.stdout_published);
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("terminal native status changed"));
+            assert!(stdout.is_empty());
+            assert!(!delivery.stdout_published);
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn remote_completion_rejects_invalid_native_statuses_and_failed_artifact_offers() {
+    for termination in [
+        ChildTermination::Exited(-1),
+        ChildTermination::Exited(256),
+        ChildTermination::Signaled { signal_number: -1 },
+        ChildTermination::Signaled { signal_number: 0 },
+        ChildTermination::Signaled { signal_number: 17 },
+        ChildTermination::Signaled { signal_number: 19 },
+        ChildTermination::Signaled { signal_number: 20 },
+        ChildTermination::Signaled { signal_number: 28 },
+        ChildTermination::Signaled { signal_number: 65 },
+    ] {
+        assert!(Message::build_finished(termination, 0, 0, None).is_err());
+        assert!(Message::complete(termination).is_err());
+        // Bypass the service constructors: hostile records must also fail in
+        // the actual client before it accepts a completion or publishes bytes.
+        let message = match termination {
+            ChildTermination::Exited(exit_code) => finished(exit_code, None),
+            ChildTermination::Signaled { signal_number } => Message::BuildSignaled {
+                signal_number,
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        };
+        let directory = private();
+        let config = delivery_config(&directory.path().join("completed"));
+        let stopped = AtomicBool::new(false);
+        let mut delivery = ClientDelivery::new(Instant::now() + Duration::from_secs(15));
+        let error = native(receive_operation(
+            &mut Wire::new(RecoveryPeer::new(&[message])),
+            &config,
+            &stopped,
+            &mut delivery,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        ))
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid remote native termination"));
+        assert!(delivery.completion.is_none());
+        assert!(!delivery.stdout_published);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    let (manifest, _) = artifact_fixture();
+    let target = ArtifactDeclaration::from_native(&manifest);
+    for termination in [
+        ChildTermination::Exited(143),
+        ChildTermination::Signaled { signal_number: 15 },
+    ] {
+        assert!(Message::build_finished(termination, 0, 0, Some(target.clone())).is_err());
+        let mut delivery = ClientDelivery::new(Instant::now() + Duration::from_secs(15));
+        assert!(
+            delivery
+                .completed(BuildCompletion {
+                    termination,
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    target: Some(target.clone()),
+                })
+                .is_err()
+        );
+        assert!(delivery.completion.is_none());
+    }
+    assert!(
+        serde_json::from_value::<Message>(json!({
+            "kind": "build-signaled", "signal_number": 15,
+            "stdout_bytes": 0, "stderr_bytes": 0, "target": target,
+        }))
+        .is_err(),
+        "a signaled wire result cannot carry an artifact declaration"
+    );
+}
+
+#[test]
 fn lost_input_acknowledgment_only_resumes_the_original_token() {
     for lost_send in [false, true] {
         let directory = private();
@@ -139,7 +381,7 @@ fn lost_input_acknowledgment_only_resumes_the_original_token() {
             &mut Vec::new(),
             &mut Vec::new(),
         ));
-        assert_eq!(result.unwrap(), 7);
+        assert_eq!(result.unwrap(), ChildTermination::Exited(7));
         assert_eq!(
             kinds(&initial_output),
             if lost_send {
@@ -225,7 +467,7 @@ fn reconnect_retains_raw_stdout_privately_and_publishes_it_once() {
             &mut stderr,
         ))
         .unwrap(),
-        0
+        ChildTermination::Exited(0)
     );
     assert_eq!(
         visible.lock().unwrap().as_slice(),
@@ -434,7 +676,7 @@ fn terminal_receipt_controls_stdout_including_failed_build_diagnostics() {
         assert_eq!(stderr, b"live diagnostic");
         assert_eq!(delivery.stdout_offset, retained.len() as u64);
         if terminal_exit == Some(7) {
-            assert_eq!(result.unwrap(), 7);
+            assert_eq!(result.unwrap(), ChildTermination::Exited(7));
             assert_eq!(stdout, retained);
             assert!(delivery.stdout_published);
             assert!(delivery.stdout_spool.is_none());
@@ -590,7 +832,7 @@ fn stdout_first_write_observes_the_verified_installed_target() {
             &mut Vec::new(),
         ))
         .unwrap(),
-        0
+        ChildTermination::Exited(0)
     );
     assert!(stdout.checked);
     assert_eq!(stdout.bytes, retained);
@@ -719,7 +961,7 @@ fn subscriber_artifact_first_write_names_the_actual_verified_file() {
             &mut stderr,
         ))
         .unwrap(),
-        0
+        ChildTermination::Exited(0)
     );
     assert!(output.checked);
     assert!(output.bytes.ends_with(runtime));
@@ -779,7 +1021,7 @@ fn source_error_presentation_survives_reconnect_with_raw_wire_frontiers() {
             &mut stderr
         ))
         .unwrap(),
-        101
+        ChildTermination::Exited(101)
     );
     assert_resume(&commands, split as u64, 5);
     assert_eq!(stderr, b"live\n");
@@ -852,7 +1094,7 @@ fn incomplete_presentation_discards_its_private_prefix_and_replays_raw_once() {
             &mut stderr
         ))
         .unwrap(),
-        101
+        ChildTermination::Exited(101)
     );
     assert_eq!(
         stdout, retained,
@@ -893,7 +1135,7 @@ fn cumulative_presentation_limit_discards_private_translation_before_raw_replay(
     delivery.stdout_offset = retained.len() as u64;
     delivery
         .completed(BuildCompletion {
-            exit_code: 101,
+            termination: ChildTermination::Exited(101),
             stdout_bytes: retained.len() as u64,
             stderr_bytes: 0,
             target: None,
@@ -1172,7 +1414,7 @@ fn artifact_tail_and_sealed_receiver_resume_without_redownloading_completed_byte
                 &mut Vec::new(),
             ))
             .unwrap(),
-            0
+            ChildTermination::Exited(0)
         );
         assert_eq!(fs::read(destination.join("program")).unwrap(), bytes);
         assert!(client.delivery.target.receiving.is_none());
@@ -1256,7 +1498,7 @@ fn publication_and_completion_loss_resend_receipt_without_reinstalling_target() 
                 &mut Vec::new(),
             ))
             .unwrap(),
-            0
+            ChildTermination::Exited(0)
         );
         assert_eq!(
             installed_inode,
@@ -1408,7 +1650,7 @@ fn reconnect_preserves_original_reuse_plan_and_never_reimports_mutated_hints() {
             &mut Vec::new(),
         ))
         .unwrap(),
-        0
+        ChildTermination::Exited(0)
     );
     assert_eq!(fs::read(destination.join("a-cached")).unwrap(), b"one");
     assert_eq!(fs::read(destination.join("b-changed")).unwrap(), changed);
@@ -1514,7 +1756,7 @@ fn reconnect_keeps_frozen_prefix_selection_and_continues_only_the_unreceived_tai
                 &mut Vec::new(),
             ))
             .unwrap(),
-            0
+            ChildTermination::Exited(0)
         );
         assert_eq!(fs::read(destination.join("a-cached")).unwrap(), b"same");
         assert_eq!(fs::read(destination.join("b-program")).unwrap(), bytes);
@@ -1598,7 +1840,7 @@ fn lost_delivered_ack_does_not_repeat_an_already_verified_completion() {
             &mut Vec::new(),
         ))
         .unwrap(),
-        0
+        ChildTermination::Exited(0)
     );
     assert_eq!(stdout, retained);
     assert!(client.delivery.stdout_published);
@@ -1612,7 +1854,7 @@ fn result_identity_and_original_delivery_deadline_cannot_change_on_reattachment(
     let original = Instant::now() + Duration::from_secs(15);
     let mut delivery = ClientDelivery::new(original);
     let result = BuildCompletion {
-        exit_code: 0,
+        termination: ChildTermination::Exited(0),
         stdout_bytes: 0,
         stderr_bytes: 0,
         target: None,
@@ -1626,7 +1868,7 @@ fn result_identity_and_original_delivery_deadline_cannot_change_on_reattachment(
     assert!(
         delivery
             .completed(BuildCompletion {
-                exit_code: 1,
+                termination: ChildTermination::Exited(1),
                 stdout_bytes: 0,
                 stderr_bytes: 0,
                 target: None,
@@ -1643,7 +1885,7 @@ fn completed_build_shortens_the_deadline_held_by_caller_output() {
     let mut delivery = ClientDelivery::new(original);
     let output = delivery.output_deadline.clone();
     let result = BuildCompletion {
-        exit_code: 0,
+        termination: ChildTermination::Exited(0),
         stdout_bytes: 0,
         stderr_bytes: 0,
         target: None,

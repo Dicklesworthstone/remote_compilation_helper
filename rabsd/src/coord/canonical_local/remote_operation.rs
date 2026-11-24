@@ -7,7 +7,7 @@
 use super::remote_toolchains::ReceivedToolchain;
 use super::target_state::TargetCacheConfig;
 use super::{
-    CompilationCommand, CompilationSelection, CompilationStdin, OperationOutput,
+    ChildTermination, CompilationCommand, CompilationSelection, CompilationStdin, OperationOutput,
     OperationProvenance, Profile, SharedRuntime, SourceSelection, default_jobs, default_manifest,
     default_timeout, invalid, overlap, private_directory, project_environment, require,
     run_operation,
@@ -270,7 +270,7 @@ fn verify_source(source: &SourceReceiver, stopped: &impl Fn() -> bool) -> io::Re
 /// One operation's typed result and its live provenance. Retain this value
 /// until sealed artifact transfer and the client's acknowledgment complete.
 pub(super) struct RemoteOperationOutcome {
-    pub(super) exit_code: i32,
+    pub(super) termination: ChildTermination,
     pub(super) retained_target: Option<PathBuf>,
     provenance: OperationProvenance,
     runtime: Arc<SharedRuntime>,
@@ -394,7 +394,7 @@ pub(super) fn start(
                 Some(inputs),
             )?;
             let outcome = RemoteOperationOutcome {
-                exit_code: outcome.exit_code,
+                termination: outcome.termination,
                 retained_target: outcome.retained_target,
                 provenance: outcome.provenance,
                 runtime,
