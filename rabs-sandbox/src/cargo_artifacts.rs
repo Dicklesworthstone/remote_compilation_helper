@@ -41,6 +41,8 @@ pub const CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoArtifactMode {
     Compilation,
+    /// HTML documentation must include a crate index reported by this invocation.
+    Documentation,
     TestExecution,
     RunExecution,
     BenchExecution,
@@ -53,7 +55,10 @@ impl CargoArtifactMode {
     /// Whether stdout after Cargo's build-finished belongs to executed programs.
     #[must_use]
     pub const fn is_execution(self) -> bool {
-        !matches!(self, Self::Compilation | Self::NextestCompilation)
+        !matches!(
+            self,
+            Self::Compilation | Self::Documentation | Self::NextestCompilation
+        )
     }
 
     /// Nextest does not emit Cargo's artifact-selection JSON protocol.
@@ -86,21 +91,6 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
     if contract.is_object() {
         return nextest::requested(request).map(Some);
     }
-    let mode = match contract.as_str() {
-        Some(CARGO_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION) => {
-            CargoArtifactMode::Compilation
-        }
-        Some(CARGO_TEST_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION) => {
-            CargoArtifactMode::TestExecution
-        }
-        Some(CARGO_RUN_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION) => {
-            CargoArtifactMode::RunExecution
-        }
-        Some(CARGO_BENCH_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION) => {
-            CargoArtifactMode::BenchExecution
-        }
-        _ => return Err(invalid("unsupported Cargo artifact contract")),
-    };
     if request["artifacts"]["tree"].as_str() != Some(TREE_FILES_VERSION)
         || request["artifacts"]["unit"].as_str() != Some("cargo")
         || request.get("dependency_context").is_some()
@@ -127,6 +117,25 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
             "Cargo artifact contract requires build, check, clippy, doc, test, run or bench",
         ));
     }
+    let mode = match contract.as_str() {
+        Some(CARGO_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION) => {
+            if command == "doc" {
+                CargoArtifactMode::Documentation
+            } else {
+                CargoArtifactMode::Compilation
+            }
+        }
+        Some(CARGO_TEST_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_TEST_ARTIFACTS_VERSION) => {
+            CargoArtifactMode::TestExecution
+        }
+        Some(CARGO_RUN_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_RUN_ARTIFACTS_VERSION) => {
+            CargoArtifactMode::RunExecution
+        }
+        Some(CARGO_BENCH_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_BENCH_ARTIFACTS_VERSION) => {
+            CargoArtifactMode::BenchExecution
+        }
+        _ => return Err(invalid("unsupported Cargo artifact contract")),
+    };
     if command == "doc"
         && (request["command_context"]["env"]["RUSTDOC"] != "/__rabs/toolchain/bin/rustdoc"
             || request["command_context"]["env"]["RUSTC"] != "/__rabs/toolchain/bin/rustc")
@@ -247,6 +256,7 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
         CargoArtifactMode::Compilation => {
             command != "run" && (!matches!(command, "test" | "bench") || no_run)
         }
+        CargoArtifactMode::Documentation => command == "doc",
         CargoArtifactMode::TestExecution => command == "test" && !no_run,
         CargoArtifactMode::RunExecution => command == "run" && !no_run,
         CargoArtifactMode::BenchExecution => command == "bench" && !no_run,
@@ -563,6 +573,7 @@ impl CargoArtifactReport {
         let mut runtime_executables = BTreeSet::new();
         let mut finished = false;
         let mut compiled_target = false;
+        let mut documented_target = false;
         let mut artifact_messages = 0_usize;
         loop {
             if finished && mode.is_execution() {
@@ -657,6 +668,22 @@ impl CargoArtifactReport {
                     let names = validate_tree_names(paths.iter().map(String::as_str))?;
                     if !kinds.iter().any(|kind| kind == "custom-build") {
                         compiled_target = true;
+                        if mode == CargoArtifactMode::Documentation
+                            && !documented_target
+                            && let Some(name) = value["target"]["name"].as_str()
+                        {
+                            // Cargo reports doc/<crate>/index.html, optionally under a
+                            // target directory. A dependency artifact or an index left
+                            // in the restored tree is not a current documentation output.
+                            let crate_name = name.replace('-', "_");
+                            documented_target = names.iter().any(|path| {
+                                let mut parts = path.rsplit('/');
+                                parts.next() == Some("index.html")
+                                    && parts.next() == Some(crate_name.as_str())
+                                    && parts.next() == Some("doc")
+                                    && parts.count() <= 1
+                            });
+                        }
                     }
                     match value.get("executable") {
                         Some(Value::Null) => {}
@@ -683,6 +710,11 @@ impl CargoArtifactReport {
         if !finished || !compiled_target {
             return Err(invalid(
                 "Cargo did not complete a real non-build-script target",
+            ));
+        }
+        if mode == CargoArtifactMode::Documentation && !documented_target {
+            return Err(invalid(
+                "Cargo did not report a documented target's crate index",
             ));
         }
         if (mode == CargoArtifactMode::RunExecution && runtime_executables.len() != 1)
@@ -1072,7 +1104,7 @@ mod tests {
         let request = doc_request();
         assert_eq!(
             requested(&request).unwrap(),
-            Some(CargoArtifactMode::Compilation)
+            Some(CargoArtifactMode::Documentation)
         );
         for field in ["RUSTDOC", "RUSTC"] {
             for value in [
@@ -1186,14 +1218,16 @@ mod tests {
             let source = format!("{prefix}/src/app/lib.rs.html");
             let asset = format!("{prefix}/static.files/main.js");
             let item = format!("{prefix}/app/fn.private_item.html");
+            let mut documented = record("lib", &[&format!("{OUTPUT_ROOT}/{index}")], None);
+            documented["target"]["name"] = json!("app");
             let bytes = stream(&[
-                record("lib", &[&format!("{OUTPUT_ROOT}/{index}")], None),
+                documented,
                 json!({"reason":"build-finished", "success":true}),
             ]);
             let report = CargoArtifactReport::read(
                 bytes.as_slice(),
                 OUTPUT_ROOT,
-                CargoArtifactMode::Compilation,
+                CargoArtifactMode::Documentation,
             )
             .unwrap();
             assert_eq!(report.files().collect::<Vec<_>>(), [index.as_str()]);
@@ -1212,6 +1246,53 @@ mod tests {
                 "assets cannot substitute for the selected crate's index"
             );
         }
+    }
+
+    #[test]
+    fn documentation_requires_a_matching_index_in_the_current_compiler_report() {
+        let mut dependency = record(
+            "lib",
+            &[&format!("{OUTPUT_ROOT}/debug/deps/liba.rmeta")],
+            None,
+        );
+        dependency["target"]["name"] = json!("a");
+        let finished = json!({"reason":"build-finished", "success":true});
+        for (kind, name, path) in [
+            ("lib", "app", "doc/other/index.html"),
+            ("bin", "app", "doc/app/module/index.html"),
+            ("lib", "app", "debug/build/out/doc/app/index.html"),
+            ("lib", "app", "doc/static.files/main.js"),
+            ("custom-build", "app", "doc/app/index.html"),
+        ] {
+            let mut unrelated = record(kind, &[&format!("{OUTPUT_ROOT}/{path}")], None);
+            unrelated["target"]["name"] = json!(name);
+            let bytes = stream(&[dependency.clone(), unrelated, finished.clone()]);
+            assert!(
+                CargoArtifactReport::read(
+                    bytes.as_slice(),
+                    OUTPUT_ROOT,
+                    CargoArtifactMode::Documentation,
+                )
+                .is_err(),
+                "{path}"
+            );
+            // The metadata is a legitimate ordinary Cargo compilation result.
+            assert!(
+                CargoArtifactReport::read(bytes.as_slice(), OUTPUT_ROOT, CargoArtifactMode::Compilation)
+                    .is_ok()
+            );
+        }
+        let mut binary = record(
+            "bin",
+            &[&format!("{OUTPUT_ROOT}/doc/my_app/index.html")],
+            None,
+        );
+        binary["target"]["name"] = json!("my-app");
+        let bytes = stream(&[dependency, binary, finished]);
+        assert!(
+            CargoArtifactReport::read(bytes.as_slice(), OUTPUT_ROOT, CargoArtifactMode::Documentation)
+                .is_ok()
+        );
     }
 
     fn clippy_request() -> Value {
