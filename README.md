@@ -111,15 +111,20 @@ Package discovery for implicit builds and compile-only tests requires Go 1.18
 or newer. Go modules and workspaces preserve the invocation directory while
 uploading the complete admitted source root. RCH asks the caller's Go executable
 for the selected `GOMOD` and `GOWORK`, then reads Go's parsed `use` and `replace`
-declarations. Workspace members and effective relative local replacements must
-remain inside the selected workspace directory. A standalone module can include
-sibling replacements inside its enclosing Git repository. Nested package
+declarations. Workspace members and effective relative local replacements may
+be siblings of the selected workfile directory inside its owning Git repository.
+For example, `ci/check.work` can select `../app` and `../library`. RCH expands
+the transfer root to that repository and checks membership before reading sibling
+module manifests. A standalone module can use the same layout for replacements.
+Nested package
 invocations, including `go build`, `go test -c`, ordinary `go test`, and `go vet`,
 retain their original command and output paths.
 
 Go's selected control files must be included by the actual source transfer;
 `.rchignore` cannot leave a stale worker manifest in place. Before execution the
 native worker verifies their exact bytes, absent sum files, and selected module.
+The selected module or workfile also determines the vendor directory. RCH checks
+its presence and the contents or absence of its `modules.txt` on the worker.
 Both package discovery and workspace execution use a private workspace copy
 outside the sources, with member paths relocated by Go itself. This preserves
 explicit `GOWORK` selection and keeps generated workspace sums and runtime

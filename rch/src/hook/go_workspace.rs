@@ -200,10 +200,11 @@ pub(super) fn workspace_modules(
     let mut roots = BTreeSet::new();
     for module in modules {
         let directory = local_directory(&root, &module.disk_path, topology)?;
-        ensure!(
-            directory.starts_with(&root),
-            "Go workspace module escapes its source root"
-        );
+        if !directory.starts_with(&root) {
+            // Validate ownership before the discovery caller opens this
+            // member's go.mod and asks Go to parse it.
+            require_shared_repository(&root, &directory, topology)?;
+        }
         ensure!(
             roots.insert(directory),
             "Go workspace repeats a module directory"
@@ -275,7 +276,22 @@ fn enclosing_repository(module: &Path, topology: &PathTopologyPolicy) -> Result<
             Err(error) => return Err(error).context("inspect Go repository boundary"),
         }
     }
-    anyhow::bail!("Go local replacements outside the module require an enclosing Git repository")
+    anyhow::bail!("Go source outside the selected module or workfile directory requires an enclosing Git repository")
+}
+
+fn require_shared_repository(
+    owner: &Path,
+    sibling: &Path,
+    topology: &PathTopologyPolicy,
+) -> Result<PathBuf> {
+    let repository = enclosing_repository(owner, topology)?;
+    ensure!(
+        sibling.starts_with(&repository) && enclosing_repository(sibling, topology)? == repository,
+        "Go source {} is outside the owning repository {}",
+        sibling.display(),
+        repository.display()
+    );
+    Ok(repository)
 }
 
 fn capture_file(
@@ -458,10 +474,6 @@ pub(super) fn plan(
     let (source_root, main_modules) = if let Some(workspace) = selected_workspace {
         let root = manifest_parent(workspace, topology)?;
         let modules = workspace_modules(workspace, workspace_json.unwrap_or_default(), topology)?;
-        ensure!(
-            invocation.starts_with(&root),
-            "Go invocation is outside its workspace source root"
-        );
         if let Some(module) = &selected_module_root {
             ensure!(
                 modules.contains(module),
@@ -470,6 +482,11 @@ pub(super) fn plan(
             ensure!(
                 invocation.starts_with(module),
                 "Go invocation is outside its selected module"
+            );
+        } else {
+            ensure!(
+                invocation.starts_with(&root),
+                "Go invocation is outside its workfile directory and has no selected member"
             );
         }
         (root, modules)
@@ -554,21 +571,14 @@ pub(super) fn plan(
             workspace_edit_args.push(format!("-replace={identity}={}", directory.display()));
         }
     }
-    let source_root = if roots.iter().all(|root| root.starts_with(&source_root)) {
-        source_root
-    } else {
-        ensure!(
-            selected_workspace.is_none(),
-            "Go workspace local replacement escapes its source root"
-        );
-        enclosing_repository(&source_root, topology)?
-    };
-    ensure!(
-        roots.iter().all(|root| root.starts_with(&source_root)),
-        "Go local replacement escapes the selected repository source boundary"
-    );
+    let mut transfer_root = source_root.clone();
+    for root in &roots {
+        if !root.starts_with(&source_root) {
+            transfer_root = require_shared_repository(&source_root, root, topology)?;
+        }
+    }
     let mut plan = GoSourcePlan {
-        source_root,
+        source_root: transfer_root,
         selected_module: selected_module.map(Path::to_owned),
         workspace: selected_workspace.map(Path::to_owned),
         vendor_directory: None,
@@ -713,6 +723,64 @@ mod tests {
                 .workspace_edit_args
                 .contains(&format!("-use={}", library.display()))
         );
+    }
+
+    #[test]
+    fn nested_workfile_closes_sibling_members_and_replacements_inside_its_repository() {
+        let (root, topology) = fixture();
+        let repo = root.join("repo");
+        let controls = repo.join("ci");
+        let app = repo.join("app");
+        let local = repo.join("library");
+        module(&app, "app");
+        module(&local, "library");
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(controls.join("vendor")).unwrap();
+        let work = controls.join("ci.work");
+        std::fs::write(&work, "go 1.22\nuse ../app\n").unwrap();
+        let work_json = serde_json::to_vec(&json!({
+            "Use": [{"DiskPath": "../app"}],
+            "Replace": [replacement("library", "../library")]
+        }))
+        .unwrap();
+        let modules = BTreeMap::from([(app.clone(), module_json("app", serde_json::Value::Null))]);
+        let invocation = app.join("cmd");
+        std::fs::create_dir(&invocation).unwrap();
+        let manifest = app.join("go.mod");
+        let discover = || {
+            plan(
+                &invocation,
+                Some(&manifest),
+                Some(&work),
+                Some(&work_json),
+                &modules,
+                &topology,
+            )
+        };
+        let planned = discover().unwrap();
+        assert_eq!(planned.source_root, repo);
+        assert_eq!(planned.vendor_directory, Some(controls.join("vendor")));
+        assert!(planned.required_files.contains_key(&local.join("go.mod")));
+        assert!(
+            planned.workspace_edit_args.contains(&format!("-use={}", app.display()))
+        );
+        assert!(
+            planned.workspace_edit_args.contains(&format!(
+                "-replace=example.invalid/library={}", local.display()
+            ))
+        );
+
+        // A replacement below the outer Git root may itself be an independent
+        // checkout. Do not admit it through the expanded transfer root.
+        std::fs::create_dir(local.join(".git")).unwrap();
+        assert!(discover().is_err());
+        std::fs::write(app.join(".git"), "gitdir: /some/worktree\n").unwrap();
+        assert!(workspace_modules(&work, &work_json, &topology).is_err());
+        let outside = root.join("outside");
+        module(&outside, "outside");
+        let outside_json =
+            serde_json::to_vec(&json!({"Use": [{"DiskPath":"../../outside"}]})).unwrap();
+        assert!(workspace_modules(&work, &outside_json, &topology).is_err());
     }
 
     #[test]

@@ -2016,6 +2016,10 @@ mod tests {
         }
 
         fn command(&self, args: &[&str]) -> String {
+            self.workfile_command(&self.source.join("selected.work"), args)
+        }
+
+        fn workfile_command(&self, workfile: &Path, args: &[&str]) -> String {
             let mut words: Vec<String> = [
                 "env",
                 "GOENV=off",
@@ -2030,10 +2034,7 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect();
-            words.push(format!(
-                "GOWORK={}",
-                self.source.join("selected.work").display()
-            ));
+            words.push(format!("GOWORK={}", workfile.display()));
             words.push(format!(
                 "GOMODCACHE={}",
                 self.directory.join("caller-modules").display()
@@ -2173,6 +2174,50 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_go_uses_nested_workfile_with_sibling_members_and_replacement() {
+        let fixture = WorkspaceFixture::new();
+        let ci = fixture.source.join("ci controls");
+        std::fs::create_dir(&ci).unwrap();
+        std::fs::create_dir(fixture.source.join(".git")).unwrap();
+        let workfile = ci.join("check.work");
+        std::fs::write(
+            &workfile,
+            "go 1.22\nuse (\n ../app\n \"../library with spaces\"\n)\nreplace example.invalid/helper => ../helper\n",
+        )
+        .unwrap();
+        let command = fixture.workfile_command(&workfile, &["build", "-p=1", "."]);
+        let cwd = fixture.cwd();
+        let plan = discover_go_source(&command, &cwd, &fixture.topology)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.source_root, fixture.source);
+        assert!(plan.absent_files.contains(&ci.join("vendor")));
+        let runtime = LocalProbeRuntime::create(&plan.source_root).unwrap();
+        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+        let workspace = local_workspace_environment(&command, &cwd, &plan, &runtime, deadline)
+            .await
+            .unwrap();
+        // Load the actual dependency graph with networking disabled. A copy
+        // that keeps paths relative to the private workfile loses both the
+        // sibling module and its overridden local dependency.
+        let query = shell_command(
+            &command,
+            format!("{}{workspace}\"$rch_go\" list -buildvcs=false -deps .", runtime.assignments),
+            &[],
+        )
+        .unwrap();
+        let listed = run_fixture(&query, &cwd).await;
+        assert!(listed.status.success(), "{listed:?}");
+        let packages = std::str::from_utf8(&listed.stdout).unwrap();
+        for expected in ["example.invalid/library", "example.invalid/helper"] {
+            assert!(packages.lines().any(|package| package == expected));
+        }
+        assert!(!ci.join("check.work.sum").exists());
     }
 
     #[cfg(unix)]
