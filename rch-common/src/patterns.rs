@@ -2515,6 +2515,52 @@ fn literal_flag_words(mut command: &str) -> Option<Vec<&str>> {
     Some(words)
 }
 
+/// Shell-words is a tokenizer, not an expansion engine. Admit only a literal
+/// argv before dropping quoting information. In particular, a quoted `*` is a
+/// filename while an unquoted one can expand to several shell arguments.
+#[must_use]
+pub fn literal_compiler_words(command: &str) -> Option<Vec<String>> {
+    if command.len() > 65_536 {
+        return None;
+    }
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if matches!(ch, '\0' | '\r' | '\n') {
+            return None;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                '$' | '`' => return None,
+                _ => {}
+            },
+            _ => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => escaped = true,
+                '$' | '`' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | '{'
+                | '}' | '~' | '#' => return None,
+                _ => {}
+            },
+        }
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    let words = shell_words::split(command).ok()?;
+    (words.len() <= 4096).then_some(words)
+}
+
 /// The common linker flags that do not introduce another output file. Go's
 /// lower-level flags also include profiles, temporary directories and external
 /// commands, so arbitrary -ldflags/-gcflags/-asmflags cannot share a one-file
@@ -2690,8 +2736,8 @@ fn go_build_flag<'a>(
 #[must_use]
 pub fn go_build_invocation(command: &str) -> Option<GoBuildInvocation> {
     let normalized = normalize_command(command);
-    let words = literal_flag_words(&normalized)?;
-    let mut args = words.iter().copied().enumerate().peekable();
+    let words = literal_compiler_words(&normalized)?;
+    let mut args = words.iter().map(String::as_str).enumerate().peekable();
     if args.next()?.1 != "go" || args.next()?.1 != "build" {
         return None;
     }
@@ -2726,11 +2772,7 @@ pub fn go_build_invocation(command: &str) -> Option<GoBuildInvocation> {
         } else {
             go_build_flag(flag, inline, &mut args)?;
             let next_index = args.peek().map_or(words.len(), |(index, _)| *index);
-            build_flags.extend(
-                words[option_index..next_index]
-                    .iter()
-                    .map(|arg| (*arg).to_owned()),
-            );
+            build_flags.extend_from_slice(&words[option_index..next_index]);
         }
     }
     Some(GoBuildInvocation {
@@ -2751,8 +2793,8 @@ pub fn go_build_invocation(command: &str) -> Option<GoBuildInvocation> {
 #[must_use]
 pub fn go_test_invocation(command: &str) -> Option<GoTestInvocation> {
     let normalized = normalize_command(command);
-    let words = literal_flag_words(&normalized)?;
-    let mut args = words.iter().copied().enumerate().peekable();
+    let words = literal_compiler_words(&normalized)?;
+    let mut args = words.iter().map(String::as_str).enumerate().peekable();
     if args.next()?.1 != "go" || args.next()?.1 != "test" {
         return None;
     }
@@ -2796,11 +2838,7 @@ pub fn go_test_invocation(command: &str) -> Option<GoTestInvocation> {
             _ => {
                 go_build_flag(flag, inline, &mut args)?;
                 let next_index = args.peek().map_or(words.len(), |(index, _)| *index);
-                build_flags.extend(
-                    words[option_index..next_index]
-                        .iter()
-                        .map(|arg| (*arg).to_owned()),
-                );
+                build_flags.extend_from_slice(&words[option_index..next_index]);
             }
         }
     }
@@ -2817,8 +2855,8 @@ pub fn go_test_invocation(command: &str) -> Option<GoTestInvocation> {
 #[must_use]
 pub fn go_coverage_invocation(command: &str) -> Option<GoCoverageInvocation> {
     let normalized = normalize_command(command);
-    let words = literal_flag_words(&normalized)?;
-    let mut args = words.iter().copied().enumerate().peekable();
+    let words = literal_compiler_words(&normalized)?;
+    let mut args = words.iter().map(String::as_str).enumerate().peekable();
     if args.next()?.1 != "go" || args.next()?.1 != "test" {
         return None;
     }
@@ -2870,11 +2908,7 @@ pub fn go_coverage_invocation(command: &str) -> Option<GoCoverageInvocation> {
             _ => go_build_flag(flag, inline, &mut args)?,
         }
         let next_index = args.peek().map_or(words.len(), |(index, _)| *index);
-        test_flags.extend(
-            words[option_index..next_index]
-                .iter()
-                .map(|argument| (*argument).to_owned()),
-        );
+        test_flags.extend_from_slice(&words[option_index..next_index]);
     }
     Some(GoCoverageInvocation {
         output: output?,
@@ -9111,6 +9145,7 @@ mod tests_go_and_typescript {
         for (command, path, option_index) in [
             ("go build -o bin/app ./cmd/app", "bin/app", 2),
             ("go build -o=bin/app ./cmd/app", "bin/app", 2),
+            ("go build -o='bin/my app' ./cmd/app", "bin/my app", 2),
             ("go build '-o=bin/app' main.go", "bin/app", 2),
             (
                 "go build -trimpath -p=2 -o './products/app [dev]*?' .",
@@ -9502,6 +9537,7 @@ mod tests_go_and_typescript {
     fn go_coverage_tests_plan_one_report_and_preserve_argument_values() {
         for command in [
             "go test -coverprofile=coverage.out ./...",
+            "go test -coverprofile='target/coverage [part]*.out' ./...",
             "go test -coverprofile 'reports/coverage file.out' -race -count=1 ./...",
             "go test ./pkg ./other -coverprofile coverage.out -run TestSelected",
             "go test -coverprofile coverage.out -run '-cpuprofile=not-an-output' ./pkg",
@@ -9543,6 +9579,9 @@ mod tests_go_and_typescript {
             "go test -coverprofile=coverage.out ./first -run TestOne ./second",
             "go test -coverprofile=coverage.out -args -custom",
             "go test -coverprofile=$OUTPUT",
+            "go test -coverprofile=\"reports/$OUTPUT\" ./...",
+            "go test -coverprofile=reports/*.out ./...",
+            "go test -coverprofile='reports/'*.out ./...",
             "go test -coverprofile=coverage.out *.go",
             "go test -coverprofile=coverage.out < diagnostics",
         ] {

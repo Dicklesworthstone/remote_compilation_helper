@@ -10,6 +10,7 @@
 //! Unsupported commands retain the caller's existing selection policy.
 //! Exact contracts are persisted and checked before publication.
 
+use rch_common::patterns::literal_compiler_words as literal_words;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -287,51 +288,6 @@ impl NativeOutputDiscovery {
 
 fn go_output_contract(command: &str) -> Option<NativeOutputContract> {
     NativeOutputContract::from_paths([go_build::invocation(command)?.output?.path])
-}
-
-/// Shell-words is a tokenizer, not an expansion engine. Admit only a literal
-/// argv before dropping quoting information. In particular, a quoted `*` is a
-/// filename while an unquoted one can expand to several shell arguments.
-fn literal_words(command: &str) -> Option<Vec<String>> {
-    if command.len() > 65_536 {
-        return None;
-    }
-    let mut quote = None;
-    let mut escaped = false;
-    for ch in command.chars() {
-        if matches!(ch, '\0' | '\r' | '\n') {
-            return None;
-        }
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match quote {
-            Some('\'') => {
-                if ch == '\'' {
-                    quote = None;
-                }
-            }
-            Some('"') => match ch {
-                '"' => quote = None,
-                '\\' => escaped = true,
-                '$' | '`' => return None,
-                _ => {}
-            },
-            _ => match ch {
-                '\'' | '"' => quote = Some(ch),
-                '\\' => escaped = true,
-                '$' | '`' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '*' | '?' | '[' | '{'
-                | '}' | '~' | '#' => return None,
-                _ => {}
-            },
-        }
-    }
-    if quote.is_some() || escaped {
-        return None;
-    }
-    let words = shell_words::split(command).ok()?;
-    (words.len() <= 4096).then_some(words)
 }
 
 /// Skip only wrappers whose argv and working directory are unchanged. Do not
