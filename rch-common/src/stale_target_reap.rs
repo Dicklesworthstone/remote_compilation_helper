@@ -229,6 +229,28 @@ pub fn is_safe_reap_base(s: &str) -> bool {
         && s.chars().all(is_safe_reap_char)
 }
 
+/// A literal root for the worker-wide GC builders, which quote every operand.
+/// Keep the legacy reap predicates above for builders that interpolate raw
+/// ASCII paths. No normalization may turn a different spelling into authority.
+#[must_use]
+pub fn is_safe_gc_base(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && path.len() <= 4096
+        && !path.contains("..")
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .skip(1)
+            .all(|part| !part.is_empty() && part != ".")
+}
+
+/// A literal GC candidate must additionally be below a top-level directory.
+#[must_use]
+pub fn is_safe_gc_path(path: &str) -> bool {
+    is_safe_gc_base(path) && path.matches('/').count() >= 2
+}
+
 /// Whether `s` is safe to embed as a directory basename token in a reap script
 /// (e.g. the current job's dir name, used to exclude it from reaping).
 pub fn is_safe_reap_token(s: &str) -> bool {
@@ -344,15 +366,16 @@ fn reap_loop_body_with_source_gate(
         // Tagged (sweep) contexts capture rm's stderr instead of silencing it
         // (bd-kwvy8: a half-removed dir with removed=0 was undiagnosable
         // because the failing rm was 2>/dev/null'd) — a failed removal emits
-        // `RCH_REAP_ERR <trigger> <path> :: <first stderr line>`.
+        // The byte-framed error record preserves literal path delimiters.
         let removal_body = match trigger {
             Some(tag) => format!(
                 "if __rmerr=$(rm -rf -- \"$d\" 2>&1); then \
                    {removed_counter}=$(({removed_counter} + 1)); {freed_kb}=$(({freed_kb} + sz)); \
                    printf 'RCH_REAP_RM %s {tag} %s\\n' \"$sz\" \"$d\"; \
                  else \
-                   printf 'RCH_REAP_ERR {tag} %s :: %s\\n' \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
-                 fi;"
+                   {error_event}\
+                 fi;",
+                error_event = reap_error_event(&shell_escape::escape(tag.into())),
             ),
             None => format!(
                 "if rm -rf -- \"$d\" 2>/dev/null; then {removed_counter}=$(({removed_counter} + 1)); {freed_kb}=$(({freed_kb} + sz)); fi;"
@@ -370,6 +393,16 @@ fn reap_loop_body_with_source_gate(
          {claim}\
          {recent}\
          {size_capture}{removal}{unlock}"
+    )
+}
+
+/// Length-frame a failed path: both it and `rm`'s message can contain the old
+/// ` :: ` separator. Count bytes in the C locale so Unicode paths round-trip.
+fn reap_error_event(trigger_argument: &str) -> String {
+    format!(
+        "__path_bytes=$(LC_ALL=C; export LC_ALL; printf '%s' \"${{#d}}\"); \
+         printf 'RCH_REAP_ERR_V2 %s %s %s %s\\n' {trigger_argument} \"$__path_bytes\" \"$d\" \
+           \"$(printf '%s' \"$__rmerr\" | head -1)\"; "
     )
 }
 
@@ -837,15 +870,17 @@ fn gate_snapshot_fragment() -> String {
         "fi; ",
         "__gc_handles() { ",
         "  if [ \"$__held_ok\" -ne 1 ]; then printf unknown; return 0; fi; ",
-        "  if __evidence=$(awk -v p=\"$1\" -v source=\"$__hsrc\" ",
-        "    'source==\"lsof\" {if (substr($0,1,1)!=\"n\") next; $0=substr($0,2)} ",
+        "  if __evidence=$(RCH_GC_MATCH_PATH=\"$1\" awk -v source=\"$__hsrc\" ",
+        "    'BEGIN {p=ENVIRON[\"RCH_GC_MATCH_PATH\"]} ",
+        "     source==\"lsof\" {if (substr($0,1,1)!=\"n\") next; $0=substr($0,2)} ",
         "     $0==p || index($0, p \"/\")==1 {f=1; exit} END{print(f?\"held\":\"free\")}' \"$__held\"); ",
         "  then printf '%s' \"$__evidence\"; else printf unknown; fi; ",
         "}; ",
         "__gc_procs() { ",
         "  if [ \"$__proc_ok\" -ne 1 ]; then printf unknown; return 0; fi; ",
-        "  if __evidence=$(awk -v p=\"$1\" -v skip=\"$__self_pids\" ",
-        "    '{ if (index(skip, \" \" $1 \" \") > 0) next; if (index($0, p) > 0) { f=1; exit } } ",
+        "  if __evidence=$(RCH_GC_MATCH_PATH=\"$1\" awk -v skip=\"$__self_pids\" ",
+        "    'BEGIN {p=ENVIRON[\"RCH_GC_MATCH_PATH\"]} ",
+        "     { if (index(skip, \" \" $1 \" \") > 0) next; if (index($0, p) > 0) { f=1; exit } } ",
         "     END{print(f?\"held\":\"free\")}' \"$__proc\"); ",
         "  then printf '%s' \"$__evidence\"; else printf unknown; fi; ",
         "}; ",
@@ -950,7 +985,7 @@ fn candidate_discovery_preamble(bases: &[&str], on_guard_exit: &str, names: &[&s
     let tmp_base_var = crate::gc_roots::RCH_CARGO_HOME_BASE_VAR;
     let bases = bases
         .iter()
-        .map(|base| format!("\"{base}\""))
+        .map(|base| shell_escape::escape((*base).into()).into_owned())
         .collect::<Vec<_>>()
         .join(" ");
     format!(
@@ -970,12 +1005,13 @@ fn candidate_discovery_preamble(bases: &[&str], on_guard_exit: &str, names: &[&s
            printf 'RCH_GC_DISCOVERY_INCOMPLETE changed-temp-root\\n' >&2; exit 1; fi; \
          {gates}\
          __all=$(rch_gc_mktemp) || {{ {cleanup}{on_guard_exit}exit 0; }}; \
+         __gc_roots=$(rch_gc_mktemp) || {{ rm -f \"$__all\"; {cleanup}{on_guard_exit}exit 0; }}; \
          __gc_discovery_failed() {{ \
            printf 'RCH_GC_DISCOVERY_INCOMPLETE\\n' >&2; \
-           rm -f \"$__all\"; {cleanup}exit 1; \
+           rm -f \"$__all\" \"$__gc_roots\"; {cleanup}exit 1; \
          }}; \
          {DISCOVERY_PATH_RECORDS}\
-         __gc_resolved_roots=\"\"; __gc_select_root=\"\"; \
+         __gc_select_root=\"\"; \
          for base in {bases}; do \
            printf 'RCH_GC_ROOT base %s\\n' \"$base\"; \
            if [ ! -d \"$base\" ]; then printf 'RCH_GC_ROOT_SKIPPED %s missing\\n' \"$base\"; continue; fi; \
@@ -984,11 +1020,15 @@ fn candidate_discovery_preamble(bases: &[&str], on_guard_exit: &str, names: &[&s
            case \"$__rt\" in *\"$__lf\"*|*\"$__cr\"*) __gc_discovery_failed;; esac; \
            [ -n \"$__rt\" ] || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; continue; }}; \
            case \"$__rt\" in */*/*) ;; *) printf 'RCH_GC_ROOT_SKIPPED %s too-shallow\\n' \"$base\"; continue;; esac; \
-           case \"$__rt\" in *[!A-Za-z0-9/._-]*|*..*) printf 'RCH_GC_ROOT_SKIPPED %s unsafe-resolved\\n' \"$base\"; continue;; esac; \
+           case \"$__rt\" in *[[:cntrl:]]*|*..*) printf 'RCH_GC_ROOT_SKIPPED %s unsafe-resolved\\n' \"$base\"; continue;; esac; \
            [ \"$base\" -ef \"$__rt\" ] || {{ printf 'RCH_GC_ROOT_SKIPPED %s changed-resolution\\n' \"$base\"; continue; }}; \
            printf 'RCH_GC_ROOT resolved %s\\n' \"$__rt\"; \
-           case \" $__gc_resolved_roots \" in *\" $__rt \"*) continue;; esac; \
-           __gc_resolved_roots=\"$__gc_resolved_roots $__rt\"; \
+           __gc_seen=0; \
+           while IFS= read -r __gc_root; do \
+             if [ \"$__gc_root\" = \"$__rt\" ]; then __gc_seen=1; break; fi; \
+           done < \"$__gc_roots\"; \
+           [ \"$__gc_seen\" -eq 0 ] || continue; \
+           printf '%s\\n' \"$__rt\" >> \"$__gc_roots\" || __gc_discovery_failed; \
            if ! find \"$__rt\" -maxdepth 8 -type d \\( {name_alternatives} \\) -prune \
              -exec sh -c \"$__discover\" RCH_GC_DISCOVERY_INVALID_PATH {{}} + >> \"$__all\"; \
            then __gc_discovery_failed; fi; \
@@ -1004,7 +1044,7 @@ fn candidate_discovery_preamble(bases: &[&str], on_guard_exit: &str, names: &[&s
          fi; \
          {dedup}\
          {SELECT_CANDIDATES}\
-         __tmpf=$(rch_gc_mktemp) || {{ rm -f \"$__all\"; {cleanup}{on_guard_exit}exit 0; }}; \
+         __tmpf=$(rch_gc_mktemp) || {{ rm -f \"$__all\" \"$__gc_roots\"; {cleanup}{on_guard_exit}exit 0; }}; \
          __gc_select \"$__tmpf\" \".rch-target-*-job-*\" \".rch-target-*-pid-*\" \"rch_target_*\"; ",
         gates = gate_snapshot_fragment(),
         cleanup = gate_snapshot_cleanup(),
@@ -1024,15 +1064,11 @@ fn validate_discovery_roots(bases: &[String]) -> Result<Vec<&str>, String> {
     }
     let mut bytes = 0usize;
     for base in bases {
-        if !is_safe_reap_base(base)
-            || base[1..]
-                .split('/')
-                .any(|part| part.is_empty() || part == ".")
-        {
+        if !is_safe_gc_base(base) {
             return Err(format!("unsafe GC scan root {base:?}"));
         }
         bytes = bytes
-            .checked_add(base.len() + 3)
+            .checked_add(shell_escape::escape(base.as_str().into()).len() + 1)
             .ok_or_else(|| "GC scan root size overflow".to_string())?;
         if bytes > MAX_DISCOVERY_ROOT_BYTES {
             return Err("GC scan roots exceed the 32 KiB command budget".to_string());
@@ -1061,8 +1097,8 @@ pub const MIN_POOLED_IDLE_MINUTES: u64 = 24 * 60;
 /// [`MIN_POOLED_IDLE_MINUTES`]. Same counters, same predicate, one metrics
 /// line covering both passes.
 ///
-/// `escaped_base` MUST already be validated with [`is_safe_reap_base`]; it is
-/// embedded inside double quotes.
+/// `escaped_base` MUST already be validated with [`is_safe_gc_base`]; the
+/// builder quotes it as one literal shell operand.
 #[must_use]
 pub fn worker_sweep_command(
     escaped_base: &str,
@@ -1250,7 +1286,8 @@ fn worker_sweep_script(
                if [ \"$total_kb\" -gt {cap_kb} ]; then \
                  printf 'RCH_REAP_CAP initial_kb=%s cap_kb={cap_kb}\\n' \"$total_kb\"; \
                  TMPDIR=\"${{RCH_GC_SCRATCH:-$__tmpbase}}\" sort -n \"$__lst\" > \"$__tmpf3\"; \
-                 while IFS=' ' read -r __n __k d; do \
+                 while IFS= read -r __row; do \
+                   __row=${{__row#* }}; __k=${{__row%% *}}; d=${{__row#* }}; \
                    [ \"$total_kb\" -le {cap_kb} ] && break; \
                    [ -d \"$d\" ] || continue; \
                    {early_recent}\
@@ -1261,7 +1298,7 @@ fn worker_sweep_script(
                      removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); total_kb=$((total_kb - __k)); \
                      printf 'RCH_REAP_RM %s cap %s\\n' \"$__k\" \"$d\"; \
                    else \
-                     printf 'RCH_REAP_ERR cap %s :: %s\\n' \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
+                     {error_event}\
                    fi; \
                    {source_end}\
                  done < \"$__tmpf3\"; \
@@ -1273,6 +1310,7 @@ fn worker_sweep_script(
             source_end = SOURCE_GC_CHECKED_RETIREMENT,
             early_recent = checked_source_recent_activity(&idle_minutes.to_string(), "cap", false),
             held_recent = checked_source_recent_activity(&idle_minutes.to_string(), "cap", true),
+            error_event = reap_error_event("cap"),
         ),
         None => String::new(),
     };
@@ -1282,15 +1320,15 @@ fn worker_sweep_script(
     // Preserve the daemon's per-root cap. Combining unrelated roots before a
     // byte-cap pass would silently turn N separate budgets into one shared
     // budget and evict caches which were previously under their limit.
-    // Resolved roots contain only the checked, whitespace-free path grammar;
-    // word splitting cannot introduce another root or expand a shell glob.
+    // Read exact records without a pipeline subshell so spaces and shell glob
+    // characters remain literal and the removal counters survive each root.
     let scoped_passes = if cap_pass.is_empty() && pressure_pass.is_empty() {
         String::new()
     } else {
         format!(
-            "for __rt in $__gc_resolved_roots; do \
+            "while IFS= read -r __rt; do \
                __gc_select_root=$__rt; {cap_pass}{pressure_pass}\
-             done; __gc_select_root=\"\"; "
+             done < \"$__gc_roots\"; __gc_select_root=\"\"; "
         )
     };
     format!(
@@ -1301,7 +1339,7 @@ fn worker_sweep_script(
          rm -f \"$__tmpf\"; \
          {pooled_pass}\
          {scoped_passes}\
-         rm -f \"$__all\"; \
+         rm -f \"$__all\" \"$__gc_roots\"; \
          {gate_cleanup}\
          printf 'RCH_WORKER_REAP_METRICS removed=%s freed_kb=%s\\n' \"$removed\" \"$freed_kb\"",
         gate_cleanup = gate_snapshot_cleanup(),
@@ -1379,7 +1417,8 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
              printf '%s %s\\n' \"$__n\" \"$d\" >> \"$__lst4\"; \
            done < \"$__tmpf4\"; \
            TMPDIR=\"${{RCH_GC_SCRATCH:-$__tmpbase}}\" sort -n \"$__lst4\" > \"$__tmpf4\"; \
-           while IFS=' ' read -r __n d; do \
+           while IFS= read -r __row; do \
+             d=${{__row#* }}; \
              __under_pressure || break; \
              [ -d \"$d\" ] || continue; \
              __candidate_mnt=$(__gc_df_field \"$d\" mount) || continue; \
@@ -1393,7 +1432,7 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
                removed=$((removed + 1)); freed_kb=$((freed_kb + __k)); \
                printf 'RCH_REAP_RM %s pressure %s\\n' \"$__k\" \"$d\"; \
              else \
-               printf 'RCH_REAP_ERR pressure %s :: %s\\n' \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
+               {error_event}\
              fi; \
              {source_end}\
            done < \"$__tmpf4\"; \
@@ -1406,6 +1445,7 @@ fn pressure_eviction_pass(idle_minutes: u64, low_disk_permille: u64) -> String {
         source_end = SOURCE_GC_CHECKED_RETIREMENT,
         early_recent = checked_source_recent_activity(&idle_minutes.to_string(), "pressure", false),
         held_recent = checked_source_recent_activity(&idle_minutes.to_string(), "pressure", true),
+        error_event = reap_error_event("pressure"),
     )
 }
 
@@ -1451,11 +1491,11 @@ pub fn parse_reap_events(stdout: &str) -> Vec<ReapEvent> {
     stdout
         .lines()
         .filter_map(|line| {
-            let rest = line.trim().strip_prefix("RCH_REAP_RM ")?;
+            let rest = line.trim_start().strip_prefix("RCH_REAP_RM ")?;
             let mut parts = rest.splitn(3, ' ');
             let kb = parts.next()?.parse::<u64>().ok()?;
             let trigger = parts.next()?.to_string();
-            let path = parts.next()?.trim();
+            let path = parts.next()?;
             if path.is_empty() {
                 return None;
             }
@@ -1479,7 +1519,7 @@ pub struct ReapError {
     pub message: String,
 }
 
-/// Parse the `RCH_REAP_ERR <trigger> <path> :: <message>` lines a
+/// Parse `RCH_REAP_ERR_V2 <trigger> <path_bytes> <path> <message>` lines a
 /// [`worker_sweep_command`] run prints — one per FAILED removal (bd-kwvy8:
 /// silenced rm failures made a half-removed dir undiagnosable). Unparseable
 /// lines are skipped.
@@ -1488,9 +1528,12 @@ pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
     stdout
         .lines()
         .filter_map(|line| {
-            let rest = line.trim().strip_prefix("RCH_REAP_ERR ")?;
+            let rest = line.trim_start().strip_prefix("RCH_REAP_ERR_V2 ")?;
             let (trigger, rest) = rest.split_once(' ')?;
-            let (path, message) = rest.split_once(" :: ")?;
+            let (length, rest) = rest.split_once(' ')?;
+            let length = length.parse::<usize>().ok()?;
+            let (path, rest) = rest.split_at_checked(length)?;
+            let message = rest.strip_prefix(' ')?;
             if path.is_empty() {
                 return None;
             }
@@ -1524,7 +1567,7 @@ pub fn parse_reap_errors(stdout: &str) -> Vec<ReapError> {
 /// and exceeded 15 minutes live on a loaded worker whose pooled dirs held
 /// millions of inodes; apparent size instead of block usage is an acceptable
 /// trade for an observability surface. `escaped_base` MUST already be
-/// validated with [`is_safe_reap_base`].
+/// validated with [`is_safe_gc_base`].
 /// Portable, checked candidate metadata helper for [`enumerate_targets_command`].
 ///
 /// Uses GNU `find -printf '%T@ %s\n'` when available (or `gfind` on macOS with
@@ -1625,7 +1668,7 @@ fn enumerate_targets_script(bases: &[&str]) -> String {
            fi; \
            printf 'RCH_TARGET_ENTRY %s %s %s %s %s\\n' \"$newest\" \"$kb\" \"$(__gc_handles \"$d\")\" \"$(__gc_procs \"$d\")\" \"$d\"; \
          done < \"$__tmpf\"; \
-         rm -f \"$__tmpf\" \"$__all\"; \
+         rm -f \"$__tmpf\" \"$__all\" \"$__gc_roots\"; \
          {gate_cleanup}exit 0",
         meta_helper = ENUMERATE_METADATA_FRAGMENT,
         cache_glob = CARGO_CACHE_GLOB,
@@ -2160,12 +2203,12 @@ pub struct GcCollectTarget {
 /// removal (a build can start in between — enumeration of a loaded worker takes
 /// minutes).
 ///
-/// Every path is re-validated with [`is_safe_reap_path`] and must carry a
+/// Every path is re-validated with [`is_safe_gc_path`] and must carry a
 /// recognized rch basename, so neither a corrupted enumeration nor a hostile
 /// path can widen what gets removed. Returns `Err` naming the offending path
 /// rather than silently dropping it.
 ///
-/// Emits the same `RCH_REAP_RM` / `RCH_REAP_ERR` / `RCH_WORKER_REAP_METRICS`
+/// Emits the same `RCH_REAP_RM` / `RCH_REAP_ERR_V2` / `RCH_WORKER_REAP_METRICS`
 /// lines as [`worker_sweep_command`], plus `RCH_GC_SKIP <trigger> <reason>
 /// <path>` for a dir the worker's re-check declined.
 pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, String> {
@@ -2176,13 +2219,13 @@ pub fn collect_paths_command(targets: &[GcCollectTarget]) -> Result<String, Stri
 ///
 /// [`collect_paths_command`] refuses a batch containing any such target. Callers
 /// screen targets with this first and report each rejected one as a skip, so a
-/// single unembeddable path (e.g. `…/worker volume/…`, which contains a space)
+/// single unembeddable path (for example, one containing a control character)
 /// cannot abort a whole worker's collection (bd-kr4qb).
 #[must_use]
 pub fn collect_target_rejection(target: &GcCollectTarget) -> Option<String> {
-    if !is_safe_reap_path(&target.path) {
+    if !is_safe_gc_path(&target.path) {
         return Some(format!(
-            "refusing to collect {:?}: not an absolute, `..`-free, metacharacter-free path at \
+            "refusing to collect {:?}: not a normalized absolute, `..`-free, control-free path at \
              least two levels deep",
             target.path
         ));
@@ -2221,10 +2264,9 @@ fn collect_paths_command_with_registry(
         if let Some(rejection) = collect_target_rejection(target) {
             return Err(rejection);
         }
-        list.push_str(&format!(
-            " \"{}:{}:{}\"",
-            target.idle_minutes, target.trigger, target.path
-        ));
+        let entry = format!("{}:{}:{}", target.idle_minutes, target.trigger, target.path);
+        list.push(' ');
+        list.push_str(&shell_escape::escape(entry.into()));
     }
     // `$__tmpbase` is the mktemp location for the gate snapshots and is
     // resolved by the very prelude that creates the dirs being collected.
@@ -2249,7 +2291,7 @@ fn collect_paths_command_with_registry(
              removed=$((removed + 1)); freed_kb=$((freed_kb + sz)); \
              printf 'RCH_REAP_RM %s %s %s\\n' \"$sz\" \"$__tag\" \"$d\"; \
            else \
-             printf 'RCH_REAP_ERR %s %s :: %s\\n' \"$__tag\" \"$d\" \"$(printf '%s' \"$__rmerr\" | head -1)\"; \
+             {error_event}\
            fi; \
            {source_end}\
          done; \
@@ -2262,6 +2304,7 @@ fn collect_paths_command_with_registry(
         source_end = SOURCE_GC_CHECKED_RETIREMENT,
         early_recent = checked_source_recent_activity("\"$__mins\"", "\"$__tag\"", false),
         held_recent = checked_source_recent_activity("\"$__mins\"", "\"$__tag\"", true),
+        error_event = reap_error_event("\"$__tag\""),
     ))
 }
 
@@ -2282,11 +2325,11 @@ pub fn parse_gc_skips(stdout: &str) -> Vec<GcSkip> {
     stdout
         .lines()
         .filter_map(|line| {
-            let rest = line.trim().strip_prefix("RCH_GC_SKIP ")?;
+            let rest = line.trim_start().strip_prefix("RCH_GC_SKIP ")?;
             let mut parts = rest.splitn(3, ' ');
             let trigger = parts.next()?.to_string();
             let reason = parts.next()?.to_string();
-            let path = parts.next()?.trim();
+            let path = parts.next()?;
             if path.is_empty() {
                 return None;
             }
@@ -2380,9 +2423,9 @@ for c in "$r"/fc-*.claim; do
     p=$(head -n 1 -- "$c"); d=${{n#*.}}; d=${{d%%.*}}; a=$(sha256sum -- "$c");
     if [ "${{a%% *}}" != "$d" ] || [ -z "$p" ]; then why=unsafe-record;
     elif [ "$age" -lt "$min" ]; then why=young;
-    elif ! h=$(awk -v p="$p/" -v q="$p" 'index($0,p)==1 || $0==q {{f=1; exit}} END{{print(f?"held":"free")}}' "$refs"); then why=unreadable-handles;
+    elif ! h=$(RCH_GC_MATCH_PATH="$p" awk 'BEGIN {{q=ENVIRON["RCH_GC_MATCH_PATH"]; p=q "/"}} index($0,p)==1 || $0==q {{f=1; exit}} END{{print(f?"held":"free")}}' "$refs"); then why=unreadable-handles;
     elif [ "$h" != free ]; then why=open-handle;
-    elif ! h=$(awk -v p="$p" 'index($0,p)>0 {{f=1; exit}} END{{print(f?"held":"free")}}' "$args"); then why=unreadable-processes;
+    elif ! h=$(RCH_GC_MATCH_PATH="$p" awk 'BEGIN {{p=ENVIRON["RCH_GC_MATCH_PATH"]}} index($0,p)>0 {{f=1; exit}} END{{print(f?"held":"free")}}' "$args"); then why=unreadable-processes;
     elif [ "$h" != free ]; then why=live-process;
     elif [ "$apply" = 1 ]; then
       dest="$r/released/$n";
@@ -2419,7 +2462,7 @@ pub fn parse_gc_claim_reports(stdout: &str) -> (Option<String>, Vec<GcClaimRepor
     let mut status = None;
     let mut claims = Vec::new();
     for line in stdout.lines() {
-        let line = line.trim();
+        let line = line.trim_start();
         if let Some(rest) = line.strip_prefix("RCH_GC_CLAIMS ") {
             status = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("RCH_GC_CLAIM ") {
@@ -2542,7 +2585,7 @@ pub fn parse_retained_source_reports(stdout: &str) -> (Option<String>, Vec<Retai
     let mut status = None;
     let mut entries = Vec::new();
     for line in stdout.lines() {
-        let line = line.trim();
+        let line = line.trim_start();
         if let Some(rest) = line.strip_prefix("RCH_GC_RETAINED_SOURCES ") {
             status = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("RCH_GC_RETAINED ") {
@@ -2596,7 +2639,7 @@ pub fn parse_scan_roots(stdout: &str) -> ScanRootReport {
     }
     let mut report = ScanRootReport::default();
     for line in stdout.lines() {
-        let line = line.trim();
+        let line = line.trim_start();
         if let Some(rest) = line.strip_prefix("RCH_GC_ROOT_SKIPPED ") {
             if !rest.is_empty() {
                 report.skipped = Some(rest.to_string());
@@ -2609,7 +2652,6 @@ pub fn parse_scan_roots(stdout: &str) -> ScanRootReport {
         let Some((kind, value)) = rest.split_once(' ') else {
             continue;
         };
-        let value = value.trim();
         let slot = match kind {
             "base" => &mut report.requested,
             "resolved" => &mut report.resolved,
@@ -2629,7 +2671,7 @@ pub fn parse_scan_root_reports(stdout: &str) -> Vec<ScanRootReport> {
     let mut reports = Vec::new();
     let mut current = None;
     let mut temp_base = None;
-    for line in stdout.lines().map(str::trim) {
+    for line in stdout.lines().map(str::trim_start) {
         if let Some(value) = line.strip_prefix("RCH_GC_ROOT base ") {
             if let Some(report) = current.take() {
                 reports.push(report);
@@ -2649,7 +2691,7 @@ pub fn parse_scan_root_reports(stdout: &str) -> Vec<ScanRootReport> {
         } else if line == "RCH_GC_ROOT tmp" {
             temp_base = None;
         } else if let Some(value) = line.strip_prefix("RCH_GC_ROOT tmp ") {
-            temp_base = Some(value.to_string());
+            temp_base = (!value.is_empty()).then(|| value.to_string());
         }
     }
     if let Some(report) = current {
@@ -2711,7 +2753,7 @@ pub fn parse_target_entries(stdout: &str) -> Vec<RemoteTargetEntry> {
     stdout
         .lines()
         .filter_map(|line| {
-            let rest = line.trim().strip_prefix("RCH_TARGET_ENTRY ")?;
+            let rest = line.trim_start().strip_prefix("RCH_TARGET_ENTRY ")?;
             let mut parts = rest.splitn(5, ' ');
             let newest_mtime_unix = parts.next()?.parse::<u64>().ok()?;
             if newest_mtime_unix == 0 {
@@ -2722,13 +2764,13 @@ pub fn parse_target_entries(stdout: &str) -> Vec<RemoteTargetEntry> {
             let (open_handles, live_process, path) = match GateEvidence::from_token(third) {
                 Some(handles) => {
                     let live = GateEvidence::from_token(parts.next()?)?;
-                    (handles, live, parts.next()?.trim().to_string())
+                    (handles, live, parts.next()?.to_string())
                 }
                 // Legacy 3-field line: everything after `<kb> ` is the path.
                 None => (
                     GateEvidence::Unknown,
                     GateEvidence::Unknown,
-                    rest.splitn(3, ' ').nth(2)?.trim().to_string(),
+                    rest.splitn(3, ' ').nth(2)?.to_string(),
                 ),
             };
             if path.is_empty() {
@@ -3130,6 +3172,196 @@ exec /usr/bin/find "$@"
                 );
                 assert_eq!(fs::read(candidate.join("artifact")).unwrap(), b"preserved");
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_inventory_preserves_literal_roots_candidates_and_aliases() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let fixture = posix_inventory_fixture();
+        let root = fixture.path();
+        let base = root.join(r#"Build Disk's "quote" $HOME $(touch injected) back\n *?[root] "#);
+        let temp = root.join("worker temp ");
+        let candidate = base.join("repo/.rch-target-worker-pool-key ");
+        let cache = temp.join("rch-cargo-cache-worker ");
+        let outside = root.join("outside/.rch-target-worker-pool-outside");
+        for path in [&candidate, &cache, &outside] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("artifact"), b"preserved").unwrap();
+        }
+        let alias = root.join("literal 'alias' ");
+        symlink(&base, &alias).unwrap();
+        for base in [&base, &alias] {
+            let output = posix_inventory_fixture_output(root, base, &temp, None);
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let entries = parse_target_entries(&stdout);
+            assert_eq!(entries.len(), 2, "{stdout}");
+            for path in [&candidate, &cache] {
+                let physical = fs::canonicalize(path).unwrap();
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.path == physical.to_str().unwrap())
+                    .unwrap();
+                assert_eq!(entry.open_handles, GateEvidence::Unknown);
+                assert!(
+                    collect_target_rejection(&GcCollectTarget {
+                        path: entry.path.clone(),
+                        idle_minutes: 60,
+                        trigger: "cap",
+                    })
+                    .is_none()
+                );
+            }
+            let report = parse_scan_roots(&stdout);
+            assert_eq!(report.requested.as_deref(), base.to_str());
+            assert_eq!(
+                report.resolved.as_deref(),
+                fs::canonicalize(base).unwrap().to_str()
+            );
+            assert_eq!(
+                report.temp_base.as_deref(),
+                fs::canonicalize(&temp).unwrap().to_str()
+            );
+        }
+        assert!(
+            !root.join("injected").exists(),
+            "command substitutions must remain literal"
+        );
+        for path in [&candidate, &cache, &outside] {
+            assert_eq!(fs::read(path.join("artifact")).unwrap(), b"preserved");
+        }
+    }
+
+    /// Exercise the actual discovery, per-root selection, sort records and
+    /// record readers without running any collection or ownership mutation.
+    #[cfg(unix)]
+    #[test]
+    fn literal_roots_keep_cap_and_pressure_selection_exact_and_separate() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let fixture = posix_inventory_fixture();
+        let root = fixture.path();
+        let temp = root.join("empty temp ");
+        let scratch = root.join("scratch");
+        fs::create_dir_all(&temp).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        let bases = [
+            root.join(r#"first ' " $HOME $(touch injected) \t *?[a] "#),
+            root.join("second "),
+        ];
+        let candidates: Vec<_> = bases
+            .iter()
+            .map(|base| base.join(".rch-target-worker-pool-key "))
+            .collect();
+        let outside = root.join("outside/.rch-target-worker-pool-outside");
+        for path in candidates.iter().chain([&outside]) {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("artifact"), b"preserved").unwrap();
+        }
+        let alias = root.join("first alias");
+        symlink(&bases[0], &alias).unwrap();
+        let scan_bases: Vec<&str> = bases
+            .iter()
+            .chain([&alias])
+            .map(|path| path.to_str().unwrap())
+            .collect();
+        let preamble = candidate_discovery_preamble(&scan_bases, "", &[".rch-target-*-pool-*"]);
+        let generated = worker_sweep_script(
+            &scan_bases,
+            60,
+            None,
+            Some(1),
+            Some(1000),
+            "/unused/registry",
+        );
+        let root_loop = generated
+            .split_once("while IFS= read -r __rt; do ")
+            .unwrap()
+            .1
+            .split_once("if [ 1 -gt 0 ]")
+            .unwrap()
+            .0;
+        let cap_start = generated
+            .split_once("if [ 1 -gt 0 ]")
+            .unwrap()
+            .1
+            .split_once("if [ \"$total_kb\" -gt 1 ]; then")
+            .unwrap()
+            .0;
+        let cap_reader = generated
+            .split_once("while IFS= read -r __row; do ")
+            .unwrap()
+            .1
+            .split_once("[ \"$total_kb\" -le 1 ]")
+            .unwrap()
+            .0;
+        let pressure = pressure_eviction_pass(60, 1000);
+        let pressure_inventory = pressure
+            .split_once("__gc_select \"$__tmpf4\"")
+            .unwrap()
+            .1
+            .split_once("while IFS= read -r __row; do ")
+            .unwrap()
+            .0;
+        let pressure_reader = pressure
+            .split_once("while IFS= read -r __row; do ")
+            .unwrap()
+            .1
+            .split_once("__under_pressure || break;")
+            .unwrap()
+            .0;
+        let script = format!(
+            "{preamble}\
+             while IFS= read -r __rt; do {root_loop}\
+               if [ 1 -gt 0 ]{cap_start}\
+                 sort -n \"$__lst\" > \"$__tmpf3\" || exit 1; \
+                 while IFS= read -r __row; do {cap_reader}\
+                   printf 'SELECTION cap %s\\t%s\\n' \"$__rt\" \"$d\"; \
+                 done < \"$__tmpf3\"; fi; \
+               __lst4=$(rch_gc_mktemp) || exit 1; __tmpf4=$(rch_gc_mktemp) || exit 1; \
+               __gc_select \"$__tmpf4\"{pressure_inventory}\
+               while IFS= read -r __row; do {pressure_reader}\
+                 printf 'SELECTION pressure %s\\t%s\\n' \"$__rt\" \"$d\"; \
+               done < \"$__tmpf4\"; \
+             done < \"$__gc_roots\";"
+        );
+        assert!(!script.contains("rm -rf"));
+        assert!(!script.contains("__gc_source_begin"));
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .current_dir(root)
+            .env("TMPDIR", &temp)
+            .env("RCH_GC_SCRATCH", scratch)
+            .env("RCH_WKR_BIN", "/absent/rch-wkr")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let actual: Vec<_> = stdout
+            .lines()
+            .filter(|line| line.starts_with("SELECTION "))
+            .collect();
+        let mut expected = Vec::new();
+        for (base, candidate) in bases.iter().zip(&candidates) {
+            let base = fs::canonicalize(base).unwrap();
+            let candidate = fs::canonicalize(candidate).unwrap();
+            for pass in ["cap", "pressure"] {
+                expected.push(format!(
+                    "SELECTION {pass} {}\t{}",
+                    base.display(),
+                    candidate.display()
+                ));
+            }
+        }
+        assert_eq!(actual, expected, "{stdout}");
+        assert!(!root.join("injected").exists());
+        for path in candidates.iter().chain([&outside]) {
+            assert_eq!(fs::read(path.join("artifact")).unwrap(), b"preserved");
         }
     }
 
@@ -3579,8 +3811,8 @@ exec /usr/bin/find "$@"
 
     #[test]
     fn collect_target_rejection_screens_unembeddable_paths_individually() {
-        // bd-kr4qb: `…/worker volume/…` (a space) must be rejected on its own,
-        // so callers can skip it and still collect every other target.
+        // Invalid framing is refused individually; ordinary literal worker
+        // volumes now remain in the collectable batch.
         let good = GcCollectTarget {
             path: POOL.to_string(),
             idle_minutes: 10_080,
@@ -3592,19 +3824,24 @@ exec /usr/bin/find "$@"
             ..good.clone()
         };
         assert_eq!(collect_target_rejection(&good), None);
-        let reason = collect_target_rejection(&spaced).expect("space must be rejected");
-        assert!(reason.contains("metacharacter-free"), "{reason}");
+        assert_eq!(collect_target_rejection(&spaced), None);
+        let invalid = GcCollectTarget {
+            path: "/tmp/line\nbreak/.rch-target-w-pool-a".into(),
+            ..good.clone()
+        };
+        let reason = collect_target_rejection(&invalid).expect("control must be rejected");
+        assert!(reason.contains("control-free"), "{reason}");
         // The rejection is exactly what fails the batch...
         assert_eq!(
-            collect_paths_command(&[good.clone(), spaced.clone()]),
+            collect_paths_command(&[good.clone(), spaced.clone(), invalid.clone()]),
             Err(reason)
         );
         // ...so screening it out leaves a collectable batch.
-        let screened: Vec<GcCollectTarget> = [good, spaced]
+        let screened: Vec<GcCollectTarget> = [good, spaced, invalid]
             .into_iter()
             .filter(|t| collect_target_rejection(t).is_none())
             .collect();
-        assert_eq!(screened.len(), 1);
+        assert_eq!(screened.len(), 2);
         assert!(collect_paths_command(&screened).is_ok());
     }
 
@@ -3631,6 +3868,87 @@ exec /usr/bin/find "$@"
         assert!(cmd.contains("[ \"$(__gc_procs \"$1\")\" = free ] || return 1"));
         assert!(cmd.contains("__held_ok\" -ne 1 ]; then printf unknown"));
         assert!(cmd.contains("__proc_ok\" -ne 1 ]; then printf unknown"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_collect_operands_round_trip_without_running_collection() {
+        let paths = [
+            r#"/tmp/it's "quoted" $HOME $(touch injected) \n *?[root]/.rch-target-w-pool-a "#,
+            "/tmp/colon:root/.rch-target-w-job-a ",
+        ];
+        let targets: Vec<_> = paths
+            .iter()
+            .map(|path| GcCollectTarget {
+                path: (*path).to_owned(),
+                idle_minutes: 60,
+                trigger: "cap",
+            })
+            .collect();
+        let command = collect_paths_command(&targets).unwrap();
+        let loop_body = command
+            .split_once("for __e in")
+            .unwrap()
+            .1
+            .split_once("if [ ! -d \"$d\" ]")
+            .unwrap()
+            .0;
+        let script = format!("for __e in{loop_body} printf '%s\\n' \"$d\"; done");
+        assert!(!script.contains("rm "));
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n", paths.join("\n"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn liveness_matchers_treat_backslashes_and_metacharacters_literally() {
+        let fixture = posix_inventory_fixture();
+        let handles = fixture.path().join("handles");
+        let processes = fixture.path().join("processes");
+        let snapshot = gate_snapshot_fragment();
+        // Only the production readers run: the fixture supplies checked
+        // snapshot contents, avoiding the host's native capture dependency.
+        let matchers = snapshot.split_once("__gc_handles() {").unwrap().1;
+        let matchers = matchers.split_once("printf 'RCH_GC_GATES").unwrap().0;
+        for path in [
+            r#"/tmp/a\n\t\x41 ' " $HOME *?[glob]/.rch-target-w-pool-a "#,
+            "/tmp/space root/.rch-target-w-pool-a ",
+        ] {
+            for source in ["proc", "lsof"] {
+                let prefix = if source == "lsof" { "n" } else { "" };
+                std::fs::write(&handles, format!("{prefix}{path}/artifact\n")).unwrap();
+                std::fs::write(&processes, format!("123456 cargo --target-dir {path}\n")).unwrap();
+                let script = format!(
+                    "__held=$2; __proc=$3; __held_ok=1; __proc_ok=1; __hsrc=$4; __self_pids=' 999999 '; \
+                     __gc_handles() {{{matchers}\
+                     printf '%s %s %s %s\\n' \"$(__gc_handles \"$1\")\" \"$(__gc_procs \"$1\")\" \
+                       \"$(__gc_handles \"$1-sibling\")\" \"$(__gc_procs \"$1-sibling\")\"; \
+                     if __gc_gates_ok \"$1\"; then exit 9; fi; \
+                     __held_ok=0; __proc_ok=0; \
+                     printf '%s %s\\n' \"$(__gc_handles \"$1\")\" \"$(__gc_procs \"$1\")\";"
+                );
+                let output = std::process::Command::new("sh")
+                    .args(["-c", &script, "literal-match", path])
+                    .arg(&handles)
+                    .arg(&processes)
+                    .arg(source)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap(),
+                    "held held free free\nunknown unknown\n",
+                    "{path:?} {source}"
+                );
+            }
+        }
     }
 
     /// Missing native support must disable both gates without inspecting an
@@ -3797,7 +4115,7 @@ exec /usr/bin/find "$@"
         // Under pressure the idle floor applies, not the 12 h TTL window.
         assert!(pass.contains("__gc_source_recent_activity \"$d\" 60;"));
         assert!(!pass.contains("__gc_source_recent_activity \"$d\" 720;"));
-        assert!(pass.contains("RCH_REAP_ERR pressure"));
+        assert!(pass.contains("RCH_REAP_ERR_V2 %s %s %s %s"));
         // An unreadable df never reads as pressure.
         assert!(cmd.contains("''|*[!0-9]*) __pa=unknown; return 1;; esac"));
     }
@@ -5710,10 +6028,12 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             vec!["/tmp/cache/./source".to_string()],
             vec!["/tmp//cache".to_string()],
             vec!["/tmp/cache/".to_string()],
-            vec!["/tmp/$(touch-owned-source)".to_string()],
+            vec!["/tmp/cache\tother".to_string()],
             vec!["/tmp/cache\n/other".to_string()],
             vec!["/tmp/cache".to_string(); MAX_DISCOVERY_ROOTS + 1],
             vec![format!("/tmp/{}", "a".repeat(4000)); 9],
+            // Quoting expansion also counts toward the command-byte limit.
+            vec![format!("/tmp/{}", "'".repeat(4000)); 3],
         ] {
             assert!(enumerate_targets_command_for_roots(&roots).is_err());
             assert!(
@@ -6058,7 +6378,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
     fn rm_failures_are_captured_in_tagged_contexts_only() {
         // Tagged sweep bodies capture rm stderr into an ERR event…
         let tagged = reap_loop_body_with_event(720, None, "removed", "freed_kb", Some("ttl"));
-        assert!(tagged.contains("RCH_REAP_ERR ttl"));
+        assert!(tagged.contains("RCH_REAP_ERR_V2 %s %s %s %s"));
         assert!(!tagged.contains("rm -rf -- \"$d\" 2>/dev/null"));
         // …while the untagged hook body keeps its historical silent shape.
         let untagged = reap_loop_body(720, None, "removed", "freed_kb");
@@ -6067,7 +6387,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
 
         // The cap pass captures failures and accounts totals.
         let cmd = worker_sweep_command("/data/projects", 720, None, Some(1024));
-        assert!(cmd.contains("RCH_REAP_ERR cap"));
+        assert!(cmd.contains("RCH_REAP_ERR_V2 %s %s %s %s"));
         assert!(cmd.contains("RCH_REAP_CAP initial_kb=%s cap_kb=1024"));
         assert!(cmd.contains("RCH_REAP_CAP final_kb=%s"));
         // Cap skips now speak the parseable `RCH_GC_SKIP <trigger> <reason>
@@ -6078,14 +6398,76 @@ flock -n "$__gc_source_registry/metadata.lock" true;
 
     #[test]
     fn parse_reap_errors_reads_trigger_path_and_message() {
-        let out = "RCH_REAP_RM 5 ttl /data/projects/r/.rch-target-w-job-1\n\
-                   RCH_REAP_ERR cap /data/projects/r/.rch-target-w-pool-x :: rm: cannot remove 'x': Permission denied\n\
-                   garbage\n";
-        let errors = parse_reap_errors(out);
+        let path = "/data/projects/r/.rch-target-w-pool-x";
+        let out = format!(
+            "RCH_REAP_RM 5 ttl /data/projects/r/.rch-target-w-job-1\n\
+                   RCH_REAP_ERR_V2 cap {} {path} rm: cannot remove 'x': Permission denied\n\
+                   garbage\n",
+            path.len()
+        );
+        let errors = parse_reap_errors(&out);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].trigger, "cap");
         assert_eq!(errors[0].path, "/data/projects/r/.rch-target-w-pool-x");
         assert!(errors[0].message.contains("Permission denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_error_records_are_byte_framed_and_read_only() {
+        let path = r#"/tmp/é :: ' " $HOME \t/.rch-target-w-pool-key "#;
+        let message = format!("cannot remove {path} :: permission denied");
+        let script = format!("d=$1; __rmerr=$2; {}", reap_error_event("cap"));
+        assert!(!script.contains("rm -"));
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script, "literal-error", path, &message])
+            .env("LC_ALL", "C.UTF-8")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let errors = parse_reap_errors(&String::from_utf8(output.stdout).unwrap());
+        assert_eq!(
+            errors,
+            [ReapError {
+                trigger: "cap".into(),
+                path: path.into(),
+                message
+            }]
+        );
+        for malformed in [
+            "RCH_REAP_ERR_V2 cap 100 /tmp/short message",
+            "RCH_REAP_ERR_V2 cap 0  message",
+            "RCH_REAP_ERR_V2 cap 1 éx message",
+            "RCH_REAP_ERR_V2 cap 2 /xmissing-separator",
+            "RCH_REAP_ERR_V2 cap invalid /tmp/path message",
+        ] {
+            assert!(parse_reap_errors(malformed).is_empty(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn literal_path_reports_never_trim_trailing_spaces() {
+        let path = r#"/tmp/it's "quoted" $HOME \t *?[root]/.rch-target-w-pool-key "#;
+        let output = format!(
+            "RCH_REAP_RM 12 cap {path}\n\
+             RCH_GC_SKIP cap gate {path}\n\
+             RCH_TARGET_ENTRY 1000000000 12 free held {path}\n\
+             RCH_TARGET_ENTRY 1000000000 12 {path}\n\
+             RCH_GC_ROOT base {path}\n\
+             RCH_GC_ROOT resolved {path}\n\
+             RCH_GC_ROOT tmp {path}\n\
+             RCH_GC_CLAIM keep open-handle 600 abc {path}\n"
+        );
+        assert_eq!(parse_reap_events(&output)[0].path, path);
+        assert_eq!(parse_gc_skips(&output)[0].path, path);
+        let entries = parse_target_entries(&output);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.path == path));
+        let report = parse_scan_roots(&output);
+        assert_eq!(report.requested.as_deref(), Some(path));
+        assert_eq!(report.resolved.as_deref(), Some(path));
+        assert_eq!(report.temp_base.as_deref(), Some(path));
+        assert_eq!(parse_gc_claim_reports(&output).1[0].path, path);
     }
 
     #[cfg(unix)]

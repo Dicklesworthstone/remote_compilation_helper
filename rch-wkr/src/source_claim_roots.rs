@@ -630,8 +630,8 @@ mod unix {
                 "/tmp/./root",
                 "/tmp//root",
                 "/tmp/root/",
-                "/tmp/a b",
-                "/tmp/$HOME",
+                "/tmp/tab\troot",
+                "/tmp/line\nbreak",
                 "relative",
             ] {
                 assert!(!is_safe_source_claim_root(path), "{path}");
@@ -642,6 +642,40 @@ mod unix {
                 format!("{:#}", fixture.inventory().unwrap_err())
                     .contains("unsafe source-claim inventory root")
             );
+        }
+
+        #[test]
+        fn authenticated_literal_roots_retain_their_exact_spelling() {
+            let fixture = Fixture::new();
+            let components = [
+                "Build Disk",
+                "it's \"quoted\"",
+                "$HOME $(id)",
+                r"back\slash",
+                "*?[root]",
+                "trailing ",
+            ];
+            let paths: Vec<PathBuf> = components
+                .iter()
+                .map(|name| fixture.source.join(name))
+                .collect();
+            for path in &paths {
+                fs::create_dir(path).unwrap();
+                assert!(is_safe_source_claim_root(path.to_str().unwrap()));
+            }
+            fixture.claim(
+                "released",
+                "ab01",
+                &paths.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+            );
+            let roots = fixture.inventory().unwrap().roots;
+            let mut expected: Vec<String> = paths
+                .iter()
+                .map(|path| path.to_str().unwrap().to_owned())
+                .collect();
+            expected.sort();
+            assert_eq!(roots, expected);
+            assert!(paths.iter().all(|path| path.is_dir()));
         }
 
         #[test]

@@ -431,9 +431,9 @@ pub struct PooledTargetConfig {
     /// how ~700 GB of `.rch-target-*-pool-*` and `rch-cargo-cache-*` went
     /// uncollected fleet-wide while `rch gc` reported "0 dirs, 0 MB".
     ///
-    /// Each entry must pass [`crate::stale_target_reap::is_safe_reap_base`]:
-    /// absolute, no `..`, at least one segment, built only from
-    /// `[A-Za-z0-9/._-]` (the value is embedded in a remote shell command).
+    /// Each entry must pass [`crate::stale_target_reap::is_safe_gc_base`]:
+    /// normalized absolute path, no `..` or control characters, at least one
+    /// segment. Shell metacharacters remain literal path bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gc_extra_roots: Vec<String>,
 
@@ -797,11 +797,11 @@ impl RemediationConfig {
                 root,
                 &mut issues,
             );
-            if !crate::stale_target_reap::is_safe_reap_base(root) {
+            if !crate::stale_target_reap::is_safe_gc_base(root) {
                 issues.push(RemediationIssue::error(
                     "remediation.pooled_target.gc_extra_roots",
                     format!(
-                        "gc_extra_roots[{idx}] {root:?} is not a usable gc scan root (absolute, no `..`, no shell metacharacters)"
+                        "gc_extra_roots[{idx}] {root:?} is not a usable gc scan root (normalized absolute path, no `..` or control characters)"
                     ),
                 ));
             }
@@ -1213,11 +1213,19 @@ mod tests {
         );
     }
 
-    /// A gc root is embedded in a remote shell command, so anything that could
-    /// break out of that context is an ERROR, not a sanitized value.
+    /// A root's structure and framing must be exact, never sanitized into a
+    /// different location.
     #[test]
     fn unsafe_gc_extra_roots_are_rejected() {
-        for bad in ["/", "relative/x", "/tmp/../etc", "/tmp/$(whoami)", "/a b/c"] {
+        for bad in [
+            "/",
+            "relative/x",
+            "/tmp/../etc",
+            "/tmp/./root",
+            "/tmp//root",
+            "/tmp/line\nbreak",
+            "/tmp/tab\troot",
+        ] {
             let mut config = RemediationConfig::default();
             config.pooled_target.gc_extra_roots = vec![bad.to_string()];
             let issues = config.validate();
@@ -1227,6 +1235,37 @@ mod tests {
                     .any(|i| i.field == "remediation.pooled_target.gc_extra_roots"
                         && i.severity == IssueSeverity::Error),
                 "{bad:?} must be rejected: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_gc_extra_roots_preserve_paths_without_widening_store_base() {
+        for literal in [
+            "/mnt/Build Disk",
+            "/mnt/it's \"quoted\"",
+            "/tmp/$HOME/$(id)",
+            r"/tmp/back\slash",
+            "/tmp/*?[root]",
+            "/tmp/trailing ",
+        ] {
+            let mut config = RemediationConfig::default();
+            config.pooled_target.gc_extra_roots = vec![literal.to_owned()];
+            assert!(
+                config.validate().iter().all(|issue| issue.field
+                    != "remediation.pooled_target.gc_extra_roots"
+                    || issue.severity != IssueSeverity::Error),
+                "{literal:?}"
+            );
+            let decoded: RemediationConfig =
+                toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(decoded.pooled_target.gc_extra_roots, [literal]);
+            config.pooled_target.store_base = Some(literal.to_owned());
+            assert!(
+                config.validate().iter().any(|issue| issue.field
+                    == "remediation.pooled_target.store_base"
+                    && issue.severity == IssueSeverity::Error),
+                "non-GC creation paths retain their separate contract: {literal:?}"
             );
         }
     }

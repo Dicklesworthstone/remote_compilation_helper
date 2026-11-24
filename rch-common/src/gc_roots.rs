@@ -44,7 +44,7 @@
 //! as unavailable and cannot authorize collection.
 
 use crate::remediation_config::PooledTargetConfig;
-use crate::stale_target_reap::is_safe_reap_base;
+use crate::stale_target_reap::is_safe_gc_base;
 
 /// Version of the worker's read-only source-claim root inventory.
 pub const SOURCE_CLAIM_ROOTS_SCHEMA_VERSION: u32 = 1;
@@ -64,15 +64,11 @@ pub struct SourceClaimRootsInventory {
     pub roots: Vec<String>,
 }
 
-/// Accept only exact absolute spellings that the existing POSIX scanner can
-/// safely embed. Do not trim, canonicalize, or infer a broader parent here.
+/// Accept only exact absolute spellings that the POSIX scanner can safely
+/// quote and frame. Do not trim, canonicalize, or infer a broader parent here.
 #[must_use]
 pub fn is_safe_source_claim_root(path: &str) -> bool {
-    is_safe_reap_base(path)
-        && path
-            .split('/')
-            .skip(1)
-            .all(|part| !part.is_empty() && part != "." && part != "..")
+    is_safe_gc_base(path)
 }
 
 impl SourceClaimRootsInventory {
@@ -302,9 +298,9 @@ impl GcRoot {
 }
 
 /// A root that failed validation. Rejected roots are never scanned — the path
-/// is embedded into a generated remote shell command, so anything that could
-/// escape its double-quoted context, traverse upward, or name the filesystem
-/// root is refused outright rather than sanitized.
+/// is passed literally into a generated remote shell command. Traversal,
+/// ambiguous components, control characters, and the filesystem root are
+/// refused outright rather than sanitized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcRootRejection {
     /// The offending value, verbatim.
@@ -340,21 +336,23 @@ pub struct GcRootSet {
 
 impl GcRootSet {
     /// Include the exact staging base of this worker without replacing shared
-    /// mirrors or borrowing another worker's storage. Staging accepts a wider
-    /// pathname domain than the current GC shell protocol; report unsupported
-    /// spellings explicitly rather than changing collection's safety gates.
+    /// mirrors or borrowing another worker's storage. Literal staging paths
+    /// use the same quoting and exact records as configured GC roots.
     #[must_use]
     pub fn with_worker_remote_base(mut self, worker: &crate::WorkerConfig) -> Self {
         let Some(raw) = worker.remote_base.as_deref() else {
             return self;
         };
         let os = crate::types::declared_os(&worker.tags);
-        let resolved = crate::types::validate_worker_remote_base(raw, os.as_deref())
-            .and_then(|path| {
-                if is_safe_reap_base(&path) {
+        let resolved =
+            crate::types::validate_worker_remote_base(raw, os.as_deref()).and_then(|path| {
+                if is_safe_gc_base(&path) {
                     Ok(path)
                 } else {
-                    Err("worker staging path is unsupported by the GC shell protocol; collection requires an absolute path built from [A-Za-z0-9/._-]".to_string())
+                    Err(
+                        "worker staging path is not a normalized, control-free absolute GC root"
+                            .to_string(),
+                    )
                 }
             });
         match resolved {
@@ -471,10 +469,9 @@ pub fn path_is_under(path: &str, base: &str) -> bool {
 }
 
 fn normalize(path: &str) -> String {
-    let trimmed = path.trim();
-    let stripped = trimmed.trim_end_matches('/');
+    let stripped = path.trim_end_matches('/');
     if stripped.is_empty() {
-        trimmed.to_string()
+        path.to_string()
     } else {
         stripped.to_string()
     }
@@ -484,7 +481,7 @@ fn normalize(path: &str) -> String {
 ///
 /// `pooled` supplies the config-derived roots; `cli_roots` are `--root` flags
 /// (already in the order the operator gave them). Every candidate is validated
-/// with [`is_safe_reap_base`]; failures land in [`GcRootSet::rejected`] rather
+/// with [`is_safe_gc_base`]; failures land in [`GcRootSet::rejected`] rather
 /// than aborting, so one bad `--root` cannot stop the sweep of the good ones —
 /// but a rejected root is never scanned, and callers surface the rejection.
 ///
@@ -508,12 +505,11 @@ pub fn derive_gc_roots(pooled: &PooledTargetConfig, cli_roots: &[String]) -> GcR
             });
             return;
         }
-        if !is_safe_reap_base(&path) {
+        if !is_safe_gc_base(&path) {
             rejected.push(GcRootRejection {
                 path: raw.to_string(),
                 source,
-                reason: "not an absolute, `..`-free path of at least one segment built from \
-                         [A-Za-z0-9/._-] (it is embedded in a remote shell command)"
+                reason: "not a normalized absolute, `..`-free, control-free path of at least one segment"
                     .to_string(),
             });
             return;
@@ -670,9 +666,9 @@ mod tests {
             "/",
             "/mnt/../etc",
             "~/rch",
-            "/mnt/Build Disk/rch",
-            "/mnt/$(touch injected)/rch",
-            "/mnt/rch'quoted",
+            "/mnt/line\nbreak",
+            "/mnt/./rch",
+            "/mnt//rch",
         ] {
             let worker = crate::WorkerConfig {
                 remote_base: Some(raw.into()),
@@ -695,6 +691,27 @@ mod tests {
         assert_eq!(roots.roots, windows.roots);
         assert_eq!(roots.rejected.len(), 1);
         assert!(roots.rejected[0].reason.contains("POSIX worker"));
+    }
+
+    #[test]
+    fn literal_worker_staging_roots_are_scannable_without_expansion() {
+        let shared = derive_gc_roots(&cfg(), &[]);
+        for raw in [
+            "/mnt/Build Disk/rch",
+            "/mnt/$(touch injected)/rch",
+            "/mnt/rch'quoted",
+            "/mnt/rch*?[glob]",
+            "/mnt/trailing ",
+        ] {
+            let worker = crate::WorkerConfig {
+                remote_base: Some(raw.into()),
+                ..Default::default()
+            };
+            let roots = shared.clone().with_worker_remote_base(&worker);
+            assert!(roots.rejected.is_empty(), "{raw:?}: {:?}", roots.rejected);
+            assert_eq!(roots.scan_bases(), ["/data/projects", raw]);
+            assert!(roots.roots.last().unwrap().is_worker_resolved());
+        }
     }
 
     #[test]
@@ -740,11 +757,10 @@ mod tests {
             "/private//tmp",
             "/private/tmp/",
             " /private/tmp",
-            "/private/tmp ",
-            "/tmp/$(id)",
             "/tmp/line\nbreak",
+            "/tmp/tab\troot",
+            "/tmp/control\u{85}root",
             "C:/rch",
-            "/tmp/with space",
         ] {
             let mut roots = derive_gc_roots(&cfg(), &[]);
             let before = roots.clone();
@@ -765,6 +781,39 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn literal_roots_retain_exact_identity_through_derivation_and_inventory() {
+        let literals = [
+            "/mnt/Build Disk",
+            "/mnt/it's \"quoted\"",
+            "/tmp/$HOME/$(id)",
+            r"/tmp/back\slash",
+            "/tmp/*?[root]",
+            "/tmp/trailing ",
+            "/tmp/é",
+        ];
+        let mut config = cfg();
+        config.gc_extra_roots = literals.iter().map(|path| (*path).to_owned()).collect();
+        let mut set = derive_gc_roots(&config, &[]);
+        assert!(set.rejected.is_empty());
+        assert_eq!(&set.scan_bases()[1..], literals);
+        let inventory = SourceClaimRootsInventory {
+            schema_version: SOURCE_CLAIM_ROOTS_SCHEMA_VERSION,
+            roots: literals.iter().map(|path| (*path).to_owned()).collect(),
+        };
+        let decoded =
+            parse_source_claim_roots_inventory(&serde_json::to_string(&inventory).unwrap())
+                .unwrap();
+        set.extend_source_claim_roots(&decoded).unwrap();
+        assert_eq!(&set.scan_bases()[1..], literals);
+        assert_eq!(
+            set.attribute("/tmp/trailing /.rch-target").unwrap().path,
+            "/tmp/trailing "
+        );
+        assert!(set.attribute("/tmp/trailing/.rch-target").is_none());
+        assert!(set.attribute("/tmp/back/slash/.rch-target").is_none());
     }
 
     #[test]
@@ -839,7 +888,10 @@ mod tests {
             assert!(!is_safe_windows_gc_base(path), "{path}");
         }
         assert!(is_safe_windows_gc_base("C:/build cache"));
-        assert!(!is_safe_reap_base(WINDOWS_REMOTE_BASE));
+        assert!(!crate::stale_target_reap::is_safe_reap_base(
+            WINDOWS_REMOTE_BASE
+        ));
+        assert!(!is_safe_gc_base(WINDOWS_REMOTE_BASE));
     }
 
     #[test]
@@ -906,8 +958,10 @@ mod tests {
             "/",
             "relative/path",
             "/tmp/../etc",
-            "/tmp/$(whoami)",
-            "/tmp/rch; rm -rf x",
+            "/tmp/./root",
+            "/tmp//root",
+            "/tmp/line\nbreak",
+            "/tmp/carriage\rreturn",
             "",
             "   ",
         ];
