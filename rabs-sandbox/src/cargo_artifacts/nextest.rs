@@ -14,6 +14,52 @@ use std::path::Path;
 
 pub const VERSION: &str = "nextest-tree-v1";
 pub const PROGRAM: &str = "/__rabs/toolchain/bin/cargo-nextest";
+/// Fresh execution reserves both compiler and runner concurrency.
+pub const RUNTIME_ADMISSION_VERSION: &str = "nextest-runtime-admission-v1";
+
+/// The host reservation covers whichever phase has the larger concurrency.
+/// This policy applies only to new execution, not retained v1 validation.
+pub fn execution_slots(
+    selection: &CompilationSelection,
+    build_jobs: u32,
+) -> io::Result<u32> {
+    if !(1..=4096).contains(&build_jobs) {
+        return Err(invalid("nextest build jobs must be between 1 and 4096"));
+    }
+    selection.cargo_arguments(CompilationCommand::Nextest)?;
+    // Nextest interprets its tail as emulated harness arguments. Keep resource
+    // controls exclusively in the typed selection, even for captured runners
+    // whose compatibility parser accepts additional aliases.
+    if selection.test_args.iter().any(|arg| {
+        matches!(
+            arg.split_once('=').map_or(arg.as_str(), |(name, _)| name),
+            "--test-threads" | "--jobs" | "--build-jobs"
+        ) || arg.starts_with("-j")
+    }) {
+        return Err(invalid(
+            "nextest concurrency must be selected before --, not in test arguments",
+        ));
+    }
+    if selection.no_run {
+        return Ok(build_jobs);
+    }
+    let test_threads = selection.test_threads.ok_or_else(|| {
+        invalid("nextest execution requires explicit --test-threads within the admitted capacity")
+    })?;
+    Ok(build_jobs.max(test_threads))
+}
+
+/// Apply current execution admission without changing historical v1 decoding.
+/// An absent contract cannot turn the captured nextest program into an
+/// unaccounted ordinary command. Other programs retain their own validation.
+pub fn fresh_execution_slots(request: &Value) -> io::Result<Option<u32>> {
+    if request["program"] != PROGRAM && !request["artifacts"]["cargo"].is_object() {
+        return Ok(None);
+    }
+    requested(request)?;
+    let contract: NextestTree = serde_json::from_value(request["artifacts"]["cargo"].clone())?;
+    contract.execution_slots().map(Some)
+}
 
 /// Nextest receives an explicit build concurrency flag. A worker must reserve
 /// that exact grant or refuse before preparation, never clamp its slot budget
@@ -49,6 +95,12 @@ impl NextestTree {
         };
         contract.arguments()?;
         Ok(contract)
+    }
+
+    /// Fresh execution policy is separate from the exact retained argv.
+    pub fn execution_slots(&self) -> io::Result<u32> {
+        self.arguments()?;
+        execution_slots(&self.selection, self.build_jobs)
     }
 
     pub fn arguments(&self) -> io::Result<Vec<String>> {
@@ -267,6 +319,97 @@ mod tests {
                 requested
             );
         }
+    }
+
+    #[test]
+    fn fresh_admission_reserves_the_larger_phase_without_rewriting_runner_intent() {
+        for (build_jobs, test_threads, expected) in [(2, 8, 8), (8, 1, 8), (3, 3, 3)] {
+            let contract = NextestTree::new(
+                "Cargo.toml".into(),
+                CompilationSelection {
+                    runner_profile: Some("serial".into()),
+                    test_threads: Some(test_threads),
+                    ..Default::default()
+                },
+                build_jobs,
+            )
+            .unwrap();
+            let original = contract.arguments().unwrap();
+            assert_eq!(contract.execution_slots().unwrap(), expected);
+            assert_eq!(contract.arguments().unwrap(), original);
+            assert!(original.windows(2).any(|pair| {
+                pair[0] == "--build-jobs" && pair[1] == build_jobs.to_string()
+            }));
+            assert!(original.windows(2).any(|pair| {
+                pair[0] == "--test-threads" && pair[1] == test_threads.to_string()
+            }));
+        }
+        let mut selection = CompilationSelection {
+            test_threads: Some(1),
+            ..Default::default()
+        };
+        for jobs in [0, 4097, u32::MAX] {
+            assert!(execution_slots(&selection, jobs).is_err());
+        }
+        for threads in [0, 4097, u32::MAX] {
+            selection.test_threads = Some(threads);
+            assert!(execution_slots(&selection, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn fresh_refusal_preserves_v1_recovery_and_compile_only_requests() {
+        let legacy = request(CompilationSelection {
+            runner_profile: Some("serial".into()),
+            ..Default::default()
+        });
+        let retained = serde_json::to_vec(&legacy).unwrap();
+        assert_eq!(requested(&legacy).unwrap(), CargoArtifactMode::NextestExecution);
+        assert!(fresh_execution_slots(&legacy).is_err());
+        assert_eq!(serde_json::to_vec(&legacy).unwrap(), retained);
+        assert_eq!(requested(&legacy).unwrap(), CargoArtifactMode::NextestExecution);
+
+        let compile_only = request(CompilationSelection {
+            no_run: true,
+            ..Default::default()
+        });
+        assert_eq!(fresh_execution_slots(&compile_only).unwrap(), Some(3));
+        assert_eq!(fresh_execution_slots(&json!({"program":"other"})).unwrap(), None);
+        let mut missing = legacy.clone();
+        missing.as_object_mut().unwrap().remove("artifacts");
+        assert!(fresh_execution_slots(&missing).is_err());
+        let mut mismatched = legacy;
+        mismatched["program"] = json!("/__rabs/toolchain/bin/cargo");
+        assert!(fresh_execution_slots(&mismatched).is_err());
+    }
+
+    #[test]
+    fn fresh_admission_never_takes_concurrency_from_the_runtime_tail() {
+        for args in [
+            vec!["--test-threads", "8"],
+            vec!["--test-threads=8"],
+            vec!["--jobs", "8"],
+            vec!["--jobs=8"],
+            vec!["-j", "8"],
+            vec!["-j8"],
+            vec!["-j=8"],
+            vec!["--build-jobs", "8"],
+            vec!["--build-jobs=8"],
+        ] {
+            let retained = request(CompilationSelection {
+                test_threads: Some(1),
+                test_args: args.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            });
+            assert!(requested(&retained).is_ok(), "historical validation remains exact");
+            assert!(fresh_execution_slots(&retained).is_err());
+        }
+        let serial = request(CompilationSelection {
+            test_threads: Some(1),
+            test_args: vec!["--nocapture".into(), "test_threads::literal".into()],
+            ..Default::default()
+        });
+        assert_eq!(fresh_execution_slots(&serial).unwrap(), Some(3));
     }
 
     #[test]

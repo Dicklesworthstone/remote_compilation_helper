@@ -805,8 +805,8 @@ async fn handle_session<S: AsyncRead + AsyncWrite + Unpin>(
     )?;
     settings.validate()?;
     require(
-        settings.jobs <= runtime.jobs_per_root && runtime.healthy(),
-        "remote service unavailable or requested jobs exceed its root grant",
+        settings.execution_slots()? <= runtime.jobs_per_root && runtime.healthy(),
+        "remote service unavailable or build and test execution slots exceed its root grant",
     )?;
     let identity = toolchain_identity.native()?;
     let manifest =

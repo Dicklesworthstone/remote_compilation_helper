@@ -43,7 +43,7 @@ pub struct CapabilityReport {
     pub dependency_modes: Vec<DependencyExecutionMode>,
     /// Missing isolation facets (empty when `canonical_namespace`).
     pub missing: Vec<String>,
-    /// Advertised execution slots (CPU-derived).
+    /// Advertised execution slots, bounded by CPUs and configured host capacity.
     pub slots: u32,
 }
 
@@ -901,6 +901,68 @@ impl ExecutionResources<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExecutionGrants {
+    build_grant: u32,
+    execution_slots: u32,
+}
+
+/// Preserve the compiler's fixed grant while reserving the larger nextest phase.
+/// Only an artifact plan validated from the original request carries runner
+/// intent; an argv tail or a bare nextest program cannot create that authority.
+fn execution_grants(
+    request: &CanonicalExecRequest,
+    artifact_plan: Option<&ArtifactPlan>,
+    resources: ExecutionResources<'_>,
+) -> Result<ExecutionGrants, String> {
+    use rabs_sandbox::cargo_artifacts::nextest::{PROGRAM, worker_build_grant};
+
+    let nextest = artifact_plan.and_then(ArtifactPlan::nextest);
+    let grants = if request.program == PROGRAM || nextest.is_some() {
+        let contract = nextest
+            .ok_or_else(|| "nextest execution requires its validated tree contract".to_owned())?;
+        if request.program != PROGRAM
+            || request.args != contract.arguments().map_err(|error| error.to_string())?
+            || request.jobserver_grant != Some(contract.build_jobs)
+        {
+            return Err("nextest execution differs from its validated tree contract".to_owned());
+        }
+        let build_grant = worker_build_grant(request.jobserver_grant, resources.slots)
+            .map_err(|error| error.to_string())?;
+        let execution_slots = contract.execution_slots().map_err(|error| error.to_string())?;
+        if execution_slots > resources.slots {
+            return Err(format!(
+                "nextest execution requires {execution_slots} slots but worker capacity is {}",
+                resources.slots,
+            ));
+        }
+        ExecutionGrants {
+            build_grant,
+            execution_slots,
+        }
+    } else {
+        let grant = request
+            .jobserver_grant
+            .unwrap_or(resources.slots)
+            .min(resources.slots)
+            .max(1);
+        ExecutionGrants {
+            build_grant: grant,
+            execution_slots: grant,
+        }
+    };
+    if let Some(budget) = resources.host_budget
+        && grants.execution_slots > budget.capacity()
+    {
+        return Err(format!(
+            "fixed execution grant {} exceeds configured host capacity {}; lower the requested compilation or test concurrency",
+            grants.execution_slots,
+            budget.capacity(),
+        ));
+    }
+    Ok(grants)
+}
+
 /// Execute through the canonical sandbox with the default finite local budget.
 /// This synchronous interface is for blocking callers; async sessions must use
 /// `ExecutionTask` so the reactor continues handling control traffic.
@@ -1141,35 +1203,18 @@ fn execute_canonical_inner(
         execution.refuse_unstarted();
         return exec_error(request.request_id);
     }
-    let grant = if request.program == rabs_sandbox::cargo_artifacts::nextest::PROGRAM {
-        match rabs_sandbox::cargo_artifacts::nextest::worker_build_grant(
-            request.jobserver_grant,
-            resources.slots,
-        ) {
-            Ok(grant) => grant,
-            Err(error) => {
-                execution.refuse_unstarted();
-                let _ = control.retain_outputs(Err(error.to_string()));
-                return exec_error(request.request_id);
-            }
+    let artifact_plan = control.artifact_plan();
+    let ExecutionGrants {
+        build_grant,
+        execution_slots,
+    } = match execution_grants(request, artifact_plan.as_ref(), resources) {
+        Ok(grants) => grants,
+        Err(error) => {
+            execution.refuse_unstarted();
+            let _ = control.retain_outputs(Err(error));
+            return exec_error(request.request_id);
         }
-    } else {
-        request
-            .jobserver_grant
-            .unwrap_or(resources.slots)
-            .min(resources.slots)
-            .max(1)
     };
-    if let Some(budget) = resources.host_budget
-        && grant > budget.capacity()
-    {
-        execution.refuse_unstarted();
-        let _ = control.retain_outputs(Err(format!(
-            "fixed execution grant {grant} exceeds configured host capacity {}; set an explicit jobserver_grant within that capacity",
-            budget.capacity(),
-        )));
-        return exec_error(request.request_id);
-    }
     let dependency_support = request
         .dependency_context
         .as_ref()
@@ -1228,7 +1273,6 @@ fn execute_canonical_inner(
     // The peer supplies only a declaration; this execution owns fresh physical
     // backing. Use D005's existing mount builder and keep the owner alive until
     // the process and drains have resolved and the exact output set is captured.
-    let artifact_plan = control.artifact_plan();
     if let Err(error) = validate_dependency_execution(
         request,
         artifact_plan.as_ref(),
@@ -1485,9 +1529,9 @@ fn execute_canonical_inner(
     // One real FIFO budget is held until the process group and drains resolve.
     // Runtime coordination belongs in writable HOME, never in verified source.
     let bridge = match if let Some(home) = homes.cargo_private_home() {
-        crate::jobserver::JobserverBridge::mint_for_private_home(grant, home)
+        crate::jobserver::JobserverBridge::mint_for_private_home(build_grant, home)
     } else {
-        crate::jobserver::JobserverBridge::mint(grant, execution_home)
+        crate::jobserver::JobserverBridge::mint(build_grant, execution_home)
     } {
         Ok(bridge) => bridge,
         Err(_) => return exec_error(request.request_id),
@@ -1513,10 +1557,10 @@ fn execute_canonical_inner(
             return exec_error(request.request_id);
         };
         let prepared =
-            crate::target_cache::target_key(scope, request, inputs, &spec, support, plan, grant)
+            crate::target_cache::target_key(scope, request, inputs, &spec, support, plan, build_grant)
                 .and_then(|key| {
                     let compatible = crate::target_cache::target_compatibility_key(
-                        scope, request, inputs, &spec, support, plan, grant,
+                        scope, request, inputs, &spec, support, plan, build_grant,
                     )?;
                     cache.acquire(
                         key,
@@ -1739,11 +1783,11 @@ fn execute_canonical_inner(
         return exec_error(request.request_id);
     }
     // Bulk source/toolchain preparation and final input verification precede
-    // host CPU admission. The entire fixed C is reserved; contention never
-    // changes NUM_JOBS or exposes a partially funded jobserver.
+    // host CPU admission. Reserve the larger compiler/runner phase; contention
+    // never changes NUM_JOBS or exposes a partially funded compiler jobserver.
     let mut host_lease = match resources
         .host_budget
-        .map(|budget| budget.acquire(grant, || control.reason().is_some()))
+        .map(|budget| budget.acquire(execution_slots, || control.reason().is_some()))
         .transpose()
     {
         Ok(lease) => lease,
@@ -1768,7 +1812,8 @@ fn execute_canonical_inner(
             "{}",
             serde_json::json!({
                 "kind":"worker-host-budget-admitted", "request_id":request.request_id,
-                "grant":grant, "host_capacity":resources.host_budget.map(|budget| budget.capacity()),
+                "grant":execution_slots, "build_grant":build_grant,
+                "host_capacity":resources.host_budget.map(|budget| budget.capacity()),
             })
         );
     }
@@ -1833,7 +1878,8 @@ fn execute_canonical_inner(
                     "{}",
                     serde_json::json!({
                         "kind":"worker-host-budget-released", "request_id":request.request_id,
-                        "grant":grant, "residual_group_members":0,
+                        "grant":execution_slots, "build_grant":build_grant,
+                        "residual_group_members":0,
                     })
                 );
             }
@@ -2309,6 +2355,140 @@ mod tests {
         assert!(!result.executed);
         assert_eq!(result.exit_code, 130);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nextest_fixture(
+        build_jobs: u32,
+        test_threads: Option<u32>,
+        no_run: bool,
+    ) -> (CanonicalExecRequest, ArtifactPlan) {
+        use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+        use rabs_sandbox::cargo_check::CompilationSelection;
+        use serde_json::json;
+
+        let contract = NextestTree::new(
+            "Cargo.toml".into(),
+            CompilationSelection {
+                test_threads,
+                no_run,
+                ..Default::default()
+            },
+            build_jobs,
+        )
+        .unwrap();
+        let value = json!({
+            "program":PROGRAM, "args":contract.arguments().unwrap(),
+            "jobserver_grant":build_jobs,
+            "command_context":{"version":COMMAND_CONTEXT_VERSION,
+                "cwd":"/__rabs/workspace", "env":{
+                    "CARGO":"/__rabs/toolchain/bin/cargo",
+                    "RUSTC":"/__rabs/toolchain/bin/rustc", "CARGO_INCREMENTAL":"0"}},
+            "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":contract},
+        });
+        let request = CanonicalExecRequest {
+            request_id: 71,
+            program: PROGRAM.into(),
+            args: contract.arguments().unwrap(),
+            command_context: parse_command_context(&value).unwrap(),
+            captured_stdin: None,
+            dependency_context: None,
+            toolchain_backing: "/absent-toolchain".into(),
+            toolchain_identity: None,
+            workspace_backing: "/absent-workspace".into(),
+            jobserver_grant: Some(build_jobs),
+        };
+        (request, crate::artifacts::parse_plan(&value).unwrap().unwrap())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nextest_host_reservation_and_compiler_jobserver_use_their_separate_grants() {
+        for (build_jobs, test_threads) in [(2, 8), (8, 1)] {
+            let root = tempfile::tempdir().unwrap();
+            let budget = crate::host_budget::HostBudget::open(&root.path().join("budget"), 8)
+                .unwrap();
+            let (request, plan) = nextest_fixture(build_jobs, Some(test_threads), false);
+            let mut resources = ExecutionResources::new(8);
+            resources.host_budget = Some(&budget);
+            let grants = execution_grants(&request, Some(&plan), resources).unwrap();
+            assert_eq!(grants.build_grant, build_jobs);
+            assert_eq!(grants.execution_slots, 8);
+            let bridge = crate::jobserver::JobserverBridge::mint(
+                grants.build_grant,
+                root.path(),
+            )
+            .unwrap();
+            let mut env = Vec::new();
+            crate::jobserver::JobserverBridge::apply(&mut env, &bridge);
+            assert!(env.contains(&("NUM_JOBS".to_owned(), build_jobs.to_string())));
+            assert!(bridge.makeflags().starts_with(&format!("-j{build_jobs} ")));
+
+            let lease = budget.acquire(grants.execution_slots, || false).unwrap();
+            let polls = std::cell::Cell::new(0);
+            let blocked = budget.acquire(1, || {
+                let count = polls.get();
+                polls.set(count + 1);
+                count > 0
+            });
+            assert_eq!(blocked.err().unwrap().kind(), std::io::ErrorKind::Interrupted);
+            drop(lease);
+            assert!(budget.acquire(8, || false).is_ok());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nextest_preflight_refuses_missing_mismatched_and_excessive_runtime_authority() {
+        let (request, plan) = nextest_fixture(2, Some(8), false);
+        assert!(execution_grants(&request, None, ExecutionResources::new(8)).is_err());
+        assert!(execution_grants(&request, Some(&plan), ExecutionResources::new(4)).is_err());
+        let root = tempfile::tempdir().unwrap();
+        let budget = crate::host_budget::HostBudget::open(&root.path().join("budget"), 4)
+            .unwrap();
+        let mut resources = ExecutionResources::new(8);
+        resources.host_budget = Some(&budget);
+        assert!(execution_grants(&request, Some(&plan), resources).is_err());
+
+        let mut changed = request.clone();
+        changed.jobserver_grant = Some(1);
+        assert!(execution_grants(&changed, Some(&plan), ExecutionResources::new(8)).is_err());
+        changed = request;
+        changed.args.push("--test-threads=9".into());
+        assert!(execution_grants(&changed, Some(&plan), ExecutionResources::new(16)).is_err());
+
+        let (legacy, legacy_plan) = nextest_fixture(2, None, false);
+        assert!(
+            execution_grants(&legacy, Some(&legacy_plan), ExecutionResources::new(8)).is_err()
+        );
+        let (compile_only, compile_plan) = nextest_fixture(2, None, true);
+        assert_eq!(
+            execution_grants(&compile_only, Some(&compile_plan), ExecutionResources::new(8))
+                .unwrap(),
+            ExecutionGrants {
+                build_grant: 2,
+                execution_slots: 2,
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bare_nextest_refuses_before_toolchain_or_output_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut request, _) = nextest_fixture(2, Some(2), false);
+        request.toolchain_backing = root.path().join("missing-sdk").display().to_string();
+        request.workspace_backing = root.path().join("missing-source").display().to_string();
+        let result = execute_canonical(
+            &request,
+            root.path(),
+            root.path(),
+            ExecutionResources::new(8),
+            root.path(),
+        );
+        assert!(!result.executed);
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]

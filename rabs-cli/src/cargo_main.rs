@@ -61,9 +61,11 @@ replaces both, including an empty selection for ordinary Cargo defaults.
 Nextest requires captured bin/cargo-nextest. Direct workers use nextest-tree-v1
 to deliver the complete target tree; private incremental projection is refused.
 --cargo-profile selects compilation; --profile selects the nextest runner.
-Nextest --test-threads/--jobs/-j selects test concurrency. Local/remote profile jobs
-and worker profile jobserver_grant control compilation independently. Test bodies
-run on every invocation.
+Nextest execution requires explicit --test-threads/--jobs/-j concurrency;
+--no-run may omit it. Local/remote profile jobs and worker jobserver_grant control
+compilation independently. Admission reserves the larger build or test count
+without changing either selection. Direct workers must advertise
+nextest-runtime-admission-v1. Test bodies run on every invocation.
 
 Worker profiles require an explicit command and retain the existing direct-worker
 contract: one pinned TLS endpoint, or an ordered worker pool with daemon_socket.

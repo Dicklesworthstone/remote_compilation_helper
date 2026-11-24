@@ -106,7 +106,15 @@ fn cargo_fixture(destination: &Path, report: &[u8]) -> Script {
 fn nextest_request() -> Value {
     use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
     let mut request = cargo_request();
-    let contract = NextestTree::new("Cargo.toml".into(), Default::default(), 1).unwrap();
+    let contract = NextestTree::new(
+        "Cargo.toml".into(),
+        rabs_sandbox::cargo_check::CompilationSelection {
+            test_threads: Some(1),
+            ..Default::default()
+        },
+        1,
+    )
+    .unwrap();
     request["program"] = json!(PROGRAM);
     request["args"] = json!(contract.arguments().unwrap());
     request["jobserver_grant"] = json!(contract.build_jobs);
@@ -447,6 +455,8 @@ fn nextest_delivery_and_recovery_preserve_native_status_raw_output_and_tree_cust
         let owner = tempfile::tempdir().unwrap();
         let destination = owner.path().join("nextest");
         let mut peer = cargo_fixture(&destination, stdout);
+        peer.replies[0]["nextest_admission_versions"] =
+            json!([cargo_artifacts::nextest::RUNTIME_ADMISSION_VERSION]);
         if exit_code != 0 {
             peer.replies[1]["exit_code"] = json!(exit_code);
             peer.replies[1]["artifact_manifest"] = Value::Null;
@@ -507,10 +517,57 @@ fn nextest_delivery_and_recovery_preserve_native_status_raw_output_and_tree_cust
     let owner = tempfile::tempdir().unwrap();
     let destination = owner.path().join("contradictory-nextest-failure");
     let mut peer = cargo_fixture(&destination, stdout);
+    peer.replies[0]["nextest_admission_versions"] =
+        json!([cargo_artifacts::nextest::RUNTIME_ADMISSION_VERSION]);
     peer.replies[1]["exit_code"] = json!(100);
     let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
     assert!(failure.detail.contains("failed-execution artifacts"));
     assert!(no_ack(&peer));
+}
+
+#[test]
+fn historical_nextest_resume_keeps_omitted_threads_without_new_execution_capability() {
+    use cargo_artifacts::nextest::NextestTree;
+    let mut request = nextest_request();
+    let original = NextestTree::new("Cargo.toml".into(), Default::default(), 1).unwrap();
+    request["args"] = json!(original.arguments().unwrap());
+    request["artifacts"]["cargo"] = json!(original);
+    validate_request(&request).unwrap();
+    assert!(cargo_artifacts::nextest::fresh_execution_slots(&request).is_err());
+
+    let owner = tempfile::tempdir().unwrap();
+    let destination = owner.path().join("historical-nextest");
+    let stdout = b"retained nextest transcript";
+    let mut peer = cargo_fixture(&destination, stdout);
+    peer.replies[0]["canonical"] = json!(false);
+    peer.replies[0]["slots"] = json!(1);
+    peer.replies[0].as_object_mut().unwrap().remove("command_contexts");
+    peer.replies[0].as_object_mut().unwrap().remove("nextest_admission_versions");
+    peer.replies[0]["request_high_water"] = json!(7);
+    peer.replies[0]["result_retentions"] = json!([RESULT_RETENTION]);
+    peer.replies[1]["resumed"] = json!(true);
+    peer.replies[1]["result_retention"] = json!(RESULT_RETENTION);
+    peer.replies[1]["retained_result_sha256"] = json!(hash(b"original nextest result"));
+    let delivered = receive_operation(
+        &mut peer,
+        &request,
+        "worker",
+        &destination,
+        DeliveryMode::Resume,
+    )
+    .unwrap();
+    assert!(peer.replies.is_empty());
+    assert!(delivered.acknowledgments_confirmed);
+    assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
+    assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+    assert_eq!(delivered.receipt["reexecute"], false);
+    assert_eq!(delivered.receipt["publication_authorized"], false);
+    assert_eq!(fs::read(destination.join("diagnostics/stdout")).unwrap(), stdout);
+    let recovered =
+        recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+            .unwrap()
+            .unwrap();
+    assert_eq!(recovered.receipt, delivered.receipt);
 }
 
 #[test]

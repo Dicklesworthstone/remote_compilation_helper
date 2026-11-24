@@ -41,6 +41,7 @@ pub struct ArtifactPlan {
     directories: BTreeSet<String>,
     tree: bool,
     cargo: Option<CargoArtifactMode>,
+    nextest: Option<cargo_artifacts::nextest::NextestTree>,
     private_incremental: Option<Vec<String>>,
 }
 
@@ -144,6 +145,7 @@ impl ArtifactPlan {
             directories,
             tree: false,
             cargo: None,
+            nextest: None,
             private_incremental: None,
         })
     }
@@ -162,6 +164,12 @@ impl ArtifactPlan {
 
     pub(crate) const fn cargo_mode(&self) -> Option<CargoArtifactMode> {
         self.cargo
+    }
+
+    /// Only parse_plan can attach this intent after validating its exact
+    /// program, argv, environment and fixed compiler grant.
+    pub(crate) fn nextest(&self) -> Option<&cargo_artifacts::nextest::NextestTree> {
+        self.nextest.as_ref()
     }
 
     /// A compiler-unit result must declare every file before execution.
@@ -861,7 +869,13 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
     } else {
         ArtifactPlan::new(unit.to_owned(), paths)
     };
-    plan.map(Some).map_err(|error| error.to_string())
+    let mut plan = plan.map_err(|error| error.to_string())?;
+    if cargo.is_some_and(CargoArtifactMode::is_nextest) {
+        plan.nextest = Some(
+            serde_json::from_value(value["cargo"].clone()).map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(Some(plan))
 }
 
 /// An absent selection keeps artifact capture disabled. No unknown version may
@@ -1921,6 +1935,12 @@ mod tests {
             let plan = parse_plan(&request).unwrap().unwrap();
             assert!(plan.cargo.unwrap().is_nextest());
             assert_eq!(plan.cargo.unwrap().is_execution(), !no_run);
+            assert_eq!(plan.nextest(), Some(&contract));
+            assert_eq!(
+                plan.nextest().unwrap().execution_slots().is_ok(),
+                no_run,
+                "retained v1 validation must not become fresh execution admission",
+            );
             // Deliberately resembles Cargo JSON followed by non-UTF-8 runner
             // output. Neither can announce, suppress or redirect target files.
             let stdout = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/fake\"]}\n\0\xffopaque test output";

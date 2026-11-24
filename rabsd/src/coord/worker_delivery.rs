@@ -265,6 +265,22 @@ fn execution_capabilities(
         hello,
         context.is_none_or(|selected| selected.mode.requires_canonical_namespace()),
     )?;
+    if let Some(slots) =
+        rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(request)?
+    {
+        require(
+            supports(
+                hello,
+                "nextest_admission_versions",
+                rabs_sandbox::cargo_artifacts::nextest::RUNTIME_ADMISSION_VERSION,
+            ),
+            "worker lacks nextest-runtime-admission-v1 execution accounting",
+        )?;
+        require(
+            u64::from(slots) <= number(hello, "slots")?,
+            "nextest build or test execution slots exceed worker capacity",
+        )?;
+    }
     if context.is_some() {
         let host = request
             .get("dependency_execution_host")
@@ -1738,6 +1754,65 @@ mod tests {
             .sent
             .iter()
             .any(|v| matches!(v["kind"].as_str(), Some("output-ack" | "artifact-ack")))
+    }
+
+    #[test]
+    fn nextest_capacity_and_version_are_required_before_dispatch_or_output_allocation() {
+        use rabs_sandbox::cargo_artifacts::nextest::{
+            NextestTree, PROGRAM, RUNTIME_ADMISSION_VERSION,
+        };
+        use rabs_sandbox::cargo_check::CompilationSelection;
+
+        let contract = NextestTree::new(
+            "Cargo.toml".into(),
+            CompilationSelection {
+                test_threads: Some(8),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+        let mut request = request();
+        request["program"] = json!(PROGRAM);
+        request["args"] = json!(contract.arguments().unwrap());
+        request["jobserver_grant"] = json!(contract.build_jobs);
+        request["command_context"] = json!({
+            "version":COMMAND_CONTEXT_VERSION, "cwd":"/__rabs/workspace",
+            "env":{"CARGO":"/__rabs/toolchain/bin/cargo",
+                "RUSTC":"/__rabs/toolchain/bin/rustc", "CARGO_INCREMENTAL":"0"},
+        });
+        request["artifacts"] = json!({
+            "unit":"cargo", "files":[], "tree":"tree-files-v1", "cargo":contract,
+        });
+        validate_request(&request).unwrap();
+
+        for (slots, version, expected) in [
+            (4, json!([RUNTIME_ADMISSION_VERSION]), "worker capacity"),
+            (8, Value::Null, "nextest-runtime-admission-v1"),
+            (8, json!(["nextest-runtime-admission-v0"]), "nextest-runtime-admission-v1"),
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            let destination = owner.path().join("never-admitted");
+            let mut peer = fixture(&destination);
+            peer.replies[0]["command_contexts"] = json!([COMMAND_CONTEXT_VERSION]);
+            peer.replies[0]["slots"] = json!(slots);
+            peer.replies[0]["nextest_admission_versions"] = version;
+            let failure =
+                receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+            assert!(failure.detail.contains(expected), "{}", failure.detail);
+            assert!(!failure.execution_may_have_run);
+            assert!(peer.sent.is_empty());
+            assert!(!destination.exists());
+        }
+
+        let mut supported = fixture(Path::new("/unused-nextest")).replies[0].clone();
+        supported["command_contexts"] = json!([COMMAND_CONTEXT_VERSION]);
+        supported["nextest_admission_versions"] = json!([RUNTIME_ADMISSION_VERSION]);
+        supported["slots"] = json!(8);
+        validate_worker_execution_capabilities(&supported, &request).unwrap();
+        // Admission must not rewrite the smaller compiler grant.
+        assert_eq!(request["jobserver_grant"], 2);
+        assert_eq!(request["artifacts"]["cargo"]["build_jobs"], 2);
     }
 
     #[test]

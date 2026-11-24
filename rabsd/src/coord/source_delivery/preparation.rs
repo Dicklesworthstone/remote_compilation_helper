@@ -100,6 +100,13 @@ impl SourcePreparation {
             "source preparation specification exceeds the request bound",
         )?;
 
+        if context == PreparationContext::RemoteRequest {
+            // Local canonical settings have a different request shape and are
+            // admitted by their typed Profile before reaching this preparer.
+            // Worker requests must carry their exact nextest execution contract.
+            rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(specification)?;
+        }
+
         let mut roots = Vec::new();
         let mut selections = Vec::new();
         let stdin_file =
@@ -316,6 +323,46 @@ mod tests {
     use rabs_sandbox::snapshot_capture::capture_sealed_source;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn nextest_worker_preparation_admits_runtime_bound_before_opening_source() {
+        use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+        use rabs_sandbox::cargo_check::CompilationSelection;
+
+        let base = Path::new("/unopened/nextest-source");
+        for no_run in [false, true] {
+            let contract = NextestTree::new(
+                "Cargo.toml".into(),
+                CompilationSelection {
+                    no_run,
+                    ..Default::default()
+                },
+                2,
+            )
+            .unwrap();
+            let request = json!({
+                "kind":"canonical-exec", "request_id":71, "program":PROGRAM,
+                "args":contract.arguments().unwrap(), "jobserver_grant":2,
+                "toolchain_backing":"/tc", "source_files":["Cargo.toml"],
+                "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+                    "env":{"CARGO":"/__rabs/toolchain/bin/cargo",
+                        "RUSTC":"/__rabs/toolchain/bin/rustc", "CARGO_INCREMENTAL":"0"}},
+                "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1",
+                    "cargo":contract},
+            });
+            let result = SourcePreparation::parse(
+                base,
+                &request,
+                PreparationContext::RemoteRequest,
+            );
+            if no_run {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("test-threads"), "{error}");
+            }
+        }
+    }
 
     fn specification(dep: &Path) -> Value {
         json!({"kind":"canonical-exec", "request_id":71, "program":"cargo",

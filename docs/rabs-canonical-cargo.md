@@ -167,7 +167,7 @@ discovered through the ambient `PATH`. A local profile's persistent service and
 the pinned remote canonical coordinator use the same execution path.
 
 ```sh
-rabs-cargo --local LOCAL.json -- nextest run --workspace
+rabs-cargo --local LOCAL.json -- nextest run --workspace --test-threads 1
 rabs-cargo --worker WORKER.json -- nextest run --workspace --test-threads 1
 rabs-cargo --remote REMOTE.json -- nextest run -p core \
   --cargo-profile release --profile ci --test-threads 1 \
@@ -187,13 +187,27 @@ Compilation and runner options remain distinct:
 | Emulated test-harness arguments | Arguments after `--` | `test_args` |
 
 Local and remote profiles supply nextest's `--build-jobs` from `jobs`. Worker
-profiles use `jobserver_grant`, defaulting to one, and retain that exact grant
-in both the execution request and runner contract. A worker with insufficient
-configured capacity refuses before starting the runner, preserving the exact
-relationship between `--build-jobs` and its reserved grant. Nextest's `--jobs` and
-`-j` control test concurrency. Omitting `test_threads` preserves nextest's project
-configuration, including serial test
-profiles. Explicit thread counts are bounded positive integers from 1 to 4096.
+profiles use `jobserver_grant`, defaulting to one, and retain that exact compiler
+grant in the execution request, runner contract, jobserver and target identity.
+Nextest's `--test-threads`, `--jobs` and `-j` control test concurrency separately.
+
+Fresh executing nextest operations require an explicit `test_threads` selection
+between 1 and 4096. Set `--test-threads 1` for serial execution. RABS does not
+guess the concurrency of a captured runner profile or replace its setting with
+the compiler grant. A `--no-run` operation may omit test concurrency because it
+only compiles. Runtime arguments after `--` cannot override the admitted build
+or test concurrency.
+
+Admission reserves the greater of the build jobs and test threads. For example,
+two build jobs and eight test threads reserve eight execution slots while the
+compiler jobserver remains at two; eight build jobs and one test thread reserve
+eight slots while tests remain serial. Direct workers check their advertised
+and host-budget capacity, and shared canonical services check their per-root
+capacity before admitting fresh work. A request that does not fit is refused;
+its selected concurrency is never silently reduced. These slots account for
+declared runner concurrency, not threads created internally by an individual
+test or a memory limit.
+
 Package, feature and target-kind selectors retain the shared canonical command
 bounds; nextest accepts at most one built-in compilation target. Doctests are
 not part of this command: use the existing `test --doc` path for them.
@@ -223,9 +237,14 @@ job count, and validates the exact runner argv and canonical compiler/environmen
 controls before admission. Native exit status decides success; stdout and stderr
 remain opaque diagnostics. After the process group drains, successful execution
 captures the complete bounded regular-file target tree and uses the existing
-manifest, digest and destination-custody checks for delivery. Older endpoints
-reject the unfamiliar contract before execution. `rabs-recover` resumes the same
-retained operation and result without running the tests again.
+manifest, digest and destination-custody checks for delivery. Fresh worker
+execution also requires the `nextest-runtime-admission-v1` capability in the
+worker hello's `nextest_admission_versions` list, preventing older workers from
+accounting only for the compiler jobs. `rabs-recover` resumes the same retained
+operation and result without running the tests again. Historical
+`nextest-tree-v1` results, including requests that omitted `test_threads`, keep
+their original request bytes and remain recoverable without the new execution
+capability.
 
 Worker nextest refuses `incremental: true` until a private incremental output
 projection is qualified for this runner. Its complete-tree contract grants no

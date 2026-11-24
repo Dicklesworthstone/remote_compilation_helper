@@ -61,6 +61,10 @@ pub(super) struct RemoteOperationSettings {
 }
 
 impl RemoteOperationSettings {
+    pub(super) fn execution_slots(&self) -> io::Result<u32> {
+        self.profile().execution_slots()
+    }
+
     /// Produce the existing source-preparation request from this exact logical
     /// intent. These two host paths are used only by the local capture caller;
     /// source preparation removes them from the executable transfer request.
@@ -70,6 +74,7 @@ impl RemoteOperationSettings {
         cargo_home_source: Option<&Path>,
     ) -> io::Result<Value> {
         self.validate()?;
+        self.execution_slots()?;
         let mut profile = self.profile();
         profile.toolchain_root = toolchain_root.to_path_buf();
         profile.cargo_home_source = cargo_home_source.map(Path::to_path_buf);
@@ -351,8 +356,8 @@ pub(super) fn start(
     settings.validate()?;
     checkpoint(&|| stopped.load(Ordering::Acquire))?;
     require(
-        runtime.healthy() && settings.jobs <= runtime.jobs_per_root,
-        "remote canonical service is unavailable or its job grant was exceeded",
+        runtime.healthy() && settings.execution_slots()? <= runtime.jobs_per_root,
+        "remote canonical service is unavailable or its build and test execution slots were exceeded",
     )?;
     let mut profile = settings.profile();
     profile.source_root = inputs
@@ -419,6 +424,40 @@ mod tests {
 
     fn settings(value: Value) -> RemoteOperationSettings {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn nextest_remote_admission_refuses_unknown_concurrency_before_source_capture() {
+        let historical = settings(json!({"command":"nextest", "jobs":2}));
+        historical.validate().unwrap();
+        let original = serde_json::to_value(&historical).unwrap();
+        assert!(historical.execution_slots().is_err());
+        assert!(
+            historical
+                .source_specification(Path::new("/unopened/toolchain"), None)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&historical).unwrap(), original);
+
+        for (selection, expected) in [
+            (json!({"test_threads":8}), 8),
+            (json!({"test_threads":1}), 2),
+            (json!({"no_run":true}), 2),
+        ] {
+            let selected = settings(json!({
+                "command":"nextest", "jobs":2, "selection":selection,
+            }));
+            selected.validate().unwrap();
+            assert_eq!(selected.execution_slots().unwrap(), expected);
+            let request = selected
+                .source_specification(Path::new("/unopened/toolchain"), None)
+                .unwrap();
+            assert!(request.get("artifacts").is_none());
+            assert_eq!(request["program"], "/__rabs/toolchain/bin/cargo-nextest");
+            assert!(request["args"].as_array().unwrap().windows(2).any(|pair| {
+                pair == [json!("--build-jobs"), json!("2")]
+            }));
+        }
     }
 
     #[test]

@@ -324,6 +324,15 @@ fn logical(
             )?;
         }
     }
+    if command == CompilationCommand::Nextest {
+        let build_jobs = profile
+            .get("jobs")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .try_into()
+            .map_err(|_| invalid("nextest build-job bound exceeds u32"))?;
+        rabs_sandbox::cargo_artifacts::nextest::execution_slots(&selection, build_jobs)?;
+    }
     let manifest = profile
         .get("manifest")
         .map_or(Some("Cargo.toml"), Value::as_str)

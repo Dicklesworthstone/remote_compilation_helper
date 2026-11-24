@@ -161,6 +161,7 @@ fn capture_source(
         }
         return Ok(None);
     }
+    rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(request)?;
     let root = match (manifest, root) {
         (None, None) => return Ok(None),
         (None, Some(_)) => {
@@ -1253,6 +1254,30 @@ mod tests {
         .unwrap();
         json!({"kind":"canonical-exec", "request_id":7, "program":"rustc",
             "args":["lib.rs"], "toolchain_backing":"/tc", "source_manifest":upload.wire_manifest()})
+    }
+
+    #[test]
+    fn fresh_nextest_refuses_unbounded_runtime_but_old_results_need_no_recapture() {
+        use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+        let contract = NextestTree::new("Cargo.toml".into(), Default::default(), 2).unwrap();
+        let request = json!({
+            "kind":"canonical-exec", "request_id":7, "program":PROGRAM,
+            "args":contract.arguments().unwrap(), "jobserver_grant":2,
+            "workspace_backing":"/retained/source", "toolchain_backing":"/tc",
+            "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace",
+                "env":{"CARGO":"/__rabs/toolchain/bin/cargo",
+                    "RUSTC":"/__rabs/toolchain/bin/rustc", "CARGO_INCREMENTAL":"0"}},
+            "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[],
+                "cargo":contract},
+        });
+        validate_request(&request).unwrap();
+        let error = capture_source(&request, DeliveryMode::Execute, None).unwrap_err();
+        assert!(error.to_string().contains("test-threads"), "{error}");
+        assert!(
+            capture_source(&request, DeliveryMode::Resume, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(unix)]

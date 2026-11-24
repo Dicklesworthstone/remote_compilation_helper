@@ -1001,7 +1001,10 @@ fn main() {
     } else {
         None
     };
-    let report = probe_capability(&worker_id);
+    let report = bound_execution_capacity(
+        probe_capability(&worker_id),
+        host_budget.as_ref().map(|budget| budget.capacity()),
+    );
     eprintln!(
         "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"dependency_execution_modes\":{}}}",
         json_string(&report.worker_id),
@@ -1028,6 +1031,18 @@ fn main() {
             runtime_pool,
         },
     ));
+}
+
+/// Advertise the execution capacity the same worker can actually reserve.
+/// Isolation measurements and advisory pressure metrics are unchanged.
+fn bound_execution_capacity(
+    mut report: rabs_wkr::session::CapabilityReport,
+    host_capacity: Option<u32>,
+) -> rabs_wkr::session::CapabilityReport {
+    if let Some(capacity) = host_capacity {
+        report.slots = report.slots.min(capacity);
+    }
+    report
 }
 
 /// Partial input and coalesced tails belong to the session, not to a disposable
@@ -2135,6 +2150,12 @@ where
                             let parsed = (|| {
                                 let request = parse_exec_request(&value)?;
                                 validate_execution_selection(&request, report, dependency_mode)?;
+                                if let Some(slots) = rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&value)
+                                    .map_err(|error| error.to_string())?
+                                    && slots > report.slots
+                                {
+                                    return Err(format!("nextest execution requires {slots} slots but worker capacity is {}", report.slots));
+                                }
                                 Ok(request)
                             })().and_then(|mut request| {
                                 // A different request or a worker-local execute
@@ -2291,6 +2312,7 @@ fn worker_hello(
         "toolchain_prefix_reuses": if toolchain_file_cache_enabled { vec![TOOLCHAIN_PREFIX_REUSE_VERSION] } else { Vec::<&str>::new() },
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
+        "nextest_admission_versions": [rabs_sandbox::cargo_artifacts::nextest::RUNTIME_ADMISSION_VERSION],
         "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
         "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_NATIVE_MODIFIERS_CAPABILITY],
         "dependency_execution_modes": report.dependency_modes.iter()
@@ -2981,6 +3003,17 @@ mod tests {
     mod dependency_tests;
     #[cfg(unix)]
     mod source_tests;
+
+    #[test]
+    fn configured_host_capacity_bounds_execution_slots_without_changing_probe_facts() {
+        let measured = report();
+        for (capacity, slots) in [(None, 4), (Some(2), 2), (Some(4), 4), (Some(8), 4)] {
+            let bounded = bound_execution_capacity(measured.clone(), capacity);
+            let mut expected = measured.clone();
+            expected.slots = slots;
+            assert_eq!(bounded, expected);
+        }
+    }
 
     #[test]
     fn pressure_snapshot_expires_from_probe_start_and_preserves_unknown_metrics() {
@@ -4649,6 +4682,94 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn nextest_request(
+        id: u64,
+        test_threads: Option<u32>,
+        no_run: bool,
+    ) -> serde_json::Value {
+        use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+        use rabs_sandbox::cargo_check::CompilationSelection;
+        use serde_json::json;
+
+        let contract = NextestTree::new(
+            "Cargo.toml".into(),
+            CompilationSelection {
+                test_threads,
+                no_run,
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+        let mut frame = request(id);
+        frame["program"] = json!(PROGRAM);
+        frame["args"] = json!(contract.arguments().unwrap());
+        frame["jobserver_grant"] = json!(2);
+        frame["command_context"] = json!({"version":"env-cwd-v1",
+            "cwd":"/__rabs/workspace", "env":{
+                "CARGO":"/__rabs/toolchain/bin/cargo",
+                "RUSTC":"/__rabs/toolchain/bin/rustc", "CARGO_INCREMENTAL":"0"}});
+        frame["artifacts"] = json!({
+            "unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":contract,
+        });
+        frame
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nextest_runtime_refusals_precede_journal_admission_and_compile_only_still_admits() {
+        use serde_json::json;
+
+        let root = private_root();
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        let hello: serde_json::Value =
+            serde_json::from_str(&worker_hello(&report(), &journal, false, None)).unwrap();
+        assert_eq!(
+            hello["nextest_admission_versions"],
+            json!([rabs_sandbox::cargo_artifacts::nextest::RUNTIME_ADMISSION_VERSION]),
+        );
+        let mut wire = Wire::default();
+        let peer = wire.clone();
+        let mut missing = nextest_request(190, Some(1), false);
+        missing.as_object_mut().unwrap().remove("artifacts");
+        for frame in [
+            nextest_request(190, None, false),
+            nextest_request(190, Some(8), false),
+            missing,
+        ] {
+            peer.frame(frame);
+        }
+        peer.frame(json!({"kind":"request-status", "request_id":190}));
+        peer.frame(nextest_request(191, None, true));
+        peer.close();
+        let launches = AtomicUsize::new(0);
+        wait(drive_session(
+            &mut wire,
+            &report(),
+            false,
+            Some(&mut journal),
+            true,
+            |request, _, plan| {
+                assert_eq!(request.request_id, 191);
+                assert!(plan.is_some());
+                launches.fetch_add(1, Ordering::SeqCst);
+                ExecutionTask::spawn(request.request_id, Duration::ZERO, |_| {
+                    panic!("the constructor must refuse before execution")
+                })
+            },
+            pressure,
+        ))
+        .unwrap();
+        let replies = peer.replies();
+        assert_eq!(replies.len(), 5);
+        assert!(replies[..3].iter().all(|reply| reply["kind"] == "error"));
+        assert_eq!(replies[3]["status"], "unknown");
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(journal.high_water(), Some(191));
+        assert_eq!(journal.status(191)["receipt"]["execution_may_have_run"], false);
+    }
+
     #[cfg(unix)]
     #[test]
     fn invalid_command_context_is_refused_before_durable_admission() {
@@ -5912,6 +6033,88 @@ mod tests {
     #[cfg(unix)]
     fn resume_request(id: u64) -> serde_json::Value {
         serde_json::json!({"kind":"result-resume", "request_id":id, "request":artifact_request(id)})
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_v1_nextest_result_resumes_without_current_execution_admission() {
+        use serde_json::json;
+
+        let root = private_root();
+        let original = nextest_request(240, None, false);
+        assert!(
+            rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&original).is_err()
+        );
+        assert!(rabs_sandbox::cargo_artifacts::requested(&original).is_ok());
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        assert_eq!(
+            journal.admit(&original, DEFAULT_EXECUTION_TIMEOUT).unwrap(),
+            None,
+        );
+        // Model the already completed v1 result: retained transport stores its
+        // exact output names, not renewed permission to execute the old runner.
+        let completed_tree =
+            ArtifactPlan::new_tree("cargo".into(), vec!["lib.rlib".into()]).unwrap();
+        let mut task = retained_launch(
+            root.path(),
+            parse_exec_request(&original).unwrap(),
+            DEFAULT_EXECUTION_TIMEOUT,
+            Some(completed_tree),
+        )
+        .unwrap();
+        let completed = wait(task.wait());
+        assert!(completed.is_ok());
+        journal_completion(
+            Some(&mut journal),
+            240,
+            &completed,
+            task.retained_result_digest().as_deref(),
+            None,
+        )
+        .unwrap();
+        drop(completed);
+        drop(task);
+        drop(journal);
+
+        let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
+        journal.authorize_result_recipient(ResultRecipient::TlsSpki([7; 32]));
+        let mut wire = Wire::default();
+        let peer = wire.clone();
+        peer.frame(json!({"kind":"result-resume", "request_id":240, "request":original}));
+        let recovery_only = rabs_wkr::session::CapabilityReport {
+            canonical_namespace: false,
+            slots: 1,
+            ..report()
+        };
+        let mut driver = Box::pin(drive_session(
+            &mut wire,
+            &recovery_only,
+            true,
+            Some(&mut journal),
+            true,
+            |_, _, _| panic!("retained nextest recovery cannot invoke the executor"),
+            pressure,
+        ));
+        pump(driver.as_mut(), &peer, 1);
+        let offer = peer.replies()[0].clone();
+        assert_eq!(offer["kind"], "exec-result");
+        assert_eq!(offer["resumed"], true);
+        peer.frame(output_read(240, "stdout", 0, 64));
+        peer.frame(json!({
+            "kind":"artifact-read", "request_id":240,
+            "name":"lib.rlib", "offset":0, "max_bytes":64,
+        }));
+        pump(driver.as_mut(), &peer, 3);
+        assert_eq!(peer.replies()[1]["data_hex"], "4100ff42");
+        assert_eq!(peer.replies()[2]["data_hex"], "6172636869766500ff");
+        peer.frame(output_ack(240));
+        peer.frame(json!({
+            "kind":"artifact-ack", "request_id":240,
+            "manifest_sha256":offer["artifact_manifest"]["manifest_sha256"],
+            "total_bytes":offer["artifact_manifest"]["total_bytes"],
+        }));
+        wait(driver).unwrap();
+        assert_eq!(journal.status(240)["receipt"]["retained_result_released"], true);
     }
 
     #[cfg(unix)]

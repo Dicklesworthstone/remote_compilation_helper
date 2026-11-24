@@ -907,8 +907,8 @@ fn handle_session(
         "canonical profile must use this service's state_root",
     )?;
     require(
-        profile.jobs <= config.jobs_per_root,
-        "canonical profile jobs exceeds the service per-root grant",
+        profile.execution_slots()? <= config.jobs_per_root,
+        "canonical profile build or test execution slots exceed the service per-root grant",
     )?;
     profile.validate()?;
     require(

@@ -336,6 +336,15 @@ pub(super) fn validate_profile(
             "jobserver_grant must be an integer from 1 to 4096",
         )?;
     }
+    if command == CompilationCommand::Nextest {
+        let build_jobs = profile
+            .get("jobserver_grant")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .try_into()
+            .map_err(|_| invalid("nextest build-job bound exceeds u32"))?;
+        rabs_sandbox::cargo_artifacts::nextest::execution_slots(&selection, build_jobs)?;
+    }
     placement(profile)?;
     manifest(profile)?;
     if let Some(vendor) = profile.get("vendor") {
@@ -925,6 +934,38 @@ mod tests {
                 assert!(actual.ends_with(&tail));
             }
         }
+    }
+
+    #[test]
+    fn worker_nextest_requires_explicit_runtime_admission_before_opening_roots() {
+        let mut profile = profile();
+        set(&mut profile, "source_root", json!("/unopened/nextest-source"));
+        let error = validate_profile(&profile, &options(&["nextest", "run"])).unwrap_err();
+        assert!(error.to_string().contains("test-threads"), "{error}");
+
+        let (root, mut profile) = filesystem_profile();
+        set(&mut profile, "jobserver_grant", json!(2));
+        for (arguments, expected) in [
+            (vec!["nextest", "run", "--test-threads", "8"], 8),
+            (vec!["nextest", "run", "--test-threads", "1"], 2),
+            (vec!["nextest", "run", "--no-run"], 2),
+        ] {
+            let options = options(&arguments);
+            validate_profile(&profile, &options).unwrap();
+            let request = specification(&profile, &options).unwrap();
+            assert_eq!(
+                rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&request)
+                    .unwrap(),
+                Some(expected)
+            );
+            assert_eq!(request["jobserver_grant"], 2);
+            assert_eq!(request["artifacts"]["cargo"]["build_jobs"], 2);
+        }
+        for alias in ["--test-threads=8", "--jobs=8", "-j8", "--build-jobs=8"] {
+            let arguments = ["nextest", "run", "--test-threads", "1", "--", alias];
+            assert!(validate_profile(&profile, &options(&arguments)).is_err(), "{alias}");
+        }
+        assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
     }
 
     #[test]

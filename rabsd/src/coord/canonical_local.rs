@@ -799,6 +799,20 @@ impl<'a> OperationOutput<'a> {
 }
 
 impl Profile {
+    /// Keep compiler parallelism distinct from the declared test-runner demand.
+    /// Retained profile validation stays compatible; only fresh admission uses
+    /// this requirement before capture or root reservation.
+    fn execution_slots(&self) -> io::Result<u32> {
+        if self.command == CompilationCommand::Nextest {
+            rabs_sandbox::cargo_artifacts::nextest::execution_slots(
+                &self.selection.clone().unwrap_or_default(),
+                self.jobs,
+            )
+        } else {
+            Ok(self.jobs)
+        }
+    }
+
     fn client_deadline(&self) -> io::Result<Instant> {
         // Admission may wait for one operation budget, followed by bounded
         // Cargo planning and execution. Capture and final drain keep the same
@@ -1409,6 +1423,7 @@ pub fn run_profile_with_release(
                 "canonical service does not accept commands with inherited stdin; select stdin: closed for EOF or stdin_file for captured input",
             ));
         }
+        profile.execution_slots()?;
         profile.validate()?;
         if profile.service_socket.is_some() {
             return service::run_client_profile(
@@ -1460,8 +1475,8 @@ pub(super) fn run_shared_profile(
     require(
         profile.service_socket.is_some()
             && profile.state_root == runtime.parent
-            && profile.jobs <= runtime.jobs_per_root,
-        "canonical profile must name this service state and stay within its per-root job grant",
+            && profile.execution_slots()? <= runtime.jobs_per_root,
+        "canonical profile must name this service state and fit its build and test execution slots",
     )?;
     profile.validate()?;
     require(
@@ -1547,6 +1562,9 @@ fn run_operation_owned(
     mut output: OperationOutput<'_>,
     custody: OperationCustody,
 ) -> io::Result<OperationOutcome> {
+    // Internal callers must satisfy the same fresh execution bound before any
+    // source capture, namespace probe or operation-owned allocation.
+    profile.execution_slots()?;
     let OperationCustody {
         prepared_inputs,
         unconfirmed_cleanup,
@@ -3126,6 +3144,40 @@ mod tests {
             "state_root":"/state", "operation_root":"/operations", "wrapper":"/bin/rabs-wrap"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn nextest_fresh_admission_keeps_build_and_test_parallelism_independent() {
+        let mut profile = application_environment_profile();
+        profile.command = CompilationCommand::Nextest;
+        for (build_jobs, test_threads, expected) in [(2, 8, 8), (8, 1, 8)] {
+            profile.jobs = build_jobs;
+            profile.selection = Some(CompilationSelection {
+                test_threads: Some(test_threads),
+                ..Default::default()
+            });
+            profile.validate_logical().unwrap();
+            assert_eq!(profile.execution_slots().unwrap(), expected);
+            let arguments = profile.compilation_args().unwrap();
+            assert!(arguments.windows(2).any(|pair| {
+                pair == ["--build-jobs".to_owned(), build_jobs.to_string()]
+            }));
+            assert!(arguments.windows(2).any(|pair| {
+                pair == ["--test-threads".to_owned(), test_threads.to_string()]
+            }));
+        }
+        profile.selection = None;
+        // The original wire intent remains readable for retained operations.
+        profile.validate_logical().unwrap();
+        assert!(profile.execution_slots().is_err());
+        profile.selection = Some(CompilationSelection {
+            no_run: true,
+            ..Default::default()
+        });
+        assert_eq!(profile.execution_slots().unwrap(), profile.jobs);
+        profile.command = CompilationCommand::Build;
+        profile.selection = None;
+        assert_eq!(profile.execution_slots().unwrap(), profile.jobs);
     }
 
     #[test]

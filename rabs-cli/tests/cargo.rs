@@ -883,6 +883,30 @@ fn local_intent_is_retained_before_one_exec_and_original_edits_cannot_replace_it
 }
 
 #[test]
+fn nextest_unknown_runtime_concurrency_refuses_before_native_handoff() {
+    for remote in [false, true] {
+        for arguments in [
+            vec!["nextest", "run"],
+            vec!["nextest", "run", "--test-threads", "1", "--", "--jobs=8"],
+        ] {
+            let fixture = Fixture::new();
+            new_file(
+                &fixture.toolchain.join("bin/cargo-nextest"),
+                b"unused captured runner fixture",
+                0o700,
+            );
+            let stderr = fixture.refused(
+                fixture.command(remote).args(arguments).output().unwrap(),
+            );
+            assert!(
+                stderr.contains("test-threads") || stderr.contains("concurrency"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn nextest_validates_captured_runner_and_retains_local_and_remote_intent() {
     for remote in [false, true] {
         let fixture = Fixture::new();
