@@ -948,6 +948,19 @@ fn selected_transfer_config(
     Ok(transfer_config)
 }
 
+/// Place managed Cargo caches beside the selected isolated worker's sources
+/// and default target pools. The attempt config already freezes and normalizes
+/// this worker's root, including when a retry selects a different worker.
+fn selected_managed_cargo_cache_base<'a>(
+    worker: &SelectedWorker,
+    transfer_config: &'a TransferConfig,
+    topology_policy: &PathTopologyPolicy,
+    isolated_source: bool,
+) -> Option<&'a str> {
+    (worker.remote_base.is_some() && (isolated_source || topology_policy.is_off_root()))
+        .then_some(transfer_config.remote_base.as_str())
+}
+
 /// Execute a compilation command on a remote worker.
 ///
 /// This function:
@@ -2843,6 +2856,16 @@ async fn execute_remote_compilation_inner(
             pipeline
         };
     let pipeline = pipeline.with_cargo_disk_cache(command, &worker_config.id);
+    let pipeline = if let Some(base) = selected_managed_cargo_cache_base(
+        worker,
+        &transfer_config,
+        topology_policy,
+        clean_overlay.is_some() || source_content_receipt,
+    ) {
+        pipeline.with_cargo_disk_cache_base(base)?
+    } else {
+        pipeline
+    };
     let owned_command = if owned_source_content_pair {
         Some(validate_owned_source_content_closure(
             &prepared_source_roots,
@@ -4687,6 +4710,33 @@ mod tests {
         assert_eq!(linux_attempt.remote_base, "/srv/build/rch");
         assert_eq!(original.remote_base, "/data/tmp/rch");
         assert_eq!(
+            selected_managed_cargo_cache_base(&mac, &mac_attempt, &controller, true),
+            Some("/Users/builder/.cache/rch")
+        );
+        assert_eq!(
+            selected_managed_cargo_cache_base(&linux, &linux_attempt, &controller, true),
+            Some("/srv/build/rch"),
+            "a retry's managed cache follows the newly selected worker"
+        );
+        assert_eq!(
+            selected_managed_cargo_cache_base(&mac, &original, &controller, false),
+            None,
+            "shared mirrors retain the existing worker cache-base discovery"
+        );
+        assert_eq!(
+            selected_managed_cargo_cache_base(&staging_worker(None), &original, &controller, true,),
+            None,
+            "isolated workers without an override retain the existing cache policy"
+        );
+        let literal = staging_worker(Some("/Volumes/build disk/builder's rch/"));
+        let literal_attempt =
+            selected_transfer_config(&literal, original.clone(), &controller, true).unwrap();
+        assert_eq!(
+            selected_managed_cargo_cache_base(&literal, &literal_attempt, &controller, true),
+            Some("/Volumes/build disk/builder's rch"),
+            "the cache uses the normalized literal root frozen for this attempt"
+        );
+        assert_eq!(
             selected_worker_to_config(&mac).remote_base,
             Some(mac_attempt.remote_base.clone())
         );
@@ -4766,6 +4816,11 @@ mod tests {
         let transfer =
             selected_transfer_config(&worker, TransferConfig::default(), &controller, false)
                 .expect("off-root source mode uses worker staging automatically");
+        assert_eq!(
+            selected_managed_cargo_cache_base(&worker, &transfer, &controller, false),
+            Some("/Users/builder/.cache/rch"),
+            "off-root source mode routes managed caches through the same worker base"
+        );
         let mut roots = Vec::new();
         for name in ["app", "dependency"] {
             let remote = super::super::dependency_closure::map_offroot_sync_root_to_remote_root(

@@ -6620,7 +6620,10 @@ async fn handle_cache_warm(
                 &project_hash,
                 &transfer_config,
                 worker,
-                rch_config.remediation.pooled_target.reaper_pooled_idle_hours,
+                rch_config
+                    .remediation
+                    .pooled_target
+                    .reaper_pooled_idle_hours,
             )
             .map(|pipeline| (worker, pipeline))
         })
@@ -10820,9 +10823,8 @@ mod tests {
                 remote_base: Some(root.into()),
                 ..Default::default()
             };
-            let error =
-                staging_transfer_config_for_worker(&override_worker, &Default::default())
-                    .unwrap_err();
+            let error = staging_transfer_config_for_worker(&override_worker, &Default::default())
+                .unwrap_err();
             assert!(error.to_string().contains("invalid-override"), "{error}");
             let configured = rch_common::TransferConfig {
                 remote_base: root.into(),

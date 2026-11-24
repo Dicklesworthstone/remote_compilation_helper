@@ -132,13 +132,14 @@ pub async fn sync_force(
         .map(|worker| plan_for_worker(worker, &closure_roots, &config.transfer))
         .collect::<Result<Vec<_>>>()?;
     let default_plan = if target_workers.is_empty() {
-        let base = rch_common::types::validate_worker_remote_base(
-            &config.transfer.remote_base,
-            None,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let base =
+            rch_common::types::validate_worker_remote_base(&config.transfer.remote_base, None)
+                .map_err(anyhow::Error::msg)?;
         let base = PathBuf::from(base);
-        Some(plan_force_resync(&stale_roots_for(&closure_roots, &base), &base))
+        Some(plan_force_resync(
+            &stale_roots_for(&closure_roots, &base),
+            &base,
+        ))
     } else {
         None
     };
@@ -305,7 +306,9 @@ async fn apply_on_worker(
                     continue;
                 }
             };
-            match crate::run_gc_surface_command(worker, &command, deadline, &mut output_budget).await {
+            match crate::run_gc_surface_command(worker, &command, deadline, &mut output_budget)
+                .await
+            {
                 Ok(out) if out.success() => match invalidation_receipt(&out.stdout) {
                     Ok(InvalidationReceipt::Removed) => removed_ok += 1,
                     Ok(InvalidationReceipt::Absent) => already_absent += 1,
@@ -457,7 +460,11 @@ fn render_human(result: &SyncForceResult, ctx: &OutputContext) {
             "deferred_worker_unavailable" => style.warning("deferred (worker unreachable)"),
             _ => style.info("preview"),
         };
-        println!("  {} {}", style.key(&format!("{}:", worker.worker_id)), status);
+        println!(
+            "  {} {}",
+            style.key(&format!("{}:", worker.worker_id)),
+            status
+        );
         render_plan(&worker.plan);
         for failure in &worker.remove_failures {
             println!("      {} {}", style.error("remove failed:"), failure);
@@ -613,9 +620,7 @@ mod tests {
         assert_eq!(result.already_absent, 0);
         assert!(!result.repair_triggered);
         assert!(!result.reachable);
-        assert!(
-            result.remove_failures[0].contains("Windows invalidation is unsupported")
-        );
+        assert!(result.remove_failures[0].contains("Windows invalidation is unsupported"));
     }
 
     #[test]
@@ -638,10 +643,8 @@ mod tests {
     #[test]
     fn invalidation_requires_one_final_retirement_receipt() {
         assert_eq!(
-            invalidation_receipt(
-                "RCH_GC_GATES handles=1 procs=1\nRCH_SYNC_INVALIDATED removed\n"
-            )
-            .unwrap(),
+            invalidation_receipt("RCH_GC_GATES handles=1 procs=1\nRCH_SYNC_INVALIDATED removed\n")
+                .unwrap(),
             InvalidationReceipt::Removed
         );
         assert_eq!(
@@ -685,10 +688,10 @@ mod tests {
     #[test]
     fn result_serializes_worker_scopes_and_preserves_guarded_apply_failures() {
         let roots = [PathBuf::from("/data/projects/x")];
-        let first_plan = plan_force_resync(&stale_roots_for(&roots, Path::new(BASE)), Path::new(BASE));
+        let first_plan =
+            plan_force_resync(&stale_roots_for(&roots, Path::new(BASE)), Path::new(BASE));
         let second_base = Path::new("/mnt/second/rch");
-        let second_plan =
-            plan_force_resync(&stale_roots_for(&roots, second_base), second_base);
+        let second_plan = plan_force_resync(&stale_roots_for(&roots, second_base), second_base);
         let mut second = SyncForceWorkerResult {
             worker_id: "second".into(),
             plan: second_plan,
@@ -721,7 +724,10 @@ mod tests {
         assert!(json.get("managed_base").is_none());
         assert!(json.get("default_plan").is_none());
         assert_eq!(json["workers"][0]["plan"]["managed_base"], BASE);
-        assert_eq!(json["workers"][1]["plan"]["managed_base"], "/mnt/second/rch");
+        assert_eq!(
+            json["workers"][1]["plan"]["managed_base"],
+            "/mnt/second/rch"
+        );
         assert_ne!(
             json["workers"][0]["plan"]["invalidations"][0]["worker_cache_path"],
             json["workers"][1]["plan"]["invalidations"][0]["worker_cache_path"]
@@ -735,18 +741,23 @@ mod tests {
         // The live output boundary uses this same decision before emitting a
         // JSON success envelope, retaining all partial per-worker evidence.
         let mut result = result;
-        for outcome in ["refused", "partially_applied", "deferred_worker_unavailable"] {
+        for outcome in [
+            "refused",
+            "partially_applied",
+            "deferred_worker_unavailable",
+        ] {
             result.workers[0].outcome = outcome.into();
             assert!(apply_failed(&result), "{outcome}");
         }
         result.workers[0].outcome = "applied".into();
-        result.workers[0].plan.refused.push(
-            rch_common::force_resync::RefusedInvalidation {
+        result.workers[0]
+            .plan
+            .refused
+            .push(rch_common::force_resync::RefusedInvalidation {
                 local_root: "/data/projects/y".into(),
                 worker_cache_path: "/outside".into(),
                 reason: "outside managed base".into(),
-            },
-        );
+            });
         assert!(apply_failed(&result));
         result.dry_run = true;
         assert!(!apply_failed(&result));

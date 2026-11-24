@@ -373,6 +373,7 @@ fn build_cleanup_command_with_source_guard(
            [ -z \"$dir\" ] && continue; \
            [ ! -d \"$dir\" ] && continue; \
            case \"$dir\" in \"$base\"/*) ;; *) continue ;; esac; \
+           case \"$dir\" in \"$base\"/{cargo_cache_prefix}*/*) continue ;; esac; \
            if rch_retained_source_gc_hold \"$dir\"; then \
              printf 'RCH_CLEANUP_RETENTION_HOLD dir=%s\\n' \"$dir\" >&2; continue; \
            else \
@@ -452,6 +453,7 @@ fn build_cleanup_command_with_source_guard(
         activity_guard = CLEANUP_SOURCE_ACTIVITY_GUARD,
         source_guard = source_guard,
         source_transaction = CLEANUP_SOURCE_TRANSACTION,
+        cargo_cache_prefix = rch_common::RCH_CARGO_CACHE_PREFIX,
     )
 }
 
@@ -2678,6 +2680,48 @@ printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' "fs 20
             "{stdout}"
         );
         assert!(!pool.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_preserves_managed_cargo_caches_during_age_and_pressure_sweeps() {
+        let _guard = test_guard!();
+        for low_disk_permille in [0, 1000] {
+            let base = tempfile::tempdir().expect("private staging base");
+            let runs = tempfile::tempdir().expect("private process records");
+            let cache = base.path().join(format!(
+                "{}staging_worker",
+                rch_common::RCH_CARGO_CACHE_PREFIX
+            ));
+            let registry = cache.join("registry");
+            let git = cache.join("git");
+            // A similarly named ordinary project child still belongs to this
+            // collector; only the reserved top-level Cargo cache is excluded.
+            let ordinary = base.path().join("project/rch-cargo-cache-old-generation");
+            for root in [&registry, &git, &ordinary] {
+                std::fs::create_dir_all(root).expect("fixture tree");
+                let state = root.join("cached-state");
+                std::fs::write(&state, b"retained cargo state").expect("fixture bytes");
+                age_dir(&state);
+                age_dir(root);
+            }
+            age_dir(&cache);
+
+            let (stdout, stderr, code) =
+                run_sweep_with(base.path(), runs.path(), &[], 0, 0, low_disk_permille);
+            assert_eq!(code, Some(0), "{stdout}{stderr}");
+            assert!(stdout.contains("removed=1"), "{stdout}{stderr}");
+            assert!(
+                !ordinary.exists(),
+                "ordinary staging generations are still reclaimed"
+            );
+            for root in [&registry, &git] {
+                assert_eq!(
+                    std::fs::read(root.join("cached-state")).expect("managed cache retained"),
+                    b"retained cargo state"
+                );
+            }
+        }
     }
 
     /// Without procfs the sweep cannot prove a pool idle, so it keeps it and

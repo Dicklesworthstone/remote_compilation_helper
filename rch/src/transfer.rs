@@ -3141,6 +3141,9 @@ pub struct TransferPipeline {
     /// Cache roots proved from the original Cargo argv before it is wrapped in
     /// source guards and opaque shells. Paths resolve on the selected worker.
     cargo_disk_cache: Option<CargoDiskCache>,
+    /// Frozen worker staging base for the default cache of an isolated job.
+    /// Explicit command CARGO_HOME values keep their existing placement.
+    cargo_disk_cache_base: Option<String>,
     /// Distinguish a checked non-Cargo command from an old direct caller whose
     /// opaque command has never supplied cache-scope evidence.
     cargo_disk_scope_captured: bool,
@@ -3344,6 +3347,7 @@ impl TransferPipeline {
             disk_budget: None,
             disk_source_root: None,
             cargo_disk_cache: None,
+            cargo_disk_cache_base: None,
             cargo_disk_scope_captured: false,
             retrieval_reference_root: project_root.clone(),
             project_root,
@@ -4382,6 +4386,7 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
     pub(crate) fn with_cargo_disk_cache(mut self, command: &str, worker: &WorkerId) -> Self {
         self.cargo_disk_scope_captured = true;
         self.cargo_disk_cache = None;
+        self.cargo_disk_cache_base = None;
         if command.contains("cargo") {
             // Cargo isolation historically also wraps non-Cargo commands whose
             // arguments contain "cargo" (for example cargo_bridge.c). Preserve
@@ -4426,6 +4431,30 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
             });
         }
         self
+    }
+
+    /// Place an isolated job's default Cargo cache on its frozen worker volume.
+    ///
+    /// The caller must supply the selected worker's effective staging base.
+    /// The directory is resolved on the worker before disk supervision; an
+    /// unavailable base refuses execution instead of falling back to another
+    /// filesystem. Explicit command CARGO_HOME values and non-Cargo commands
+    /// keep their existing cache selection.
+    pub(crate) fn with_cargo_disk_cache_base(mut self, base: &str) -> Result<Self> {
+        anyhow::ensure!(
+            !self.worker_platform.is_windows(),
+            "worker staging cache placement requires a POSIX worker"
+        );
+        let base = rch_common::types::validate_worker_remote_base(base, None)
+            .map_err(anyhow::Error::msg)?;
+        if self
+            .cargo_disk_cache
+            .as_ref()
+            .is_some_and(|cache| cache.verified && cache.additional_home.is_none())
+        {
+            self.cargo_disk_cache_base = Some(base);
+        }
+        Ok(self)
     }
 
     /// Whether the original command selected a managed worker Cargo cache.
@@ -6666,10 +6695,14 @@ mkdir -p {} && rm -f {} && {launch}",
                     "case \"${{{base_var}}}\" in /*) ;; *) {base_var}=\"./${{{base_var}}}\" ;; esac; {base_var}=\"$(CDPATH= cd \"${{{base_var}}}\" && pwd -P)\" || exit $?; "
                 )
             };
-            format!(
-                "{}; {physical_base}export {base_var}; ",
-                rch_common::remote_cargo_home_base_prelude()
-            )
+            let base_prelude = self
+                .cargo_disk_cache_base
+                .as_deref()
+                .filter(|_| !self.worker_platform.is_windows())
+                .map_or_else(rch_common::remote_cargo_home_base_prelude, |base| {
+                    format!("{base_var}={}", escape(Cow::Borrowed(base)))
+                });
+            format!("{base_prelude}; {physical_base}export {base_var}; ")
         } else {
             String::new()
         };
@@ -20819,6 +20852,197 @@ func main() {
 
     #[cfg(unix)]
     #[test]
+    fn cargo_home_boundary_selected_staging_base_owns_durable_default_cache() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let staging = retained.join("staging ' $HOME volume");
+        let worker_temp = retained.join("worker temp");
+        for directory in [&staging, &worker_temp] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let staging_alias = retained.join("staging alias");
+        std::os::unix::fs::symlink(&staging, &staging_alias).unwrap();
+        let physical_staging = staging.canonicalize().unwrap();
+        let worker = WorkerId::new("staging-worker");
+        let cache = physical_staging.join("rch-cargo-cache-staging-worker");
+
+        for round in 0..2 {
+            let source = staging.join(format!("source-{round}"));
+            std::fs::create_dir(&source).unwrap();
+            let script = source.join("cargo-cache-probe.sh");
+            std::fs::write(
+                &script,
+                "set -eu\nprintf 'home=%s\\ntmp=%s\\n' \"$CARGO_HOME\" \"$TMPDIR\"\nmkdir -p \"$CARGO_HOME/registry\" \"$CARGO_HOME/git\"\nprintf x >> \"$CARGO_HOME/registry/reused\"\nprintf y >> \"$CARGO_HOME/git/reused\"\nprintf 'cache-stderr' >&2\n",
+            )
+            .unwrap();
+            let requested = format!("sh {}", shell_words::quote(script.to_str().unwrap()));
+            let selected_base = if round == 0 { &staging } else { &staging_alias };
+            let pipeline = cargo_home_boundary_pipeline(&source)
+                .with_compilation_kind(Some(CompilationKind::Job))
+                .with_cargo_disk_cache(&requested, &worker)
+                .with_cargo_disk_cache_base(selected_base.to_str().unwrap())
+                .unwrap();
+            let workload = crate::hook::add_cargo_isolation(
+                &requested,
+                &worker,
+                pipeline.uses_managed_cargo_cache(),
+            );
+            let command = pipeline.build_remote_command(&workload, None);
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .current_dir(&retained)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &retained)
+                .env("TMPDIR", &worker_temp)
+                .env("RCH_CH_BASE", &worker_temp)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{round}: {output:?}");
+            assert_eq!(output.stderr, b"cache-stderr");
+            assert_eq!(
+                output.stdout,
+                format!(
+                    "home={}\ntmp={}\n",
+                    cache.display(),
+                    source.canonicalize().unwrap().join(".rch-tmp").display()
+                )
+                .into_bytes()
+            );
+            assert_eq!(
+                std::fs::read(cache.join("registry/reused")).unwrap(),
+                vec![b'x'; round + 1]
+            );
+            assert_eq!(
+                std::fs::read(cache.join("git/reused")).unwrap(),
+                vec![b'y'; round + 1]
+            );
+            assert!(!worker_temp.join("rch-cargo-cache-staging-worker").exists());
+            assert!(!source.join("rch-cargo-cache-staging-worker").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_staging_cargo_cache_is_in_existing_gc_inventory() {
+        use rch_common::gc_roots::derive_gc_roots;
+        use rch_common::remediation_config::PooledTargetConfig;
+        use rch_common::stale_target_reap::{
+            GcClass, enumerate_targets_command_for_roots, parse_target_entries,
+        };
+
+        let retained = tempfile::Builder::new()
+            .prefix("rch-cargo-inventory-")
+            .tempdir_in("/tmp")
+            .unwrap()
+            .keep();
+        let staging = retained.join("staging");
+        let shared = retained.join("shared");
+        let scratch = retained.join("scratch");
+        let cache = staging.join("rch-cargo-cache-w");
+        for directory in [&shared, &scratch, &cache] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(cache.join("registry-object"), b"retained cache").unwrap();
+        let mut worker = worker_with_os(Some("linux"));
+        worker.remote_base = Some(staging.to_str().unwrap().to_owned());
+        let roots = derive_gc_roots(
+            &PooledTargetConfig {
+                remote_base: shared.to_str().unwrap().to_owned(),
+                ..Default::default()
+            },
+            &[],
+        )
+        .with_worker_remote_base(&worker);
+        assert!(roots.rejected.is_empty());
+        let command = enumerate_targets_command_for_roots(&roots.scan_bases()).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .env("TMPDIR", &scratch)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let entries = parse_target_entries(&String::from_utf8(output.stdout).unwrap());
+        assert!(entries.iter().any(|entry| {
+            entry.path == cache.to_str().unwrap() && entry.class() == GcClass::CargoCache
+        }));
+        assert!(cache.join("registry-object").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_boundary_unavailable_selected_base_refuses_before_workload() {
+        let _guard = test_guard!();
+        let retained = tempfile::tempdir().unwrap().keep();
+        let source = retained.join("source");
+        let worker_temp = retained.join("worker temp");
+        for directory in [&source, &worker_temp] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let missing = retained.join("unavailable staging");
+        let script = source.join("cargo-cache-probe.sh");
+        std::fs::write(&script, "printf started > workload-started\n").unwrap();
+        let requested = format!("sh {}", shell_words::quote(script.to_str().unwrap()));
+        let worker = WorkerId::new("staging-worker");
+        let pipeline = cargo_home_boundary_pipeline(&source)
+            .with_compilation_kind(Some(CompilationKind::Job))
+            .with_cargo_disk_cache(&requested, &worker)
+            .with_cargo_disk_cache_base(missing.to_str().unwrap())
+            .unwrap();
+        let workload = crate::hook::add_cargo_isolation(
+            &requested,
+            &worker,
+            pipeline.uses_managed_cargo_cache(),
+        );
+        let command = pipeline.build_remote_command(&workload, None);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .current_dir(&retained)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &retained)
+            .env("TMPDIR", &worker_temp)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!source.join("workload-started").exists());
+        assert!(!worker_temp.join("rch-cargo-cache-staging-worker").exists());
+        assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_disk_cache_base_requires_safe_default_cache_provenance() {
+        let worker = WorkerId::new("staging-worker");
+        let default = cargo_home_boundary_pipeline(Path::new("/worker/source"))
+            .with_cargo_disk_cache("cargo check", &worker);
+        for invalid in [
+            "/",
+            "/tmp",
+            "relative",
+            "/worker/../outside",
+            "/worker\ncache",
+        ] {
+            assert!(
+                default.clone().with_cargo_disk_cache_base(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        let selected = default
+            .with_cargo_disk_cache_base("/worker/staging///")
+            .unwrap();
+        assert_eq!(
+            selected.cargo_disk_cache_base.as_deref(),
+            Some("/worker/staging")
+        );
+        let changed = selected.with_cargo_disk_cache("gcc -c main.c", &worker);
+        assert!(changed.cargo_disk_cache_base.is_none());
+        assert!(!changed.uses_managed_cargo_cache());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cargo_home_boundary_preserves_explicit_home_streams_and_exit() {
         let _guard = test_guard!();
         let retained = tempfile::tempdir().unwrap().keep();
@@ -20835,12 +21059,16 @@ func main() {
             shell_words::quote(inner)
         );
         let worker = WorkerId::new("cache-worker");
+        let unused_staging = retained.join("unused staging");
         let pipeline = cargo_home_boundary_pipeline(&source)
             .with_compilation_kind(Some(CompilationKind::Job))
-            .with_cargo_disk_cache(&requested, &worker);
+            .with_cargo_disk_cache(&requested, &worker)
+            .with_cargo_disk_cache_base(unused_staging.to_str().unwrap())
+            .unwrap();
         let cache = pipeline.cargo_disk_cache.as_ref().unwrap();
         assert!(cache.verified);
         assert_eq!(cache.additional_home.as_deref(), explicit_home.to_str());
+        assert!(pipeline.cargo_disk_cache_base.is_none());
         let workload = crate::hook::add_cargo_isolation(
             &requested,
             &worker,
@@ -20859,6 +21087,7 @@ func main() {
             format!("{}\ncargo-out", explicit_home.display()).into_bytes()
         );
         assert_eq!(output.stderr, b"cargo-err");
+        assert!(!unused_staging.exists());
     }
 
     /// Execute the real isolation/launch shell with a job argv sentinel. The
