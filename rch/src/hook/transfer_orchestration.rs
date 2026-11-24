@@ -5073,6 +5073,7 @@ mod tests {
             source_root: root.clone(),
             selected_module: Some(root.join("go.mod")),
             workspace: None,
+            vendor_directory: None,
             required_files: [(root.join("go.mod"), manifest.to_owned())].into(),
             absent_files: vec![root.join("go.sum")],
             workspace_edit_args: Vec::new(),

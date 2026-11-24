@@ -22,6 +22,7 @@ pub(super) struct GoSourcePlan {
     pub(super) source_root: PathBuf,
     pub(super) selected_module: Option<PathBuf>,
     pub(super) workspace: Option<PathBuf>,
+    pub(super) vendor_directory: Option<PathBuf>,
     pub(super) required_files: BTreeMap<PathBuf, String>,
     pub(super) absent_files: Vec<PathBuf>,
     pub(super) workspace_edit_args: Vec<String>,
@@ -384,25 +385,30 @@ fn capture_file(
     Ok(())
 }
 
-fn capture_workspace_vendor(
+fn capture_vendor(
+    root: &Path,
     plan: &mut GoSourcePlan,
     total: &mut usize,
     topology: &PathTopologyPolicy,
 ) -> Result<()> {
-    let vendor = plan.source_root.join("vendor");
+    let vendor = root.join("vendor");
     match std::fs::symlink_metadata(&vendor) {
         Ok(metadata) => {
             ensure!(
                 metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "Go workspace vendor root must be a real directory"
+                "Go vendor root must be a real directory"
             );
-            capture_file(vendor.join("modules.txt"), true, plan, total, topology)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            plan.absent_files.push(vendor.join("modules.txt"));
+            capture_file(vendor.join("modules.txt"), true, plan, total, topology)?;
+            plan.vendor_directory = Some(vendor);
             Ok(())
         }
-        Err(error) => Err(error).context("inspect Go workspace vendor root"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A vendor directory can enable Go's automatic vendor mode even
+            // without modules.txt. Bind absence of the directory itself.
+            plan.absent_files.push(vendor);
+            Ok(())
+        }
+        Err(error) => Err(error).context("inspect Go vendor root"),
     }
 }
 
@@ -414,6 +420,7 @@ pub(super) fn read_control_file(path: &Path, topology: &PathTopologyPolicy) -> R
         source_root,
         selected_module: None,
         workspace: None,
+        vendor_directory: None,
         required_files: BTreeMap::new(),
         absent_files: Vec::new(),
         workspace_edit_args: Vec::new(),
@@ -564,6 +571,7 @@ pub(super) fn plan(
         source_root,
         selected_module: selected_module.map(Path::to_owned),
         workspace: selected_workspace.map(Path::to_owned),
+        vendor_directory: None,
         required_files: BTreeMap::new(),
         absent_files: Vec::new(),
         workspace_edit_args,
@@ -573,12 +581,16 @@ pub(super) fn plan(
         capture_file(root.join("go.mod"), false, &mut plan, &mut total, topology)?;
         capture_file(root.join("go.sum"), true, &mut plan, &mut total, topology)?;
     }
+    let control = selected_workspace
+        .or(selected_module)
+        .context("missing selected Go control file")?;
+    let control_root = control.parent().context("Go control file has no parent")?;
+    capture_vendor(control_root, &mut plan, &mut total, topology)?;
     if let Some(workspace) = selected_workspace {
         capture_file(workspace.to_owned(), false, &mut plan, &mut total, topology)?;
         let mut sum = workspace.as_os_str().to_os_string();
         sum.push(".sum");
         capture_file(PathBuf::from(sum), true, &mut plan, &mut total, topology)?;
-        capture_workspace_vendor(&mut plan, &mut total, topology)?;
         // Go compares vendored replacement spellings with paths relative to
         // the selected workfile. Relocating that workfile would change those
         // spellings while the read-only vendor metadata retains the originals.
@@ -586,7 +598,7 @@ pub(super) fn plan(
             !has_local_replacements
                 || !plan
                     .required_files
-                    .contains_key(&plan.source_root.join("vendor/modules.txt")),
+                    .contains_key(&control_root.join("vendor/modules.txt")),
             "Go workspace vendoring with local replacements requires a private vendor metadata projection"
         );
     }
@@ -695,11 +707,7 @@ mod tests {
         }
         assert!(planned.absent_files.contains(&root.join("go.work.sum")));
         assert!(planned.absent_files.contains(&library.join("go.sum")));
-        assert!(
-            planned
-                .absent_files
-                .contains(&root.join("vendor/modules.txt"))
-        );
+        assert!(planned.absent_files.contains(&root.join("vendor")));
         assert!(
             planned
                 .workspace_edit_args
@@ -820,6 +828,41 @@ mod tests {
         assert!(planned.workspace.is_none());
         assert!(planned.workspace_edit_args.is_empty());
         assert_eq!(planned.required_files.len(), 1);
+    }
+
+    #[test]
+    fn standalone_vendoring_tracks_the_module_even_when_source_expands() {
+        let (repo, topology) = fixture();
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        let app = repo.join("app");
+        module(&app, "app");
+        module(&repo.join("dependency"), "dependency");
+        let modules = BTreeMap::from([(
+            app.clone(),
+            module_json("app", json!([replacement("dependency", "../dependency")])),
+        )]);
+        let manifest = app.join("go.mod");
+        let discover = || plan(&app, Some(&manifest), None, None, &modules, &topology).unwrap();
+        let vendor = app.join("vendor");
+        let index = vendor.join("modules.txt");
+        std::fs::create_dir(repo.join("vendor")).unwrap();
+        let absent = discover();
+        assert_eq!(absent.source_root, repo);
+        assert!(absent.absent_files.contains(&vendor));
+        assert!(absent.vendor_directory.is_none());
+
+        std::fs::create_dir(&vendor).unwrap();
+        let empty = discover();
+        assert_eq!(empty.vendor_directory.as_ref(), Some(&vendor));
+        assert!(empty.absent_files.contains(&index));
+
+        std::fs::write(&index, "# example.invalid/dependency v1.0.0\n").unwrap();
+        let populated = discover();
+        assert_eq!(populated.vendor_directory.as_ref(), Some(&vendor));
+        assert_eq!(
+            populated.required_files[&index],
+            "# example.invalid/dependency v1.0.0\n"
+        );
     }
 
     #[test]

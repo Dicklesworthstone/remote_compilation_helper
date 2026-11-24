@@ -520,6 +520,13 @@ pub(in crate::hook) fn verify_go_source_selection(
             path.display()
         );
     }
+    if let Some(vendor) = &plan.vendor_directory {
+        ensure!(
+            std::fs::symlink_metadata(vendor)?.is_dir(),
+            "Go vendor directory changed after closure discovery: {}",
+            vendor.display()
+        );
+    }
     for path in &plan.absent_files {
         ensure!(
             matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
@@ -558,7 +565,7 @@ struct GoSourceGuard {
     absent: Vec<String>,
     workspace: Option<String>,
     workspace_sum: bool,
-    workspace_vendor: bool,
+    vendor_directory: Option<String>,
     workspace_edits: String,
     selected_module: Option<String>,
 }
@@ -630,9 +637,11 @@ impl GoSourceGuard {
                 .collect::<Result<_>>()?,
             workspace,
             workspace_sum,
-            workspace_vendor: plan
-                .required_files
-                .contains_key(&plan.source_root.join("vendor/modules.txt")),
+            vendor_directory: plan
+                .vendor_directory
+                .as_ref()
+                .map(|path| relative_source_path(&plan.source_root, path).map(str::to_owned))
+                .transpose()?,
             workspace_edits,
             selected_module: plan
                 .selected_module
@@ -666,6 +675,16 @@ impl GoSourceGuard {
                  printf '%s\\n' 'RCH: worker has a stale Go control input absent from the dispatcher' >&2; exit 113; fi; "
             ));
         }
+        let vendor = self
+            .vendor_directory
+            .as_deref()
+            .map(|path| shell_escape::escape(path.into()));
+        if let Some(path) = &vendor {
+            script.push_str(&format!(
+                "if [ ! -d \"$rch_go_closure_root\"/{path} ] || [ -L \"$rch_go_closure_root\"/{path} ]; then \
+                 printf '%s\\n' 'RCH: worker Go vendor directory is missing or replaced' >&2; exit 113; fi; "
+            ));
+        }
         if let Some(workspace) = &self.workspace {
             let workspace = shell_escape::escape(workspace.as_str().into());
             script.push_str(&format!(
@@ -676,10 +695,10 @@ impl GoSourceGuard {
                     "cp \"$rch_go_closure_root\"/{workspace}.sum \"$rch_go_build/selection.work.sum\" || exit 113; "
                 ));
             }
-            if self.workspace_vendor {
-                script.push_str(
-                    "ln -s \"$rch_go_closure_root/vendor\" \"$rch_go_build/vendor\" || exit 113; ",
-                );
+            if let Some(path) = &vendor {
+                script.push_str(&format!(
+                    "ln -s \"$rch_go_closure_root\"/{path} \"$rch_go_build/vendor\" || exit 113; "
+                ));
             }
             script.push_str(&format!(
                 "GOWORK=off GOTOOLCHAIN=local \"$rch_go\" work edit{} \"$rch_go_build/selection.work\" || exit 113; \
@@ -743,11 +762,8 @@ async fn local_workspace_environment(
     if let Some(bytes) = plan.required_files.get(&PathBuf::from(sum)) {
         std::fs::write(directory.join("selection.work.sum"), bytes)?;
     }
-    if plan
-        .required_files
-        .contains_key(&plan.source_root.join("vendor/modules.txt"))
-    {
-        std::os::unix::fs::symlink(plan.source_root.join("vendor"), directory.join("vendor"))?;
+    if let Some(vendor) = &plan.vendor_directory {
+        std::os::unix::fs::symlink(vendor, directory.join("vendor"))?;
     }
     let copy = shell_escape::escape(
         copy.to_str()
@@ -2196,6 +2212,35 @@ mod tests {
             BTreeSet::from(["server".into()])
         );
         assert_eq!(source_tree(&fixture.source), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standalone_go_vendor_metadata_must_survive_source_selection() {
+        let fixture = WorkspaceFixture::new();
+        let app = fixture.source.join("app");
+        let cwd = fixture.cwd();
+        let command = format!(
+            "{} GOWORK=off go test -p=1 ./...",
+            fixture.command(&[]).strip_suffix("go").unwrap()
+        );
+        let absent = discover_go_source(&command, &cwd, &fixture.topology)
+            .await
+            .unwrap()
+            .unwrap();
+        let vendor = app.join("vendor");
+        std::fs::create_dir(&vendor).unwrap();
+        let selected: Vec<_> = source_tree(&app).into_keys().collect();
+        assert!(verify_go_source_selection(&absent, &app, &selected, &fixture.topology).is_err());
+
+        std::fs::write(vendor.join("modules.txt"), "").unwrap();
+        let present = discover_go_source(&command, &cwd, &fixture.topology)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(verify_go_source_selection(&present, &app, &selected, &fixture.topology).is_err());
+        let selected: Vec<_> = source_tree(&app).into_keys().collect();
+        verify_go_source_selection(&present, &app, &selected, &fixture.topology).unwrap();
     }
 
     #[cfg(unix)]
