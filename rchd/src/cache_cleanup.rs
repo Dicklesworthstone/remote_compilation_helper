@@ -262,6 +262,23 @@ fn disk_starved(pressure: &crate::disk_pressure::PressureAssessment) -> bool {
         )
 }
 
+// Check df's own status before parsing it. An empty or partial result must
+// never put a young cache in the pressure-eviction candidate set.
+const CLEANUP_DISK_MEASUREMENT: &str = r#"
+rch_cleanup_measure_disk() {
+    rch_cleanup_df=$(LC_ALL=C df -Pk "$base") || return 1
+    rch_cleanup_space=$(printf '%s\n' "$rch_cleanup_df" | LC_ALL=C awk '
+        NR == 2 && NF >= 6 && $2 ~ /^[0-9]+$/ && $4 ~ /^-?[0-9]+$/ && $5 ~ /^[0-9]+%$/ {
+            pair = $2 ":" ($4 < 0 ? "0" : $4)
+        }
+        END { if (NR != 2 || pair == "") exit 1; print pair }
+    ') || return 1
+    total_kb=${rch_cleanup_space%:*}
+    available_kb=${rch_cleanup_space#*:}
+    [ "$total_kb" -gt 0 ] && [ "$available_kb" -le "$total_kb" ]
+}
+"#;
+
 fn build_cleanup_command_with_source_guard(
     escaped_base: &str,
     escaped_run_root: &str,
@@ -295,12 +312,11 @@ fn build_cleanup_command_with_source_guard(
          orphan_after_minutes={orphan_after_minutes}; \
          if [ ! -d \"$base\" ]; then mkdir -p \"$base\"; fi; \
          if physical=$(cd \"$base\" 2>/dev/null && pwd -P); then base=$physical; fi; \
-         total_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $2}}'); \
-         case \"$total_kb\" in ''|*[!0-9]*) total_kb=0 ;; esac; \
+         {disk_measurement}\n\
+         rch_cleanup_measure_disk || {{ printf 'RCH_CLEANUP_DISK_UNKNOWN initial\\n' >&2; exit 1; }}; \
+         before_kb=$available_kb; \
          ratio_kb=$((total_kb / 1000 * low_disk_permille)); \
          if [ \"$ratio_kb\" -gt \"$threshold_kb\" ]; then threshold_kb=$ratio_kb; fi; \
-         before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
-         if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
          removed=0; freed_kb=0; low_disk=0; remove_errors=0; orphans_killed=0; \
          if [ \"$before_kb\" -lt \"$threshold_kb\" ]; then low_disk=1; fi; \
          run_root={run_root}; \
@@ -372,6 +388,12 @@ fn build_cleanup_command_with_source_guard(
              printf 'RCH_CLEANUP_ACTIVITY_UNKNOWN dir=%s reason=recent\\n' \"$dir\" >&2; continue; \
            fi; \
            if [ -n \"$recent_active\" ]; then continue; fi; \
+           if [ \"$low_disk\" -eq 1 ]; then \
+             if ! rch_cleanup_measure_disk; then \
+               rm -f \"$candidates\"; printf 'RCH_CLEANUP_DISK_UNKNOWN eviction\\n' >&2; exit 1; \
+             fi; \
+             if [ \"$available_kb\" -ge \"$threshold_kb\" ]; then break; fi; \
+           fi; \
            if rch_cleanup_source_candidate_begin \"$dir\" \"$active_grace_minutes\"; then \
              :; \
            else \
@@ -406,17 +428,13 @@ fn build_cleanup_command_with_source_guard(
            if ! rch_cleanup_source_candidate_end \"$dir\"; then \
              remove_errors=$((remove_errors + 1)); break; \
            fi; \
-           if [ \"$low_disk\" -eq 1 ]; then \
-             current_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
-             if [ -n \"$current_kb\" ] && [ \"$current_kb\" -ge \"$threshold_kb\" ]; then break; fi; \
-           fi; \
          done < \"$candidates\"; \
          rm -f \"$candidates\"; \
          if [ -d \"$base/offroot\" ]; then \
            find \"$base/offroot\" -mindepth 1 -maxdepth 1 -type d -empty -exec rmdir -- {{}} + 2>/dev/null || :; \
          fi; \
-         after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
-         if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
+         rch_cleanup_measure_disk || {{ printf 'RCH_CLEANUP_DISK_UNKNOWN final\\n' >&2; exit 1; }}; \
+         after_kb=$available_kb; \
          printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s orphans_killed=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\" \"$orphans_killed\"; \
          if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi",
         timing = rch_common::timing::shell_prefix(),
@@ -430,6 +448,7 @@ fn build_cleanup_command_with_source_guard(
         orphan_after_minutes = orphan_after_minutes,
         empty_run_dir_minutes = empty_run_dir_minutes,
         identity = rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
+        disk_measurement = CLEANUP_DISK_MEASUREMENT,
         activity_guard = CLEANUP_SOURCE_ACTIVITY_GUARD,
         source_guard = source_guard,
         source_transaction = CLEANUP_SOURCE_TRANSACTION,
@@ -2239,11 +2258,9 @@ flock -n "$__gc_source_registry/metadata.lock" true;
              printf 'RCH_CLEANUP_EFFECTIVE_SCALE=%s\\n' \"$RCH_TIMING_SCALE\"\n",
             rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT,
         );
-        let output = std::process::Command::new("sh")
-            .args(["-c", &command])
-            .env("RCH_TIMING_SCALE", "invalid-worker-environment")
-            .output()
-            .expect("run empty sweep and embedded timing parser");
+        let output = run_cleanup_script(&command, |shell| {
+            shell.env("RCH_TIMING_SCALE", "invalid-worker-environment");
+        });
         assert!(
             output.status.success(),
             "{}",
@@ -2492,6 +2509,21 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             .expect("chmod shim");
     }
 
+    // Full observer and ownership scripts can exceed the kernel's limit for
+    // a single argv string. Keep fixture stdin free, as on the worker.
+    fn run_cleanup_script(
+        script: &str,
+        configure: impl FnOnce(&mut std::process::Command),
+    ) -> std::process::Output {
+        let scripts = tempfile::tempdir().unwrap();
+        let path = scripts.path().join("sweep.sh");
+        std::fs::write(&path, script).unwrap();
+        let mut shell = std::process::Command::new("sh");
+        shell.arg(path);
+        configure(&mut shell);
+        shell.output().expect("run generated cleanup script")
+    }
+
     /// Runs the generated sweep against a scratch tree, optionally with
     /// directories prepended to PATH (for command shims), capturing
     /// stdout, stderr, and exit status.
@@ -2510,7 +2542,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         prepend_path: &[std::path::PathBuf],
     ) -> (String, String, Option<i32>) {
         // A zero ratio keeps low-disk mode independent of the test host's disk.
-        run_sweep_with(base, runs, prepend_path, 0, 0)
+        run_sweep_with(base, runs, prepend_path, 0, 0, 0)
     }
 
     fn run_sweep_with(
@@ -2518,6 +2550,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         runs: &std::path::Path,
         prepend_path: &[std::path::PathBuf],
         max_cache_age_hours: u64,
+        min_free_gb: u64,
         low_disk_permille: u64,
     ) -> (String, String, Option<i32>) {
         use std::env::{join_paths, split_paths};
@@ -2539,23 +2572,78 @@ flock -n "$__gc_source_registry/metadata.lock" true;
             &escaped,
             &format!("'{}'", runs.display()),
             max_cache_age_hours,
-            0,
+            min_free_gb,
             low_disk_permille,
             &source_guard,
         );
         let mut full_path: Vec<std::path::PathBuf> = prepend_path.to_vec();
         full_path.extend(split_paths(&std::env::var_os("PATH").unwrap_or_default()));
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .env("PATH", join_paths(full_path.iter()).expect("join PATH"))
-            .output()
-            .expect("run sweep");
+        let output = run_cleanup_script(&command, |shell| {
+            shell.env("PATH", join_paths(full_path.iter()).expect("join PATH"));
+        });
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
             output.status.code(),
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_disk_evidence_cannot_evict_young_caches_or_report_success() {
+        let _guard = test_guard!();
+        for (case, phase) in [
+            ("empty", "initial"),
+            ("malformed", "initial"),
+            ("failed-with-output", "initial"),
+            ("lost-under-pressure", "eviction"),
+            ("lost-at-end", "final"),
+        ] {
+            let base = tempfile::tempdir().unwrap();
+            let runs = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let pool = base.path().join("repo/.rch-target-pool-young");
+            std::fs::create_dir_all(&pool).unwrap();
+            let artifact = pool.join("cached-output");
+            std::fs::write(&artifact, b"keep this output").unwrap();
+            age_dir(&artifact);
+            age_dir(&pool);
+            write_shim(
+                bin.path(),
+                "df",
+                &format!(
+                    r#"#!/bin/sh
+set -eu
+marker="${{0%/*}}/sampled"
+case {case} in
+    empty) exit 0 ;;
+    malformed) printf '%s\n' 'header' 'fs 2000000 100 nope 1% /'; exit 0 ;;
+    failed-with-output) free=5 ;;
+    lost-under-pressure) [ ! -e "$marker" ] || exit 1; free=5 ;;
+    lost-at-end) [ ! -e "$marker" ] || exit 1; free=1900000 ;;
+esac
+: > "$marker"
+printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' "fs 2000000 100 $free 1% /"
+[ {case} != failed-with-output ]
+"#
+                ),
+            );
+            let (stdout, stderr, code) = run_sweep_with(
+                base.path(),
+                runs.path(),
+                &[bin.path().to_owned()],
+                72,
+                1,
+                70,
+            );
+            assert_eq!(code, Some(1), "{case}: {stdout}{stderr}");
+            assert!(
+                stderr.contains(&format!("RCH_CLEANUP_DISK_UNKNOWN {phase}")),
+                "{case}: {stderr}"
+            );
+            assert!(!stdout.contains("RCH_CLEANUP_METRICS"), "{case}: {stdout}");
+            assert_eq!(std::fs::read(&artifact).unwrap(), b"keep this output");
+        }
     }
 
     /// A worker at or below the placement policy's critical free ratio gets no
@@ -2575,7 +2663,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         std::fs::create_dir_all(pool.join("deps")).expect("pool tree");
         // Past the 5-minute activity grace, far younger than 72 h.
         age_dir(&pool);
-        let (stdout, stderr, code) = run_sweep_with(base.path(), runs.path(), &[], 72, 0);
+        let (stdout, stderr, code) = run_sweep_with(base.path(), runs.path(), &[], 72, 0, 0);
         assert_eq!(code, Some(0), "{stdout}{stderr}");
         assert!(
             stdout.contains("removed=0") && stdout.contains("low_disk=0"),
@@ -2583,7 +2671,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
         );
         assert!(pool.exists());
         // No filesystem has 100% free, so this ratio always demands eviction.
-        let (stdout, stderr, code) = run_sweep_with(base.path(), runs.path(), &[], 72, 1000);
+        let (stdout, stderr, code) = run_sweep_with(base.path(), runs.path(), &[], 72, 0, 1000);
         assert_eq!(code, Some(0), "{stdout}{stderr}");
         assert!(
             stdout.contains("removed=1") && stdout.contains("low_disk=1"),
