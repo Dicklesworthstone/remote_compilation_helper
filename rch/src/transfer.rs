@@ -13329,6 +13329,7 @@ esac
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_path_probe_reports_absence_only_for_missing_paths() {
         use std::os::unix::fs::{PermissionsExt, symlink};
