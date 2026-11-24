@@ -183,6 +183,81 @@ mod native_transport {
     }
 
     #[test]
+    fn losing_the_first_postfork_clock_reaps_the_setup_child() {
+        let fault = r#"
+rch_policy_select_file() { rch_policy_file=; }
+rch_scope_launch_clock() {
+    [ -z "${__sl_child:-}" ] || return 1
+    rch_observation_clock || return 1
+    rch_launch_now=$rch_observation_now
+}
+# Hold a real direct child before it can publish a record or run the payload.
+rch_scope_launch_exec() { exec /bin/sleep 6; }
+rch_scope_launch_supervise "$1/receipt" 0 RCH_SETUP_TEST 1 /bin/true 3>&2
+status=$?
+[ "$status" = 255 ] && [ -n "${__sl_child:-}" ] || exit 90
+rch_scope_launch_process "$__sl_child"
+case $? in
+    1) exit 0;;
+    *) wait "$__sl_child"; exit 91;;
+esac
+"#;
+        let script = format!("{PROTOCOL}\n{fault}");
+        for shell in SHELLS {
+            let directory = fixture();
+            let output = invoke(shell, &script)
+                .arg(directory.path())
+                .output()
+                .expect("observe setup after the clock fails");
+            assert!(output.status.success(), "{shell}: {output:?}");
+            assert!(!directory.path().join("receipt.supervisor.v1/go").exists());
+        }
+    }
+
+    #[test]
+    fn a_live_parent_cannot_hold_or_open_an_expired_setup_gate() {
+        // The parent stays alive but never runs the admission loop. The child
+        // publishes a real receipt in its own session and checks the gate.
+        let observer = r#"
+rch_scope_launch_process "$$" || exit 90
+if [ "$RCH_GATE_CASE" = late ]; then : > "$2/go"; fi
+setsid "$1" -c "$rch_launch_source
+$RCH_GATE_HOOK" rch-gate-child "$2/receipt" "$2" RCH_GATE_TEST 42 \
+    "$$" "$rch_launch_birth" 0 "" "" user 6001 /bin/sh -c 'echo ran > "$1"' sh "$2/payload"
+status=$?
+[ "$status" = 137 ] && [ -f "$2/receipt" ] && [ ! -e "$2/payload" ]
+"#;
+        // Only the child's clock is synthetic. After recording its identity it
+        // sees the absolute deadline or repeatedly reads the same tick.
+        let child = r#"
+rch_observation_clock() {
+    rch_observation_now=100
+    if [ -f "$__sl_record" ]; then
+        case "$RCH_GATE_CASE" in
+            frozen) rch_observation_now=101;;
+            *) rch_observation_now=6001;;
+        esac
+    fi
+}
+rch_scope_launch_child "$@"
+"#;
+        let script = format!("{PROTOCOL}\n{observer}");
+        for shell in SHELLS {
+            for case in ["closed", "late", "frozen"] {
+                let directory = fixture();
+                let output = invoke(shell, &script)
+                    .arg(shell)
+                    .arg(directory.path())
+                    .env("RCH_GATE_CASE", case)
+                    .env("RCH_GATE_HOOK", child)
+                    .output()
+                    .expect("observe child admission with a live waiting parent");
+                assert!(output.status.success(), "{shell}, {case}: {output:?}");
+            }
+        }
+    }
+
+    #[test]
     fn one_literal_hydrates_the_exact_child_program() {
         let fragments = [
             rch_common::wkr_locate::WKR_LOCATE_SHELL,
