@@ -1,4 +1,4 @@
-//! Shared worker disk reservations and conservative process observations.
+//! Shared worker disk/CPU reservations and conservative process observations.
 //!
 //! The version-one ledger is shared with previously deployed workers. A live
 //! process group keeps its entire reservation, even if its original leader
@@ -56,6 +56,60 @@ pub(super) struct Reservation {
     pub devices: BTreeSet<u64>,
     pub budget: u64,
     pub floor: u64,
+    pub cpu: Option<CpuReservation>,
+}
+
+/// Capacity is observed by the worker, never supplied by a dispatcher.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CpuReservation {
+    pub slots: u32,
+    pub capacity: u32,
+}
+
+impl CpuReservation {
+    pub(super) fn for_worker(slots: u32) -> Result<Self> {
+        let unavailable = |detail| {
+            let mut failure = Failure::unavailable(detail);
+            failure.cpu = Some(CpuRefusal {
+                requested_slots: slots,
+                capacity_slots: 0,
+                reserved_slots: 0,
+            });
+            failure
+        };
+        let capacity = std::thread::available_parallelism()
+            .map_err(|error| unavailable(format!("worker CPU capacity unavailable: {error}")))?;
+        let capacity = u32::try_from(capacity.get())
+            .map_err(|_| unavailable("worker CPU capacity exceeds supported range".to_owned()))?;
+        if slots == 0 || capacity == 0 {
+            return Err(unavailable("invalid worker CPU reservation".to_owned()));
+        }
+        Ok(Self { slots, capacity })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CpuRefusal {
+    pub requested_slots: u32,
+    pub capacity_slots: u32,
+    pub reserved_slots: u64,
+}
+
+impl CpuRefusal {
+    fn fits(self) -> bool {
+        self.reserved_slots + u64::from(self.requested_slots) <= u64::from(self.capacity_slots)
+    }
+
+    fn failure(self) -> Failure {
+        let mut failure = Failure::new(
+            "capacity_busy",
+            0,
+            0,
+            "worker CPU capacity cannot cover active build reservations",
+        );
+        failure.cpu = Some(self);
+        failure
+    }
 }
 
 pub(super) struct Admission {
@@ -72,6 +126,10 @@ struct Entry {
     devices: Vec<u64>,
     budget: u64,
     floor: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_slots: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_capacity: Option<u32>,
     // Older readers retain entry fields they do not interpret. Preserve that
     // property when compacting the same shared ledger under its original lock.
     #[serde(flatten)]
@@ -88,6 +146,12 @@ impl Entry {
             || self.devices.is_empty()
         {
             return Err(Failure::unavailable("invalid worker disk reservation"));
+        }
+        if !matches!(
+            (self.cpu_slots, self.cpu_capacity),
+            (None, None) | (Some(1..), Some(1..))
+        ) {
+            return Err(Failure::unavailable("invalid worker CPU reservation"));
         }
         Ok(())
     }
@@ -106,6 +170,8 @@ impl From<&Reservation> for Entry {
             devices: reservation.devices.iter().copied().collect(),
             budget: reservation.budget,
             floor: reservation.floor,
+            cpu_slots: reservation.cpu.map(|cpu| cpu.slots),
+            cpu_capacity: reservation.cpu.map(|cpu| cpu.capacity),
             extra: BTreeMap::new(),
         }
     }
@@ -465,6 +531,11 @@ impl Registry {
         if records.len() >= MAX_RESERVATIONS {
             return Err(Failure::unavailable("worker disk ledger reservation limit"));
         }
+        if let Some(cpu) = cpu_admission(&records, reservation)
+            && !cpu.fits()
+        {
+            return Err(cpu.failure());
+        }
         let mut floors = Samples::new();
         for (&device, &available) in &free {
             let (floor, required) = required_on_device(&records, reservation, device);
@@ -510,8 +581,30 @@ fn required_on_device(records: &[Entry], reservation: &Reservation, device: u64)
 }
 
 fn fits(records: &[Entry], reservation: &Reservation, free: &Samples) -> bool {
-    free.iter().all(|(&device, &available)| {
-        u128::from(available) >= required_on_device(records, reservation, device).1
+    cpu_admission(records, reservation).is_none_or(CpuRefusal::fits)
+        && free.iter().all(|(&device, &available)| {
+            u128::from(available) >= required_on_device(records, reservation, device).1
+        })
+}
+
+fn cpu_admission(records: &[Entry], reservation: &Reservation) -> Option<CpuRefusal> {
+    let cpu = reservation.cpu?;
+    // A lower worker observation remains binding while its owners live. Disk
+    // devices are deliberately irrelevant: different staging volumes share CPUs.
+    let capacity = records
+        .iter()
+        .filter_map(|entry| entry.cpu_capacity)
+        .fold(cpu.capacity, u32::min);
+    let reserved = records
+        .iter()
+        // Legacy owners have unknown concurrency, not zero concurrency. Only
+        // the existing complete process census may prove they no longer count.
+        .map(|entry| u64::from(entry.cpu_slots.unwrap_or(capacity)))
+        .sum();
+    Some(CpuRefusal {
+        requested_slots: cpu.slots,
+        capacity_slots: capacity,
+        reserved_slots: reserved,
     })
 }
 
@@ -943,6 +1036,7 @@ mod tests {
             devices: devices.iter().copied().collect(),
             budget,
             floor,
+            cpu: None,
         }
     }
 
@@ -961,6 +1055,253 @@ mod tests {
             .iter()
             .map(|group| (*group, record(*group, 'S')))
             .collect()
+    }
+
+    fn cpu_request(slots: u32, capacity: u32, devices: &[u64]) -> Reservation {
+        Reservation {
+            cpu: Some(CpuReservation { slots, capacity }),
+            ..request(GIB, 0, devices)
+        }
+    }
+
+    #[test]
+    fn cpu_admission_spans_filesystems_and_retains_the_lowest_active_capacity() {
+        let fixture = Fixture::new();
+        let mut old = Entry::from(&cpu_request(3, 4, &[2]));
+        old.group = 600;
+        old.extra.insert(
+            "future_evidence".into(),
+            serde_json::json!({"retain": true}),
+        );
+        let before = fixture.write_entries(vec![old]);
+        let failure = fixture
+            .registry
+            .admit_with(
+                &cpu_request(2, 8, &[1]),
+                &mut || Ok((BTreeMap::from([(1, 20 * GIB)]), Instant::now())),
+                &mut || Ok(()),
+                |_| Ok(census(&[500, 600])),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, "capacity_busy");
+        let cpu = failure.cpu.unwrap();
+        assert_eq!(cpu.requested_slots, 2);
+        assert_eq!(cpu.capacity_slots, 4);
+        assert_eq!(cpu.reserved_slots, 3);
+        assert_eq!(
+            fixture.bytes(),
+            before,
+            "refusal must not publish a reservation"
+        );
+
+        fixture
+            .registry
+            .admit_with(
+                &cpu_request(1, 8, &[1]),
+                &mut || Ok((BTreeMap::from([(1, 20 * GIB)]), Instant::now())),
+                &mut || Ok(()),
+                |_| panic!("the remaining slot fits without retiring any owner"),
+            )
+            .unwrap();
+        let (entries, _) = fixture.registry.read().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].extra["future_evidence"],
+            serde_json::json!({"retain": true})
+        );
+        assert_eq!(entries[1].cpu_slots, Some(1));
+        assert_eq!(entries[1].cpu_capacity, Some(8));
+    }
+
+    #[test]
+    fn unknown_legacy_and_live_descendants_keep_the_cpu_pool_reserved() {
+        for cpu in [
+            None,
+            Some(CpuReservation {
+                slots: 4,
+                capacity: 4,
+            }),
+        ] {
+            for leader_state in ['S', 'Z'] {
+                let fixture = Fixture::new();
+                let mut previous = request(GIB, 0, &[2]);
+                previous.group = 600;
+                previous.cpu = cpu;
+                let before = fixture.write_entries(vec![Entry::from(&previous)]);
+                let mut snapshot = BTreeMap::from([(600, record(600, leader_state))]);
+                snapshot.insert(
+                    601,
+                    ProcessRecord {
+                        pid: 601,
+                        ..record(600, 'S')
+                    },
+                );
+                let failure = fixture
+                    .registry
+                    .admit_with(
+                        &cpu_request(1, 4, &[1]),
+                        &mut || Ok((BTreeMap::from([(1, 20 * GIB)]), Instant::now())),
+                        &mut || Ok(()),
+                        |_| Ok(snapshot.clone()),
+                    )
+                    .err()
+                    .unwrap();
+                assert_eq!(failure.reason, "capacity_busy");
+                assert_eq!(failure.cpu.unwrap().reserved_slots, 4);
+                assert_eq!(fixture.bytes(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_reclaim_requires_complete_census_then_resamples_disk() {
+        let fixture = Fixture::new();
+        let mut old_boot = Entry::from(&cpu_request(4, 4, &[2]));
+        old_boot.boot = OTHER_BOOT.into();
+        old_boot.group = 600;
+        let mut dead_legacy = Entry::from(&request(GIB, 0, &[2]));
+        dead_legacy.group = 700;
+        let before = fixture.write_entries(vec![old_boot, dead_legacy]);
+        let request = cpu_request(4, 4, &[1]);
+        let failure = fixture
+            .registry
+            .admit_with(
+                &request,
+                &mut || Ok((BTreeMap::from([(1, 20 * GIB)]), Instant::now())),
+                &mut || Ok(()),
+                |_| Err(Failure::unavailable("incomplete census")),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, "monitor_unavailable");
+        assert_eq!(fixture.bytes(), before);
+
+        let first = Instant::now();
+        let second = first + Duration::from_millis(1);
+        let mut samples = [first, second].into_iter();
+        let admission = fixture
+            .registry
+            .admit_with(
+                &request,
+                &mut || Ok((BTreeMap::from([(1, 20 * GIB)]), samples.next().unwrap())),
+                &mut || Ok(()),
+                |_| Ok(census(&[500, 600])),
+            )
+            .unwrap();
+        assert_eq!(admission.sampled_at, second);
+        let (entries, _) = fixture.registry.read().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].group, 500);
+        assert_eq!(entries[0].cpu_slots, Some(4));
+    }
+
+    #[test]
+    fn cpu_capacity_is_atomic_with_disk_reservations() {
+        use std::sync::{Arc, Barrier};
+        let fixture = Fixture::new();
+        let ready = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = [500, 600]
+            .into_iter()
+            .map(|group| {
+                let root = fixture.registry.root.clone();
+                let ready = Arc::clone(&ready);
+                std::thread::spawn(move || {
+                    let registry = Registry::at(root, Duration::from_secs(2)).unwrap();
+                    let mut request = cpu_request(3, 4, &[u64::from(group)]);
+                    request.group = group;
+                    ready.wait();
+                    registry.admit_with(
+                        &request,
+                        &mut || {
+                            Ok((
+                                BTreeMap::from([(u64::from(group), 20 * GIB)]),
+                                Instant::now(),
+                            ))
+                        },
+                        &mut || Ok(()),
+                        |_| Ok(census(&[500, 600])),
+                    )
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        let failure = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .unwrap();
+        assert_eq!(failure.reason, "capacity_busy");
+        assert_eq!(failure.cpu.unwrap().reserved_slots, 3);
+        let (entries, _) = fixture.registry.read().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cpu_slots, Some(3));
+    }
+
+    #[test]
+    fn malformed_cpu_accounting_never_becomes_free_capacity() {
+        for (slots, capacity) in [
+            (Some(0), Some(4)),
+            (Some(1), Some(0)),
+            (Some(1), None),
+            (None, Some(4)),
+        ] {
+            let fixture = Fixture::new();
+            let mut entry = Entry::from(&request(GIB, 0, &[1]));
+            entry.cpu_slots = slots;
+            entry.cpu_capacity = capacity;
+            let before = fixture.write_entries(vec![entry]);
+            assert!(
+                fixture
+                    .registry
+                    .admit_with(
+                        &cpu_request(1, 4, &[1]),
+                        &mut || panic!("invalid ledger must refuse before probing"),
+                        &mut || Ok(()),
+                        |_| panic!("invalid ledger cannot authorize reclaim"),
+                    )
+                    .is_err()
+            );
+            assert_eq!(fixture.bytes(), before);
+        }
+        let fixture = Fixture::new();
+        let failure = fixture
+            .registry
+            .admit_with(
+                &cpu_request(5, 4, &[1]),
+                &mut || Ok((BTreeMap::from([(1, 20 * GIB)]), Instant::now())),
+                &mut || Ok(()),
+                |_| Ok(census(&[500])),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(failure.reason, "capacity_busy");
+        assert_eq!(failure.cpu.unwrap().reserved_slots, 0);
+        assert!(!fixture.registry.root.join("ledger.json").exists());
+    }
+
+    #[test]
+    fn legacy_requests_preserve_cpu_evidence_without_activating_cpu_admission() {
+        let fixture = Fixture::new();
+        let previous = Entry::from(&cpu_request(4, 4, &[2]));
+        fixture.write_entries(vec![previous]);
+        fixture
+            .registry
+            .admit_with(
+                &request(GIB, 0, &[1]),
+                &mut || Ok((BTreeMap::from([(1, 20 * GIB)]), Instant::now())),
+                &mut || Ok(()),
+                |_| panic!("legacy requests retain their disk-only admission policy"),
+            )
+            .unwrap();
+        let (entries, _) = fixture.registry.read().unwrap();
+        assert_eq!(entries[0].cpu_slots, Some(4));
+        assert_eq!(entries[0].cpu_capacity, Some(4));
+        assert_eq!(entries[1].cpu_slots, None);
+        assert_eq!(entries[1].cpu_capacity, None);
     }
 
     #[test]

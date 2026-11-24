@@ -1,4 +1,4 @@
-//! Native disk reservation and execution supervisor.
+//! Native disk/CPU reservation and execution supervisor.
 //!
 //! The guardian remains in the build's owned group while a separate process
 //! performs admission, probes, scans, and receipt I/O. Filesystem stalls cannot
@@ -26,6 +26,7 @@ pub(super) struct Failure {
     pub growth: u64,
     pub detail: String,
     pub required_growth_bytes: Option<u64>,
+    cpu: Option<ledger::CpuRefusal>,
 }
 
 #[cfg(unix)]
@@ -37,6 +38,7 @@ impl Failure {
             growth,
             detail: detail.into(),
             required_growth_bytes: None,
+            cpu: None,
         }
     }
 
@@ -115,6 +117,7 @@ mod unix {
     use serde_json::{Value, json};
 
     const PROBE: &[u8] = b"rch-wkr disk-supervise v1\n";
+    const CPU_PROBE: &[u8] = b"rch-wkr disk-supervise cpu-v1\n";
     const INTERNAL: &str = "__supervise";
     const DISK_SUFFIX: &str = "_DISK_BUDGET:";
     const MAX_RECEIPT_BYTES: usize = 8192;
@@ -126,6 +129,7 @@ mod unix {
     struct Invocation {
         budget: u64,
         floor: u64,
+        cpu_slots: Option<u32>,
         marker: String,
         target: PathBuf,
         probes: Vec<PathBuf>,
@@ -252,6 +256,16 @@ mod unix {
                     .filter(|value| *value <= i64::MAX as u64)
                     .ok_or_else(|| Failure::unavailable("invalid execution deadline"))?,
             };
+            let cpu_slots = plan
+                .get("cpu_slots")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|slots| u32::try_from(slots).ok())
+                        .filter(|slots| *slots > 0)
+                        .ok_or_else(|| Failure::unavailable("invalid CPU slot request"))
+                })
+                .transpose()?;
             let standalone = match text(mode)? {
                 "standalone" => true,
                 "tracked" => false,
@@ -260,6 +274,7 @@ mod unix {
             Ok(Self {
                 budget: unsigned(budget, true)?,
                 floor: unsigned(floor, false)?,
+                cpu_slots,
                 marker: marker.to_owned(),
                 target: absolute(&Value::String(text(target)?.to_owned()))?,
                 probes: path_list(&plan, "probe")?,
@@ -286,6 +301,10 @@ mod unix {
     pub(super) fn run(arguments: &[OsString]) -> Result<i32> {
         if arguments.len() == 1 && arguments[0] == "probe" {
             io::stdout().lock().write_all(PROBE)?;
+            return Ok(0);
+        }
+        if arguments.len() == 1 && arguments[0] == "probe-cpu" {
+            io::stdout().lock().write_all(CPU_PROBE)?;
             return Ok(0);
         }
         let timing = Timing::from_environment()?;
@@ -941,6 +960,24 @@ mod unix {
         accounting: Option<&scan::Accounting>,
         peak: Option<u64>,
     ) -> Vec<(String, Option<Value>)> {
+        // CPU refusal is a prelaunch scheduling result. Keep its distinct
+        // durable receipt; it must not become a disk incident or a statement
+        // about an already running payload.
+        if !started
+            && matches!(failure.reason, "capacity_busy" | "monitor_unavailable")
+            && let Some(cpu) = failure.cpu
+        {
+            return vec![(
+                format!("{}_CPU_BUDGET:", invocation.prefix()),
+                Some(json!({
+                    "reason": failure.reason, "started": false,
+                    "requested_slots": cpu.requested_slots,
+                    "capacity_slots": cpu.capacity_slots,
+                    "reserved_slots": cpu.reserved_slots,
+                    "detail": failure.detail.chars().take(240).collect::<String>(),
+                })),
+            )];
+        }
         let mut receipts = if failure.reason == "deadline" {
             vec![(invocation.prefix().to_owned(), None)]
         } else {
@@ -1029,6 +1066,10 @@ mod unix {
                 devices: scanner.devices.clone(),
                 budget: invocation.budget,
                 floor: invocation.floor,
+                cpu: invocation
+                    .cpu_slots
+                    .map(ledger::CpuReservation::for_worker)
+                    .transpose()?,
             };
             let admitted_scanner = Arc::clone(&scanner);
             let admission_heartbeat = heartbeat.clone();
@@ -1194,6 +1235,13 @@ mod unix {
             assert_eq!(parsed.command, [OsString::from("/bin/true"), binary]);
             assert!(!parsed.standalone);
             assert!(parsed.timeout.is_zero());
+            assert!(parsed.cpu_slots.is_none());
+            let mut cpu = plan();
+            cpu["cpu_slots"] = json!(u32::MAX);
+            assert_eq!(
+                Invocation::parse(&arguments(cpu)).unwrap().cpu_slots,
+                Some(u32::MAX)
+            );
         }
 
         #[test]
@@ -1210,6 +1258,13 @@ mod unix {
                 ("receipt_initialized", Value::Null),
                 ("require_incremental_tracking", json!(1)),
                 ("cargo_cache_required", json!("yes")),
+                ("cpu_slots", Value::Null),
+                ("cpu_slots", json!(0)),
+                ("cpu_slots", json!(-1)),
+                ("cpu_slots", json!(1.0)),
+                ("cpu_slots", json!("1")),
+                ("cpu_slots", json!(true)),
+                ("cpu_slots", json!(u64::from(u32::MAX) + 1)),
             ] {
                 let mut candidate = base.clone();
                 candidate[field] = value;
@@ -1225,6 +1280,45 @@ mod unix {
                 argv[2] = marker.into();
                 assert!(Invocation::parse(&argv).is_err(), "{marker:?}");
             }
+        }
+
+        #[test]
+        fn cpu_refusal_has_one_distinct_durable_prelaunch_receipt() {
+            let invocation = Invocation::parse(&arguments(plan())).unwrap();
+            let mut failure = Failure::new("capacity_busy", 0, 0, "all CPUs are reserved");
+            failure.cpu = Some(ledger::CpuRefusal {
+                requested_slots: 2,
+                capacity_slots: 4,
+                reserved_slots: 3,
+            });
+            let receipts = failure_receipts(&invocation, &failure, false, None, Some(10));
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].0, "RCH_TEST_CPU_BUDGET:");
+            let value = receipts[0].1.as_ref().unwrap();
+            assert_eq!(value["reason"], "capacity_busy");
+            assert_eq!(value["started"], false);
+            assert_eq!(value["requested_slots"], 2);
+            assert_eq!(value["capacity_slots"], 4);
+            assert_eq!(value["reserved_slots"], 3);
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join("receipt");
+            persist_receipt(&path, &receipts).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(bytes, receipt_text(&receipts).unwrap());
+            assert!(!String::from_utf8(bytes).unwrap().contains("_DISK_BUDGET:"));
+            failure.reason = "monitor_unavailable";
+            failure.cpu = Some(ledger::CpuRefusal {
+                requested_slots: 2,
+                capacity_slots: 0,
+                reserved_slots: 0,
+            });
+            let receipts = failure_receipts(&invocation, &failure, false, None, None);
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].0, "RCH_TEST_CPU_BUDGET:");
+            assert_eq!(
+                receipts[0].1.as_ref().unwrap()["reason"],
+                "monitor_unavailable"
+            );
         }
 
         #[test]

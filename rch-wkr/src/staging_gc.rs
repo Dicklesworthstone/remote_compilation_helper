@@ -494,7 +494,11 @@ mod native {
             .read_to_end(&mut bytes)?;
         let expected = format!("{}\n", path.to_str().ok_or(Error::Changed)?);
         require(bytes == expected.as_bytes())?;
-        require(format!("{:x}", Sha256::digest(&bytes)) == *digest)?;
+        let actual: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        require(actual == *digest)?;
         require(fields(&rustix::fs::fstat(&file)?) == fields(&before))?;
         require(fields(&named(&directory, &name)?) == fields(&before))?;
         require(Identity::of(&named(&directory, c"metadata.lock")?) == Identity::of(&lock))?;
