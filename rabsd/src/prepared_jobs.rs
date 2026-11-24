@@ -109,13 +109,7 @@ fn with_client_stdout<T>(
 ) -> io::Result<T> {
     #[cfg(target_os = "linux")]
     {
-        let stopped = AtomicBool::new(false);
-        let mut stdout = rabsd::ControlledOutput::with_deadline(
-            &io::stdout(),
-            &stopped,
-            deadline.output.clone(),
-        )?;
-        work(&mut stdout)
+        client_stdout_to(&io::stdout(), deadline, &AtomicBool::new(false), work)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -163,7 +157,19 @@ fn write_client_record_to(
 }
 
 #[cfg(target_os = "linux")]
-fn client_console_to<T>(
+pub(crate) fn client_stdout_to<T>(
+    stdout: &impl std::os::fd::AsFd,
+    deadline: &ClientDeadline,
+    stopped: &AtomicBool,
+    work: impl FnOnce(&mut dyn Write) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut stdout =
+        rabsd::ControlledOutput::with_deadline(stdout, stopped, deadline.output.clone())?;
+    work(&mut stdout)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn client_console_to<T>(
     stdout: &impl std::os::fd::AsFd,
     stderr: &impl std::os::fd::AsFd,
     deadline: &ClientDeadline,
@@ -599,14 +605,14 @@ pub(crate) fn run(args: &[String], socket: &str) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The reader stays open without consuming a byte. A regressed blocking
     /// writer is released only after the watchdog has recorded failure, so the
     /// test never leaves a stranded native thread behind.
     #[cfg(target_os = "linux")]
-    pub(super) fn with_full_pipe<T: Send + 'static>(
+    pub(crate) fn with_full_pipe<T: Send + 'static>(
         case: impl FnOnce(std::fs::File) -> T + Send + 'static,
     ) -> T {
         use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};

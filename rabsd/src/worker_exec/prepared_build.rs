@@ -8,6 +8,7 @@ use super::{
     read_request, recover_existing_delivery, request_manifest, run_loopback_operation,
     run_tls_operation, run_tls_operation_inner,
 };
+use crate::prepared_jobs::ClientDeadline;
 use rabsd::coord::delivery_recovery::{InstalledOutputs, install_delivery_outputs};
 use rabsd::coord::prepared_operation::DiagnosticSnapshot;
 use rabsd::coord::secure_worker_delivery::{PinnedWorkerAdmission, parse_worker_pin};
@@ -506,32 +507,19 @@ impl PreparedBuild<'_> {
                     "build completed but its console output could not be delivered: {error}"
                 ),
             };
-            if replay_diagnostics {
-                let until = Instant::now() + DIAGNOSTIC_REPLAY_BUDGET;
+            let deadline = ClientDeadline::new(Instant::now() + DIAGNOSTIC_REPLAY_BUDGET);
+            let diagnostics = if replay_diagnostics {
                 // The execution/recovery path has already verified this entire
                 // delivery. Capture and hash BOTH streams again before exposing
                 // either, so corruption cannot print only half a compiler result.
                 let snapshot =
-                    DiagnosticSnapshot::from_delivery(&delivery, until).map_err(failed)?;
+                    DiagnosticSnapshot::from_delivery(&delivery, deadline.get()).map_err(failed)?;
                 diagnostics_may_have_been_exposed = true;
-                emit_report(
-                    &report,
-                    Some(snapshot),
-                    &mut io::stdout().lock(),
-                    &mut io::stderr().lock(),
-                    until,
-                )
-                .map_err(failed)?;
+                Some(snapshot)
             } else {
-                emit_report(
-                    &report,
-                    None,
-                    &mut io::stdout().lock(),
-                    &mut io::stderr().lock(),
-                    Instant::now() + DIAGNOSTIC_REPLAY_BUDGET,
-                )
-                .map_err(failed)?;
-            }
+                None
+            };
+            emit_client_report(&report, diagnostics, &deadline).map_err(failed)?;
             let code = delivery.receipt["exit_code"]
                 .as_i64()
                 .and_then(|code| i32::try_from(code).ok())
@@ -561,6 +549,70 @@ impl PreparedBuild<'_> {
             "kind":"worker-build", "bundle":self.bundle, "delivery":delivery.to_json(),
             "installed_outputs":installed.map(InstalledOutputs::to_json),
             "publication_authorized":false, "reexecute":false,
+        })
+    }
+}
+
+/// Bound the console writes themselves as well as diagnostic verification. A
+/// full pipe must not strand a completed build or renew its replay budget.
+fn emit_client_report(
+    report: &Value,
+    diagnostics: Option<DiagnosticSnapshot>,
+    deadline: &ClientDeadline,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        emit_client_report_to(
+            report,
+            diagnostics,
+            &io::stdout(),
+            &io::stderr(),
+            deadline,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        emit_report(
+            report,
+            diagnostics,
+            &mut io::stdout().lock(),
+            &mut io::stderr().lock(),
+            deadline.get(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn emit_client_report_to(
+    report: &Value,
+    diagnostics: Option<DiagnosticSnapshot>,
+    stdout: &impl std::os::fd::AsFd,
+    stderr: &impl std::os::fd::AsFd,
+    deadline: &ClientDeadline,
+    stopped: &std::sync::atomic::AtomicBool,
+) -> io::Result<()> {
+    if let Some(snapshot) = diagnostics {
+        crate::prepared_jobs::client_console_to(
+            stdout,
+            stderr,
+            deadline,
+            stopped,
+            |mut stdout, mut stderr| {
+                emit_report(
+                    report,
+                    Some(snapshot),
+                    &mut stdout,
+                    &mut stderr,
+                    deadline.get(),
+                )
+            },
+        )
+    } else {
+        // Native JSON owns only stdout. An unused closed or read-only stderr
+        // cannot turn a successfully delivered report into a build failure.
+        crate::prepared_jobs::client_stdout_to(stdout, deadline, stopped, |mut stdout| {
+            emit_report(report, None, &mut stdout, &mut io::sink(), deadline.get())
         })
     }
 }
@@ -938,6 +990,182 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(stdout.0, 1);
         assert!(stderr.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn console_bytes(file: &fs::File) -> Vec<u8> {
+        use std::io::{Read, Seek};
+        let mut reader = file.try_clone().unwrap();
+        reader.rewind().unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_direct_console_preserves_exact_diagnostics_and_native_reports() {
+        use std::sync::atomic::AtomicBool;
+
+        let raw_stdout = b"compiler output\0\xff\n";
+        let raw_stderr = b"compiler diagnostic\xff";
+        for exit_code in [0, 101] {
+            for replay in [false, true] {
+                let stdout = tempfile::tempfile().unwrap();
+                let stderr = tempfile::tempfile().unwrap();
+                let report = json!({"kind":"worker-build", "exit_code":exit_code,
+                    "publication_authorized":false, "reexecute":false});
+                let diagnostics = replay.then(|| diagnostic_snapshot(raw_stdout, raw_stderr));
+                let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(10));
+                let until = deadline.get();
+                emit_client_report_to(
+                    &report,
+                    diagnostics,
+                    &stdout,
+                    &stderr,
+                    &deadline,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                let status = format!("{report}\n");
+                if replay {
+                    assert_eq!(console_bytes(&stdout), raw_stdout);
+                    assert_eq!(
+                        console_bytes(&stderr),
+                        [raw_stderr.as_slice(), status.as_bytes()].concat()
+                    );
+                } else {
+                    assert_eq!(console_bytes(&stdout), status.as_bytes());
+                    assert!(console_bytes(&stderr).is_empty());
+                }
+                assert_eq!(deadline.get(), until, "output must not renew the budget");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_native_report_does_not_open_an_unused_read_only_stderr() {
+        use std::sync::atomic::AtomicBool;
+
+        let stdout = tempfile::tempfile().unwrap();
+        let unused = tempfile::NamedTempFile::new().unwrap();
+        let stderr = fs::File::open(unused.path()).unwrap();
+        let report = json!({"kind":"worker-build", "exit_code":0, "reexecute":false});
+        let deadline = ClientDeadline::new(Instant::now() + Duration::from_secs(10));
+        emit_client_report_to(
+            &report,
+            None,
+            &stdout,
+            &stderr,
+            &deadline,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(console_bytes(&stdout), format!("{report}\n").as_bytes());
+        assert!(console_bytes(&stderr).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_report_deadline_bounds_every_used_output_pipe() {
+        use crate::prepared_jobs::tests::with_full_pipe;
+        use std::sync::atomic::AtomicBool;
+
+        for (replay, stdout_stalls) in [(false, true), (true, true), (true, false)] {
+            with_full_pipe(move |pipe| {
+                let ordinary = tempfile::tempfile().unwrap();
+                let diagnostics =
+                    replay.then(|| diagnostic_snapshot(b"worker stdout", b"worker stderr"));
+                let (stdout, stderr) = if stdout_stalls {
+                    (&pipe, &ordinary)
+                } else {
+                    (&ordinary, &pipe)
+                };
+                let deadline = ClientDeadline::new(Instant::now() + Duration::from_millis(50));
+                let error = emit_client_report_to(
+                    &json!({"kind":"worker-build", "exit_code":0, "reexecute":false}),
+                    diagnostics,
+                    stdout,
+                    stderr,
+                    &deadline,
+                    &AtomicBool::new(false),
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert_eq!(
+                    console_bytes(&ordinary),
+                    if stdout_stalls {
+                        b"".as_slice()
+                    } else {
+                        b"worker stdout".as_slice()
+                    },
+                    "a stalled stream cannot trigger a retry or a success report"
+                );
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_report_cancellation_interrupts_an_already_stalled_pipe() {
+        use crate::prepared_jobs::tests::with_full_pipe;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        for (replay, stdout_stalls) in [(false, true), (true, true), (true, false)] {
+            with_full_pipe(move |pipe| {
+                let ordinary = tempfile::tempfile().unwrap();
+                let diagnostics =
+                    replay.then(|| diagnostic_snapshot(b"worker stdout", b"worker stderr"));
+                let (stdout, stderr) = if stdout_stalls {
+                    (&pipe, &ordinary)
+                } else {
+                    (&ordinary, &pipe)
+                };
+                let stopped = AtomicBool::new(false);
+                let error = std::thread::scope(|scope| {
+                    let (entered, started) = mpsc::sync_channel(0);
+                    let (finished, result) = mpsc::sync_channel(1);
+                    let stop_flag = &stopped;
+                    scope.spawn(move || {
+                        let deadline =
+                            ClientDeadline::new(Instant::now() + Duration::from_secs(30));
+                        entered.send(()).unwrap();
+                        let outcome = emit_client_report_to(
+                            &json!({"kind":"worker-build", "exit_code":0, "reexecute":false}),
+                            diagnostics,
+                            stdout,
+                            stderr,
+                            &deadline,
+                            stop_flag,
+                        );
+                        let _ = finished.send(outcome);
+                    });
+                    started.recv_timeout(Duration::from_secs(2)).unwrap();
+                    let pending = result.recv_timeout(Duration::from_millis(50));
+                    stopped.store(true, Ordering::Release);
+                    assert!(
+                        matches!(pending, Err(RecvTimeoutError::Timeout)),
+                        "the full pipe must still be pending before cancellation: {pending:?}"
+                    );
+                    result
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("cancellation did not release the stalled report")
+                        .unwrap_err()
+                });
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                assert_eq!(
+                    console_bytes(&ordinary),
+                    if stdout_stalls {
+                        b"".as_slice()
+                    } else {
+                        b"worker stdout".as_slice()
+                    },
+                    "cancelled replay cannot duplicate diagnostics or emit success"
+                );
+            });
+        }
     }
 
     fn preparation_fixture(root: &Path) -> (PathBuf, PathBuf) {
