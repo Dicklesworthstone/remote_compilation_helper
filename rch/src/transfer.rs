@@ -8958,6 +8958,24 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         }
     }
 
+    /// Exercise the production upload arguments against an owned local worker
+    /// tree. Only the destination selects local transport; rsync does not run
+    /// the SSH receiver launcher when both operands are local paths.
+    #[cfg(test)]
+    pub(crate) fn local_source_sync_for_test(
+        &self,
+        worker: &WorkerConfig,
+        destination: &Path,
+    ) -> Command {
+        let destination = format!("{}/", destination.display());
+        self.build_sync_command(
+            worker,
+            &destination,
+            &escape(Cow::from(destination.clone())),
+            &self.get_effective_excludes(),
+        )
+    }
+
     /// Exercise the production retrieval arguments with an owned local worker
     /// tree in filesystem integration tests. Only the source operand changes;
     /// no SSH connection or remote execution is claimed by these tests.

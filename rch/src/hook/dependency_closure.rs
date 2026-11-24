@@ -904,6 +904,92 @@ pub(super) fn canonicalize_sync_root_for_plan(root: &Path, policy: &PathTopology
         .unwrap_or_else(|| root.to_path_buf())
 }
 
+/// Native build graphs and relative includes may read siblings of the invocation
+/// directory. The nearest repository is their source boundary, while execution
+/// and artifact paths remain relative to the original cwd. Never climb outside
+/// the configured topology or through a nested repository/worktree boundary.
+/// Other command families retain their own source-selection rules.
+pub(super) fn native_repository_source_root(
+    invocation: &Path,
+    kind: Option<CompilationKind>,
+    policy: &PathTopologyPolicy,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !matches!(
+        kind,
+        Some(
+            CompilationKind::Gcc
+                | CompilationKind::Gpp
+                | CompilationKind::Clang
+                | CompilationKind::Clangpp
+                | CompilationKind::Make
+                | CompilationKind::Ninja
+                | CompilationKind::Meson
+                | CompilationKind::CmakeBuild
+        )
+    ) {
+        return Ok(None);
+    }
+    let normalized = normalize_project_path_with_policy(invocation, policy)
+        .context("native invocation is outside the configured source topology")?;
+    anyhow::ensure!(
+        normalized.canonical_path() == invocation && invocation.is_dir(),
+        "native invocation changed during source planning"
+    );
+    for (depth, ancestor) in invocation
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(normalized.canonical_root()))
+        .enumerate()
+    {
+        anyhow::ensure!(
+            depth < 64,
+            "native repository ancestry exceeds its depth limit"
+        );
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    !metadata.file_type().is_symlink() && (metadata.is_dir() || metadata.is_file()),
+                    "native repository boundary is not an ordinary Git directory or worktree file"
+                );
+                let root = normalize_project_path_with_policy(ancestor, policy)
+                    .context("native repository is outside the configured source topology")?;
+                anyhow::ensure!(
+                    root.canonical_path() == ancestor && invocation.starts_with(ancestor),
+                    "native repository changed during source planning"
+                );
+                return Ok(Some(ancestor.to_owned()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("inspect native repository boundary"),
+        }
+    }
+    // Without a repository boundary, preserve the existing cwd-based planner,
+    // including workspace metadata used by native wrappers around Cargo.
+    Ok(None)
+}
+
+/// A native source selection is already complete within its repository. Do not
+/// interpret an incidental Cargo.toml or add an enclosing Cargo workspace.
+pub(super) fn build_native_sync_closure_plan(
+    source_root: &Path,
+    project_hash: &str,
+    policy: &PathTopologyPolicy,
+) -> anyhow::Result<Vec<SyncClosurePlanEntry>> {
+    let normalized = normalize_project_path_with_policy(source_root, policy)
+        .context("native source root is outside the configured source topology")?;
+    anyhow::ensure!(
+        normalized.canonical_path() == source_root && source_root.is_dir(),
+        "native source root changed before synchronization"
+    );
+    Ok(vec![SyncClosurePlanEntry {
+        local_root: source_root.to_owned(),
+        remote_root: map_sync_root_to_remote_root(source_root, policy),
+        project_id: project_id_from_path(source_root),
+        root_hash: project_hash.to_owned(),
+        is_primary: true,
+        mode: SyncClosureMode::Full,
+    }])
+}
+
 fn enclosing_workspace_root_for_sync_root(
     root: &Path,
     policy: &PathTopologyPolicy,
@@ -1426,6 +1512,191 @@ pub(super) fn dependency_preflight_timeout(check_count: usize) -> Duration {
         .div_ceil(DEPENDENCY_PREFLIGHT_PATHS_PER_TIMEOUT_WINDOW)
         .max(1);
     Duration::from_secs(20).saturating_mul(u32::try_from(windows).unwrap_or(u32::MAX))
+}
+
+#[cfg(test)]
+mod native_source_tests {
+    use super::*;
+
+    fn fixture() -> (PathBuf, PathBuf, PathBuf, PathTopologyPolicy) {
+        let storage = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let repository = storage.join("native repository");
+        let invocation = repository.join("components/app[1]");
+        std::fs::create_dir_all(&invocation).unwrap();
+        std::fs::create_dir(repository.join(".git")).unwrap();
+        let policy = PathTopologyPolicy::new(storage.clone(), storage.join("alias"));
+        (storage, repository, invocation, policy)
+    }
+
+    #[test]
+    fn native_repository_source_selection_is_bounded_and_skips_cargo_planning() {
+        let (storage, repository, invocation, policy) = fixture();
+        // An incidental, even invalid Cargo manifest must not prevent a native
+        // build or admit sources belonging to a different dependency graph.
+        std::fs::write(
+            storage.join("Cargo.toml"),
+            "[workspace]\nmembers=['missing']\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("Cargo.toml"), "not a Cargo manifest\n").unwrap();
+        for kind in [
+            CompilationKind::Gcc,
+            CompilationKind::Gpp,
+            CompilationKind::Clang,
+            CompilationKind::Clangpp,
+            CompilationKind::Make,
+            CompilationKind::Ninja,
+            CompilationKind::Meson,
+            CompilationKind::CmakeBuild,
+        ] {
+            let selected = native_repository_source_root(&invocation, Some(kind), &policy)
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected, repository, "{kind:?}");
+            let plan = build_native_sync_closure_plan(&selected, "native-hash", &policy).unwrap();
+            assert_eq!(plan.len(), 1);
+            assert_eq!(plan[0].local_root, repository);
+            assert_eq!(Path::new(&plan[0].remote_root), repository);
+            assert_eq!(plan[0].project_id, project_id_from_path(&repository));
+            assert_eq!(plan[0].root_hash, "native-hash");
+            assert!(plan[0].is_primary);
+            assert_eq!(plan[0].mode, SyncClosureMode::Full);
+        }
+        for kind in [
+            None,
+            Some(CompilationKind::Rustc),
+            Some(CompilationKind::CargoBuild),
+            Some(CompilationKind::CargoTest),
+            Some(CompilationKind::CargoDoc),
+            Some(CompilationKind::GoBuild),
+            Some(CompilationKind::GoTest),
+            Some(CompilationKind::Tsc),
+            Some(CompilationKind::BunTest),
+            Some(CompilationKind::BunTypecheck),
+            Some(CompilationKind::NixBuild),
+            Some(CompilationKind::Job),
+        ] {
+            assert!(
+                native_repository_source_root(&invocation, kind, &policy)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // The outer Git root is outside this deliberately narrower policy.
+        let ceiling = repository.join("components");
+        let limited = PathTopologyPolicy::new(ceiling.clone(), storage.join("limited-alias"));
+        assert_eq!(
+            native_repository_source_root(&invocation, Some(CompilationKind::Make), &limited)
+                .unwrap(),
+            None
+        );
+        let standalone = storage.join("standalone/src");
+        std::fs::create_dir_all(&standalone).unwrap();
+        assert_eq!(
+            native_repository_source_root(&standalone, Some(CompilationKind::Gcc), &policy)
+                .unwrap(),
+            None
+        );
+        assert!(build_native_sync_closure_plan(&storage, "native-hash", &limited).is_err());
+    }
+
+    #[test]
+    fn native_repository_no_marker_preserves_cargo_workspace_metadata_for_wrappers() {
+        let storage = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let workspace = storage.join("workspace");
+        let invocation = workspace.join("member");
+        std::fs::create_dir_all(invocation.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers=['member']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            invocation.join("Cargo.toml"),
+            "[package]\nname='native-wrapper-member'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(invocation.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        let policy = PathTopologyPolicy::new(storage.clone(), storage.join("alias"));
+        for kind in [CompilationKind::Make, CompilationKind::CmakeBuild] {
+            assert!(
+                native_repository_source_root(&invocation, Some(kind), &policy)
+                    .unwrap()
+                    .is_none()
+            );
+            let selected =
+                super::super::node_workspace::source_root(&invocation, Some(kind), &policy)
+                    .unwrap();
+            assert_eq!(selected, invocation);
+            let runtime = build_dependency_runtime_plan(
+                &selected,
+                Some(kind),
+                &HookReporter::new(OutputVisibility::None),
+                &policy,
+            );
+            assert!(runtime.fail_open_decision.is_none());
+            let plan =
+                build_sync_closure_plan(&runtime.sync_roots, &selected, "native-hash", &policy);
+            assert_eq!(plan.len(), 2);
+            assert!(plan.iter().any(|entry| entry.local_root == workspace
+                && entry.mode == SyncClosureMode::WorkspaceMetadata
+                && !entry.is_primary));
+            assert!(plan.iter().any(|entry| entry.local_root == invocation
+                && entry.mode == SyncClosureMode::Full
+                && entry.is_primary));
+        }
+    }
+
+    #[test]
+    fn native_repository_source_selection_stops_at_nested_repositories_and_worktrees() {
+        let (storage, repository, invocation, policy) = fixture();
+        let nested = repository.join("components");
+        std::fs::create_dir(nested.join(".git")).unwrap();
+        assert_eq!(
+            native_repository_source_root(&invocation, Some(CompilationKind::Ninja), &policy)
+                .unwrap(),
+            Some(nested)
+        );
+        let worktree = storage.join("linked worktree");
+        let worktree_cwd = worktree.join("src/tool");
+        std::fs::create_dir_all(&worktree_cwd).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../native repository/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        assert_eq!(
+            native_repository_source_root(&worktree_cwd, Some(CompilationKind::Clang), &policy)
+                .unwrap(),
+            Some(worktree)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_repository_source_selection_refuses_ambiguous_boundaries_and_path_drift() {
+        let (storage, repository, invocation, policy) = fixture();
+        std::os::unix::fs::symlink(repository.join(".git"), invocation.join(".git")).unwrap();
+        let error =
+            native_repository_source_root(&invocation, Some(CompilationKind::Make), &policy)
+                .unwrap_err();
+        assert!(error.to_string().contains("repository boundary"));
+        let alias = storage.join("unexpected-alias");
+        std::os::unix::fs::symlink(&repository, &alias).unwrap();
+        assert!(
+            native_repository_source_root(&alias, Some(CompilationKind::Gcc), &policy).is_err()
+        );
+        assert!(build_native_sync_closure_plan(&alias, "native-hash", &policy).is_err());
+        assert!(
+            native_repository_source_root(
+                &storage.join("absent"),
+                Some(CompilationKind::Gcc),
+                &policy
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -36,10 +36,10 @@ use super::cargo_target_dir::{
 };
 use super::daemon_ipc::urlencoding_encode;
 use super::dependency_closure::{
-    SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome, build_owned_sync_closure_layout,
-    build_sync_closure_manifest, build_sync_closure_plan, merge_sync_result,
-    verify_remote_dependency_manifests, verify_selected_dependency_inputs,
-    workspace_metadata_sync_patterns,
+    SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome, build_native_sync_closure_plan,
+    build_owned_sync_closure_layout, build_sync_closure_manifest, build_sync_closure_plan,
+    merge_sync_result, native_repository_source_root, verify_remote_dependency_manifests,
+    verify_selected_dependency_inputs, workspace_metadata_sync_patterns,
 };
 use super::formatting::{cache_hit, detect_target_label, emit_job_banner, render_compile_summary};
 use super::progress_reporting::{
@@ -600,8 +600,8 @@ pub(super) fn apply_source_sync_integrity_policy(
     exact_dependency_closure_sync: bool,
     source_content_receipt: bool,
 ) -> TransferPipeline {
-    // Exact Cargo closure sync is correctness-authoritative: rsync's default size-and-mtime
-    // quick check can otherwise retain stale dependency bytes with matching metadata.
+    // A selected source closure is correctness-authoritative: rsync's default
+    // size-and-mtime quick check can retain stale inputs with matching metadata.
     if exact_dependency_closure_sync || source_content_receipt {
         pipeline.with_sync_checksum(true)
     } else {
@@ -1317,8 +1317,8 @@ async fn execute_remote_compilation_inner(
         None
     };
 
-    // Source authority covers the selected Git root or declared frozen Node
-    // workspace. The invocation cwd remains the command/artifact basis.
+    // Source authority covers the selected repository or declared workspace.
+    // The invocation cwd remains the command/artifact basis.
     let project_root =
         std::env::current_dir().map_err(|e| TransferError::NoProjectRoot { source: e })?;
     let normalized_project = normalize_project_path_with_policy(&project_root, topology_policy)
@@ -1346,6 +1346,11 @@ async fn execute_remote_compilation_inner(
     } else {
         None
     };
+    let native_source_root = if clean_overlay.is_none() {
+        native_repository_source_root(&normalized_invocation_root, kind, topology_policy)?
+    } else {
+        None
+    };
     let normalized_project_root = if let Some(spec) = clean_overlay {
         anyhow::ensure!(
             normalized_invocation_root == spec.invocation_root(),
@@ -1366,6 +1371,8 @@ async fn execute_remote_compilation_inner(
         spec.repository_root.clone()
     } else if let Some(plan) = &go_source_plan {
         plan.source_root.clone()
+    } else if let Some(root) = &native_source_root {
+        root.clone()
     } else {
         super::node_workspace::source_root(&normalized_invocation_root, kind, topology_policy)?
     };
@@ -1473,6 +1480,8 @@ async fn execute_remote_compilation_inner(
         let mut roots = vec![normalized_project_root.clone()];
         roots.extend(spec.dependencies.iter().map(|(root, _)| root.clone()));
         roots
+    } else if native_source_root.is_some() {
+        vec![normalized_project_root.clone()]
     } else {
         let dependency_plan =
             build_dependency_runtime_plan(dependency_entry_root, kind, reporter, topology_policy);
@@ -1699,6 +1708,8 @@ async fn execute_remote_compilation_inner(
                 mode: SyncClosureMode::Full,
             })
             .collect()
+    } else if native_source_root.is_some() {
+        build_native_sync_closure_plan(&normalized_project_root, &project_hash, topology_policy)?
     } else {
         build_sync_closure_plan(
             &raw_sync_roots,
@@ -2439,7 +2450,9 @@ async fn execute_remote_compilation_inner(
         }
         root_pipeline = apply_source_sync_integrity_policy(
             root_pipeline,
-            exact_dependency_closure_sync || go_source_plan.is_some(),
+            exact_dependency_closure_sync
+                || go_source_plan.is_some()
+                || native_source_root.is_some(),
             source_content_receipt,
         );
         if root_overlay.is_some()
@@ -5185,6 +5198,326 @@ mod tests {
                 &plan, &root, &selected, &topology,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn native_repository_plan_retains_full_source_authority_and_member_destinations() {
+        use super::*;
+
+        let storage = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let repository = storage.join("repository");
+        let first = repository.join("components/first");
+        let second = repository.join("components/second");
+        for directory in [&first, &second, &repository.join(".git")] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let topology =
+            PathTopologyPolicy::new(storage.clone(), storage.join("alias")).with_off_root(true);
+        let first_root =
+            native_repository_source_root(&first, Some(CompilationKind::Make), &topology)
+                .unwrap()
+                .unwrap();
+        let second_root =
+            native_repository_source_root(&second, Some(CompilationKind::Gcc), &topology)
+                .unwrap()
+                .unwrap();
+        assert_eq!(first_root, repository);
+        assert_eq!(second_root, first_root);
+        let mut plan =
+            build_native_sync_closure_plan(&first_root, "native-hash", &topology).unwrap();
+        assert_eq!(
+            plan,
+            build_native_sync_closure_plan(&second_root, "native-hash", &topology).unwrap(),
+            "sibling invocations must overlap on their complete source authority"
+        );
+        plan[0].remote_root =
+            super::super::dependency_closure::map_offroot_sync_root_to_remote_root(
+                &plan[0].local_root,
+                &plan[0].project_id,
+                &topology,
+                "/worker/staging",
+            )
+            .unwrap();
+        assert!(plan[0].remote_root.starts_with("/worker/staging/offroot/"));
+        assert!(plan[0].remote_root.ends_with("/repository"));
+        plan[0].remote_root = project_lane_remote_root(&plan[0].remote_root, 2);
+        let authority = source_namespace::build_source_roots(
+            &plan,
+            None,
+            None,
+            None,
+            Some("/worker/granted/target"),
+        );
+        assert!(authority.contains(&plan[0].remote_root));
+        assert!(authority.contains(&"/worker/granted/target".to_owned()));
+        assert_eq!(authority.len(), 2);
+        for invocation in [&first, &second] {
+            let remote_cwd = super::super::node_workspace::remote_invocation_root(
+                &plan[0].remote_root,
+                &first_root,
+                invocation,
+            )
+            .unwrap();
+            assert_eq!(
+                remote_cwd,
+                format!(
+                    "{}/{}",
+                    plan[0].remote_root,
+                    invocation.strip_prefix(&repository).unwrap().display()
+                )
+            );
+            assert!(!authority.contains(&remote_cwd));
+            let pipeline = TransferPipeline::new(
+                first_root.clone(),
+                plan[0].project_id.clone(),
+                "native-hash".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override(&plan[0].remote_root)
+            .with_remote_cargo_target_dir_override("/worker/granted/target")
+            .with_build_id(Some(42));
+            let execution = invocation_execution_pipeline(pipeline, invocation, &remote_cwd);
+            assert_eq!(execution.remote_path(), remote_cwd);
+            assert_eq!(
+                execution.remote_cargo_target_dir(),
+                "/worker/granted/target"
+            );
+            assert_eq!(
+                execution.remote_pgid_file_path(),
+                Some(TransferPipeline::remote_pgid_file_path_for_root(
+                    &remote_cwd,
+                    42
+                ))
+            );
+            let retrieval = execution.local_artifact_retrieval_for_test(
+                &WorkerConfig::default(),
+                &repository,
+                &["build/**".into()],
+            );
+            assert_eq!(
+                retrieval.as_std().get_args().last().unwrap(),
+                std::ffi::OsStr::new(&format!("{}/", invocation.display()))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_repository_source_sync_builds_fresh_siblings_without_exposing_excluded_inputs()
+    {
+        use super::*;
+        use rch_common::test_guard;
+        use tokio::process::Command;
+
+        async fn output(command: &mut Command) -> std::process::Output {
+            rch_common::ssh::capture_control_output(
+                command,
+                None,
+                64 * 1024,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(20),
+            )
+            .await
+            .expect("real Git, rsync, Make and GCC must complete the native source regression")
+        }
+
+        fn make(directory: &Path) -> Command {
+            let mut command = Command::new("make");
+            command
+                .args(["--no-print-directory", "-j1"])
+                .current_dir(directory);
+            for variable in [
+                "MAKEFLAGS",
+                "MFLAGS",
+                "GNUMAKEFLAGS",
+                "MAKEFILES",
+                "DEPENDENCIES_OUTPUT",
+                "SUNPRO_DEPENDENCIES",
+            ] {
+                command.env_remove(variable);
+            }
+            command
+        }
+
+        let _guard = test_guard!();
+        let storage = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let repository = storage.join("native repository");
+        let invocation = repository.join("components/app[1]");
+        let shared = repository.join("components/shared");
+        let old_root = storage.join("worker-cwd-only");
+        let worker_root = storage.join("worker-repository");
+        let relative = Path::new("components/app[1]");
+        let old_cwd = old_root.join(relative);
+        let worker_cwd = worker_root.join(relative);
+        for directory in [
+            invocation.join("build"),
+            invocation.join("nested"),
+            shared.clone(),
+            old_cwd.clone(),
+            worker_cwd.clone(),
+            worker_root.join("components/shared"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        git_output(&repository, &["init", "-q"]).await.unwrap();
+        let main = b"#include <stdio.h>\nint value(void); int main(void) { printf(\"%d\\n\", value()); return 0; }\n";
+        std::fs::write(invocation.join("main.c"), main).unwrap();
+        std::fs::write(
+            invocation.join("Makefile"),
+            b"include ../shared/rules.mk\nbuild/result: main.c ../shared/helper.c ../shared/value.h\n\tmkdir -p build\n\tgcc $(CPPFLAGS) main.c ../shared/helper.c -o build/result\n",
+        )
+        .unwrap();
+        std::fs::write(shared.join("rules.mk"), b"CPPFLAGS := -I../shared\n").unwrap();
+        std::fs::write(
+            shared.join("helper.c"),
+            b"#include \"value.h\"\nint value(void) { return VALUE; }\n",
+        )
+        .unwrap();
+        std::fs::write(shared.join("value.h"), b"#define VALUE 37\n").unwrap();
+        std::fs::write(invocation.join("build/result"), b"stale caller output\n").unwrap();
+        for path in [
+            invocation.join("private.txt"),
+            invocation.join("config-private.txt"),
+            invocation.join("nested/private.txt"),
+            invocation.join("nested/key.pem"),
+            shared.join("private.pem"),
+            repository.join("root-private.txt"),
+            repository.join(".env"),
+        ] {
+            std::fs::write(path, b"private fixture bytes\n").unwrap();
+        }
+        std::fs::write(invocation.join(".rchignore"), b"/private.txt\n*.pem\n").unwrap();
+        std::fs::write(repository.join(".rchignore"), b"/root-private.txt\n").unwrap();
+        let mut settings = TransferConfig::default();
+        settings.exclude_patterns.push("/config-private.txt".into());
+        let original = TransferPipeline::new(
+            invocation.clone(),
+            "native-cwd".into(),
+            "native-hash".into(),
+            settings.clone(),
+        );
+        let worker = WorkerConfig::default();
+        let sent = output(&mut original.local_source_sync_for_test(&worker, &old_cwd)).await;
+        assert!(sent.status.success(), "{sent:?}");
+        assert!(!old_root.join("components/shared/rules.mk").exists());
+        let omitted = output(&mut make(&old_cwd)).await;
+        assert!(
+            !omitted.status.success(),
+            "cwd-only upload unexpectedly built: {omitted:?}"
+        );
+        assert!(!old_cwd.join("build/result").exists());
+
+        // A populated mirror is not enough: matching size/mtime must not keep
+        // obsolete sibling bytes when its repository is selected for upload.
+        let stale_header = worker_root.join("components/shared/value.h");
+        std::fs::write(&stale_header, b"#define VALUE 11\n").unwrap();
+        let source_header = std::fs::metadata(shared.join("value.h")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_header)
+            .unwrap()
+            .set_modified(source_header.modified().unwrap())
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&stale_header).unwrap().len(),
+            source_header.len()
+        );
+        assert_eq!(
+            std::fs::metadata(&stale_header)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            source_header.modified().unwrap()
+        );
+        let topology = PathTopologyPolicy::new(storage.clone(), storage.join("alias"));
+        let selected =
+            native_repository_source_root(&invocation, Some(CompilationKind::Make), &topology)
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected, repository);
+        let mut plan = build_native_sync_closure_plan(&selected, "native-hash", &topology).unwrap();
+        plan[0].remote_root = worker_root.to_str().unwrap().to_owned();
+        let settings = super::super::node_workspace::preserve_invocation_excludes(
+            settings,
+            &selected,
+            &invocation,
+            "native-hash",
+        )
+        .unwrap();
+        let upload = apply_source_sync_integrity_policy(
+            TransferPipeline::new(
+                selected.clone(),
+                plan[0].project_id.clone(),
+                "native-hash".into(),
+                settings,
+            )
+            .with_remote_path_override(&plan[0].remote_root),
+            true,
+            false,
+        );
+        let sent = output(&mut upload.local_source_sync_for_test(&worker, &worker_root)).await;
+        assert!(sent.status.success(), "{sent:?}");
+        assert_eq!(std::fs::read(&stale_header).unwrap(), b"#define VALUE 37\n");
+        assert!(!worker_root.join(".git").exists());
+        for excluded in [
+            ".env",
+            "root-private.txt",
+            "components/shared/private.pem",
+            "components/app[1]/private.txt",
+            "components/app[1]/config-private.txt",
+            "components/app[1]/nested/key.pem",
+            "components/app[1]/build/result",
+        ] {
+            assert!(
+                !worker_root.join(excluded).exists(),
+                "excluded input arrived: {excluded}"
+            );
+        }
+        assert!(worker_cwd.join("nested/private.txt").is_file());
+        let remote_cwd = super::super::node_workspace::remote_invocation_root(
+            &plan[0].remote_root,
+            &selected,
+            &invocation,
+        )
+        .unwrap();
+        assert_eq!(Path::new(&remote_cwd), worker_cwd);
+        let execution = invocation_execution_pipeline(upload, &invocation, &remote_cwd);
+        let built = output(&mut make(Path::new(&execution.remote_path()))).await;
+        assert!(built.status.success(), "{built:?}");
+        let produced = output(&mut Command::new(worker_cwd.join("build/result"))).await;
+        assert!(produced.status.success(), "{produced:?}");
+        assert_eq!(produced.stdout, b"37\n");
+        let artifact = std::fs::read(worker_cwd.join("build/result")).unwrap();
+        std::fs::write(
+            worker_cwd.join("main.c"),
+            b"worker-side source must not return\n",
+        )
+        .unwrap();
+        let patterns =
+            get_project_artifact_patterns(Some(CompilationKind::Make), Some("make -j1"), false);
+        let returned = output(&mut execution.local_artifact_retrieval_for_test(
+            &worker,
+            &worker_cwd,
+            &patterns,
+        ))
+        .await;
+        assert!(returned.status.success(), "{returned:?}");
+        assert_eq!(
+            std::fs::read(invocation.join("build/result")).unwrap(),
+            artifact
+        );
+        let delivered = output(&mut Command::new(invocation.join("build/result"))).await;
+        assert!(delivered.status.success(), "{delivered:?}");
+        assert_eq!(delivered.stdout, b"37\n");
+        assert_eq!(std::fs::read(invocation.join("main.c")).unwrap(), main);
+        assert_eq!(
+            std::fs::read(invocation.join("private.txt")).unwrap(),
+            b"private fixture bytes\n"
+        );
+        assert!(
+            !repository.join("build/result").exists(),
+            "artifact destination moved to repository root"
         );
     }
 
