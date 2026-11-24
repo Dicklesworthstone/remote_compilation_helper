@@ -244,8 +244,8 @@ Use `rch config set timeouts.scale 2.5`, `get`, `reset`,
   pays a fresh handshake: several seconds per request on an intercontinental
   link, against about half a second on a reused connection. One such setup
   (#132) cut the fixed per-`rch exec` overhead from about 60 s to about 24 s.
-  The connection still lasts for one dispatch only, so each `rch exec` pays one
-  handshake.
+  Without a matching daemon pool, the dedicated connection lasts for one dispatch
+  only, so each `rch exec` pays one handshake.
 - `sync_timeout_ms` (u64, optional; `1000..=3600000`) — Per-attempt timeout for
   uploading source to the worker. When unset, RCH uses a payload-aware default:
   30 seconds plus one second per MiB at a conservative 1 MiB/s floor, capped at

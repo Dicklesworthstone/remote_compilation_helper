@@ -413,8 +413,9 @@ warning. The independent 25 GiB warning floor, 10 GiB critical floor, critical
 ratio, memory/I/O pressure, `/tmp` safety floor and build reservations remain
 active. Warning caps must be finite and at least 25 GiB, or `"uncapped"`.
 Ratios must satisfy `0 < disk_critical_free_ratio < disk_warning_free_ratio < 1`.
-The `[remediation.disk_pressure] warning_avail_pct` setting controls disk
-pressure reports; daemon selection uses these `[selection]` settings.
+The `[remediation.disk_pressure] warning_avail_pct` setting is validated but
+does not affect daemon selection; selection uses only these `[selection]`
+settings.
 
 Use `rch config set selection.disk_warning_free_ratio 0.07` and
 `rch config set selection.disk_warning_ratio_cap_gb 50` to edit the dispatcher
