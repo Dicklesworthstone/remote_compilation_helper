@@ -476,8 +476,8 @@ usage instructions](docs/rabs-canonical-cargo.md#native-canonical-cargo-entry-po
 
 ### Named Cargo JSON for installer consumers
 
-An installer selecting explicit binary targets can request caller-visible
-Cargo JSON through the canonical Cargo shim:
+An installer can request caller-visible Cargo JSON when building named binaries
+and examples through the canonical Cargo shim.
 
 ```bash
 RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1 cargo build --locked --release \
@@ -486,14 +486,18 @@ RCH_CARGO_JSON_STDOUT=1 RCH_REQUIRE_REMOTE=1 cargo build --locked --release \
 
 This opt-in requires the durable POSIX worker route and refuses local fallback,
 arbitrary jobs, machine envelopes, and unsupported target selections. Selected
-binary records reach stdout after artifact publication and acknowledged worker
+artifact records reach stdout after artifact publication and acknowledged worker
 release. Their executable, filenames, manifest, and source paths refer to the
 caller tree. Selected output files are copied into an invocation-private retained
 directory beneath the caller's actual target root and checked against the exact
 publication fingerprints. A later build cannot replace these copies by publishing
 into the shared target paths. Each record carries an `rch` extension retaining the original worker
-record, exact retained stdout receipt, wrapper/build identity, and executable
-BLAKE3 publication fingerprint. Unselected dependency records keep their worker
+record, exact retained stdout receipt, and wrapper/build identity. Executables carry
+an `executable_blake3` fingerprint. Use `--example NAME` for an executable or
+library example, including alongside `--bin NAME`. A library example retains
+Cargo's `null` executable. Its `filenames` refer to the delivered files, and
+`rch.file_blake3` maps their output-relative paths to verified fingerprints.
+Unselected dependency records keep their worker
 metadata and do not assert local delivery of intermediates. Diagnostics stay on
 stderr. Compiler failure stdout comes from the same invocation's immutable
 nonzero completion receipt; a successful compile with failed artifact delivery

@@ -96,8 +96,9 @@ that bundle contents were published before reporting successful delivery.
 Explicit named Cargo JSON retains the bundle directory in `filenames` while
 binding its retained contents to the files published by the completed job.
 
-Full builds use their normal human output; explicit caller JSON remains limited
-to the existing named-executable contract for ordinary Cargo commands.
+Full builds use their normal human output. Explicit caller JSON supports named
+build binaries and examples and named test or benchmark executables built with
+`--no-run`. Library examples retain their declared filenames and null executable.
 Unsupported explicit message formats, opaque flags, documentation/package
 commands and transports without durable Cargo evidence refuse before execution.
 Streaming check, clippy, ordinary test reports, non-Cargo commands and explicitly

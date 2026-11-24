@@ -5086,7 +5086,7 @@ pub async fn run_exec(
         anyhow::ensure!(
             cargo_output_contract::CargoOutputCapture::for_command(classified.kind, &command)
                 .is_some_and(|capture| capture.caller_json_supported()),
-            "RCH_CARGO_JSON_STDOUT requires cargo build --bin, cargo test --no-run --test, or cargo bench --no-run --bench with literal named targets and an explicit JSON message format"
+            "RCH_CARGO_JSON_STDOUT requires cargo build --bin/--example, cargo test --no-run --test, or cargo bench --no-run --bench with literal named targets and an explicit JSON message format"
         );
     }
     let exact_worker_requested = exact_worker.is_some();
