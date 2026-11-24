@@ -299,6 +299,27 @@ mod tests {
     }
 
     #[test]
+    fn retry_and_ignored_test_policies_preserve_grants_and_compile_only_requests() {
+        let selection = CompilationSelection {
+            retries: Some(3),
+            run_ignored: Some("only".into()),
+            test_threads: Some(7),
+            ..Default::default()
+        };
+        let executing = request(selection.clone());
+        assert_eq!(fresh_execution_slots(&executing).unwrap(), Some(7));
+        let compile_only = request(CompilationSelection {
+            no_run: true,
+            ..selection
+        });
+        assert_eq!(
+            requested(&compile_only).unwrap(),
+            CargoArtifactMode::NextestCompilation
+        );
+        assert_eq!(fresh_execution_slots(&compile_only).unwrap(), Some(3));
+    }
+
+    #[test]
     fn unknown_or_mismatched_intent_cannot_change_execution_or_output_contract() {
         let original = request(CompilationSelection::default());
         let mut cases = Vec::new();

@@ -204,10 +204,20 @@ Compilation and runner options remain distinct:
 | Cargo compilation profile | `--cargo-profile NAME` or `--release` | `profile` or `release` |
 | Nextest configuration profile | `--profile NAME` | `runner_profile` |
 | Explicit test concurrency | `--test-threads N`, `--jobs N`, or `-jN` | `test_threads` |
+| Retry attempts per failed test | `--retries N` (zero disables retries) | `retries` |
+| Ignored-test selection | `--run-ignored` with `default`, `only`, or `all` | `run_ignored` |
 | One test partition | `--partition hash:M/N`, `slice:M/N`, or `count:M/N` | `partition` |
 | Nextest filter expressions | Repeated `--filterset EXPR` or `-E EXPR` | `filtersets` |
 | One optional test-name filter | Positional filter | `test_filter` |
 | Emulated test-harness arguments | Arguments after `--` | `test_args` |
+
+To run only ignored tests and turn off profile-configured retries, use
+`nextest run --run-ignored only --retries 0 --test-threads 1`.
+Omitting these options leaves the captured runner's defaults in effect.
+Retries run within the same test-thread grant. The worker invokes nextest for
+each job, and its exit status includes the outcome of any retries.
+With `--no-run`, the captured runner still receives the options and the
+operation reserves only its compilation grant.
 
 For a CI matrix, submit each partition as its own operation. Two jobs can use:
 

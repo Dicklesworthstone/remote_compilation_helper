@@ -289,6 +289,8 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
                     | "-j"
                     | "--filterset"
                     | "-E"
+                    | "--retries"
+                    | "--run-ignored"
                     | "--partition"
             ) {
                 return Err(invalid(
@@ -339,6 +341,19 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
                         })?;
                     if selected.test_threads.replace(count).is_some() {
                         return Err(invalid("nextest test threads may be selected only once"));
+                    }
+                }
+                "--retries" if command == CompilationCommand::Nextest => {
+                    let count = value
+                        .parse::<u32>()
+                        .map_err(|_| invalid("nextest --retries requires a nonnegative integer"))?;
+                    if selected.retries.replace(count).is_some() {
+                        return Err(invalid("nextest --retries may be selected only once"));
+                    }
+                }
+                "--run-ignored" if command == CompilationCommand::Nextest => {
+                    if selected.run_ignored.replace(value).is_some() {
+                        return Err(invalid("nextest --run-ignored may be selected only once"));
                     }
                 }
                 "--partition" if command == CompilationCommand::Nextest => {
@@ -490,6 +505,47 @@ mod tests {
                 parse_strings(&["--remote", "p.json", command, "--partition=hash:1/4"]).is_err(),
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn nextest_accepts_explicit_retry_and_ignored_test_controls() {
+        for mode in ["--local", "--remote", "--worker"] {
+            for ignored in ["default", "only", "all"] {
+                let Invocation::Run(options) = parse_strings(&[
+                    mode,
+                    "p.json",
+                    "nextest",
+                    "run",
+                    "--run-ignored",
+                    ignored,
+                    "--retries=0",
+                ])
+                .unwrap() else {
+                    panic!("expected nextest invocation");
+                };
+                let (command, selection) = options.selected.unwrap();
+                assert_eq!(selection.run_ignored.as_deref(), Some(ignored));
+                assert_eq!(selection.retries, Some(0));
+                assert_eq!(
+                    selection.cargo_arguments(command).unwrap(),
+                    ["nextest", "run", "--retries", "0", "--run-ignored", ignored]
+                );
+            }
+        }
+        for arguments in [
+            vec!["nextest", "run", "--retries"],
+            vec!["nextest", "run", "--retries=-1"],
+            vec!["nextest", "run", "--retries=4294967296"],
+            vec!["nextest", "run", "--retries=1", "--retries", "2"],
+            vec!["nextest", "run", "--run-ignored=unknown"],
+            vec!["nextest", "run", "--run-ignored=only", "--run-ignored=all"],
+            vec!["test", "--run-ignored=only"],
+            vec!["build", "--retries=1"],
+        ] {
+            let mut invocation = vec!["--local", "p.json"];
+            invocation.extend(arguments);
+            assert!(parse_strings(&invocation).is_err(), "{invocation:?}");
         }
     }
 

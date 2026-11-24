@@ -242,7 +242,7 @@ impl SelectedCommand {
                 | "--example" | "--bench" | "--target" | "--profile" | "--manifest-path"
                 | "--target-dir" | "--message-format" | "--color" | "--jobs"
                 | "--cargo-profile" | "--test-threads" | "--filterset" | "-E" | "--build-jobs"
-                | "--partition" => {
+                | "--partition" | "--run-ignored" | "--retries" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -322,6 +322,24 @@ impl SelectedCommand {
                                 "nextest test threads must be one integer between 1 and 4096",
                             )?;
                             selection.test_threads = count;
+                        }
+                        "--retries" => {
+                            require(
+                                command == CompilationCommand::Nextest
+                                    && selection.retries.is_none(),
+                                "retries require nextest run and may be selected only once",
+                            )?;
+                            selection.retries = Some(value.parse::<u32>().map_err(|_| {
+                                invalid("nextest --retries requires a nonnegative integer")
+                            })?);
+                        }
+                        "--run-ignored" => {
+                            require(
+                                command == CompilationCommand::Nextest
+                                    && selection.run_ignored.is_none(),
+                                "ignored-test selection requires nextest run and may be selected only once",
+                            )?;
+                            selection.run_ignored = Some(value.to_owned());
                         }
                         "--partition" => {
                             require(

@@ -333,7 +333,8 @@ fn nextest_compilation_arguments(args: &[String], mode: CargoArtifactMode) -> Op
             "--" => break,
             "--no-run" if !no_run => no_run = true,
             "--no-fail-fast" => {}
-            "--profile" | "--test-threads" | "--partition" | "--filterset" => {
+            "--profile" | "--test-threads" | "--partition" | "--filterset" | "--retries"
+            | "--run-ignored" => {
                 at += 1;
                 let value = args.get(at)?;
                 if value.is_empty() || value.starts_with('-') {
@@ -721,6 +722,15 @@ mod tests {
             },
             CompilationSelection {
                 partition: Some("hash:2/5".into()),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                retries: Some(0),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                retries: Some(2),
+                run_ignored: Some("all".into()),
                 ..selection.clone()
             },
             CompilationSelection {

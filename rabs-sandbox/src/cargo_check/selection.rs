@@ -137,6 +137,12 @@ pub struct CompilationSelection {
     /// parallelism remains the driver's independent `--build-jobs` control.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_threads: Option<u32>,
+    /// Explicit retries per failed test. Zero overrides a captured profile's retries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
+    /// Nextest's ignored-test selection: default, only, or all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_ignored: Option<String>,
     /// One literal nextest partition, such as `hash:1/4` or `slice:2/4`.
     /// The captured runner owns test assignment. Partitioning never narrows the
     /// Cargo graph, reduces admitted concurrency, or authorizes a cached pass.
@@ -296,6 +302,8 @@ impl CompilationSelection {
         if command != CompilationCommand::Nextest
             && (self.runner_profile.is_some()
                 || self.test_threads.is_some()
+                || self.retries.is_some()
+                || self.run_ignored.is_some()
                 || self.partition.is_some()
                 || !self.filtersets.is_empty())
         {
@@ -321,6 +329,15 @@ impl CompilationSelection {
         {
             return Err(invalid(
                 "nextest partition must be hash:M/N, slice:M/N or count:M/N with 1 <= M <= N",
+            ));
+        }
+        if self
+            .run_ignored
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "default" | "only" | "all"))
+        {
+            return Err(invalid(
+                "nextest --run-ignored requires default, only or all",
             ));
         }
         if self.filtersets.iter().any(|filter| {
@@ -428,6 +445,8 @@ impl CompilationSelection {
             + usize::from(self.profile.is_some())
             + usize::from(self.runner_profile.is_some())
             + usize::from(self.test_threads.is_some())
+            + usize::from(self.retries.is_some())
+            + usize::from(self.run_ignored.is_some())
             + usize::from(self.partition.is_some())
             + self.filtersets.len()
             + usize::from(self.test_filter.is_some())
@@ -492,6 +511,12 @@ impl CompilationSelection {
         if let Some(threads) = self.test_threads {
             args.extend(["--test-threads".into(), threads.to_string()]);
         }
+        if let Some(retries) = self.retries {
+            args.extend(["--retries".into(), retries.to_string()]);
+        }
+        if let Some(mode) = &self.run_ignored {
+            args.extend(["--run-ignored".into(), mode.clone()]);
+        }
         if let Some(partition) = &self.partition {
             args.extend(["--partition".into(), partition.clone()]);
         }
@@ -548,6 +573,8 @@ impl CompilationSelection {
         compilation.test_args.clear();
         compilation.runner_profile = None;
         compilation.test_threads = None;
+        compilation.retries = None;
+        compilation.run_ignored = None;
         compilation.partition = None;
         compilation.filtersets.clear();
         Ok(compilation)
@@ -1119,7 +1146,14 @@ mod tests {
             ["test", "--no-run"]
         );
         let encoded = serde_json::to_value(&selection).unwrap();
-        for field in ["runner_profile", "test_threads", "partition", "filtersets"] {
+        for field in [
+            "runner_profile",
+            "test_threads",
+            "retries",
+            "run_ignored",
+            "partition",
+            "filtersets",
+        ] {
             assert!(encoded.get(field).is_none(), "old commands gained {field}");
         }
         let selected: CompilationSelection = serde_json::from_value(json!({

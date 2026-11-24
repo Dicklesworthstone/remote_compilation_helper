@@ -1281,6 +1281,9 @@ fn nextest_validates_captured_runner_and_retains_local_and_remote_intent() {
                     "1",
                     "--partition",
                     "slice:2/3",
+                    "--run-ignored=all",
+                    "--retries",
+                    "1",
                     "-E",
                     "package(core)",
                     "--",
@@ -1299,6 +1302,8 @@ fn nextest_validates_captured_runner_and_retains_local_and_remote_intent() {
         assert_eq!(settings["selection"]["runner_profile"], "ci");
         assert_eq!(settings["selection"]["test_threads"], 1);
         assert_eq!(settings["selection"]["partition"], "slice:2/3");
+        assert_eq!(settings["selection"]["retries"], 1);
+        assert_eq!(settings["selection"]["run_ignored"], "all");
         assert_eq!(
             settings["selection"]["filtersets"],
             json!(["package(core)"])

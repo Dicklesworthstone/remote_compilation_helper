@@ -161,7 +161,7 @@ fn selected_native_nextest_plans_only_its_cargo_build_selection() {
         json!({
             "workspace":true, "features":["feature-a"], "profile":"release",
             "runner_profile":"ci", "filtersets":["package(core)"],
-            "test_threads":1, "partition":"hash:2/5",
+            "test_threads":1, "partition":"hash:2/5", "run_ignored":"only", "retries":2,
             "test_filter":"roundtrip", "test_args":["--exact"],
         }),
     ));
@@ -184,7 +184,8 @@ fn selected_native_nextest_plans_only_its_cargo_build_selection() {
         ]
     );
     assert!(selected.graph_tail_arguments().unwrap().is_empty());
-    assert_eq!(selected.selection.partition.as_deref(), Some("hash:2/5"));
+    assert_eq!(selected.selection.run_ignored.as_deref(), Some("only"));
+    assert_eq!(selected.selection.retries, Some(2));
     assert!(
         SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
     );
@@ -237,6 +238,8 @@ fn selected_worker_nextest_reuses_shared_build_selection_and_requires_exact_cont
             runner_profile: Some("ci".into()),
             test_threads: Some(1),
             partition: Some("slice:3/5".into()),
+            retries: Some(0),
+            run_ignored: Some("all".into()),
             filtersets: vec!["package(core)".into()],
             test_filter: Some("roundtrip".into()),
             test_args: vec!["--exact".into()],
@@ -255,6 +258,8 @@ fn selected_worker_nextest_reuses_shared_build_selection_and_requires_exact_cont
         SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).unwrap();
     assert_eq!(selected.command, CompilationCommand::Nextest);
     assert_eq!(selected.selection.partition.as_deref(), Some("slice:3/5"));
+    assert_eq!(selected.selection.retries, Some(0));
+    assert_eq!(selected.selection.run_ignored.as_deref(), Some("all"));
     assert_eq!(
         selected.graph_arguments(&Value::Null, None).unwrap(),
         [
@@ -284,6 +289,8 @@ fn selected_worker_nextest_reuses_shared_build_selection_and_requires_exact_cont
     }
     for (field, value) in [
         ("test_threads", json!(2)),
+        ("retries", json!(1)),
+        ("run_ignored", json!("only")),
         ("partition", json!("slice:4/5")),
         ("partition", Value::Null),
     ] {
