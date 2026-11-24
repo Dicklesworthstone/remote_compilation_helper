@@ -348,13 +348,30 @@ async fn metadata_json(
     Ok((bytes, probe(&query, invocation_root, deadline).await?))
 }
 
+/// Discovery binds the parsed source closure to the invocation. Streaming
+/// commands carry their execution settings here; output-producing commands
+/// capture those settings together with their file-output contract.
+#[derive(Debug)]
+pub(in crate::hook) struct DiscoveredGoSource {
+    plan: GoSourcePlan,
+    streaming_settings: Option<String>,
+}
+
+impl std::ops::Deref for DiscoveredGoSource {
+    type Target = GoSourcePlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
 /// Ask the selected Go executable which module/workspace it really uses, then
 /// close the declared local module graph before choosing a transfer root.
 pub(in crate::hook) async fn discover_go_source(
     command: &str,
     invocation_root: &Path,
     topology: &PathTopologyPolicy,
-) -> Result<Option<GoSourcePlan>> {
+) -> Result<Option<DiscoveredGoSource>> {
     let packages = source_packages(command)
         .context("Go source closure requires supported literal build/test/vet arguments")?;
     // The eventual module/workspace root may be an ancestor of the cwd. Keep
@@ -493,7 +510,28 @@ pub(in crate::hook) async fn discover_go_source(
             }
         }
     }
-    Ok(Some(plan))
+    let streaming_settings = if invocation(command).is_none() {
+        // Streaming test and vet commands skip the file-output planner. Bind
+        // the effective compiler environment here, before the source upload.
+        let workspace =
+            local_workspace_environment(command, invocation_root, &plan, &runtime, deadline).await?;
+        let depth = source_ancestor_depth(invocation_root, &plan.source_root)?;
+        let prefix = format!(
+            "{}{workspace}{}{}",
+            runtime.assignments,
+            capture_function(),
+            module_cache_check(depth)
+        );
+        let (settings, _) =
+            capture_build_settings(command, invocation_root, &prefix, deadline).await?;
+        Some(settings)
+    } else {
+        None
+    };
+    Ok(Some(DiscoveredGoSource {
+        plan,
+        streaming_settings,
+    }))
 }
 
 /// Use the upload's actual selected file paths, not another interpretation of
@@ -823,12 +861,16 @@ pub(in crate::hook) fn go_source_execution_command(
     command: &str,
     invocation_root: &Path,
     source_root: &Path,
-    plan: &GoSourcePlan,
+    plan: &DiscoveredGoSource,
     managed_runtime: &BTreeMap<String, String>,
 ) -> Result<String> {
     source_packages(command).context("Go command lost its admitted source grammar")?;
     let args =
         compiler_arguments(command, &["go"]).context("Go command lost its literal arguments")?;
+    let settings = plan
+        .streaming_settings
+        .as_deref()
+        .context("streaming Go command lost its dispatcher compiler settings")?;
     let guard = GoSourceGuard::new(plan, invocation_root)?;
     let depth = source_ancestor_depth(invocation_root, source_root)?;
     let runtime = managed_runtime_assignments(Some(managed_runtime))
@@ -836,11 +878,12 @@ pub(in crate::hook) fn go_source_execution_command(
     shell_command(
         command,
         format!(
-            "{runtime}{}{}export GOWORK=off; {}{}\"$rch_go\" \"$@\"",
+            "{runtime}{}{}export GOWORK=off; {}{}{}\"$rch_go\" \"$@\"",
             build_temporary_directory(depth, None),
             capture_function(),
             module_cache_check(depth),
             guard.worker_setup(),
+            environment_check(settings),
         ),
         &args,
     )
@@ -1423,6 +1466,37 @@ fn source_ancestor_depth(invocation_root: &Path, source_root: &Path) -> Result<u
     Ok(depth)
 }
 
+async fn capture_build_settings(
+    command: &str,
+    project_root: &Path,
+    prefix: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(String, BTreeMap<String, String>)> {
+    let query = shell_words::join(GO_BUILD_ENVIRONMENT);
+    let environment_command = shell_command(
+        command,
+        format!("{prefix}\"$rch_go\" env -json {query}"),
+        &[],
+    )
+    .context("Go build has unsupported wrappers")?;
+    let settings = String::from_utf8(probe(&environment_command, project_root, deadline).await?)
+        .context("non-UTF-8 Go build environment")?;
+    let values: BTreeMap<String, String> =
+        serde_json::from_str(&settings).context("invalid Go build environment")?;
+    ensure!(
+        values.len() == GO_BUILD_ENVIRONMENT.len()
+            && GO_BUILD_ENVIRONMENT
+                .iter()
+                .all(|name| values.contains_key(*name)),
+        "incomplete Go build environment"
+    );
+    ensure!(
+        values["GOFLAGS"].is_empty(),
+        "Go source closure requires empty GOFLAGS"
+    );
+    Ok((settings, values))
+}
+
 /// Resolve the caller's exact promised file before upload or compilation.
 /// A successful library/multiple-package build promises no implicit binary and
 /// must not be changed into one by injecting our private execution -o option.
@@ -1439,7 +1513,7 @@ pub(in crate::hook) async fn validate_go_build_output_in_source(
     command: &str,
     project_root: &Path,
     source_root: &Path,
-    source_plan: Option<&GoSourcePlan>,
+    source_plan: Option<&DiscoveredGoSource>,
 ) -> Result<GoBuildEnvironment> {
     let invocation = invocation(command).context("Go build has no supported output contract")?;
     let runtime = LocalProbeRuntime::create(source_root)?;
@@ -1456,7 +1530,6 @@ pub(in crate::hook) async fn validate_go_build_output_in_source(
         String::new()
     };
     let workspace = source_plan.is_some_and(|plan| plan.workspace.is_some());
-    let query = shell_words::join(GO_BUILD_ENVIRONMENT);
     let initial_paths = if needs_package_query || source_plan.is_some() {
         // Toolchain startup may download into GOMODCACHE before executing
         // `go env`. Inspect its placement with GOTOOLCHAIN=local first; the
@@ -1473,30 +1546,13 @@ pub(in crate::hook) async fn validate_go_build_output_in_source(
     } else {
         String::new()
     };
-    let environment_command = shell_command(
-        command,
-        format!(
-            "{}{workspace_environment}{initial_paths}\"$rch_go\" env -json {query}",
-            runtime.assignments
-        ),
-        &[],
-    )
-    .context("Go build has unsupported wrappers")?;
-    let settings = String::from_utf8(probe(&environment_command, project_root, deadline).await?)
-        .context("non-UTF-8 Go build environment")?;
-    let values: BTreeMap<String, String> =
-        serde_json::from_str(&settings).context("invalid Go build environment")?;
-    ensure!(
-        values.len() == GO_BUILD_ENVIRONMENT.len()
-            && GO_BUILD_ENVIRONMENT
-                .iter()
-                .all(|name| values.contains_key(*name)),
-        "incomplete Go build environment"
-    );
+    let prefix = format!("{}{workspace_environment}{initial_paths}", runtime.assignments);
+    let (settings, values) =
+        capture_build_settings(command, project_root, &prefix, deadline).await?;
     let (goos, goarch) = native_go_target().context("unsupported native Go target")?;
     ensure!(
-        values["GOFLAGS"].is_empty() && values["GOOS"] == goos && values["GOARCH"] == goarch,
-        "Go output delivery requires empty GOFLAGS and the dispatcher native GOOS/GOARCH"
+        values["GOOS"] == goos && values["GOARCH"] == goarch,
+        "Go output delivery requires the dispatcher native GOOS/GOARCH"
     );
     let package_record = if needs_package_query {
         ensure!(
@@ -2261,6 +2317,34 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn streaming_go_test_and_vet_bind_the_effective_build_environment() {
+        let fixture = WorkspaceFixture::new();
+        let cwd = fixture.cwd();
+        for subcommand in ["test", "vet"] {
+            let command = fixture.command(&[subcommand, "./..."]);
+            let plan = discover_go_source(&command, &cwd, &fixture.topology)
+                .await
+                .unwrap()
+                .unwrap();
+            let settings = plan.streaming_settings.as_deref().unwrap();
+            let values: BTreeMap<String, String> = serde_json::from_str(settings).unwrap();
+            assert_eq!(values["CGO_ENABLED"], "0");
+            let script = format!("{}{}", capture_function(), environment_check(settings));
+            let query = shell_command(&command, script.clone(), &[]).unwrap();
+            assert!(run_fixture(&query, &cwd).await.status.success());
+            let changed = command.replace("CGO_ENABLED=0", "CGO_ENABLED=1");
+            let query = shell_command(&changed, script, &[]).unwrap();
+            let refused = run_fixture(&query, &cwd).await;
+            assert_eq!(refused.status.code(), Some(113), "{refused:?}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("settings differ"),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn standalone_go_vendor_metadata_must_survive_source_selection() {
         let fixture = WorkspaceFixture::new();
         let app = fixture.source.join("app");
@@ -2393,6 +2477,10 @@ mod tests {
             vec!["vet", "-p=1", "./..."],
         ] {
             let command = fixture.command(&arguments);
+            let plan = discover_go_source(&command, &fixture.cwd(), &fixture.topology)
+                .await
+                .unwrap()
+                .unwrap();
             let guarded = go_source_execution_command(
                 &command,
                 &fixture.cwd(),
@@ -2403,6 +2491,18 @@ mod tests {
             .unwrap();
             let output = run_fixture(&guarded, &cwd).await;
             assert!(output.status.success(), "{arguments:?}: {output:?}");
+            let changed = command.replace("CGO_ENABLED=0", "CGO_ENABLED=1");
+            let guarded = go_source_execution_command(
+                &changed,
+                &fixture.cwd(),
+                &fixture.source,
+                &plan,
+                &runtime,
+            )
+            .unwrap();
+            let refused = run_fixture(&guarded, &cwd).await;
+            assert_eq!(refused.status.code(), Some(113), "{refused:?}");
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("settings differ"));
         }
         let test = fixture.command(&["test", "-c", "-p=1"]);
         let test_environment =
