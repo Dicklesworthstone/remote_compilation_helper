@@ -1,5 +1,37 @@
 # Selecting and recovering returned artifacts
 
+## Default Cargo build delivery
+
+Supported full Cargo builds retain a complete output receipt even when no
+additional artifact exclusions are configured. This extends output proof to
+literal `cargo build` commands with Cargo's default human output, including
+plain builds, full workspaces, libraries, broad or mixed target selectors and
+examples, and build-only `cargo test --no-run` / `cargo bench --no-run`. It
+applies on the durable Unix worker path with a resolved target directory.
+Existing named-executable capture keeps its original contract.
+
+Before publishing any files from this complete capture, RCH checks that every
+selected Cargo-reported executable, library and sidecar is present in the owned
+staging tree. A nonempty transfer cannot replace a missing output, and a stale file
+already present in the caller's target directory cannot satisfy the check.
+The existing output selection and cache exclusions remain in force; this proof
+does not turn compiler intermediates or arbitrary worker-private files into
+required deliverables.
+
+The original selection, capture mode and complete producer receipt are retained
+with the job. If collection is interrupted or one output is missing, recovery
+uses that same completed invocation without rebuilding it. No local output is
+published until the complete required set passes validation. A failed Cargo
+command keeps its original failure status and diagnostics.
+
+This automatic lane instruments only the default human output with the same
+Cargo JSON capture already used for named executable delivery. Explicit
+message formats, opaque flags, shell compounds, documentation/package commands,
+Zigbuild and transports without durable Unix output evidence keep their
+existing behavior. Existing named-executable caller JSON remains unchanged.
+Old recovery recipes retain their originally admitted contract; they are not
+silently upgraded during collection.
+
 ## Cargo target exclusions
 
 Keep worker-private caches out of Cargo artifact return with committed project

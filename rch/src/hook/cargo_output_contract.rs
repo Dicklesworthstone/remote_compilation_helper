@@ -1,11 +1,12 @@
-//! Bind named Cargo executable delivery to the completed invocation's JSON.
+//! Bind Cargo output delivery to the completed invocation's JSON.
 //!
 //! Transfer globs remain useful for runtime support files, but cannot prove
 //! that every requested executable was returned. This contract records Cargo's
 //! actual executable paths and checks them before any staged output publishes,
 //! including explicitly named test/benchmark targets built with `--no-run`.
-//! Explicit retrieval exclusions also bind selected libraries, examples, and
-//! sidecars while keeping Cargo's separate compiler intermediates private.
+//! Supported ordinary full builds and explicit retrieval exclusions also bind
+//! selected libraries, examples, and sidecars while keeping Cargo's separate
+//! compiler intermediates private.
 
 use super::artifact_patterns::cargo_bins;
 use anyhow::{Context, Result};
@@ -14,6 +15,10 @@ use rch_telemetry::protocol::PIGGYBACK_MARKER;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(test)]
+#[path = "cargo_output_contract/default_build_tests.rs"]
+mod default_build_tests;
 
 /// The transport must return the complete receipt or report an error. The
 /// ordinary SSH output accumulator is smaller and must not supply this proof.
@@ -47,17 +52,22 @@ struct SelectedTarget {
 
 /// Persist before execution so a replacement collector knows which Cargo
 /// records the original invocation must have produced. Named executable
-/// capture is automatic; explicit retrieval exclusions additionally admit a
-/// bounded full-build grammar and protect the original output selection.
+/// capture and supported human-output full builds are automatic; explicit
+/// retrieval exclusions require complete evidence for the same bounded grammar.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct CargoOutputCapture {
     selected: BTreeSet<SelectedTarget>,
     instrumented: bool,
-    /// Opt-in exclusion safety needs every originally selected Cargo output,
-    /// including libraries and sidecars. Freeze the pre-exclusion policy so
-    /// detached collection cannot silently use current configuration instead.
+    /// Complete delivery needs every originally selected Cargo output,
+    /// including libraries and sidecars. Freeze the original policy so detached
+    /// collection cannot silently use current configuration instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retrieval_baseline: Option<Vec<String>>,
+    /// Distinguish automatic full-build proof from an opt-in exclusion policy.
+    /// Legacy recipes default to false: losing their configured exclusions
+    /// must never be reinterpreted as a newly admitted automatic contract.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    automatic_complete_outputs: bool,
     /// Broad selectors combined with a named target still require the other
     /// selected target-root outputs during detached collection.
     #[serde(default)]
@@ -191,6 +201,7 @@ impl CargoOutputCapture {
             selected,
             instrumented,
             retrieval_baseline: None,
+            automatic_complete_outputs: false,
             broad_targets: false,
         })
     }
@@ -201,13 +212,37 @@ impl CargoOutputCapture {
         baseline: &[String],
         directories: &[String],
     ) -> Result<Option<Self>> {
-        if directories.is_empty() {
-            return Ok(Self::for_command(kind, command));
+        let automatic_complete_outputs = directories.is_empty();
+        if automatic_complete_outputs {
+            let named = Self::for_command(kind, command);
+            if named.is_some()
+                || baseline.is_empty()
+                || !matches!(
+                    kind,
+                    Some(
+                        CompilationKind::CargoBuild
+                            | CompilationKind::CargoTest
+                            | CompilationKind::CargoBench
+                    )
+                )
+            {
+                return Ok(named);
+            }
+        }
+        let selection = match cargo_bins::retrieval_selection(kind, command) {
+            Some(selection) => selection,
+            None if automatic_complete_outputs => return Ok(None),
+            None => anyhow::bail!(
+                "transfer.cargo_retrieval_exclude_dirs requires a supported literal Cargo build, zigbuild, or test/bench --no-run command with a complete output receipt"
+            ),
+        };
+        if automatic_complete_outputs && !selection.message_formats.is_empty() {
+            // This lane instruments only the default human output. Explicit
+            // formats and unsupported commands keep their existing contract;
+            // they cannot acquire a guessed or partial output proof.
+            return Ok(None);
         }
         retrieval_baseline_filters(baseline)?;
-        let selection = cargo_bins::retrieval_selection(kind, command).context(
-            "transfer.cargo_retrieval_exclude_dirs requires a supported literal Cargo build, zigbuild, or test/bench --no-run command with a complete output receipt",
-        )?;
         let instrumented = match selection.message_formats.as_slice() {
             [] => true,
             [format] if explicit_json_format(format) => false,
@@ -238,12 +273,17 @@ impl CargoOutputCapture {
             selected,
             instrumented,
             retrieval_baseline: Some(baseline.to_vec()),
+            automatic_complete_outputs,
             broad_targets: selection.broad_targets,
         }))
     }
 
     pub(super) fn retrieval_baseline(&self) -> Option<&[String]> {
         self.retrieval_baseline.as_deref()
+    }
+
+    pub(super) fn automatic_complete_outputs(&self) -> bool {
+        self.automatic_complete_outputs
     }
 
     /// A restored recipe must retain both its original positive selection and
@@ -257,6 +297,10 @@ impl CargoOutputCapture {
         let baseline = self
             .retrieval_baseline()
             .context("Cargo retrieval exclusions lack an original output baseline")?;
+        anyhow::ensure!(
+            !self.automatic_complete_outputs || self.instrumented,
+            "automatic Cargo output capture lost its human-output instrumentation"
+        );
         anyhow::ensure!(
             self.instrumented || self.caller_json_supported(),
             "Cargo retrieval exclusions lack a supported complete output capture mode"
@@ -2086,6 +2130,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let automatic = CargoOutputCapture::for_retrieval_policy(kind, command, &baseline, &[])
+            .unwrap()
+            .unwrap();
+        assert!(automatic.automatic_complete_outputs());
+        assert_eq!(
+            automatic.execution_command(command),
+            capture.execution_command(command)
+        );
         for warm in [false, true] {
             let output = std::process::Command::new(env!("CARGO"))
                 .args([
@@ -2116,6 +2168,13 @@ mod tests {
             let contract = capture
                 .parse_receipt_with_roots(&output.stdout, &[&target, &canonical_target])
                 .unwrap();
+            assert_eq!(
+                automatic
+                    .parse_receipt_with_roots(&output.stdout, &[&target, &canonical_target])
+                    .unwrap(),
+                contract,
+                "default delivery must protect the same complete native Cargo outputs"
+            );
             assert!(contract.required_files.contains(Path::new("ci-fast/app")));
             assert!(
                 contract
@@ -2221,6 +2280,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let automatic = CargoOutputCapture::for_retrieval_policy(kind, command, &baseline, &[])
+            .unwrap()
+            .unwrap();
+        assert!(automatic.automatic_complete_outputs());
+        assert_eq!(
+            automatic.execution_command(command),
+            capture.execution_command(command)
+        );
         for warm in [false, true] {
             let output = std::process::Command::new(env!("CARGO"))
                 .args([
@@ -2292,6 +2359,13 @@ mod tests {
             let contract = capture
                 .parse_receipt_with_roots(&output.stdout, &roots)
                 .unwrap();
+            assert_eq!(
+                automatic
+                    .parse_receipt_with_roots(&output.stdout, &roots)
+                    .unwrap(),
+                contract,
+                "default delivery must preserve separate build-directory semantics"
+            );
             assert_eq!(contract.required_files, [PathBuf::from("debug/app")].into());
             assert!(contract.required_directories.is_empty());
             contract.verify_staged(&target).unwrap();

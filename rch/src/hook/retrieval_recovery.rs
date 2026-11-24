@@ -716,25 +716,36 @@ impl RecoveryRecipe {
             .cargo_output_capture
             .as_ref()
             .and_then(CargoOutputCapture::retrieval_baseline);
+        let automatic_complete_outputs = self
+            .cargo_output_capture
+            .as_ref()
+            .is_some_and(CargoOutputCapture::automatic_complete_outputs);
         if !cargo_retrieval_exclusions_apply(self.kind) {
             anyhow::ensure!(
-                capture_baseline.is_none(),
+                capture_baseline.is_none() && !automatic_complete_outputs,
                 "Cargo retrieval capture belongs to an unrelated command"
             );
             return Ok(());
         }
-        if self.transfer.cargo_retrieval_exclude_dirs.is_empty() {
+        if self.transfer.cargo_retrieval_exclude_dirs.is_empty() && !automatic_complete_outputs {
             anyhow::ensure!(
                 capture_baseline.is_none(),
                 "Cargo retrieval capture lost its admitted exclusions"
             );
             return Ok(());
         }
+        if automatic_complete_outputs {
+            anyhow::ensure!(
+                self.transfer.cargo_retrieval_exclude_dirs.is_empty()
+                    && self.kind == Some(CompilationKind::CargoBuild),
+                "automatic Cargo output capture contradicts its admitted build policy"
+            );
+        }
         anyhow::ensure!(
             self.cargo_output_capture
                 .as_ref()
                 .is_some_and(CargoOutputCapture::supports_retrieval_exclusions),
-            "Cargo retrieval exclusions require a supported complete Cargo output capture"
+            "Cargo delivery requires a supported complete Cargo output capture"
         );
         let mut phases = self
             .phases
@@ -742,9 +753,9 @@ impl RecoveryRecipe {
             .filter(|phase| phase.custom_target && !phase.patterns.is_empty());
         let phase = phases
             .next()
-            .context("Cargo retrieval exclusions lost their target phase")?;
+            .context("complete Cargo delivery lost its target phase")?;
         let baseline =
-            capture_baseline.context("Cargo retrieval exclusions lack complete output capture")?;
+            capture_baseline.context("Cargo delivery lacks complete output capture")?;
         let required = phase.cargo_outputs.as_ref().map(|outputs| {
             outputs
                 .required_files
@@ -760,7 +771,7 @@ impl RecoveryRecipe {
                 && phase.native_outputs.is_none()
                 && !WorkerPlatform::from_worker(&self.worker).is_windows()
                 && phase.patterns.ends_with(&expected),
-            "Cargo retrieval exclusions contradict their admitted target selection"
+            "Cargo delivery contradicts its admitted target selection"
         );
         // Once exact priority rules are installed, none may override a
         // configured exclusion. Recovery validates this before any transfer.
@@ -12235,6 +12246,334 @@ func TestValue(t *testing.T) {{
         (directory, stage_owner, session)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_cargo_delivery_requires_every_output_before_publication_and_recovery() {
+        let identity = format!("default-cargo-{}", uuid::Uuid::new_v4().simple());
+        let (directory, writer, worker) = preparation_fixture_with_identity(&identity);
+        let remote = tempfile::tempdir().unwrap();
+        let partial = tempfile::tempdir().unwrap();
+        let local = directory.path().join("target");
+        let outputs = [
+            ("debug/app", &b"worker executable"[..]),
+            ("debug/app.pdb", &b"worker debug symbols"[..]),
+            ("debug/libmodel.rlib", &b"worker library"[..]),
+        ];
+        for (name, bytes) in outputs {
+            let path = remote.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+            let old = local.join(name);
+            std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+            std::fs::write(old, b"stale local output").unwrap();
+        }
+        std::fs::create_dir_all(partial.path().join("debug")).unwrap();
+        std::fs::write(partial.path().join("debug/app"), b"worker executable").unwrap();
+        let transfer = TransferConfig::default();
+        assert!(transfer.cargo_retrieval_exclude_dirs.is_empty());
+        let pipeline = TransferPipeline::new(
+            directory.path().to_owned(),
+            "default-cargo".into(),
+            identity.clone(),
+            transfer.clone(),
+        )
+        .with_remote_path_override("/data/projects/source-recovery")
+        .with_remote_cargo_target_dir_override(remote.path().to_str().unwrap());
+        let command = "cargo build --workspace";
+        let mut session = RecoverySession::prepare(
+            &writer,
+            &worker,
+            &pipeline,
+            vec!["/data/projects/source-recovery".into()],
+            None,
+            None,
+            None,
+            transfer,
+            directory.path().to_owned(),
+            Some(&local),
+            Some(CompilationKind::CargoBuild),
+            command,
+            &[],
+            identity,
+        )
+        .unwrap();
+        assert_eq!(session.recipe.phases.len(), 1);
+        assert!(
+            session
+                .cargo_output_capture()
+                .unwrap()
+                .automatic_complete_outputs()
+        );
+        session.starting_execution().unwrap();
+        session.completed(0).unwrap();
+        let mut session = reload_publication(&session);
+        assert!(session.needs_cargo_artifact_evidence());
+        let artifact = |kind: &str, name: &str, paths: &[&str], executable: Option<&str>| {
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "target": {"kind": [kind], "name": name},
+                "filenames": paths.iter().map(|path| remote.path().join(path)).collect::<Vec<_>>(),
+                "executable": executable.map(|path| remote.path().join(path)),
+                "fresh": true,
+            })
+        };
+        let stdout = format!(
+            "{}\n{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
+            artifact("bin", "app", &["debug/app", "debug/app.pdb"], Some("debug/app")),
+            artifact("lib", "model", &["debug/libmodel.rlib"], None),
+        )
+        .into_bytes();
+        session
+            .install_complete_cargo_evidence(&crate::transfer::CargoArtifactEvidence {
+                stdout: stdout.clone(),
+                remote_root: remote.path().to_owned(),
+                remote_project_root: None,
+            })
+            .unwrap();
+        let patterns = session.cargo_artifact_patterns("target").unwrap();
+        assert_eq!(
+            patterns,
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild), Some(command)),
+            "complete proof must not replace the original output selection"
+        );
+        assert_eq!(
+            session.recipe.phases[0]
+                .cargo_outputs
+                .as_ref()
+                .unwrap()
+                .required_files,
+            outputs
+                .iter()
+                .map(|(name, _)| PathBuf::from(*name))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        // Current configuration cannot revise the original receipt's selection.
+        session
+            .apply_retrieval_config(&TransferConfig {
+                cargo_retrieval_exclude_dirs: vec!["debug".into()],
+                ..TransferConfig::default()
+            })
+            .unwrap();
+        let mut session = reload_publication(&session);
+        assert!(session.recipe.transfer.cargo_retrieval_exclude_dirs.is_empty());
+        assert_eq!(
+            session.retained_cargo_artifact_evidence().unwrap().unwrap().stdout,
+            stdout
+        );
+        assert!(!session.needs_cargo_artifact_evidence());
+
+        for complete in [false, true] {
+            let staged = session.staging_pipeline("target", &pipeline).unwrap();
+            let mut retrieve = staged.local_artifact_retrieval_for_test(
+                &worker,
+                if complete { remote.path() } else { partial.path() },
+                &patterns,
+            );
+            let output = retrieve.output().await.unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(session.stage(0).join("debug/app").is_file());
+            if !complete {
+                // A successful nonempty transfer and stale destination files
+                // cannot stand in for the missing library and debug sidecar.
+                let before = std::fs::read(&session.writer.path).unwrap();
+                assert!(session.publish("target").await.is_err());
+                assert_eq!(std::fs::read(&session.writer.path).unwrap(), before);
+                assert!(session.recipe.phases[0].published.is_empty());
+                assert!(!session.recipe.phases[0].complete);
+                assert!(session.recipe.returned.is_none());
+                for (name, _) in outputs {
+                    assert_eq!(std::fs::read(local.join(name)).unwrap(), b"stale local output");
+                }
+                session = reload_publication(&session);
+                assert_eq!(
+                    session.retained_cargo_artifact_evidence().unwrap().unwrap().stdout,
+                    stdout
+                );
+            } else {
+                session.publish("target").await.unwrap();
+                session.returned(0).unwrap();
+                let recovered = reload_publication(&session);
+                assert!(recovered.recipe.phases[0].complete);
+                assert_eq!(recovered.recipe.returned, Some(0));
+                assert_eq!(recovered.recipe.exit_code, Some(0));
+                assert_eq!(recovered.recipe.phases[0].published.len(), outputs.len());
+                assert_eq!(
+                    recovered.retained_cargo_artifact_evidence().unwrap().unwrap().stdout,
+                    stdout
+                );
+                for (name, bytes) in outputs {
+                    assert_eq!(std::fs::read(local.join(name)).unwrap(), bytes);
+                }
+                assert!(!recovered.writer.snapshot().terminal_acknowledged);
+                assert!(!recovered.recipe.sources_released);
+            }
+        }
+    }
+
+    #[test]
+    fn default_cargo_no_run_preparation_freezes_build_delivery_and_original_patterns() {
+        for (kind, command) in [
+            (CompilationKind::CargoTest, "cargo test --no-run"),
+            (CompilationKind::CargoBench, "cargo bench --no-run"),
+        ] {
+            let (directory, writer, worker) = preparation_fixture();
+            let pipeline = TransferPipeline::new(
+                directory.path().to_owned(),
+                "default-cargo-no-run".into(),
+                "abc123".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override("/data/projects/source-recovery")
+            .with_remote_cargo_target_dir_override("/worker/target");
+            let session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                directory.path().to_owned(),
+                Some(&directory.path().join("target")),
+                Some(kind),
+                command,
+                &[],
+                "abc123".into(),
+            )
+            .unwrap();
+            let restored = reload_publication(&session);
+            let expected = get_custom_target_artifact_patterns(Some(kind), Some(command));
+            for recipe in [&session.recipe, &restored.recipe] {
+                assert_eq!(recipe.kind, Some(CompilationKind::CargoBuild), "{command}");
+                assert!(
+                    recipe
+                        .cargo_output_capture
+                        .as_ref()
+                        .unwrap()
+                        .automatic_complete_outputs(),
+                    "{command}"
+                );
+                assert!(recipe.transfer.cargo_retrieval_exclude_dirs.is_empty());
+                let target = recipe.phases.iter().find(|phase| phase.custom_target).unwrap();
+                assert!(target.output_gate);
+                assert_eq!(target.patterns, expected, "{command}");
+                recipe.validate_cargo_retrieval_policy().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn default_cargo_failed_build_preserves_exit_without_claiming_output_delivery() {
+        for exit in [101, 137] {
+            let (directory, writer, worker) = preparation_fixture();
+            let pipeline = TransferPipeline::new(
+                directory.path().to_owned(),
+                "failed-default-cargo".into(),
+                "abc123".into(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override("/data/projects/source-recovery")
+            .with_remote_cargo_target_dir_override("/worker/target");
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                directory.path().to_owned(),
+                Some(&directory.path().join("target")),
+                Some(CompilationKind::CargoBuild),
+                "cargo build --workspace",
+                &[],
+                "abc123".into(),
+            )
+            .unwrap();
+            assert!(
+                session
+                    .cargo_output_capture()
+                    .unwrap()
+                    .automatic_complete_outputs()
+            );
+            session.starting_execution().unwrap();
+            session.completed(exit).unwrap();
+            session.returned(exit).unwrap();
+            let restored = reload_publication(&session);
+            assert_eq!(restored.recipe.exit_code, Some(exit));
+            assert_eq!(restored.recipe.returned, Some(exit));
+            assert!(restored.recipe.cargo_stdout.is_none());
+            assert!(restored.recipe.phases[0].cargo_outputs.is_none());
+            assert!(!restored.recipe.phases[0].complete);
+            assert!(restored.recipe.phases[0].published.is_empty());
+        }
+    }
+
+    #[test]
+    fn default_cargo_recovery_rejects_lost_capture_provenance_or_selection() {
+        let (_directory, _stage_owner, mut session) = captured_publication_fixture(
+            CompilationKind::CargoBuild,
+            "cargo build --bin app",
+            Path::new("/worker/cargo-output"),
+            true,
+        );
+        let command = "cargo build --workspace";
+        let baseline =
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild), Some(command));
+        session.recipe.cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
+            Some(CompilationKind::CargoBuild),
+            command,
+            &baseline,
+            &[],
+        )
+        .unwrap();
+        session.recipe.phases[0].patterns = baseline;
+        session.persist().unwrap();
+        let original = reload_publication(&session).recipe;
+        original.validate_cargo_retrieval_policy().unwrap();
+        for patch in [
+            serde_json::json!({"automatic_complete_outputs": false}),
+            serde_json::json!({"instrumented": false}),
+            serde_json::json!({"retrieval_baseline": null}),
+            serde_json::json!({"retrieval_baseline": []}),
+        ] {
+            let mut rejected = original.clone();
+            let mut capture = serde_json::to_value(&rejected.cargo_output_capture).unwrap();
+            capture.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+            rejected.cargo_output_capture = Some(serde_json::from_value(capture).unwrap());
+            assert!(
+                rejected.validate_cargo_retrieval_policy().is_err(),
+                "{patch}"
+            );
+        }
+        let mut changed_policy = original.clone();
+        changed_policy.transfer.cargo_retrieval_exclude_dirs = vec!["debug".into()];
+        assert!(changed_policy.validate_cargo_retrieval_policy().is_err());
+        let mut changed_phase = original.clone();
+        changed_phase.phases[0].patterns = vec!["debug/app".into()];
+        assert!(changed_phase.validate_cargo_retrieval_policy().is_err());
+
+        // Old exclusion receipts must not acquire automatic authority merely
+        // because their configured exclusions disappeared from a journal.
+        let mut lost_exclusions = original.clone();
+        lost_exclusions.cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
+            Some(CompilationKind::CargoBuild),
+            command,
+            &lost_exclusions.phases[0].patterns,
+            &["debug/.wrapper-shims".into()],
+        )
+        .unwrap();
+        assert!(lost_exclusions.transfer.cargo_retrieval_exclude_dirs.is_empty());
+        assert!(lost_exclusions.validate_cargo_retrieval_policy().is_err());
+        original.validate_cargo_retrieval_policy().unwrap();
+    }
+
     #[tokio::test]
     async fn cargo_retrieval_policy_survives_recovery_and_real_rsync_publication() {
         let remote = tempfile::tempdir().unwrap();
@@ -12854,7 +13193,7 @@ func TestValue(t *testing.T) {{
             let error = rejected.validate_cargo_retrieval_policy().unwrap_err();
             assert!(
                 error.to_string().contains(
-                    "Cargo retrieval exclusions require a supported complete Cargo output capture"
+                    "Cargo delivery requires a supported complete Cargo output capture"
                 ),
                 "{patch}: {error:#}"
             );
