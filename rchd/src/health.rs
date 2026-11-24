@@ -1425,15 +1425,22 @@ async fn probe_worker_capabilities_allowed(
         return None;
     }
 
-    // Check if mock mode is enabled
     if is_mock_transport(worker) {
-        // In mock mode, return mock capabilities that include Rust
-        // (so mock workers can be selected for Rust compilation)
         debug!(
             "Worker {} capabilities probe: mock mode, returning mock capabilities",
             worker_config.id
         );
-        let capabilities = WorkerCapabilities::mock_with_rust();
+        // Mock SSH models a Rust worker with make and a finite build volume.
+        // Publish through the same freshness and generation checks as SSH.
+        let capabilities = WorkerCapabilities {
+            build_disk_free_gb: Some(1024.0),
+            build_disk_total_gb: Some(2048.0),
+            native_tools: rch_common::types::NativeToolCapabilities {
+                present: vec!["make".into()],
+                ..Default::default()
+            },
+            ..WorkerCapabilities::mock_with_rust()
+        };
         return worker
             .publish_capabilities(context, capabilities.clone())
             .await
@@ -3531,6 +3538,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_worker_capabilities_mock_mode() {
+        use crate::disk_pressure::{DiskHeadroomAdmission, DiskHeadroomRejection};
+
         let _lock = test_lock().lock().await;
         set_mock_enabled_override(Some(true));
 
@@ -3539,7 +3548,7 @@ mod tests {
             host: "cap.mock.host".to_string(),
             user: "capuser".to_string(),
             identity_file: "~/.ssh/cap".to_string(),
-            total_slots: 8,
+            total_slots: 64,
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
@@ -3550,11 +3559,24 @@ mod tests {
 
         clear_mock_overrides();
 
-        // In mock mode, should return mock capabilities
-        assert!(capabilities.is_some());
         let caps = capabilities.unwrap();
-        // Mock capabilities include Rust
         assert!(caps.rustc_version.is_some());
+        assert_eq!(caps.native_tools.missing_reason("make"), None);
+        assert_eq!(worker.available_slots().await, 64);
+        let disk = DiskHeadroomAdmission {
+            capacity: worker.disk_capacity_observation().await,
+            requested_gib: 1024 - 10,
+            floor_gib: 10,
+            ..Default::default()
+        };
+        assert_eq!(disk.check("cap-mock", 0), Ok(()));
+        assert_eq!(
+            disk.check("cap-mock", 1),
+            Err(DiskHeadroomRejection::Insufficient {
+                free_gib: 1024,
+                required_gib: 1025,
+            })
+        );
     }
 
     #[tokio::test(start_paused = true)]

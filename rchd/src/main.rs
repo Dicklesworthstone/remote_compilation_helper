@@ -1310,7 +1310,7 @@ async fn async_main() -> Result<()> {
     // inherit the same budget as workers present at startup.
     // Workers start with unknown disk; hold them at zero slots until their
     // first capacity probe (normally well under a minute), at most 2 min.
-    // Mock transport never reports disk, so it keeps the configured ceiling.
+    // Mock transport skips the startup hold and publishes synthetic disk capacity.
     // A corrupt/unreadable disable store cannot safely be treated as empty:
     // that would silently restore workers the operator explicitly took out.
     let admin_disable_store = Arc::new(Mutex::new(AdminDisableStore::try_load(

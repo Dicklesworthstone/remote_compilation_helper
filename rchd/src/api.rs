@@ -10901,6 +10901,9 @@ mod tests {
                 release_source_fence_test_build(&ctx, &lease).await;
                 assert!(ctx.history.active_builds().is_empty());
                 assert_eq!(worker.available_slots().await, 8);
+                // A fresh post-completion probe funds the next build, but
+                // cannot release the interrupted wrapper's source fence.
+                set_test_build_disk(&ctx.pool, "worker1", 100.0).await;
                 for _attempt in 0..2 {
                     let denied = handle_select_worker(
                         &ctx,
@@ -11129,14 +11132,29 @@ mod tests {
             SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".into())
         );
         settle_source_fence_test_lease(&path, &lease);
-        let admitted = handle_select_worker(
-            &ctx,
-            source_fence_test_request(crate::history::observable_test_process_id()),
-            false,
-            None,
-        )
-        .await
-        .unwrap();
+        let request = source_fence_test_request(crate::history::observable_test_process_id());
+        // Source settlement restores the lane. The disk reading taken on
+        // restart still predates the release of the previous build's budget.
+        let stale = handle_select_worker(&ctx, request.clone(), false, None)
+            .await
+            .unwrap();
+        assert!(stale.worker.is_none());
+        assert_eq!(
+            stale.reason,
+            SelectionReason::NoAdmissibleWorkers("disk_headroom=1".into())
+        );
+        assert!(
+            stale.diagnostics.unwrap().workers[0]
+                .reason_codes
+                .iter()
+                .any(|code| code == "disk_headroom_stale")
+        );
+        assert!(ctx.history.active_builds().is_empty());
+        assert_eq!(worker.used_slots(), 0);
+        set_test_build_disk(&ctx.pool, "worker1", 100.0).await;
+        let admitted = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
         assert_eq!(admitted.reason, SelectionReason::Success);
         assert_eq!(admitted.worker.as_ref().unwrap().id.as_str(), "worker1");
         assert_ne!(admitted.build_id, Some(build_id));
@@ -12249,6 +12267,21 @@ mod tests {
         handle_release_worker(&ctx, (*request).clone())
             .await
             .unwrap();
+        let settled = BypassRecordStore::load(directory.path().join("bypass.json"))
+            .get("worker1")
+            .cloned()
+            .unwrap();
+        // Settlement makes a recovery probe due. Only that probe can
+        // supply evidence toward clearing the worker's quarantine.
+        assert!(settled.probe_due(u64::try_from(Utc::now().timestamp_millis()).unwrap()));
+        assert!(settled.next_probe_unix_ms <= before.next_probe_unix_ms);
+        assert_eq!(
+            settled,
+            BypassRecord {
+                next_probe_unix_ms: settled.next_probe_unix_ms,
+                ..before
+            }
+        );
         handle_release_worker(&ctx, *request).await.unwrap();
         assert_eq!(worker.used_slots(), 0);
         assert!(ctx.history.active_build(build_id).is_none());
@@ -12260,8 +12293,8 @@ mod tests {
         assert!(!handle_ready(&ctx).await.workers_available);
         assert_eq!(
             BypassRecordStore::load(directory.path().join("bypass.json")).get("worker1"),
-            Some(&before),
-            "safe release and heartbeat cannot satisfy process-lifecycle recovery"
+            Some(&settled),
+            "duplicate release and heartbeat must preserve the pending recovery probe"
         );
     }
 

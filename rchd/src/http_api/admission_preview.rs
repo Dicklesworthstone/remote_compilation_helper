@@ -361,6 +361,10 @@ mod tests {
                 .set_capabilities(rch_common::WorkerCapabilities {
                     build_disk_free_gb: Some(100.0),
                     build_disk_total_gb: Some(200.0),
+                    native_tools: rch_common::types::NativeToolCapabilities {
+                        present: vec!["make".into()],
+                        ..Default::default()
+                    },
                     ..Default::default()
                 })
                 .await;
@@ -463,10 +467,17 @@ mod tests {
         assert!(headers.starts_with("HTTP/1.0 200"), "{headers}");
         let preview: PreviewResponse = serde_json::from_str(body).unwrap();
         preview.validate().unwrap();
+        let selected = preview.selection.worker.expect("worker");
+        assert_eq!(selected.id.as_str(), "requested");
         assert_eq!(
-            preview.selection.worker.expect("worker").id.as_str(),
-            "requested"
+            selected.disk_budget,
+            Some(rch_common::BuildDiskBudget {
+                max_growth_bytes: 20 * rch_common::BuildDiskBudget::GIB,
+                min_free_bytes: 10 * rch_common::BuildDiskBudget::GIB,
+                warm_policy: None,
+            })
         );
+        assert_eq!(ctx.history.reserved_disk_headroom_gib("requested"), 0);
         assert!(ctx.history.active_builds().is_empty());
         assert_eq!(
             ctx.pool
@@ -806,7 +817,13 @@ mod tests {
     #[tokio::test]
     async fn source_fences_tool_requirements_and_unknown_disk_budget_are_not_dropped() {
         let _guard = rch_common::test_guard!();
-        for fence in ["live", "busy", "tools", "disk"] {
+        for (fence, reason_code) in [
+            ("live", "active_project_exclusion"),
+            ("busy", "active_project_exclusion"),
+            ("tools", "tool.required_missing"),
+            ("make", "tool.required_missing"),
+            ("disk", "disk_headroom_unknown"),
+        ] {
             let (ctx, router) = fixture().await;
             let mut request = input();
             match fence {
@@ -815,14 +832,16 @@ mod tests {
                     .fence_live_checkout(&request.project, "requested"),
                 "busy" => ctx.history.fence_source_busy(&request.project, "requested"),
                 "tools" => request.required_tools.push("never-probed-tool".into()),
-                "disk" => {
-                    request.disk_headroom_gib = 23;
-                    ctx.pool
-                        .get(&WorkerId::new("requested"))
-                        .await
-                        .unwrap()
-                        .set_capabilities(rch_common::WorkerCapabilities::default())
-                        .await;
+                "make" | "disk" => {
+                    let worker = ctx.pool.get(&WorkerId::new("requested")).await.unwrap();
+                    let mut caps = worker.capabilities().await;
+                    if fence == "make" {
+                        caps.native_tools.present.clear();
+                    } else {
+                        request.disk_headroom_gib = 23;
+                        caps.build_disk_free_gb = None;
+                    }
+                    worker.set_capabilities(caps).await;
                 }
                 _ => unreachable!(),
             }
@@ -832,7 +851,25 @@ mod tests {
                 .unwrap();
             let response = decoded(response).await;
             assert!(response.selection.worker.is_none(), "{fence}");
-            assert!(response.selection.diagnostics.is_some(), "{fence}");
+            let diagnostics = response.selection.diagnostics.unwrap();
+            let requested = diagnostics
+                .workers
+                .iter()
+                .find(|worker| worker.worker_id.as_str() == "requested")
+                .unwrap();
+            assert!(
+                requested
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == reason_code),
+                "{fence}: {requested:?}"
+            );
+            if fence == "make" {
+                assert_eq!(
+                    requested.final_reason,
+                    "capability_missing:native_tool:make:unprobed"
+                );
+            }
             assert_unowned(&ctx, 4).await;
         }
     }

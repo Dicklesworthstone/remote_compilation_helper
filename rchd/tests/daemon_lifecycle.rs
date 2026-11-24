@@ -1124,6 +1124,7 @@ while True:
                 // This supplies health/capacity only. No live remote worker is
                 // part of this test; worker settlement is injected below.
                 .env("RCH_MOCK_SSH", "1")
+                .env("RCH_MOCK_SSH_STDOUT", "health_check")
                 .env("RUST_LOG", "rchd::lease_recovery=debug")
                 .env(
                     "PATH",
