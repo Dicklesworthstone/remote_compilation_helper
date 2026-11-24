@@ -151,7 +151,7 @@ impl RecoveryRecipe {
     }
 }
 
-fn validate_sealed_phase(phase: &RecoveryPhase) -> anyhow::Result<()> {
+pub(super) fn validate_sealed_phase(phase: &RecoveryPhase) -> anyhow::Result<()> {
     anyhow::ensure!(
         phase.pending.is_none() && phase.missing_result.is_none(),
         "completed publication has pending or failed delivery evidence"

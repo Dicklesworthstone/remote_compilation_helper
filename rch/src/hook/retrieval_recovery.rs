@@ -778,7 +778,7 @@ impl RecoveryRecipe {
         Ok(())
     }
 
-    fn validate_go_output_contract(&self) -> anyhow::Result<()> {
+    fn go_output_phase(&self) -> anyhow::Result<&RecoveryPhase> {
         let mut phases = self.phases.iter().filter(|phase| phase.name == "project");
         let phase = phases
             .next()
@@ -799,6 +799,22 @@ impl RecoveryRecipe {
                 && !WorkerPlatform::from_worker(&self.worker).is_windows(),
             "Go execution requires exactly one bound project executable"
         );
+        Ok(phase)
+    }
+
+    fn validate_go_delivery(&self, returned: Option<i32>) -> anyhow::Result<()> {
+        if self.kind == Some(CompilationKind::GoBuild) {
+            if returned == Some(0) {
+                let phase = self.go_output_phase()?;
+                anyhow::ensure!(
+                    self.execution_started && self.exit_code == Some(0) && phase.complete,
+                    "Go success requires a completed execution and its published output"
+                );
+                publication_state::validate_sealed_phase(phase)?;
+            } else if self.execution_started {
+                self.go_output_phase()?;
+            }
+        }
         Ok(())
     }
 
@@ -814,12 +830,7 @@ impl RecoveryRecipe {
                 && self.build_system_output_capture.is_none(),
             "Go coverage cannot replace another output contract"
         );
-        self.validate_go_output_contract()?;
-        let phase = self
-            .phases
-            .iter()
-            .find(|phase| phase.name == "project")
-            .context("Go coverage has no publication phase")?;
+        let phase = self.go_output_phase()?;
         anyhow::ensure!(
             ((capture.present().is_none() && capture.rejection().is_none())
                 || self.execution_started)
@@ -3068,7 +3079,7 @@ impl RecoverySession {
                 existing == &contract && phase.patterns == patterns,
                 "Go discovery differs from its already bound executable output"
             );
-            return self.recipe.validate_go_output_contract();
+            return self.recipe.go_output_phase().map(|_| ());
         }
         anyhow::ensure!(
             phase.patterns.is_empty(),
@@ -3076,7 +3087,7 @@ impl RecoverySession {
         );
         phase.patterns = patterns;
         phase.native_outputs = Some(contract);
-        next.validate_go_output_contract()?;
+        next.go_output_phase()?;
         self.persist_next_recipe(next)
     }
 
@@ -3451,7 +3462,7 @@ impl RecoverySession {
             "execution requires an unconsumed prepared source grant"
         );
         if self.recipe.kind == Some(CompilationKind::GoBuild) {
-            self.recipe.validate_go_output_contract()?;
+            self.recipe.go_output_phase()?;
         }
         self.recipe.validate_go_coverage_contract()?;
         let mut next_recipe = self.recipe.clone();
@@ -3925,6 +3936,7 @@ impl RecoverySession {
         Ok(())
     }
     pub(crate) fn returned(&mut self, exit: i32) -> anyhow::Result<()> {
+        self.recipe.validate_go_delivery(Some(exit))?;
         anyhow::ensure!(
             self.recipe
                 .go_coverage_capture
@@ -5133,9 +5145,7 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
             "build output capture contradicts its admitted publication state"
         );
     }
-    if recipe.kind == Some(CompilationKind::GoBuild) && recipe.execution_started {
-        recipe.validate_go_output_contract()?;
-    }
+    recipe.validate_go_delivery(recipe.returned)?;
     recipe.validate_go_coverage_contract()?;
     for phase in &recipe.phases {
         if let Some(contract) = &phase.native_outputs {
@@ -9588,6 +9598,16 @@ mod tests {
             assert!(session.starting_execution().is_err());
             assert!(session.returned(0).is_err());
             assert_eq!(std::fs::read(&writer.path).unwrap(), pending);
+            let load_changed = |session: &RecoverySession, edit: fn(&mut serde_json::Value)| {
+                let mut changed = session.writer.snapshot();
+                edit(changed.recovery.as_mut().unwrap());
+                load_recipe(&DurableLeaseWriter {
+                    path: session.writer.path.clone(),
+                    recovery_ownership: None,
+                    lease: Arc::new(Mutex::new(changed)),
+                })
+            };
+            assert!(load_changed(&session, |recipe| recipe["returned"] = 0.into()).is_err());
             session = reload_publication(&session);
             session.require_go_outputs(contract.clone()).unwrap();
             let bound = std::fs::read(&writer.path).unwrap();
@@ -9604,15 +9624,12 @@ mod tests {
 
             // A recovered execution must retain the exact publication
             // contract. Dropping it cannot turn Go into glob-only delivery.
-            let mut damaged = writer.snapshot();
-            damaged.recovery.as_mut().unwrap()["phases"][0]["native_outputs"] =
-                serde_json::Value::Null;
-            let damaged_writer = DurableLeaseWriter {
-                path: writer.path.clone(),
-                recovery_ownership: None,
-                lease: Arc::new(Mutex::new(damaged)),
-            };
-            assert!(load_recipe(&damaged_writer).is_err());
+            assert!(
+                load_changed(&session, |recipe| {
+                    recipe["phases"][0]["native_outputs"] = serde_json::Value::Null;
+                })
+                .is_err()
+            );
 
             let guarded = go_build_execution_command(&command, &environment, None).unwrap();
             let mut compiler = Command::new("sh");
@@ -9637,6 +9654,15 @@ mod tests {
                     session.publish("project").await.unwrap();
                     session.returned(0).unwrap();
                     session = reload_publication(&session);
+                    assert!(
+                        load_changed(&session, |recipe| recipe["exit_code"] = 1.into()).is_err()
+                    );
+                    assert!(
+                        load_changed(&session, |recipe| {
+                            recipe["phases"][0]["published"] = serde_json::json!({});
+                        })
+                        .is_err()
+                    );
                     session.publish("project").await.unwrap();
                     let mut executable = Command::new(local.join(fixture.output));
                     let output = run_go_fixture(&mut executable).await;
