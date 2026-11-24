@@ -983,6 +983,12 @@ pub(crate) fn verify_cargo_artifacts(
         return Ok(());
     };
     verified_artifact_names(request, artifacts)?;
+    if mode.is_nextest() {
+        // Every delivered file still passes the ordinary complete-manifest,
+        // chunk digest, mode and destination-custody checks. Runner output has
+        // no Cargo artifact authority, even if it looks like Cargo JSON.
+        return Ok(());
+    }
     let report = CargoArtifactReport::read(stdout, "/__rabs/out/cargo", mode)?;
     if let Some(roots) = cargo_artifacts::private_incremental_roots(request)? {
         require(

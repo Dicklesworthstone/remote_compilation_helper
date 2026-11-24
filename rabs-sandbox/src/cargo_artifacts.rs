@@ -14,6 +14,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, BufReader, Read};
 
+pub mod nextest;
+
 /// Explicit opt-in under artifacts.cargo; old endpoints must reject this field.
 pub const CARGO_ARTIFACTS_VERSION: &str = "cargo-json-v1";
 /// Test execution has arbitrary program output after Cargo's build-finished.
@@ -42,13 +44,22 @@ pub enum CargoArtifactMode {
     TestExecution,
     RunExecution,
     BenchExecution,
+    /// Nextest owns its opaque transcript; the complete target tree is delivered.
+    NextestCompilation,
+    NextestExecution,
 }
 
 impl CargoArtifactMode {
     /// Whether stdout after Cargo's build-finished belongs to executed programs.
     #[must_use]
     pub const fn is_execution(self) -> bool {
-        !matches!(self, Self::Compilation)
+        !matches!(self, Self::Compilation | Self::NextestCompilation)
+    }
+
+    /// Nextest does not emit Cargo's artifact-selection JSON protocol.
+    #[must_use]
+    pub const fn is_nextest(self) -> bool {
+        matches!(self, Self::NextestCompilation | Self::NextestExecution)
     }
 }
 /// Bound the whole stream, including non-JSON output from procedural macros.
@@ -72,6 +83,9 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
     else {
         return Ok(None);
     };
+    if contract.is_object() {
+        return nextest::requested(request).map(Some);
+    }
     let mode = match contract.as_str() {
         Some(CARGO_ARTIFACTS_VERSION | CARGO_PRIVATE_INCREMENTAL_ARTIFACTS_VERSION) => {
             CargoArtifactMode::Compilation
@@ -236,6 +250,7 @@ pub fn requested(request: &Value) -> io::Result<Option<CargoArtifactMode>> {
         CargoArtifactMode::TestExecution => command == "test" && !no_run,
         CargoArtifactMode::RunExecution => command == "run" && !no_run,
         CargoArtifactMode::BenchExecution => command == "bench" && !no_run,
+        CargoArtifactMode::NextestCompilation | CargoArtifactMode::NextestExecution => false,
     };
     if !format || !target || !matching_command {
         return Err(invalid("incomplete Cargo compilation artifact contract"));
@@ -531,6 +546,11 @@ impl CargoArtifactReport {
     /// procedural macro stdout. Malformed JSON-shaped records fail closed in
     /// the compilation report; runtime output after build-finished stays opaque.
     pub fn read(reader: impl Read, output_root: &str, mode: CargoArtifactMode) -> io::Result<Self> {
+        if mode.is_nextest() {
+            return Err(invalid(
+                "nextest output is not a Cargo JSON artifact report",
+            ));
+        }
         if !output_root.starts_with('/') || output_root.ends_with('/') {
             return Err(invalid("Cargo output root must be an absolute directory"));
         }

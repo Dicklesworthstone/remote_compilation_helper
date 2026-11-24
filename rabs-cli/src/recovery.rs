@@ -968,18 +968,22 @@ fn load_canonical_intent(root: PathBuf, override_state: Option<&OsStr>) -> Resul
         "cargo-private-incremental-run-json-v1",
         "cargo-private-incremental-bench-json-v1",
     ];
+    let cargo_json = matches!(
+        request["program"].as_str(),
+        Some("/__rabs/toolchain/bin/cargo" | "/__rabs/toolchain/bin/cargo-clippy")
+    ) && artifacts["cargo"]
+        .as_str()
+        .is_some_and(|format| cargo_formats.contains(&format));
+    let nextest = artifacts["cargo"].is_object()
+        && rabs_sandbox::cargo_artifacts::requested(&request)?
+            .is_some_and(rabs_sandbox::cargo_artifacts::CargoArtifactMode::is_nextest);
     require(
-        matches!(
-            request["program"].as_str(),
-            Some("/__rabs/toolchain/bin/cargo" | "/__rabs/toolchain/bin/cargo-clippy")
-        ) && request["source_manifest"].is_object()
+        (cargo_json || nextest)
+            && request["source_manifest"].is_object()
             && request.get("dependency_context").is_none()
             && artifacts.is_object()
             && artifacts["unit"] == "cargo"
-            && artifacts["tree"] == "tree-files-v1"
-            && artifacts["cargo"]
-                .as_str()
-                .is_some_and(|format| cargo_formats.contains(&format)),
+            && artifacts["tree"] == "tree-files-v1",
         "prepared request is not a canonical Cargo operation",
     )?;
     let state_fd = open_directory(&state)?;

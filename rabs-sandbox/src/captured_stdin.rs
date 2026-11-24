@@ -55,7 +55,7 @@ pub fn selected_path(request: &Value) -> io::Result<Option<&str>> {
     require(
         crate::cargo_artifacts::requested(request)?
             .is_some_and(crate::cargo_artifacts::CargoArtifactMode::is_execution),
-        "captured stdin requires an executing Cargo run, test or bench contract",
+        "captured stdin requires an executing Cargo run, test, nextest or bench contract",
     )?;
     Ok(Some(path))
 }
@@ -357,6 +357,51 @@ mod tests {
                 validate_request(&request("run"), Some(&manifest)).is_ok(),
                 accepted
             );
+        }
+    }
+
+    #[test]
+    fn nextest_stdin_requires_executing_exact_contract_and_sealed_source_bytes() {
+        use crate::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+        use crate::cargo_check::CompilationSelection;
+
+        let bytes = b"\0nextest input\xff\n";
+        let (_parent, source, expected) = sealed(bytes);
+        for no_run in [false, true] {
+            let contract = NextestTree::new(
+                "Cargo.toml".into(),
+                CompilationSelection {
+                    no_run,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+            let request = json!({
+                "program":PROGRAM, "args":contract.arguments().unwrap(), "jobserver_grant":1,
+                "command_context":{"version":"env-cwd-v1","cwd":"/__rabs/workspace",
+                    "env":{"CARGO":"/__rabs/toolchain/bin/cargo","RUSTC":"/__rabs/toolchain/bin/rustc","CARGO_INCREMENTAL":"0"}},
+                "artifacts":{"unit":"cargo","tree":"tree-files-v1","files":[],"cargo":contract},
+                "captured_stdin":{"version":CAPTURED_STDIN_VERSION,"path":"inputs/request.bin"},
+            });
+            let selected = validate_request(&request, Some(source.manifest()));
+            if no_run {
+                assert!(
+                    selected.is_err(),
+                    "compile-only nextest cannot consume execution input"
+                );
+            } else {
+                assert_eq!(selected.unwrap(), Some(expected.clone()));
+                let captured = CapturedStdin::capture(&source, &expected, &|| false).unwrap();
+                let mut actual = Vec::new();
+                captured
+                    .file
+                    .try_clone()
+                    .unwrap()
+                    .read_to_end(&mut actual)
+                    .unwrap();
+                assert_eq!(actual, bytes);
+            }
         }
     }
 

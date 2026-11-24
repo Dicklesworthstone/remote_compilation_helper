@@ -333,6 +333,16 @@ impl PreparedArtifacts {
                 "Cargo artifact capture interrupted or has dependency-only inputs",
             ));
         }
+        if mode.is_nextest() {
+            // Nextest's own report format is not Cargo artifact JSON. The
+            // versioned contract promises the complete, settled target tree;
+            // native execution status was checked before entering capture.
+            let mut resolved = self.plan.clone();
+            resolved.cargo = None;
+            let mut captured = self.capture_tree(&resolved, stopped)?;
+            captured.plan = self.plan.clone();
+            return Ok(captured);
+        }
         let report = CargoArtifactReport::read(stdout, output_root, mode)?;
         if report
             .files()
@@ -1884,6 +1894,69 @@ mod tests {
         invalid = request;
         invalid["artifacts"]["cargo"] = serde_json::json!("cargo-json-v2");
         assert!(parse_plan(&invalid).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nextest_capture_uses_complete_tree_custody_and_never_interprets_runner_output() {
+        use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+        use rabs_sandbox::cargo_check::CompilationSelection;
+
+        for no_run in [false, true] {
+            let contract = NextestTree::new(
+                "Cargo.toml".into(),
+                CompilationSelection {
+                    no_run,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+            let request = serde_json::json!({
+                "program":PROGRAM,"args":contract.arguments().unwrap(),"jobserver_grant":1,
+                "command_context":{"version":"env-cwd-v1","cwd":"/__rabs/workspace",
+                    "env":{"CARGO":"/__rabs/toolchain/bin/cargo","RUSTC":"/__rabs/toolchain/bin/rustc","CARGO_INCREMENTAL":"0"}},
+                "artifacts":{"unit":"cargo","tree":TREE_FILES_VERSION,"files":[],"cargo":contract},
+            });
+            let plan = parse_plan(&request).unwrap().unwrap();
+            assert!(plan.cargo.unwrap().is_nextest());
+            assert_eq!(plan.cargo.unwrap().is_execution(), !no_run);
+            // Deliberately resembles Cargo JSON followed by non-UTF-8 runner
+            // output. Neither can announce, suppress or redirect target files.
+            let stdout = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/fake\"]}\n\0\xffopaque test output";
+            for case in 0..4 {
+                let prepared = PreparedArtifacts::new(plan.clone()).unwrap();
+                fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();
+                if case != 1 {
+                    fs::write(
+                        prepared.backing().join("debug/deps/test-app"),
+                        b"test executable",
+                    )
+                    .unwrap();
+                    fs::write(
+                        prepared.backing().join("debug/runner-metadata"),
+                        b"complete target tree",
+                    )
+                    .unwrap();
+                }
+                if case == 2 {
+                    std::os::unix::fs::symlink(
+                        "/outside/secret",
+                        prepared.backing().join("debug/unsafe"),
+                    )
+                    .unwrap();
+                }
+                let captured = prepared.capture_with_cargo_output(None, stdout, || case == 3);
+                if case == 0 {
+                    let captured = captured.unwrap();
+                    assert_eq!(captured.manifest()["files"].as_array().unwrap().len(), 2);
+                    assert!(captured.file_identity("debug/deps/test-app").is_some());
+                    assert!(captured.file_identity("debug/runner-metadata").is_some());
+                } else {
+                    assert!(captured.is_err(), "case {case}");
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

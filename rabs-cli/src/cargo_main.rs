@@ -29,8 +29,8 @@ Options:
   --remote PROFILE       Captured inputs and verified results over pinned TLS
   --worker PROFILE       Direct worker or daemon-owned pool through a canonical-cargo-v1 profile
   --rabsd EXECUTABLE     Explicit native driver (otherwise CARGO_RABS_DAEMON or sibling rabsd)
-  --stdin closed|inherit  Supply EOF, or inherit nonterminal input for direct local run/test/bench
-  --stdin-file RELATIVE  Capture one source-root-relative input file for run/test/bench execution
+  --stdin closed|inherit  Supply EOF, or inherit nonterminal input for direct local runtime commands
+  --stdin-file RELATIVE  Capture source-relative input for run/test/nextest/bench execution
   -h, --help             Print help without starting any operation
   --version              Print version
 
@@ -58,10 +58,12 @@ Literal program/test/lint arguments follow its -- separator. Manifest, jobs,
 environment and physical roots remain explicit profile settings. With no
 command, retain the profile's command and selection. An explicit command
 replaces both, including an empty selection for ordinary Cargo defaults.
-Nextest requires captured bin/cargo-nextest and a local or remote profile.
+Nextest requires captured bin/cargo-nextest. Direct workers use nextest-tree-v1
+to deliver the complete target tree; private incremental projection is refused.
 --cargo-profile selects compilation; --profile selects the nextest runner.
-Nextest --test-threads/--jobs/-j selects test concurrency; the profile's jobs
-controls compilation independently. Test bodies run on every invocation.
+Nextest --test-threads/--jobs/-j selects test concurrency. Local/remote profile jobs
+and worker profile jobserver_grant control compilation independently. Test bodies
+run on every invocation.
 
 Worker profiles require an explicit command and retain the existing direct-worker
 contract: one pinned TLS endpoint, or an ordered worker pool with daemon_socket.
@@ -69,7 +71,7 @@ The native driver captures inputs, allocates the request identity, executes once
 and returns verified artifacts. A private cargo-ID operation retains spec.json,
 operation.json and an optional pool.json for rabs-recover. Worker stdin defaults
 to EOF. --stdin-file selects a captured source-relative regular file of at most
-16 MiB for run, executing test or bench; inherited stdin remains unavailable.
+16 MiB for run, executing test, nextest or bench; inherited stdin remains unavailable.
 The worker must support source-file-stdin-v1. Profiles may select incremental
 state, jobserver_grant and live_stderr. TLS credentials remain in the
 local driver environment.

@@ -1141,11 +1141,25 @@ fn execute_canonical_inner(
         execution.refuse_unstarted();
         return exec_error(request.request_id);
     }
-    let grant = request
-        .jobserver_grant
-        .unwrap_or(resources.slots)
-        .min(resources.slots)
-        .max(1);
+    let grant = if request.program == rabs_sandbox::cargo_artifacts::nextest::PROGRAM {
+        match rabs_sandbox::cargo_artifacts::nextest::worker_build_grant(
+            request.jobserver_grant,
+            resources.slots,
+        ) {
+            Ok(grant) => grant,
+            Err(error) => {
+                execution.refuse_unstarted();
+                let _ = control.retain_outputs(Err(error.to_string()));
+                return exec_error(request.request_id);
+            }
+        }
+    } else {
+        request
+            .jobserver_grant
+            .unwrap_or(resources.slots)
+            .min(resources.slots)
+            .max(1)
+    };
     if let Some(budget) = resources.host_budget
         && grant > budget.capacity()
     {

@@ -158,15 +158,6 @@ pub(crate) fn parse(arguments: &[OsString]) -> io::Result<Invocation> {
     if mode == Mode::Worker && selected.is_none() {
         return Err(invalid("worker profiles require an explicit Cargo command"));
     }
-    if mode == Mode::Worker
-        && selected
-            .as_ref()
-            .is_some_and(|(command, _)| *command == CompilationCommand::Nextest)
-    {
-        return Err(invalid(
-            "nextest requires a local or remote canonical profile; worker artifact delivery does not support nextest",
-        ));
-    }
     Ok(Invocation::Run(Box::new(Options {
         mode,
         profile,
@@ -444,9 +435,8 @@ mod tests {
     }
 
     #[test]
-    fn nextest_refuses_unimplemented_routes_and_ambiguous_controls() {
+    fn nextest_refuses_unimplemented_commands_and_ambiguous_controls() {
         for arguments in [
-            vec!["--worker", "p", "nextest", "run"],
             vec!["--local", "p", "nextest"],
             vec!["--local", "p", "nextest", "list"],
             vec!["--local", "p", "nextest", "run", "--doc"],
@@ -478,7 +468,7 @@ mod tests {
         ] {
             assert!(parse_strings(&arguments).is_err(), "{arguments:?}");
         }
-        for mode in ["--local", "--remote"] {
+        for mode in ["--local", "--remote", "--worker"] {
             let Invocation::Run(options) = parse_strings(&[mode, "p", "nextest", "run"]).unwrap()
             else {
                 panic!("expected invocation");

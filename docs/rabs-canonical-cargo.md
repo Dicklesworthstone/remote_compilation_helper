@@ -122,11 +122,10 @@ and the shared remote coordinator.
 | `--local` | `canonical-compile-local-v1` | Local canonical driver or its selected service |
 | `--remote` | `canonical-compile-remote-v1` | Shared pinned-TLS coordinator |
 
-The canonical modes expose `build`, `check`, `clippy`, `doc`, `test`, `run`, and
-`bench`. Local and remote canonical profiles also support `nextest run`, as
-described below. The local and shared-coordinator modes support explicitly closed or
-captured file input for executing `run`/`test`/`bench`. Worker execution uses
-closed stdin.
+The canonical modes expose `build`, `check`, `clippy`, `doc`, `test`, `run`,
+`bench`, and `nextest run`, as described below. Local, shared-coordinator and
+worker modes support explicitly closed or captured file input for executing
+`run`/`test`/`nextest`/`bench`. Worker execution defaults to closed stdin.
 
 Build it from the same checkout as the native driver:
 
@@ -161,14 +160,15 @@ command contract.
 
 ### Run nextest with captured inputs
 
-`rabs-cargo --local` and `--remote` accept `nextest run`. The captured toolchain
-must contain an ordinary executable `bin/cargo-nextest` alongside `bin/cargo`
+`rabs-cargo --local`, `--remote`, and `--worker` accept `nextest run`. The captured
+toolchain must contain an ordinary executable `bin/cargo-nextest` alongside `bin/cargo`
 and `bin/rustc`. The runner is included in the toolchain identity and is never
 discovered through the ambient `PATH`. A local profile's persistent service and
 the pinned remote canonical coordinator use the same execution path.
 
 ```sh
 rabs-cargo --local LOCAL.json -- nextest run --workspace
+rabs-cargo --worker WORKER.json -- nextest run --workspace --test-threads 1
 rabs-cargo --remote REMOTE.json -- nextest run -p core \
   --cargo-profile release --profile ci --test-threads 1 \
   -E 'test(roundtrip)' -- --exact
@@ -186,9 +186,13 @@ Compilation and runner options remain distinct:
 | One optional test-name filter | Positional filter | `test_filter` |
 | Emulated test-harness arguments | Arguments after `--` | `test_args` |
 
-The profile's `jobs` supplies nextest's independent `--build-jobs`; it is never
-passed as nextest's `--jobs`, which controls test concurrency. Omitting
-`test_threads` preserves nextest's project configuration, including serial test
+Local and remote profiles supply nextest's `--build-jobs` from `jobs`. Worker
+profiles use `jobserver_grant`, defaulting to one, and retain that exact grant
+in both the execution request and runner contract. A worker with insufficient
+configured capacity refuses before starting the runner, preserving the exact
+relationship between `--build-jobs` and its reserved grant. Nextest's `--jobs` and
+`-j` control test concurrency. Omitting `test_threads` preserves nextest's project
+configuration, including serial test
 profiles. Explicit thread counts are bounded positive integers from 1 to 4096.
 Package, feature and target-kind selectors retain the shared canonical command
 bounds; nextest accepts at most one built-in compilation target. Doctests are
@@ -206,15 +210,28 @@ Tests, setup scripts and test-pass results receive no action-cache authority;
 the existing isolated dependency-compilation boundary still applies. The
 complete captured source and toolchain, including nextest itself, remain part
 of private target identity. `--no-run` compiles without running test bodies and
-delivers the completed target tree. Nextest defaults to closed stdin; executing
-tests may use the existing captured-input policy. Compilation-only requests
-cannot inherit or capture stdin.
+delivers the completed target tree. Nextest defaults to closed stdin; an executing
+runner may receive an existing captured input file. This supplies input to the
+runner, without changing its handling of child processes: ordinary nextest test
+processes receive null stdin, as documented in nextest's
+[execution-mode comparison](https://nexte.st/docs/integrations/debuggers-tracers/).
+Compilation-only requests cannot inherit or capture stdin.
 
-The direct `--worker` frontend rejects nextest before preparing an operation:
-its separate Cargo JSON artifact-delivery contract does not yet support this
-runner. Use `--local` or `--remote`. `nextest list`, arbitrary configuration
-overrides, user-selected manifests/output roots and machine-output overrides
-are outside this bounded frontend.
+Worker execution uses the versioned `nextest-tree-v1` object under
+`artifacts.cargo`. It retains the shared selection, relative manifest and build
+job count, and validates the exact runner argv and canonical compiler/environment
+controls before admission. Native exit status decides success; stdout and stderr
+remain opaque diagnostics. After the process group drains, successful execution
+captures the complete bounded regular-file target tree and uses the existing
+manifest, digest and destination-custody checks for delivery. Older endpoints
+reject the unfamiliar contract before execution. `rabs-recover` resumes the same
+retained operation and result without running the tests again.
+
+Worker nextest refuses `incremental: true` until a private incremental output
+projection is qualified for this runner. Its complete-tree contract grants no
+test-result cache authority. `nextest list`, arbitrary configuration overrides,
+user-selected manifests/output roots and machine-output overrides are outside
+this bounded frontend.
 
 ### Input and toolchain selection
 
@@ -223,12 +240,14 @@ file within the approved `source_root`; the native driver captures it with the
 source and delivers the captured bytes to the executing program or test harness.
 A stdin override replaces either saved stdin policy. Remote operations and local
 service submissions require explicit closed or captured file input for `run`
-and executing `bench`; `test` defaults to EOF and also accepts captured input.
-`--stdin inherit` is available for direct local `run`, executing `test`, and
-executing `bench`, subject to the driver's noninteractive-input rules.
+and executing `bench`; `test` and `nextest` default to EOF and also accept captured
+input. `--stdin inherit` is available for direct local `run`, executing `test`,
+`nextest`, and `bench`, subject to the driver's noninteractive-input rules.
 `--worker` defaults to EOF and also accepts `--stdin-file` for `run`, executing
-`test`, and executing `bench`, with a **16 MiB** input limit. This works with a
-direct worker, a daemon-owned worker, or an ordered worker pool. The file must be
+`test`, `nextest`, and `bench`, with a **16 MiB** input limit. Nextest receives
+input at the runner boundary described above. All `--no-run` selections refuse
+captured input. This works with a direct worker, a daemon-owned worker, or an
+ordered worker pool. The file must be
 an ordinary, nonsymlink member of the approved `source_root`; paths are relative
 to that root even when the Cargo manifest is in a subdirectory. The worker
 receives the exact snapshot bytes through an immutable descriptor, including
@@ -1261,7 +1280,8 @@ in the captured toolchain or admitted worker environment; selecting a triple doe
 not install a cross-compiler. Cargo remains responsible for package/feature
 resolution and may reject an otherwise syntactically supported request.
 
-The profile owns `--manifest-path`, `--target-dir` and `--message-format=json`.
+The profile owns `--manifest-path`, `--target-dir` and the Cargo JSON contracts'
+`--message-format=json`. Nextest keeps its native diagnostic format.
 Target JSON, `--config`, unstable Cargo flags,
 test-harness arguments on compilation-only commands, arguments other than the
 supported lint controls after Clippy's delimiter, and unknown Cargo options
@@ -1274,6 +1294,7 @@ Cargo is always locked/offline, without duplicating supplied flags.
 
 The worker receives its existing clear-environment canonical base, with
 `CARGO_INCREMENTAL=0` by default or `1` for the explicit incremental opt-in.
+Worker nextest requires `CARGO_INCREMENTAL=0` and rejects that opt-in.
 **Ambient dispatcher RUSTFLAGS, Cargo configuration,
 custom wrappers and other environment values are not copied into the worker
 command.** The supported captured project configuration described above still
@@ -1281,16 +1302,18 @@ applies. This is an explicitly selected canonical build profile, not transparent
 preservation of the dispatcher's execution environment. TLS credentials remain
 local to the transport process. The worker retains ownership of its jobserver;
 this frontend does not send the dispatcher's descriptor numbers to another host.
-Tests, programs and benchmarks execute with closed stdin under the same isolated
-network and read-only source namespace as
+Tests, programs, nextest and benchmarks execute with closed stdin or their
+explicit captured file under the same isolated network and read-only source namespace as
 the build; their writes must use admitted output/home/temporary paths. The
 profile does not claim equivalence to programs relying on the dispatcher's network,
 credentials, mutable checkout or other ambient state.
 
 The optional profile field `jobserver_grant` requests an integer from 1 to 4096
 worker execution slots. It becomes native request intent; the launcher does not
-inject `NUM_JOBS`, `--jobs` or dispatcher jobserver handles. When a worker uses a
-shared host budget, choose a grant no larger than that budget. For example, a
+inject `NUM_JOBS`, Cargo `--jobs` or dispatcher jobserver handles. For nextest,
+the same grant, defaulting to one, supplies the exact `--build-jobs` argument;
+workers refuse a grant exceeding their configured execution capacity. When a
+worker uses a shared host budget, choose a grant no larger than that budget. For example, a
 host with eight shared slots can admit four Cargo roots requesting two slots
 each. Each root owns its implicit slot and receives at most one transferable
 jobserver token. The worker keeps that grant through process-group cleanup.
@@ -1305,14 +1328,17 @@ The explicit `artifacts.cargo` contract augments `tree-files-v1`:
 | Test | `cargo-test-json-v1` | `cargo-private-incremental-test-json-v1` |
 | Run | `cargo-run-json-v1` | `cargo-private-incremental-run-json-v1` |
 | Bench | `cargo-bench-json-v1` | `cargo-private-incremental-bench-json-v1` |
+| Nextest run or `--no-run` | `nextest-tree-v1` object | Unavailable; `incremental: true` refuses |
 
-The launcher selects the private column for `incremental: true`. Each contract
-requires matching native support; older endpoints refuse an unknown contract
+The launcher selects the private column for supported commands with
+`incremental: true`. Each contract requires matching native support; older
+endpoints refuse an unknown contract
 before execution. The contract must match the actual Cargo command and its
 execution or `--no-run` mode.
 The launcher's `files` minimum is empty because it does not guess
-hashed library, metadata, executable or target-triple paths. After Cargo exits
-successfully and its writers have drained, the worker requires a complete
+hashed library, metadata, executable or target-triple paths. For the Cargo JSON
+contracts, after Cargo exits successfully and its writers have drained, the
+worker requires a complete
 `compiler-artifact` / `build-finished` report with at least one ordinary target.
 For test, run and bench execution, `build-finished` ends only Cargo's compilation report. Later
 stdout belongs to the programs and is retained byte-for-byte, including
@@ -1322,6 +1348,15 @@ make the complete operation successful.** A passing compilation followed by a
 program failure retains the failure and diagnostics without offering successful
 artifacts. Run requires exactly one reported non-build-script executable; bench
 requires at least one. There is no cached runtime outcome or inferred test-pass count.
+
+Nextest uses its own native exit status and opaque stdout/stderr, including
+JSON-shaped and binary bytes. Its `nextest-tree-v1` object binds the shared
+selection, manifest and exact build-job grant to the actual execution request.
+After successful exit and process-group drain, the worker captures the complete
+bounded regular-file target tree, including files absent from runner output.
+An empty output manifest refuses success. A failing nextest run retains its
+actual status and diagnostics without offering successful artifacts. Neither
+the runner's transcript nor this artifact contract authorizes cached test results.
 
 Every reported output must exist beneath `/__rabs/out/cargo`, and each reported
 executable must retain executable mode. The ordinary contracts capture the entire
@@ -1336,15 +1371,18 @@ Reported compiler outputs cannot be hidden by this projection. The worker's
 retained seed includes the complete state, and the full-tree integrity and size
 checks apply before projection, including to the files that remain private.
 Incidental files such as `.rustc_info.json`, or a success marker alone, cannot
-satisfy the contract.
+satisfy a Cargo JSON contract's required compilation report.
 
-The coordinator independently checks the hash-verified report against the artifact
-manifest before acknowledging delivery, then verifies every delivered file using
-the existing protocol. Offline recovery repeats the report check after verifying
-the retained bytes and modes. Missing outputs, truncated reports, failed builds
-and malformed output paths refuse success. Old worker/driver versions reject the
-new declaration; install matching binaries. Cargo's report supplies output names,
-never cache authority or permission to skip a compiler.
+For Cargo JSON contracts, the coordinator independently checks the hash-verified
+report against the artifact manifest before acknowledging delivery. Nextest keeps
+its transcript opaque. Every contract verifies the complete nonempty manifest,
+individual file bytes and executable modes, and destination custody through the
+existing protocol. Offline recovery repeats the applicable checks on the retained
+bytes. Diagnostic capture and delivery remain bounded, with exact length and
+digest verification. Missing outputs, truncated required reports, failed builds
+and malformed output paths refuse success. Old worker/driver versions reject an
+unknown declaration; install matching binaries. Cargo's report supplies output
+names, never cache authority or permission to skip a compiler.
 
 Before handing off, the launcher prints the retained operation directory to
 stderr. `spec.json` is preparation intent, not an input or result digest.
@@ -1353,9 +1391,10 @@ execution receipt. Source/toolchain capture and verified delivery stay with
 `rabsd`; the launcher does not parse a success-looking stdout line into authority.
 
 The canonical launcher selects native `--replay-diagnostics`. **stdout contains
-the exact verified Cargo/program stdout**, and the matching stderr bytes are replayed
-to stderr. Execution therefore produces Cargo JSON followed by ordinary
-program output; stdout is not promised to be a pure JSON stream. The native
+the exact verified Cargo/program/runner stdout**, and the matching stderr bytes
+are replayed to stderr. Cargo execution produces Cargo JSON followed by ordinary
+program output; nextest retains its native runner output. Stdout is not promised
+to be a pure JSON stream. The native
 worker-build result report and launcher operation-location message go to stderr.
 Replay happens after complete verified delivery, including on compiler/program
 failure; this is not live output streaming. Both streams are verified and
@@ -2587,9 +2626,11 @@ capture or coordinator startup because the managed Cargo process group does not
 own terminal foreground control. Redirect input, use `</dev/null`, or deliver a
 binary with `build` and run it outside this profile when it needs an interactive
 terminal. `bench --no-run` does not consume stdin or require this redirection.
-Check, Build, Clippy and Doc retain closed stdin. Test also defaults to closed
-stdin, but an executing Test can explicitly inherit nonterminal input or use a
-captured file as described below. The source workspace and HOME remain read-only,
+Check, Build, Clippy and Doc retain closed stdin. Test and Nextest also default
+to closed stdin, but an executing command can explicitly inherit nonterminal
+input or use a captured file as described below. Nextest controls its child test
+processes' stdin, as explained in [Run nextest with captured inputs](#run-nextest-with-captured-inputs).
+The source workspace and HOME remain read-only,
 temporary and target directories are
 private and writable, and external networking remains unavailable.
 
@@ -2612,8 +2653,9 @@ through both persistent local and pinned-TLS remote canonical services.
 Omitting the field preserves the existing command-specific defaults: Run and
 executing Bench inherit nonterminal input in standalone mode and refuse service
 submission. An explicit `"stdin": "inherit"` also remains standalone-only and
-is available for executing Test as well. Test defaults to EOF; compilation-only
-commands, including `test --no-run` and `bench --no-run`, reject inherited input.
+is available for executing Test and Nextest as well. Test and Nextest default
+to EOF; compilation-only commands, including `test --no-run`, `nextest run --no-run`
+and `bench --no-run`, reject inherited input.
 
 For a native local profile, add `"stdin": "closed"` beside `"command": "run"`
 and submit with `rabsd --canonical-compile-local PROFILE.json`. The same profile
@@ -2651,9 +2693,10 @@ restriction. No live stdin stream is forwarded by the remote protocol.
 #### Run with a captured input file
 
 Native local, shared and remote profiles can instead select
-`"stdin_file": "inputs/request.bin"` for Run, executing Test, or executing Bench. The name is
-relative to the approved `source_root`, independently of the selected manifest's
-directory. For a remote profile, put it in `settings`:
+`"stdin_file": "inputs/request.bin"` for Run, executing Test, Nextest, or Bench.
+For Nextest, this supplies the runner's input; it does not change its child test
+processes' null stdin. The name is relative to the approved `source_root`,
+independently of the selected manifest's directory. For a remote profile, put it in `settings`:
 
 ```json
 {
@@ -2669,8 +2712,8 @@ directory. For a remote profile, put it in `settings`:
 Use `rabsd --canonical-compile-local PROFILE.json` or
 `rabsd --canonical-compile-remote PROFILE.json`; a local profile may also name
 `service_socket`. Omit `stdin` when selecting `stdin_file`: combining the two
-is an error. Check, Build, Clippy, Doc, `test --no-run` and `bench --no-run` do not
-accept this field. Their existing EOF behavior is unchanged.
+is an error. Check, Build, Clippy, Doc, `test --no-run`, `nextest run --no-run`
+and `bench --no-run` do not accept this field. Their existing EOF behavior is unchanged.
 
 For a test harness that reads standard input, select `"command": "test"` and,
 for example, `"selection": {"test": ["parser"], "test_args": ["--nocapture"]}`.
@@ -2699,9 +2742,9 @@ travel through the ordinary verified source upload, including its existing
 whole-file and prefix reuse.
 
 After source sealing, the operation copies this exact member into private
-descriptor custody, verifies its checksum, and gives Cargo one read-only regular
-file at offset zero. Cargo decides which descendants inherit it, as with an
-ordinary redirected Cargo invocation. Planning receives EOF and never consumes
+descriptor custody, verifies its checksum, and gives Cargo or nextest one read-only
+regular file at offset zero. The command decides which descendants inherit it,
+as with its ordinary redirected invocation. Planning receives EOF and never consumes
 the file. File bytes, identity and ownership are checked again before spawn and
 after the process group drains. Client or service stdin is not read. Empty files
 produce EOF, binary data is preserved, and a new admitted command starts from
@@ -2709,7 +2752,7 @@ offset zero even when its compiled targets are fresh.
 
 The original operation retains this input across a connection interruption;
 reattachment cannot reopen a host pathname, rewind the running command or execute
-it again. Test, Run and Bench outcomes remain uncached. The native Cargo/namespace
+it again. Test, Nextest, Run and Bench outcomes remain uncached. The native Cargo/namespace
 fixture `canonical_captured_stdin_run_test_and_bench_execute_current_bytes_locally_and_in_service`
 checks current file contents, client-input isolation and repeated execution on
 a capable host; its presence does not establish native or fleet qualification.
@@ -2931,10 +2974,11 @@ preparation with an independent 120-second cooperative deadline and cancels and
 joins it during shutdown. Images are private to this service lifetime; restart
 captures them again.
 
-The service supports `check`, `build`, `clippy`, `doc`, `test`, `test --no-run` and
-`bench --no-run`. Native profiles also support `run` and executing `bench` with
+The service supports `check`, `build`, `clippy`, `doc`, `test`, `test --no-run`,
+`nextest run`, `nextest run --no-run`, and `bench --no-run`. Native profiles also support `run` and executing `bench` with
 explicit `"stdin": "closed"` or a captured `"stdin_file"`. Executing `test` can
-also select captured input while retaining EOF by default. The service never
+also select captured input while retaining EOF by default; executing nextest
+provides the same input choices at its runner boundary. The service never
 forwards inherited input.
 Profiles retaining inherited stdin refuse before capture. Test, program and
 benchmark bodies still run on each newly admitted operation and retain their
@@ -3354,10 +3398,11 @@ environment contract as the canonical local profile. Defaults are `check`,
 `Cargo.toml`, one job and 1800 seconds. Jobs must fit the service's per-root
 grant. Omitting `selection` for Check retains its library-only default; an
 explicit empty selection uses Cargo's ordinary default members and targets.
-The remote service accepts Check, Build, Clippy, Doc, Test and benchmark
+The remote service accepts Check, Build, Clippy, Doc, Test, Nextest, and benchmark
 compilation with `"no_run": true`. Native settings also admit Run and executing
 Bench with explicit `"stdin": "closed"` or a captured `"stdin_file"`; executing
-Test also accepts captured input and otherwise defaults to EOF. Any inherited
+Test and Nextest also accept captured input and otherwise default to EOF.
+Nextest controls input inheritance for its child processes. Any inherited
 stdin remains unsupported even when the client redirects its input: the service
 does not forward that stream. Test, program and benchmark bodies still execute
 for each newly admitted operation and retain their actual exit status.

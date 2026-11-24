@@ -1181,7 +1181,12 @@ fn native_worker_submission_fixture() {
     let value: Value = serde_json::from_slice(&fs::read(specification).unwrap()).unwrap();
     assert_eq!(value["kind"], "canonical-exec");
     assert_eq!(value["request_id"], "allocate");
-    if value.get("captured_stdin").is_some() {
+    if value["program"] == "/__rabs/toolchain/bin/cargo-nextest" {
+        assert_eq!(
+            rabs_sandbox::cargo_artifacts::requested(&value).unwrap(),
+            Some(rabs_sandbox::cargo_artifacts::CargoArtifactMode::NextestExecution),
+        );
+    } else if value.get("captured_stdin").is_some() {
         assert_eq!(value["artifacts"]["cargo"], "cargo-run-json-v1");
         assert_eq!(
             value["captured_stdin"],
@@ -1218,7 +1223,7 @@ fn native_worker_submission_records_feed_native_recovery_without_resubmission() 
         ("daemon", true),
         ("pool", true),
     ] {
-        worker_submission_recovers(placement, captured_input, false);
+        worker_submission_recovers(placement, captured_input, false, false);
     }
 }
 
@@ -1226,16 +1231,27 @@ fn native_worker_submission_records_feed_native_recovery_without_resubmission() 
 fn native_worker_captured_stdin_direct_submission_recovers_without_resubmission() {
     // The direct route requires no Unix listener, allowing real frontend and
     // recovery processes to run on hosts that prohibit socket creation.
-    worker_submission_recovers("direct", true, false);
+    worker_submission_recovers("direct", true, false, false);
 }
 
 #[test]
 fn native_direct_live_stderr_submission_preserves_recovery_without_resubmission() {
-    worker_submission_recovers("direct", false, true);
-    worker_submission_recovers("direct", true, true);
+    worker_submission_recovers("direct", false, true, false);
+    worker_submission_recovers("direct", true, true, false);
 }
 
-fn worker_submission_recovers(placement: &str, captured_input: bool, direct_live: bool) {
+#[test]
+fn native_worker_nextest_submission_recovers_without_reexecution_or_original_inputs() {
+    worker_submission_recovers("direct", false, false, true);
+    worker_submission_recovers("direct", true, true, true);
+}
+
+fn worker_submission_recovers(
+    placement: &str,
+    captured_input: bool,
+    direct_live: bool,
+    nextest: bool,
+) {
     let root = tempfile::Builder::new()
         .prefix("rwrec-")
         .tempdir()
@@ -1249,7 +1265,7 @@ fn worker_submission_recovers(placement: &str, captured_input: bool, direct_live
         private_directory(path);
     }
     private_directory(&toolchain.join("bin"));
-    for name in ["cargo", "rustc"] {
+    for name in ["cargo", "rustc", "cargo-nextest"] {
         new_file(
             &toolchain.join("bin").join(name),
             b"unused compiler fixture",
@@ -1306,16 +1322,24 @@ fn worker_submission_recovers(placement: &str, captured_input: bool, direct_live
     let profile_path = root.join("profile.json");
     new_file(&profile_path, &serde_json::to_vec(&profile).unwrap(), 0o600);
     let submission_report = root.join("submission-report.json");
+    let mut cargo_arguments = if captured_input {
+        vec!["--stdin-file", "input.bin", "--"]
+    } else {
+        vec!["--"]
+    };
+    cargo_arguments.extend(if nextest {
+        vec!["nextest", "run", "--profile", "ci", "--test-threads", "1"]
+    } else if captured_input {
+        vec!["run"]
+    } else {
+        vec!["build", "--workspace"]
+    });
     let output = Command::new(env!("CARGO_BIN_EXE_rabs-cargo"))
         .arg("--worker")
         .arg(&profile_path)
         .arg("--rabsd")
         .arg(&submitter)
-        .args(if captured_input {
-            vec!["--stdin-file", "input.bin", "--", "run"]
-        } else {
-            vec!["--", "build", "--workspace"]
-        })
+        .args(cargo_arguments)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("RABS_SUBMISSION_RECOVERY_REPORT", &submission_report)
@@ -1373,9 +1397,22 @@ fn worker_submission_recovers(placement: &str, captured_input: bool, direct_live
             "program":"/__rabs/toolchain/bin/cargo", "source_manifest":{},
             "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "cargo":"cargo-json-v1"},
         });
+        if nextest {
+            for field in [
+                "program",
+                "args",
+                "jobserver_grant",
+                "command_context",
+                "artifacts",
+            ] {
+                request[field] = specification[field].clone();
+            }
+        }
         if captured_input {
             request["captured_stdin"] = specification["captured_stdin"].clone();
-            request["artifacts"]["cargo"] = "cargo-run-json-v1".into();
+            if !nextest {
+                request["artifacts"]["cargo"] = "cargo-run-json-v1".into();
+            }
         }
         private_directory(&operation.join("bundle"));
         new_file(

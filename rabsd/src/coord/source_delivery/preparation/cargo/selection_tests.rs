@@ -213,6 +213,70 @@ fn selected_native_nextest_plans_only_its_cargo_build_selection() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn selected_worker_nextest_reuses_shared_build_selection_and_requires_exact_contract() {
+    use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+
+    let contract = NextestTree::new(
+        "Cargo.toml".into(),
+        CompilationSelection {
+            workspace: true,
+            features: vec!["feature-a".into()],
+            profile: Some("release".into()),
+            runner_profile: Some("ci".into()),
+            test_threads: Some(1),
+            filtersets: vec!["package(core)".into()],
+            test_filter: Some("roundtrip".into()),
+            test_args: vec!["--exact".into()],
+            ..Default::default()
+        },
+        2,
+    )
+    .unwrap();
+    let input = json!({
+        "program":PROGRAM,"args":contract.arguments().unwrap(),"jobserver_grant":2,
+        "command_context":{"version":COMMAND_CONTEXT_VERSION,"cwd":"/__rabs/workspace",
+            "env":{"CARGO":"/__rabs/toolchain/bin/cargo","RUSTC":"/__rabs/toolchain/bin/rustc","CARGO_INCREMENTAL":"0"}},
+        "artifacts":{"unit":"cargo","tree":"tree-files-v1","files":[],"cargo":contract},
+    });
+    let selected =
+        SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).unwrap();
+    assert_eq!(selected.command, CompilationCommand::Nextest);
+    assert_eq!(
+        selected.graph_arguments(&Value::Null, None).unwrap(),
+        [
+            "test",
+            "--workspace",
+            "--no-run",
+            "--features",
+            "feature-a",
+            "--profile",
+            "release",
+            "--jobs",
+            "2",
+        ]
+    );
+    assert!(selected.graph_tail_arguments().unwrap().is_empty());
+    for contract in [
+        json!("cargo-test-json-v1"),
+        json!({"version":"nextest-tree-v2"}),
+        Value::Null,
+    ] {
+        let mut changed = input.clone();
+        changed["artifacts"]["cargo"] = contract;
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err()
+        );
+    }
+    let mut changed = input;
+    changed["artifacts"]["cargo"]["selection"]["test_threads"] = json!(2);
+    assert!(
+        SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn selected_nextest_requires_captured_runner_but_uses_cargo_for_graphs() {
     use std::os::unix::fs::PermissionsExt;
     let input = native_specification(native_profile("nextest", json!({})));

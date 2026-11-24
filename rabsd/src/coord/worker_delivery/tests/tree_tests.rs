@@ -103,6 +103,19 @@ fn cargo_fixture(destination: &Path, report: &[u8]) -> Script {
     peer
 }
 
+fn nextest_request() -> Value {
+    use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+    let mut request = cargo_request();
+    let contract = NextestTree::new("Cargo.toml".into(), Default::default(), 1).unwrap();
+    request["program"] = json!(PROGRAM);
+    request["args"] = json!(contract.arguments().unwrap());
+    request["jobserver_grant"] = json!(contract.build_jobs);
+    request["command_context"] = json!({"version":COMMAND_CONTEXT_VERSION,"cwd":"/__rabs/workspace",
+        "env":{"CARGO":"/__rabs/toolchain/bin/cargo","RUSTC":"/__rabs/toolchain/bin/rustc","CARGO_INCREMENTAL":"0"}});
+    request["artifacts"]["cargo"] = json!(contract);
+    request
+}
+
 fn cargo_runtime_request(command: &str, private_incremental: bool) -> Value {
     let mut request = cargo_request();
     request["args"] = json!([
@@ -424,6 +437,80 @@ fn cargo_runtime_delivery_recovery_preserves_opaque_output_and_native_status() {
             );
         }
     }
+}
+
+#[test]
+fn nextest_delivery_and_recovery_preserve_native_status_raw_output_and_tree_custody() {
+    let request = nextest_request();
+    let stdout = b"{\"reason\":\"build-finished\",\"success\":false}\n\xff\0opaque runner output";
+    for exit_code in [0, 100] {
+        let owner = tempfile::tempdir().unwrap();
+        let destination = owner.path().join("nextest");
+        let mut peer = cargo_fixture(&destination, stdout);
+        if exit_code != 0 {
+            peer.replies[1]["exit_code"] = json!(exit_code);
+            peer.replies[1]["artifact_manifest"] = Value::Null;
+            peer.replies[1]["artifact_ack_required"] = json!(false);
+            peer.replies.truncate(4);
+            peer.replies.push_back(
+                json!({"kind":"output-acknowledged","request_id":7,"already_released":false}),
+            );
+        }
+        let delivery = receive_execution(&mut peer, &request, "worker", &destination).unwrap();
+        assert!(delivery.acknowledgments_confirmed && peer.replies.is_empty());
+        assert_eq!(delivery.receipt["exit_code"], exit_code);
+        assert_eq!(
+            delivery.receipt["artifact_manifest"].is_null(),
+            exit_code != 0
+        );
+        assert_eq!(
+            fs::read(destination.join("diagnostics/stdout")).unwrap(),
+            stdout
+        );
+        let recovered =
+            recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
+                .unwrap()
+                .unwrap();
+        assert_eq!(recovered.receipt, delivery.receipt);
+        assert_eq!(recovered.receipt["publication_authorized"], false);
+        assert_eq!(recovered.receipt["reexecute"], false);
+        assert_eq!(
+            peer.sent
+                .iter()
+                .filter(|frame| frame["kind"] == "canonical-exec")
+                .count(),
+            1
+        );
+        if exit_code == 0 {
+            // Opaque stdout never grants permission to ignore a changed file.
+            fs::write(
+                destination.join("artifacts/deps/f0001"),
+                b"changed artifact",
+            )
+            .unwrap();
+            assert!(
+                recover_existing_delivery(
+                    &request,
+                    "worker",
+                    &destination,
+                    DeliveryTrust::Loopback
+                )
+                .is_err()
+            );
+        } else {
+            assert!(!peer.sent.iter().any(|frame| matches!(
+                frame["kind"].as_str(),
+                Some("artifact-read" | "artifact-ack")
+            )));
+        }
+    }
+    let owner = tempfile::tempdir().unwrap();
+    let destination = owner.path().join("contradictory-nextest-failure");
+    let mut peer = cargo_fixture(&destination, stdout);
+    peer.replies[1]["exit_code"] = json!(100);
+    let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+    assert!(failure.detail.contains("failed-execution artifacts"));
+    assert!(no_ack(&peer));
 }
 
 #[test]

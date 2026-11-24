@@ -66,9 +66,13 @@ impl SelectedCommand {
             }
         };
         let native = preparation == PreparationContext::CanonicalLocal;
+        let worker_nextest = !native
+            && command == CompilationCommand::Nextest
+            && rabs_sandbox::cargo_artifacts::requested(request)?
+                .is_some_and(rabs_sandbox::cargo_artifacts::CargoArtifactMode::is_nextest);
         require(
-            command != CompilationCommand::Nextest || native,
-            "selected nextest requires the canonical driver and its build-job controls",
+            command != CompilationCommand::Nextest || native || worker_nextest,
+            "selected nextest requires the canonical driver or its worker full-tree contract",
         )?;
         require(
             request["program"]
@@ -288,7 +292,7 @@ impl SelectedCommand {
                                 (1..=4096).contains(count) && count.to_string() == value
                             });
                             require(
-                                native
+                                (native || worker_nextest)
                                     && jobs.is_none()
                                     && count.is_some()
                                     && ((option == "--build-jobs")

@@ -11,6 +11,7 @@ use super::{
     string,
 };
 use crate::cargo_cli::{Input, Options};
+use rabs_sandbox::cargo_artifacts::nextest::NextestTree;
 use rabs_sandbox::cargo_check::{CompilationCommand, CompilationSelection, CompilationStdin};
 use rabs_sandbox::process_context::CommandContext;
 use rustix::fs::{Mode as FileMode, OFlags};
@@ -190,10 +191,6 @@ fn selected(options: &Options) -> io::Result<(CompilationCommand, &CompilationSe
         .as_ref()
         .map(|(command, selection)| (*command, selection))
         .ok_or_else(|| invalid("worker profiles require an explicit Cargo command"))?;
-    require(
-        command != CompilationCommand::Nextest,
-        "nextest requires a local or remote canonical profile; worker artifact delivery does not support nextest",
-    )?;
     Ok((command, selection))
 }
 
@@ -222,7 +219,10 @@ fn context(
             "0".into()
         },
     )];
-    if command == CompilationCommand::Clippy {
+    if matches!(
+        command,
+        CompilationCommand::Clippy | CompilationCommand::Nextest
+    ) {
         controls.extend([
             ("CARGO".into(), "/__rabs/toolchain/bin/cargo".into()),
             ("RUSTC".into(), "/__rabs/toolchain/bin/rustc".into()),
@@ -286,10 +286,11 @@ pub(super) fn validate_profile(
                         command,
                         CompilationCommand::Run
                             | CompilationCommand::Test
+                            | CompilationCommand::Nextest
                             | CompilationCommand::Bench
                     )
                     && !selection.no_run,
-                "captured stdin requires an ordinary source-relative file and run, test or bench execution",
+                "captured stdin requires an ordinary source-relative file and run, test, nextest or bench execution",
             )?;
         }
     }
@@ -307,7 +308,8 @@ pub(super) fn validate_profile(
         "worker target must be one supported explicit Linux triple",
     )?;
     require(
-        !selection.no_run
+        command == CompilationCommand::Nextest
+            || !selection.no_run
             || (selection.test_filter.is_none()
                 && !selection.doc
                 && selection.test_args.is_empty()),
@@ -321,6 +323,11 @@ pub(super) fn validate_profile(
             )?;
         }
     }
+    require(
+        command != CompilationCommand::Nextest
+            || profile.get("incremental") != Some(&Value::Bool(true)),
+        "worker nextest delivers its complete target tree and does not support private incremental projection",
+    )?;
     if let Some(grant) = profile.get("jobserver_grant") {
         require(
             grant
@@ -377,6 +384,9 @@ pub(super) fn validate_profile(
         if command == CompilationCommand::Clippy {
             tools.extend(["cargo-clippy", "clippy-driver"]);
         }
+        if command == CompilationCommand::Nextest {
+            tools.push("cargo-nextest");
+        }
         if matches!(command, CompilationCommand::Doc | CompilationCommand::Test) {
             tools.push("rustdoc");
         }
@@ -419,18 +429,36 @@ fn path_text(path: &Path) -> io::Result<&str> {
 
 fn specification(profile: &Map<String, Value>, options: &Options) -> io::Result<Value> {
     let (command, selection) = selected(options)?;
-    let mut args = selection.cargo_arguments(command)?;
-    let canonical_manifest = format!("/__rabs/workspace/{}", manifest(profile)?);
-    args.extend([
-        "--locked".into(),
-        "--offline".into(),
-        "--message-format=json".into(),
-        "--manifest-path".into(),
-        canonical_manifest,
-        "--target-dir".into(),
-        "/__rabs/out/cargo".into(),
-    ]);
-    args.extend(selection.runtime_arguments(command)?);
+    let nextest = (command == CompilationCommand::Nextest)
+        .then(|| {
+            NextestTree::new(
+                manifest(profile)?.to_owned(),
+                selection.clone(),
+                profile
+                    .get("jobserver_grant")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+                    .try_into()
+                    .map_err(|_| invalid("nextest build-job bound exceeds u32"))?,
+            )
+        })
+        .transpose()?;
+    let args = if let Some(contract) = &nextest {
+        contract.arguments()?
+    } else {
+        let mut args = selection.cargo_arguments(command)?;
+        args.extend([
+            "--locked".into(),
+            "--offline".into(),
+            "--message-format=json".into(),
+            "--manifest-path".into(),
+            format!("/__rabs/workspace/{}", manifest(profile)?),
+            "--target-dir".into(),
+            "/__rabs/out/cargo".into(),
+        ]);
+        args.extend(selection.runtime_arguments(command)?);
+        args
+    };
     let context = context(profile, command)?;
     let environment: Map<String, Value> = context
         .environment()
@@ -465,6 +493,8 @@ fn specification(profile: &Map<String, Value>, options: &Options) -> io::Result<
         "kind":"canonical-exec", "request_id":"allocate",
         "program":if command == CompilationCommand::Clippy {
             "/__rabs/toolchain/bin/cargo-clippy"
+        } else if command == CompilationCommand::Nextest {
+            rabs_sandbox::cargo_artifacts::nextest::PROGRAM
         } else {
             "/__rabs/toolchain/bin/cargo"
         },
@@ -474,6 +504,10 @@ fn specification(profile: &Map<String, Value>, options: &Options) -> io::Result<
         "cargo_source":source,
         "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[], "cargo":contract},
     });
+    if let Some(contract) = nextest {
+        spec["jobserver_grant"] = json!(contract.build_jobs);
+        spec["artifacts"]["cargo"] = serde_json::to_value(contract)?;
+    }
     if let Some(grant) = profile.get("jobserver_grant") {
         spec["jobserver_grant"] = grant.clone();
     }
@@ -725,7 +759,14 @@ mod tests {
         }
         let bin = root.join("sdk/bin");
         fs::create_dir(&bin).unwrap();
-        for name in ["cargo", "rustc", "rustdoc", "cargo-clippy", "clippy-driver"] {
+        for name in [
+            "cargo",
+            "rustc",
+            "rustdoc",
+            "cargo-clippy",
+            "clippy-driver",
+            "cargo-nextest",
+        ] {
             let path = bin.join(name);
             fs::write(&path, b"frontend fixture; never executed").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -887,6 +928,85 @@ mod tests {
     }
 
     #[test]
+    fn worker_nextest_captures_shared_selection_and_exact_fresh_execution_contract() {
+        use rabs_sandbox::cargo_artifacts::{CargoArtifactMode, requested};
+
+        let (root, mut profile) = filesystem_profile();
+        set(&mut profile, "jobserver_grant", json!(3));
+        set(
+            &mut profile,
+            "source_selection",
+            json!("cargo-unit-graph-v1"),
+        );
+        let options = options(&[
+            "nextest",
+            "run",
+            "--workspace",
+            "--cargo-profile",
+            "release",
+            "--profile",
+            "ci",
+            "--test-threads",
+            "1",
+            "-E",
+            "test(roundtrip)",
+            "--",
+            "--exact",
+            "--message-format=json",
+        ]);
+        validate_profile(&profile, &options).unwrap();
+        let spec = specification(&profile, &options).unwrap();
+        assert_eq!(spec["program"], "/__rabs/toolchain/bin/cargo-nextest");
+        assert_eq!(spec["jobserver_grant"], 3);
+        assert_eq!(
+            requested(&spec).unwrap(),
+            Some(CargoArtifactMode::NextestExecution)
+        );
+        assert_eq!(spec["artifacts"]["cargo"]["version"], "nextest-tree-v1");
+        assert_eq!(spec["artifacts"]["cargo"]["build_jobs"], 3);
+        let contract: NextestTree =
+            serde_json::from_value(spec["artifacts"]["cargo"].clone()).unwrap();
+        assert_eq!(contract.selection, options.selected.as_ref().unwrap().1);
+        let args = spec["args"].as_array().unwrap();
+        assert_eq!(&args[..2], &[json!("nextest"), json!("run")]);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == [json!("--build-jobs"), json!("3")])
+        );
+        assert_eq!(
+            &args[args.len() - 3..],
+            &[
+                json!("--"),
+                json!("--exact"),
+                json!("--message-format=json")
+            ]
+        );
+        assert!(!args[..args.len() - 3].contains(&json!("--message-format=json")));
+        assert_eq!(spec["cargo_source"]["selection"], "cargo-unit-graph-v1");
+        assert_eq!(spec["command_context"]["env"]["CARGO_INCREMENTAL"], "0");
+
+        profile.remove("jobserver_grant");
+        let default = specification(&profile, &options).unwrap();
+        assert_eq!(default["jobserver_grant"], 1);
+        assert_eq!(default["artifacts"]["cargo"]["build_jobs"], 1);
+        assert_eq!(
+            requested(&default).unwrap(),
+            Some(CargoArtifactMode::NextestExecution)
+        );
+
+        set(&mut profile, "incremental", json!(true));
+        assert!(validate_profile(&profile, &options).is_err());
+        set(&mut profile, "incremental", json!(false));
+        fs::set_permissions(
+            root.join("sdk/bin/cargo-nextest"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(validate_profile(&profile, &options).is_err());
+        assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
+    }
+
+    #[test]
     fn worker_lint_and_documentation_controls_use_captured_companions() {
         let mut profile = profile();
         set(&mut profile, "vendor", json!("vendor"));
@@ -1022,8 +1142,13 @@ mod tests {
         let (root, profile) = filesystem_profile();
         fs::create_dir(root.join("source/inputs")).unwrap();
         fs::write(root.join("source/inputs/request.bin"), b"\0input\xff").unwrap();
-        for command in ["run", "test", "bench"] {
-            let mut options = options(&[command]);
+        for arguments in [
+            vec!["run"],
+            vec!["test"],
+            vec!["bench"],
+            vec!["nextest", "run"],
+        ] {
+            let mut options = options(&arguments);
             let closed = specification(&profile, &options).unwrap();
             options.input = Some(Input::File("inputs/request.bin".into()));
             validate_profile(&profile, &options).unwrap();
@@ -1045,6 +1170,7 @@ mod tests {
             vec!["check"],
             vec!["test", "--no-run"],
             vec!["bench", "--no-run"],
+            vec!["nextest", "run", "--no-run"],
         ] {
             let mut options = options(&arguments);
             options.input = Some(Input::File("inputs/request.bin".into()));
