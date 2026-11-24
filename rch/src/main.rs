@@ -4423,6 +4423,8 @@ async fn handle_admit(
 #[derive(Debug, serde::Serialize)]
 struct CacheWarmWorkerResult {
     worker_id: String,
+    /// Exact destination selected by the worker's transfer pipeline.
+    remote_path: String,
     success: bool,
     bytes_transferred: u64,
     files_transferred: u64,
@@ -4574,6 +4576,53 @@ async fn handle_cache_clean(
         println!("  {} pass --execute to actually delete", style.muted("→"));
     }
     Ok(())
+}
+
+/// Resolve the staging namespace before transport. These explicit staging
+/// operations share the worker override used by isolated remote execution;
+/// ordinary canonical mirrors keep their separate topology.
+fn staging_transfer_config_for_worker(
+    worker: &rch_common::WorkerConfig,
+    configured: &rch_common::TransferConfig,
+) -> Result<rch_common::TransferConfig> {
+    let mut resolved = configured.clone();
+    resolved.remote_base = if transfer::WorkerPlatform::from_worker(worker).is_windows() {
+        anyhow::ensure!(
+            worker.remote_base.is_none(),
+            "worker {} cannot use a POSIX remote_base override with Windows staging",
+            worker.id
+        );
+        transfer::WINDOWS_DEFAULT_REMOTE_BASE.to_owned()
+    } else {
+        let selected = worker
+            .remote_base
+            .as_deref()
+            .unwrap_or(&configured.remote_base);
+        rch_common::types::validate_worker_remote_base(selected, None).map_err(|error| {
+            anyhow::anyhow!("invalid staging root for worker {}: {error}", worker.id)
+        })?
+    };
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn cache_warm_pipeline(
+    project_root: &std::path::Path,
+    project_id: &str,
+    project_hash: &str,
+    configured: &rch_common::TransferConfig,
+    worker: &rch_common::WorkerConfig,
+    pooled_idle_hours: u32,
+) -> Result<transfer::TransferPipeline> {
+    let transfer = staging_transfer_config_for_worker(worker, configured)?;
+    Ok(transfer::TransferPipeline::new(
+        project_root.to_path_buf(),
+        project_id.to_owned(),
+        project_hash.to_owned(),
+        transfer,
+    )
+    .with_worker_platform(transfer::WorkerPlatform::from_worker(worker))
+    .with_pooled_target_prune_idle_hours(pooled_idle_hours))
 }
 
 fn resolve_cache_warm_project_root(
@@ -6560,23 +6609,25 @@ async fn handle_cache_warm(
     let mut succeeded: usize = 0;
     let mut failed: usize = 0;
 
-    for worker in &selected {
-        // Each worker gets its own TransferPipeline so state (env
-        // overrides, color mode, estimated bytes) cannot leak across
-        // warm targets.
-        let pipeline = transfer::TransferPipeline::new(
-            project_root.clone(),
-            project_id.clone(),
-            project_hash.clone(),
-            transfer_config.clone(),
-        )
-        .with_worker_platform(transfer::WorkerPlatform::from_worker(worker))
-        .with_pooled_target_prune_idle_hours(
-            rch_config
-                .remediation
-                .pooled_target
-                .reaper_pooled_idle_hours,
-        );
+    // Validate every selected destination before the first transfer, then keep
+    // each pipeline bound to that worker's exact staging namespace.
+    let pipelines = selected
+        .iter()
+        .map(|worker| {
+            cache_warm_pipeline(
+                &project_root,
+                &project_id,
+                &project_hash,
+                &transfer_config,
+                worker,
+                rch_config.remediation.pooled_target.reaper_pooled_idle_hours,
+            )
+            .map(|pipeline| (worker, pipeline))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for (worker, pipeline) in pipelines {
+        let remote_path = pipeline.remote_path();
         let started = std::time::Instant::now();
         match pipeline.sync_to_remote(worker).await {
             Ok(sync_result) => {
@@ -6586,6 +6637,7 @@ async fn handle_cache_warm(
                 tracing::info!(
                     target: "rch::cache::warm",
                     worker = %worker.id,
+                    remote_path = %remote_path,
                     bytes = sync_result.bytes_transferred,
                     files = sync_result.files_transferred,
                     duration_ms = sync_result.duration_ms,
@@ -6593,9 +6645,10 @@ async fn handle_cache_warm(
                 );
                 if !ctx.is_json() {
                     eprintln!(
-                        "  {} {}: {} bytes, {} files, {}ms",
+                        "  {} {} → {}: {} bytes, {} files, {}ms",
                         style.format_success("✓"),
                         style.highlight(worker.id.as_str()),
+                        style.muted(&remote_path),
                         sync_result.bytes_transferred,
                         sync_result.files_transferred,
                         sync_result.duration_ms,
@@ -6603,6 +6656,7 @@ async fn handle_cache_warm(
                 }
                 results.push(CacheWarmWorkerResult {
                     worker_id: worker.id.to_string(),
+                    remote_path,
                     success: true,
                     bytes_transferred: sync_result.bytes_transferred,
                     files_transferred: u64::from(sync_result.files_transferred),
@@ -6617,20 +6671,23 @@ async fn handle_cache_warm(
                 tracing::warn!(
                     target: "rch::cache::warm",
                     worker = %worker.id,
+                    remote_path = %remote_path,
                     error = %error_msg,
                     duration_ms,
                     "cache.warm.worker.failed",
                 );
                 if !ctx.is_json() {
                     eprintln!(
-                        "  {} {}: {}",
+                        "  {} {} → {}: {}",
                         style.format_error("✗"),
                         style.highlight(worker.id.as_str()),
+                        style.muted(&remote_path),
                         style.error(&error_msg),
                     );
                 }
                 results.push(CacheWarmWorkerResult {
                     worker_id: worker.id.to_string(),
+                    remote_path,
                     success: false,
                     bytes_transferred: 0,
                     files_transferred: 0,
@@ -10691,6 +10748,110 @@ mod tests {
                 "no writable base outside the default topology roots \
                  (/data/projects, /dp); this test cannot express its contract here",
             )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_warm_binds_the_actual_pipeline_to_each_workers_staging_root() {
+        let configured = rch_common::TransferConfig {
+            remote_base: "/var/cache/rch-default".into(),
+            ..Default::default()
+        };
+        for (id, root, expected) in [
+            ("default", None, "/var/cache/rch-default"),
+            ("linux", Some("/mnt/build/rch"), "/mnt/build/rch"),
+            (
+                "darwin",
+                Some("/Volumes/Build Disk/$HOME/'quoted/rch///"),
+                "/Volumes/Build Disk/$HOME/'quoted/rch",
+            ),
+        ] {
+            let worker = rch_common::WorkerConfig {
+                id: rch_common::WorkerId::new(id),
+                remote_base: root.map(str::to_owned),
+                ..Default::default()
+            };
+            let pipeline = cache_warm_pipeline(
+                std::path::Path::new("/data/projects/demo"),
+                "demo-id",
+                "0123456789abcdef",
+                &configured,
+                &worker,
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                pipeline.remote_path(),
+                format!("{expected}/demo-id/0123456789abcdef"),
+                "{id}"
+            );
+        }
+        assert_eq!(configured.remote_base, "/var/cache/rch-default");
+
+        let windows = rch_common::WorkerConfig {
+            tags: vec!["os:windows".into()],
+            ..Default::default()
+        };
+        let pipeline = cache_warm_pipeline(
+            std::path::Path::new("/data/projects/demo"),
+            "demo-id",
+            "0123456789abcdef",
+            &configured,
+            &windows,
+            0,
+        )
+        .unwrap();
+        assert_eq!(pipeline.remote_path(), "C:/rch/demo-id/0123456789abcdef");
+    }
+
+    #[test]
+    fn staging_root_selection_rejects_invalid_selected_storage_before_transport() {
+        for root in [
+            "/",
+            "/tmp",
+            "relative/rch",
+            "~/rch",
+            "/mnt/rch/../outside",
+            "/mnt/build\\rch",
+            "/mnt/build\nrch",
+        ] {
+            let override_worker = rch_common::WorkerConfig {
+                id: rch_common::WorkerId::new("invalid-override"),
+                remote_base: Some(root.into()),
+                ..Default::default()
+            };
+            let error =
+                staging_transfer_config_for_worker(&override_worker, &Default::default())
+                    .unwrap_err();
+            assert!(error.to_string().contains("invalid-override"), "{error}");
+            let configured = rch_common::TransferConfig {
+                remote_base: root.into(),
+                ..Default::default()
+            };
+            assert!(
+                staging_transfer_config_for_worker(&Default::default(), &configured).is_err(),
+                "{root:?}"
+            );
+            let valid_override = rch_common::WorkerConfig {
+                remote_base: Some("/mnt/valid/rch".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                staging_transfer_config_for_worker(&valid_override, &configured)
+                    .unwrap()
+                    .remote_base,
+                "/mnt/valid/rch",
+                "a worker override replaces its unused global fallback"
+            );
+        }
+        let windows_override = rch_common::WorkerConfig {
+            tags: vec!["os:windows".into()],
+            remote_base: Some("/mnt/invalid-for-windows/rch".into()),
+            ..Default::default()
+        };
+        assert!(
+            staging_transfer_config_for_worker(&windows_override, &Default::default()).is_err()
+        );
     }
 
     #[test]

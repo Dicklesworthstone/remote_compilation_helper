@@ -10,9 +10,10 @@
 //!    ([`build_dependency_closure_plan`]). The closure is fail-open: a
 //!    non-Cargo or unresolvable project degrades to invalidating just the
 //!    target root, never an error.
-//! 2. Map every closure root to its RCH-managed worker cache path under the
-//!    configured `transfer.remote_base` (`<remote_base>/<project_id>`), the
-//!    same id the transfer pipeline uses (`project_id_from_path`).
+//! 2. Resolve each selected worker's staging base from its configured override
+//!    or the global transfer fallback. Map every closure root below that base
+//!    using the same project id as the transfer pipeline. Each worker's report
+//!    includes its exact plan; an untargeted preview uses only the default base.
 //! 3. Plan a safety-checked invalidation ([`plan_force_resync`]): every target
 //!    must live strictly under the managed base, never the base itself, never
 //!    an escaping `..` path. Canonical source mirrors (e.g. `/data/projects/x`)
@@ -41,18 +42,12 @@ use crate::ui::context::OutputContext;
 use super::load_workers_from_config;
 use super::send_daemon_command;
 
-/// A refused invalidation surfaced to the agent (cache path escaped the base).
-#[derive(Debug, Clone, Serialize)]
-struct RefusedEntry {
-    local_root: String,
-    worker_cache_path: String,
-    reason: String,
-}
-
 /// Per-worker outcome of a force-resync.
 #[derive(Debug, Clone, Serialize)]
 struct SyncForceWorkerResult {
     worker_id: String,
+    /// Exact staging namespace and paths selected for this worker.
+    plan: ForceResyncPlan,
     reachable: bool,
     /// Applied, partially applied, refused, deferred, or preview.
     outcome: String,
@@ -68,15 +63,15 @@ struct SyncForceWorkerResult {
 #[derive(Debug, Clone, Serialize)]
 struct SyncForceResult {
     project: String,
-    managed_base: String,
     force: bool,
     dry_run: bool,
     /// True only when at least one worker confirmed a completed removal.
     applied: bool,
     closure_roots: Vec<String>,
-    /// RCH-managed cache paths that were (or, in preview, would be) invalidated.
-    planned_invalidations: Vec<String>,
-    refused: Vec<RefusedEntry>,
+    /// A default-root lexical preview when no worker was selected. A selected
+    /// worker always carries its own exact plan instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_plan: Option<ForceResyncPlan>,
     workers: Vec<SyncForceWorkerResult>,
 }
 
@@ -101,9 +96,8 @@ pub async fn sync_force(
     let project_root = project.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
 
-    // 2. Managed base from config (the only root under which we ever delete).
+    // 2. Worker staging overrides resolve against this configured fallback.
     let config = load_config()?;
-    let managed_base = PathBuf::from(config.transfer.remote_base.trim_end_matches('/'));
 
     // 3. Select target workers and validate the request *before* doing any
     //    (potentially expensive) closure resolution.
@@ -130,42 +124,42 @@ pub async fn sync_force(
         anyhow::bail!("force-resync requires an explicit target: pass --worker <id> or --all");
     }
 
-    // 4. Closure roots -> stale roots -> safety-checked plan.
+    // 4. Resolve and validate every selected namespace before the first SSH
+    // operation. A worker override replaces its fallback; it never adds roots.
     let closure_roots = closure_roots_for(&project_root);
-    let stale_roots = stale_roots_for(&closure_roots, &managed_base);
-    let plan = plan_force_resync(&stale_roots, &managed_base);
+    let worker_plans = target_workers
+        .iter()
+        .map(|worker| plan_for_worker(worker, &closure_roots, &config.transfer))
+        .collect::<Result<Vec<_>>>()?;
+    let default_plan = if target_workers.is_empty() {
+        let base = rch_common::types::validate_worker_remote_base(
+            &config.transfer.remote_base,
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let base = PathBuf::from(base);
+        Some(plan_force_resync(&stale_roots_for(&closure_roots, &base), &base))
+    } else {
+        None
+    };
 
-    // 5. Apply (or preview) per worker.
+    // 5. Apply (or preview) each worker's independently resolved plan.
     let mut worker_results = Vec::with_capacity(target_workers.len());
-    for w in &target_workers {
-        worker_results.push(apply_on_worker(w, &plan, &managed_base, is_apply).await);
+    for (worker, plan) in target_workers.iter().zip(worker_plans) {
+        worker_results.push(apply_on_worker(worker, plan, is_apply).await);
     }
 
     // 6. Assemble + render.
     let result = SyncForceResult {
         project: project_root.display().to_string(),
-        managed_base: managed_base.display().to_string(),
         force,
         dry_run,
         applied: worker_results.iter().any(|worker| worker.removed_ok > 0),
         closure_roots: closure_roots
             .iter()
-            .map(|r| r.display().to_string())
+            .map(|root| root.display().to_string())
             .collect(),
-        planned_invalidations: plan
-            .invalidations
-            .iter()
-            .map(|a| a.worker_cache_path.display().to_string())
-            .collect(),
-        refused: plan
-            .refused
-            .iter()
-            .map(|r| RefusedEntry {
-                local_root: r.local_root.display().to_string(),
-                worker_cache_path: r.worker_cache_path.display().to_string(),
-                reason: r.reason.clone(),
-            })
-            .collect(),
+        default_plan,
         workers: worker_results,
     };
 
@@ -191,8 +185,10 @@ pub async fn sync_force(
 fn apply_failed(result: &SyncForceResult) -> bool {
     result.force
         && !result.dry_run
-        && (!result.refused.is_empty()
-            || result.workers.iter().any(|worker| worker.outcome != "applied"))
+        && result
+            .workers
+            .iter()
+            .any(|worker| worker.outcome != "applied" || worker.plan.has_refusals())
 }
 
 /// Resolve the path-dependency closure roots for `project_root`. Fail-open: an
@@ -245,16 +241,26 @@ fn invalidation_receipt(stdout: &str) -> Result<InvalidationReceipt> {
     }
 }
 
+fn plan_for_worker(
+    worker: &WorkerConfig,
+    roots: &[PathBuf],
+    configured: &rch_common::TransferConfig,
+) -> Result<ForceResyncPlan> {
+    let selected = crate::staging_transfer_config_for_worker(worker, configured)?;
+    let base = PathBuf::from(selected.remote_base);
+    Ok(plan_force_resync(&stale_roots_for(roots, &base), &base))
+}
+
 /// Probe + (optionally) apply the invalidation on one worker.
 async fn apply_on_worker(
     worker: &WorkerConfig,
-    plan: &ForceResyncPlan,
-    managed_base: &Path,
+    plan: ForceResyncPlan,
     is_apply: bool,
 ) -> SyncForceWorkerResult {
     if is_apply && crate::transfer::WorkerPlatform::from_worker(worker).is_windows() {
         return SyncForceWorkerResult {
             worker_id: worker.id.0.clone(),
+            plan,
             reachable: false,
             outcome: "refused".into(),
             removed_ok: 0,
@@ -275,7 +281,8 @@ async fn apply_on_worker(
             Ok(out) => out.success(),
             Err(_) => false,
         };
-    let report = apply_force_resync(plan, reachable);
+    let managed_base = &plan.managed_base;
+    let report = apply_force_resync(&plan, reachable);
     let mut removed_ok = 0usize;
     let mut already_absent = 0usize;
     let mut remove_failures = Vec::new();
@@ -343,6 +350,7 @@ async fn apply_on_worker(
 
     SyncForceWorkerResult {
         worker_id: worker.id.0.clone(),
+        plan,
         reachable,
         outcome: outcome.to_string(),
         removed_ok,
@@ -381,38 +389,52 @@ fn render_human(result: &SyncForceResult, ctx: &OutputContext) {
         style.key("project:"),
         style.value(&result.project)
     );
-    println!(
-        "  {} {}",
-        style.key("managed base:"),
-        style.value(&result.managed_base)
-    );
     let mode = if result.force && !result.dry_run {
         style.warning("APPLY (destructive)")
     } else {
         style.info("preview (no destructive action)")
     };
     println!("  {} {}", style.key("mode:"), mode);
-
     println!(
-        "  {} {} closure root(s), {} planned invalidation(s), {} refused",
-        style.key("plan:"),
+        "  {} {}",
+        style.key("closure roots:"),
         style.value(&result.closure_roots.len().to_string()),
-        style.value(&result.planned_invalidations.len().to_string()),
-        style.value(&result.refused.len().to_string()),
     );
-    for path in &result.planned_invalidations {
-        println!("    {} {}", style.muted("invalidate:"), path);
-    }
-    for refused in &result.refused {
+
+    let render_plan = |plan: &ForceResyncPlan| {
         println!(
-            "    {} {} ({})",
-            style.error("REFUSED:"),
-            refused.worker_cache_path,
-            style.muted(&refused.reason)
+            "    {} {}",
+            style.key("managed base:"),
+            style.value(&plan.managed_base.display().to_string())
         );
-    }
+        println!(
+            "    {} {} planned invalidation(s), {} refused",
+            style.key("plan:"),
+            style.value(&plan.invalidations.len().to_string()),
+            style.value(&plan.refused.len().to_string()),
+        );
+        for action in &plan.invalidations {
+            println!(
+                "      {} {}",
+                style.muted("invalidate:"),
+                action.worker_cache_path.display()
+            );
+        }
+        for refused in &plan.refused {
+            println!(
+                "      {} {} ({})",
+                style.error("REFUSED:"),
+                refused.worker_cache_path.display(),
+                style.muted(&refused.reason)
+            );
+        }
+    };
 
     if result.workers.is_empty() {
+        if let Some(plan) = &result.default_plan {
+            println!("  {}", style.key("default staging preview:"));
+            render_plan(plan);
+        }
         println!(
             "  {}",
             style.muted("no target worker selected (use --worker <id> or --all to act)")
@@ -420,26 +442,27 @@ fn render_human(result: &SyncForceResult, ctx: &OutputContext) {
         return;
     }
 
-    for w in &result.workers {
-        let status = match w.outcome.as_str() {
+    for worker in &result.workers {
+        let status = match worker.outcome.as_str() {
             "applied" => style.success(&format!(
                 "applied ({} removed, {} already absent)",
-                w.removed_ok, w.already_absent
+                worker.removed_ok, worker.already_absent
             )),
             "partially_applied" => style.warning(&format!(
                 "partially applied ({} removed, {} failed)",
-                w.removed_ok,
-                w.remove_failures.len()
+                worker.removed_ok,
+                worker.remove_failures.len()
             )),
             "refused" => style.error("refused (no confirmed removal)"),
             "deferred_worker_unavailable" => style.warning("deferred (worker unreachable)"),
             _ => style.info("preview"),
         };
-        println!("  {} {}", style.key(&format!("{}:", w.worker_id)), status);
-        for failure in &w.remove_failures {
+        println!("  {} {}", style.key(&format!("{}:", worker.worker_id)), status);
+        render_plan(&worker.plan);
+        for failure in &worker.remove_failures {
             println!("      {} {}", style.error("remove failed:"), failure);
         }
-        if let Some(repair) = &w.repair_status {
+        if let Some(repair) = &worker.repair_status {
             println!("      {} {}", style.muted("convergence repair:"), repair);
         }
     }
@@ -488,6 +511,111 @@ mod tests {
         let plan = plan_force_resync(&stale, base);
         assert_eq!(plan.invalidations.len(), 2);
         assert!(!plan.has_refusals());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_plans_match_the_real_cache_warm_destinations() {
+        let roots = vec![
+            PathBuf::from("/data/projects/primary"),
+            PathBuf::from("/data/projects/dependency"),
+        ];
+        let configured = rch_common::TransferConfig {
+            remote_base: "/var/cache/rch-default".into(),
+            ..Default::default()
+        };
+        let mut plans = Vec::new();
+        for (id, root, expected) in [
+            ("default", None, "/var/cache/rch-default"),
+            ("first", Some("/mnt/worker-one/rch"), "/mnt/worker-one/rch"),
+            (
+                "second",
+                Some("/Volumes/Build Disk/$HOME/'quoted/rch///"),
+                "/Volumes/Build Disk/$HOME/'quoted/rch",
+            ),
+        ] {
+            let worker = WorkerConfig {
+                id: rch_common::WorkerId::new(id),
+                remote_base: root.map(str::to_owned),
+                ..Default::default()
+            };
+            let plan = plan_for_worker(&worker, &roots, &configured).unwrap();
+            assert_eq!(plan.managed_base, Path::new(expected));
+            assert!(!plan.has_refusals());
+            assert_eq!(plan.invalidations.len(), roots.len());
+            for (root, action) in roots.iter().zip(&plan.invalidations) {
+                let pipeline = crate::cache_warm_pipeline(
+                    root,
+                    &project_id_from_path(root),
+                    "0123456789abcdef",
+                    &configured,
+                    &worker,
+                    0,
+                )
+                .unwrap();
+                let destination = PathBuf::from(pipeline.remote_path());
+                assert_eq!(
+                    destination.parent().unwrap(),
+                    action.worker_cache_path.as_path(),
+                    "force-resync must invalidate the parent containing this worker's warmed hash"
+                );
+                assert!(
+                    remote_invalidation_command(&action.worker_cache_path, &plan.managed_base)
+                        .is_ok(),
+                    "the exact selected literal scope must pass the guarded command builder"
+                );
+            }
+            plans.push(plan);
+        }
+        assert_ne!(
+            plans[1].invalidations[0].worker_cache_path,
+            plans[2].invalidations[0].worker_cache_path
+        );
+        assert_eq!(configured.remote_base, "/var/cache/rch-default");
+    }
+
+    #[test]
+    fn worker_plans_reject_invalid_roots_before_dispatch() {
+        let roots = [PathBuf::from("/data/projects/demo")];
+        for root in ["~/rch", "/tmp", "/mnt/rch/../outside", "/mnt/build\nrch"] {
+            let worker = WorkerConfig {
+                id: rch_common::WorkerId::new("invalid-root"),
+                remote_base: Some(root.into()),
+                ..Default::default()
+            };
+            assert!(
+                plan_for_worker(&worker, &roots, &Default::default()).is_err(),
+                "{root:?}"
+            );
+        }
+        let invalid_fallback = rch_common::TransferConfig {
+            remote_base: "/".into(),
+            ..Default::default()
+        };
+        assert!(plan_for_worker(&Default::default(), &roots, &invalid_fallback).is_err());
+    }
+
+    #[tokio::test]
+    async fn windows_apply_preserves_the_native_preview_scope_and_refuses_before_transport() {
+        let worker = WorkerConfig {
+            id: rch_common::WorkerId::new("windows"),
+            host: "must-not-contact.invalid".into(),
+            tags: vec!["os:windows".into()],
+            ..Default::default()
+        };
+        let roots = [PathBuf::from("/data/projects/demo")];
+        let plan = plan_for_worker(&worker, &roots, &Default::default()).unwrap();
+        assert_eq!(plan.managed_base, Path::new("C:/rch"));
+        let result = apply_on_worker(&worker, plan, true).await;
+        assert_eq!(result.outcome, "refused");
+        assert_eq!(result.plan.managed_base, Path::new("C:/rch"));
+        assert_eq!(result.removed_ok, 0);
+        assert_eq!(result.already_absent, 0);
+        assert!(!result.repair_triggered);
+        assert!(!result.reachable);
+        assert!(
+            result.remove_failures[0].contains("Windows invalidation is unsupported")
+        );
     }
 
     #[test]
@@ -555,34 +683,53 @@ mod tests {
     }
 
     #[test]
-    fn result_serializes_with_expected_shape() {
+    fn result_serializes_worker_scopes_and_preserves_guarded_apply_failures() {
+        let roots = [PathBuf::from("/data/projects/x")];
+        let first_plan = plan_force_resync(&stale_roots_for(&roots, Path::new(BASE)), Path::new(BASE));
+        let second_base = Path::new("/mnt/second/rch");
+        let second_plan =
+            plan_force_resync(&stale_roots_for(&roots, second_base), second_base);
+        let mut second = SyncForceWorkerResult {
+            worker_id: "second".into(),
+            plan: second_plan,
+            reachable: true,
+            outcome: "applied".into(),
+            removed_ok: 1,
+            already_absent: 0,
+            remove_failures: vec![],
+            repair_triggered: true,
+            repair_status: Some("ok".into()),
+        };
+        let first = SyncForceWorkerResult {
+            worker_id: "first".into(),
+            plan: first_plan.clone(),
+            ..second.clone()
+        };
+        second.removed_ok = 0;
+        second.already_absent = 1;
         let result = SyncForceResult {
-            project: "/data/projects/x".to_string(),
-            managed_base: BASE.to_string(),
+            project: "/data/projects/x".into(),
             force: true,
             dry_run: false,
             applied: true,
-            closure_roots: vec!["/data/projects/x".to_string()],
-            planned_invalidations: vec!["/tmp/rch/x".to_string()],
-            refused: vec![],
-            workers: vec![SyncForceWorkerResult {
-                worker_id: "css".to_string(),
-                reachable: true,
-                outcome: "applied".to_string(),
-                removed_ok: 1,
-                already_absent: 0,
-                remove_failures: vec![],
-                repair_triggered: true,
-                repair_status: Some("ok".to_string()),
-            }],
+            closure_roots: vec!["/data/projects/x".into()],
+            default_plan: None,
+            workers: vec![first, second],
         };
         let json = serde_json::to_value(&result).expect("serializes");
         assert_eq!(json["applied"], true);
-        assert_eq!(json["managed_base"], BASE);
+        assert!(json.get("managed_base").is_none());
+        assert!(json.get("default_plan").is_none());
+        assert_eq!(json["workers"][0]["plan"]["managed_base"], BASE);
+        assert_eq!(json["workers"][1]["plan"]["managed_base"], "/mnt/second/rch");
+        assert_ne!(
+            json["workers"][0]["plan"]["invalidations"][0]["worker_cache_path"],
+            json["workers"][1]["plan"]["invalidations"][0]["worker_cache_path"]
+        );
         assert_eq!(json["workers"][0]["outcome"], "applied");
         assert_eq!(json["workers"][0]["removed_ok"], 1);
         assert_eq!(json["workers"][0]["repair_status"], "ok");
-        assert_eq!(json["workers"][0]["already_absent"], 0);
+        assert_eq!(json["workers"][1]["already_absent"], 1);
         assert!(!apply_failed(&result));
 
         // The live output boundary uses this same decision before emitting a
@@ -593,13 +740,24 @@ mod tests {
             assert!(apply_failed(&result), "{outcome}");
         }
         result.workers[0].outcome = "applied".into();
-        result.refused.push(RefusedEntry {
-            local_root: "/data/projects/y".into(),
-            worker_cache_path: "/outside".into(),
-            reason: "outside managed base".into(),
-        });
+        result.workers[0].plan.refused.push(
+            rch_common::force_resync::RefusedInvalidation {
+                local_root: "/data/projects/y".into(),
+                worker_cache_path: "/outside".into(),
+                reason: "outside managed base".into(),
+            },
+        );
         assert!(apply_failed(&result));
         result.dry_run = true;
+        assert!(!apply_failed(&result));
+
+        result.force = false;
+        result.applied = false;
+        result.workers.clear();
+        result.default_plan = Some(first_plan);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["default_plan"]["managed_base"], BASE);
+        assert_eq!(json["workers"], serde_json::json!([]));
         assert!(!apply_failed(&result));
     }
 }

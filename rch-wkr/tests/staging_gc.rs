@@ -147,7 +147,6 @@ fn native_preview_refuses_foreign_claim_and_replaced_parent() {
     fixture.assert_retained();
 }
 
-
 fn force_resync_custody(fixture: &Fixture) -> (PathBuf, PathBuf) {
     use sha2::{Digest as _, Sha256};
     use std::os::unix::fs::PermissionsExt as _;
@@ -239,7 +238,9 @@ fn force_resync_owns_native_deletion_without_spawning_an_unlabelled_rm() {
     let marker = fixture.root.join("rm-invoked");
     let witness = force_resync_witness(&fixture);
     let mut command = force_resync_command(&fixture, "apply", Some(&witness));
-    command.env("PATH", &tools).env("RCH_TEST_RM_MARKER", &marker);
+    command
+        .env("PATH", &tools)
+        .env("RCH_TEST_RM_MARKER", &marker);
     // The native process retains this ordinary argv field until its own
     // descriptor-relative deletion has completed; it never execs a child rm.
     assert!(
@@ -251,7 +252,10 @@ fn force_resync_owns_native_deletion_without_spawning_an_unlabelled_rm() {
     assert!(result.status.success(), "{result:?}");
     assert_eq!(result.stdout, b"removed\n");
     assert!(!fixture.tree.parent().unwrap().exists());
-    assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"outside cache");
+    assert_eq!(
+        fs::read(outside.join("sentinel")).unwrap(),
+        b"outside cache"
+    );
     assert!(!marker.exists());
     assert!(!fixture.root.join("absent").exists());
     assert_eq!(

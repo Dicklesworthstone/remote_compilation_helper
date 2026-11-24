@@ -403,8 +403,8 @@ mod native {
         require(absolute_clean(path))?;
         let base = path.parent().ok_or(Error::Changed)?;
         let text = base.to_str().ok_or(Error::Changed)?;
-        let normalized =
-            rch_common::types::validate_worker_remote_base(text, None).map_err(|_| Error::Changed)?;
+        let normalized = rch_common::types::validate_worker_remote_base(text, None)
+            .map_err(|_| Error::Changed)?;
         require(normalized == text && base.canonicalize()?.as_path() == base)?;
         require(std::env::current_dir()?.as_path() == base)?;
         let name = path.file_name().ok_or(Error::Changed)?;
