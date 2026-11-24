@@ -939,6 +939,33 @@ fn nextest_validates_captured_runner_and_retains_local_and_remote_intent() {
 }
 
 #[test]
+fn selected_vendor_intent_reaches_local_and_remote_drivers_unchanged() {
+    for remote in [false, true] {
+        for binary in [BINARY, SUBCOMMAND] {
+            let fixture = Fixture::new();
+            let profile = if remote { &fixture.remote } else { &fixture.local };
+            rewrite_json(profile, |profile| {
+                let settings = if remote { &mut profile["settings"] } else { profile };
+                settings["vendor"] = json!("vendor");
+                settings["source_selection"] = json!("cargo-unit-graph-v1");
+            });
+            let mut command = fixture.command_using(remote, Path::new(binary));
+            command
+                .env("CARGO_RABS_DAEMON", &fixture.daemon)
+                .args(["--", "check", "--package", "selected-package"]);
+            let report = fixture.handed_off(command.output().unwrap());
+            let retained = &report["profile"];
+            let settings = if remote { &retained["settings"] } else { retained };
+            assert_eq!(settings["vendor"], "vendor");
+            assert_eq!(settings["source_selection"], "cargo-unit-graph-v1");
+            assert_eq!(settings["command"], "check");
+            assert_eq!(settings["selection"]["packages"], json!(["selected-package"]));
+            assert!(settings.get("cargo_home_source").is_none());
+        }
+    }
+}
+
+#[test]
 fn explicit_commands_replace_saved_selection_and_preserve_literal_runtime_tails() {
     for (arguments, command, field, tail) in [
         (

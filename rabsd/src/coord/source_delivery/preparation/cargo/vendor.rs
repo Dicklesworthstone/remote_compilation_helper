@@ -678,6 +678,75 @@ impl VendoredSources {
         Ok(seen)
     }
 
+    /// Bind a selected host or target unit to its checksum-verified vendor
+    /// directory and the selected workspace's exact lock. Cargo unit IDs omit
+    /// Git commit hashes; only the already-bound lock supplies that revision.
+    /// Neither a package name nor a source path alone can select an owner.
+    pub(super) fn check_selected_package(
+        &self,
+        image: &SealedSourceSnapshot,
+        root: &Path,
+        id: &str,
+        sources: &[&str],
+        locked: &LockedPackages,
+        control: &PreparationControl<'_>,
+    ) -> io::Result<()> {
+        control.checkpoint()?;
+        let first = sources
+            .first()
+            .ok_or_else(|| invalid("selected vendor package has no sources"))?;
+        let first = super::captured_metadata_path(image, root, &Value::String((*first).into()))?;
+        let relative = first
+            .strip_prefix(root)
+            .map_err(|_| invalid("selected vendor source escapes the captured anchor"))?;
+        let (directory, expected) = self
+            .packages
+            .iter()
+            .find(|(directory, _)| relative.starts_with(directory))
+            .ok_or_else(|| invalid("selected unit is outside the verified vendor packages"))?;
+        let mut owner = None;
+        for (name, version, source) in locked {
+            control.checkpoint()?;
+            if name != &expected.name || version != &expected.version {
+                continue;
+            }
+            let selector = if source.starts_with("git+") {
+                let (selector, _) = source
+                    .rsplit_once('#')
+                    .ok_or_else(|| invalid("selected vendor Git source lacks its locked revision"))?;
+                require(
+                    GitSource::parse(source)? == GitSource::parse_encoded(source)?,
+                    "selected vendor Git source uses an ambiguous encoded selector",
+                )?;
+                selector
+            } else {
+                source.as_str()
+            };
+            if super::selection::package_id_matches(id, selector, name, version) {
+                require(owner.is_none(), "selected vendor unit has ambiguous locked owners")?;
+                owner = Some(source);
+            }
+        }
+        let source = owner
+            .ok_or_else(|| invalid("selected vendor unit differs from its locked package source"))?;
+        // Every target entrypoint must be an actual retained ordinary file,
+        // including host build scripts and proc macros. check_package below
+        // additionally binds all of them to this same verified package root.
+        for source in sources {
+            control.checkpoint()?;
+            super::captured_metadata_path(image, root, &Value::String((*source).into()))?;
+        }
+        self.check_package(
+            root,
+            &serde_json::json!({
+                "id":id, "source":source, "name":expected.name, "version":expected.version,
+                "manifest_path":root.join(directory).join("Cargo.toml"),
+                "targets":sources.iter().map(|path| serde_json::json!({"src_path":path})).collect::<Vec<_>>(),
+            }),
+            locked,
+        )
+    }
+
     pub(super) fn check_package(
         &self,
         root: &Path,

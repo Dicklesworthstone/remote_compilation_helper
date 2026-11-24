@@ -57,7 +57,16 @@ fn selected_local_inheritance_skips_retained_excluding_ancestors() {
         environment: Vec::new(),
         jobs: None,
     };
-    validate_selected_graph(&image, root, &selection, &metadata, &graph, None, &control).unwrap();
+    validate_selected_graph(
+        &image,
+        root,
+        &selection,
+        &metadata,
+        &graph,
+        SelectedSources::Local,
+        &control,
+    )
+    .unwrap();
 }
 
 use super::super::{CargoSource, RegistryCache};
@@ -1677,9 +1686,19 @@ fn selection_is_explicit_and_invalid_request_refuses_before_cache_access() {
         .unwrap_err();
     assert!(error.to_string().contains("manifest-parent context"));
     let selected_vendor = json!({"manifest":"Cargo.toml","selection":VERSION,"vendor":"vendor"});
+    let selected = CargoSource::parse_request(
+        &selected_vendor,
+        &request("check", &[]),
+        PreparationContext::RemoteRequest,
+    )
+    .unwrap();
+    assert!(selected.requires_selected_toolchain());
+    assert!(selected.cargo_home_projection().is_none());
+    let mut invalid_vendor = selected_vendor.clone();
+    invalid_vendor["vendor"] = json!("../vendor");
     assert!(
         CargoSource::parse_request(
-            &selected_vendor,
+            &invalid_vendor,
             &request("check", &[]),
             PreparationContext::RemoteRequest,
         )
@@ -2076,7 +2095,7 @@ fn selected_graph_checks_host_sources_and_reached_manifests_inside_the_complete_
         &selection,
         &metadata,
         &graph,
-        None,
+        SelectedSources::Local,
         &PreparationControl::uncontrolled(),
     )
     .unwrap();
@@ -2089,7 +2108,7 @@ fn selected_graph_checks_host_sources_and_reached_manifests_inside_the_complete_
             &selection,
             &metadata,
             &outside,
-            None,
+            SelectedSources::Local,
             &PreparationControl::uncontrolled()
         )
         .is_err()
@@ -2104,7 +2123,7 @@ fn selected_graph_checks_host_sources_and_reached_manifests_inside_the_complete_
         &selection,
         &metadata,
         &unrelated,
-        None,
+        SelectedSources::Local,
         &PreparationControl::uncontrolled(),
     )
     .unwrap_err();
@@ -2125,7 +2144,7 @@ fn selected_graph_checks_host_sources_and_reached_manifests_inside_the_complete_
             &selection,
             &metadata,
             &wrong,
-            None,
+            SelectedSources::Local,
             &PreparationControl::uncontrolled()
         )
         .is_err()
@@ -3313,7 +3332,7 @@ fn selected_local_versions_bind_declared_inherited_and_default_manifest_identity
             &selection,
             &metadata,
             &graph,
-            None,
+            SelectedSources::Local,
             &PreparationControl::uncontrolled(),
         )
         .unwrap();
@@ -3328,7 +3347,7 @@ fn selected_local_versions_bind_declared_inherited_and_default_manifest_identity
             &selection,
             &metadata,
             &forged,
-            None,
+            SelectedSources::Local,
             &PreparationControl::uncontrolled(),
         )
         .unwrap_err();

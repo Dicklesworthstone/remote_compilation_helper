@@ -112,10 +112,6 @@ impl CargoSource {
                     version.as_str() == Some(selection::VERSION),
                     "unsupported Cargo source selection version",
                 )?;
-                require(
-                    value.get("vendor").is_none(),
-                    "selected Cargo preparation does not support vendor sources",
-                )?;
                 selection::SelectedCommand::parse(
                     request.ok_or_else(|| {
                         invalid("selected Cargo preparation requires its execution request")
@@ -428,9 +424,13 @@ impl CargoSource {
                 selection,
                 &metadata,
                 &graph,
-                registry
-                    .as_ref()
-                    .map(|registry| (registry, cargo_home.as_path())),
+                if let Some(vendor) = &vendor {
+                    selection::SelectedSources::Vendor(vendor)
+                } else if let Some(registry) = &registry {
+                    selection::SelectedSources::CargoHome(registry, &cargo_home)
+                } else {
+                    selection::SelectedSources::Local
+                },
                 control,
             )?)
         } else {

@@ -341,9 +341,8 @@ fn logical(
     }
     if let Some(selection) = profile.get("source_selection") {
         require(
-            selection.as_str() == Some("cargo-unit-graph-v1")
-                && profile.get("vendor").is_none_or(Value::is_null),
-            "source_selection must be cargo-unit-graph-v1 without vendor",
+            selection.as_str() == Some("cargo-unit-graph-v1"),
+            "source_selection must be cargo-unit-graph-v1",
         )?;
     }
     let mut environment = vec![

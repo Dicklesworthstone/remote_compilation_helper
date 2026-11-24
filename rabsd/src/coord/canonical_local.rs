@@ -1149,10 +1149,6 @@ impl Profile {
         if self.source_selection == SourceSelection::Complete {
             return Ok(None);
         }
-        require(
-            self.vendor.is_none(),
-            "selected Cargo preparation does not support vendor sources",
-        )?;
         Ok(Some("cargo-unit-graph-v1"))
     }
 }
@@ -3296,25 +3292,44 @@ mod tests {
     }
 
     #[test]
-    fn source_selection_rejects_vendor_before_opening_profile_roots() {
-        let mut profile = application_environment_profile();
-        profile.source_selection = SourceSelection::UnitGraph;
-        profile.vendor = Some("vendor".into());
-        let error = profile.validate().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not support vendor sources")
-        );
-        assert!(profile.source_specification().is_err());
-        profile.command = CompilationCommand::Clippy;
-        let error = profile.validate().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not support vendor sources")
-        );
-        assert!(profile.source_specification().is_err());
+    fn selected_vendor_profiles_preserve_source_and_command_controls() {
+        for command in [
+            CompilationCommand::Check,
+            CompilationCommand::Build,
+            CompilationCommand::Clippy,
+            CompilationCommand::Test,
+            CompilationCommand::Nextest,
+        ] {
+            let mut profile = application_environment_profile();
+            profile.command = command;
+            profile.source_selection = SourceSelection::UnitGraph;
+            profile.vendor = Some("vendor".into());
+            profile.selection = Some(CompilationSelection {
+                no_run: matches!(command, CompilationCommand::Test | CompilationCommand::Nextest),
+                ..Default::default()
+            });
+            profile.validate_logical().unwrap();
+            let request = profile.source_specification().unwrap();
+            assert_eq!(
+                request["cargo_source"],
+                json!({"manifest":"Cargo.toml", "vendor":"vendor",
+                    "selection":"cargo-unit-graph-v1"})
+            );
+            assert_eq!(request["args"], json!(profile.compilation_args().unwrap()));
+            assert_eq!(request["program"], profile.program());
+            assert!(request.get("publication_authorized").is_none());
+            profile.cargo_home_source = Some("/unapproved-cargo-home".into());
+            assert!(
+                profile.validate_logical().unwrap_err().to_string()
+                    .contains("choose vendor or cargo_home_source")
+            );
+            profile.cargo_home_source = None;
+            profile.vendor = Some("../vendor".into());
+            assert!(
+                profile.validate_logical().unwrap_err().to_string()
+                    .contains("vendor must be an ordinary relative path")
+            );
+        }
     }
 
     #[test]

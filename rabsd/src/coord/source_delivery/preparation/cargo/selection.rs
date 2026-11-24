@@ -8,6 +8,7 @@
 use super::{
     MAX_PACKAGES, OUTPUT_LIMIT, PreparationContext, PreparationControl, captured_metadata_path,
     graph, invalid, registry::RegistryCache, require, validate_metadata_packages_controlled,
+    vendor::VendoredSources,
 };
 use rabs_sandbox::cargo_check::{CompilationCommand, CompilationSelection, run_build_selection};
 use rabs_sandbox::process_context::{COMMAND_CONTEXT_VERSION, CommandContext};
@@ -19,6 +20,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(super) const VERSION: &str = "cargo-unit-graph-v1";
+
+/// An external source owner already verified from this command's retained
+/// capture. A selected graph cannot combine a vendor tree with a Cargo home.
+pub(super) enum SelectedSources<'a> {
+    Local,
+    Vendor(&'a VendoredSources),
+    CargoHome(&'a RegistryCache, &'a Path),
+}
 
 #[derive(Debug)]
 pub(super) struct SelectedCommand {
@@ -638,19 +647,24 @@ pub(super) fn validate_selected_graph(
     selection: &SelectedCommand,
     metadata: &Value,
     units: &Value,
-    registry: Option<(&RegistryCache, &Path)>,
+    sources: SelectedSources<'_>,
     control: &PreparationControl<'_>,
 ) -> io::Result<BTreeSet<String>> {
+    let (vendor, registry) = match sources {
+        SelectedSources::Local => (None, None),
+        SelectedSources::Vendor(vendor) => (Some(vendor), None),
+        SelectedSources::CargoHome(registry, home) => (None, Some((registry, home))),
+    };
     let manifest = selection.manifest.as_str();
     require(
         metadata.get("resolve").is_some_and(Value::is_null),
         "selected Cargo workspace metadata must omit dependency resolution",
     )?;
-    validate_metadata_packages_controlled(image, root, manifest, metadata, None, None, control)?;
+    validate_metadata_packages_controlled(image, root, manifest, metadata, vendor, None, control)?;
     let controls = graph::ControlInputs::discover_controlled(
         image,
         manifest,
-        None,
+        vendor,
         registry.is_some(),
         control,
     )?;
@@ -666,6 +680,9 @@ pub(super) fn validate_selected_graph(
     if let Some((registry, _)) = registry {
         registry.check_lock(Path::new(&controls.lock))?;
     }
+    let vendored_lock = vendor
+        .map(|vendor| vendor.bind_lock(image, Path::new(&controls.lock)))
+        .transpose()?;
     let lock: toml::Value = toml::from_str(
         std::str::from_utf8(
             image
@@ -732,6 +749,10 @@ pub(super) fn validate_selected_graph(
                 .ok()
                 .and_then(Path::to_str)
                 .ok_or_else(|| invalid("selected local manifest escapes its capture"))?;
+            require(
+                vendor.is_none_or(|vendor| !vendor.contains(relative)),
+                "selected vendor package cannot be reclassified as a local path package",
+            )?;
             require(
                 controls.manifests.contains(relative),
                 "selected local package is not a reached Cargo control manifest",
@@ -802,9 +823,18 @@ pub(super) fn validate_selected_graph(
             for source in sources {
                 captured_metadata_path(image, root, &Value::String(source.to_owned()))?;
             }
+        } else if let (Some(vendor), Some(locked)) = (vendor, vendored_lock.as_ref()) {
+            vendor.check_selected_package(
+                image,
+                root,
+                id,
+                &sources.into_iter().collect::<Vec<_>>(),
+                locked,
+                control,
+            )?;
         } else {
             let (registry, home) = registry.ok_or_else(|| {
-                invalid("selected external package requires an approved Cargo home")
+                invalid("selected external package requires an approved Cargo home or vendor tree")
             })?;
             external.push(registry.selected_package(
                 home,

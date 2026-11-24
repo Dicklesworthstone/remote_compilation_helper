@@ -1023,9 +1023,9 @@ command-specific dependency preparation with this field:
 "source_selection": "cargo-unit-graph-v1"
 ```
 
-This mode accepts local source anchors and an approved `cargo_home_source`.
-It cannot be combined with `vendor`; existing vendor profiles continue to use
-the default preparer.
+This mode accepts local source anchors, an approved `cargo_home_source`, or
+an explicitly approved `vendor` directory. Choose one dependency-source owner;
+`vendor` and `cargo_home_source` remain mutually exclusive.
 
 The launcher passes that local intent as `cargo_source.selection`. The native
 preparer binds it to the actual validated Cargo request and asks the captured
@@ -1087,6 +1087,18 @@ fall back to a different selection. Pinned Git capture retains its existing
 complete locked-revision contract. Selected Git packages also require an
 unambiguous source selector and one retained manifest for each package name in
 the selected commit; duplicate same-name manifests are refused.
+
+With `vendor`, the preparer verifies the complete captured directory source and
+its original source-replacement configuration before asking Cargo for the
+selected graph. Every selected target and host unit must name a retained file
+inside its checksum-verified package and match the selected workspace's locked
+package name, version and source. Locked Git revisions supply the precise
+commit omitted from Cargo's unit IDs; ambiguous encoded selectors are refused.
+All locked vendor packages and all package files remain required, including
+unselected packages. A changed checksum, missing locked package, foreign source,
+extra active Cargo configuration layer or target outside its package refuses
+preparation. This option does not prune the vendor tree or grant action-cache
+publication or test-result reuse.
 
 This option still captures the complete approved source anchor and retains its
 original manifests, lockfile and configuration. It changes dependency
@@ -1792,21 +1804,24 @@ capability; a wrapper-supplied path or environment flag cannot construct one.
 
 ### Select native source preparation
 
-For a native profile using an approved Cargo cache, replace `vendor` with these
-fields to prepare dependencies for the command you actually select:
+For a native profile using an approved Cargo cache, use these fields to prepare
+dependencies for the command you actually select:
 
 ```json
 "cargo_home_source": "/home/builder/.cargo",
 "source_selection": "cargo-unit-graph-v1"
 ```
 
+For a vendored project, use `"vendor": "vendor"` together with
+`"source_selection": "cargo-unit-graph-v1"` and omit `cargo_home_source`. The
+vendor directory and source-replacement config stay inside the approved anchor.
 A purely local graph needs only `source_selection`. Both the native entry point
 and `cargo rabs --rabs-canonical-local` support this mode for `check`, `build`,
-`clippy`, `doc`, `test`, `run` and `bench`. The captured Cargo plans the actual package, feature,
+`clippy`, `doc`, `test`, `nextest`, `run` and `bench`. The captured Cargo plans the actual package, feature,
 target and profile selection, including host build dependencies and procedural
 macros. The driver's fixed compiler paths, output directory and job count remain
 bound to that execution. The [selected preparation constraints](#prepare-the-selected-cargo-dependency-graph)
-apply; `vendor` cannot use this opt-in mode.
+apply to every dependency-source owner.
 
 For Clippy, preparation invokes the captured `cargo-clippy` and requires its
 ordinary executable `clippy-driver` companion. Its exact `CARGO` and `RUSTC`
@@ -3407,8 +3422,9 @@ stdin remains unsupported even when the client redirects its input: the service
 does not forward that stream. Test, program and benchmark bodies still execute
 for each newly admitted operation and retain their actual exit status.
 
-For a vendored source graph, omit `cargo_home_source` and `source_selection`,
-then add `"vendor": "vendor"` inside `settings`. For an entirely local graph,
+For a vendored source graph, omit `cargo_home_source` and add
+`"vendor": "vendor"` inside `settings`; `source_selection` may also select
+`"cargo-unit-graph-v1"`. For an entirely local graph,
 omit both dependency-source choices. The
 [selected source-preparation rules](#select-native-source-preparation) apply
 when `source_selection` is enabled. The entire approved source anchor remains

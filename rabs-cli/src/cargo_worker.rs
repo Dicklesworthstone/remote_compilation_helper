@@ -347,8 +347,8 @@ pub(super) fn validate_profile(
     }
     if let Some(source) = profile.get("source_selection") {
         require(
-            source == "cargo-unit-graph-v1" && !profile.contains_key("vendor"),
-            "source_selection must be cargo-unit-graph-v1 without vendor",
+            source == "cargo-unit-graph-v1",
+            "source_selection must be cargo-unit-graph-v1",
         )?;
     }
     context(profile, command)?;
@@ -1107,8 +1107,8 @@ mod tests {
         set(&mut conflicting, "vendor", json!("vendor"));
         set(
             &mut conflicting,
-            "source_selection",
-            json!("cargo-unit-graph-v1"),
+            "cargo_home_source",
+            baseline["source_root"].clone(),
         );
         assert!(validate_profile(&conflicting, &build_options).is_err());
         for input in [
@@ -1120,6 +1120,32 @@ mod tests {
             assert!(validate_profile(&baseline, &options).is_err());
         }
         assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn selected_vendor_worker_profiles_retain_both_controls_without_creating_state() {
+        for arguments in [
+            vec!["check"],
+            vec!["build"],
+            vec!["clippy"],
+            vec!["test", "--no-run"],
+            vec!["nextest", "run", "--no-run"],
+        ] {
+            let (root, mut profile) = filesystem_profile();
+            let options = options(&arguments);
+            set(&mut profile, "vendor", json!("vendor"));
+            set(&mut profile, "source_selection", json!("cargo-unit-graph-v1"));
+            validate_profile(&profile, &options).unwrap();
+            let request = specification(&profile, &options).unwrap();
+            assert_eq!(
+                request["cargo_source"],
+                json!({"manifest":"nested/Cargo.toml", "vendor":"vendor",
+                    "selection":"cargo-unit-graph-v1"})
+            );
+            assert_eq!(request["request_id"], "allocate");
+            assert!(request.get("publication_authorized").is_none());
+            assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
+        }
     }
 
     #[test]
