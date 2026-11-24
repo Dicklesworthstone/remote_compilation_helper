@@ -1943,7 +1943,7 @@ mod tests {
             );
             // Deliberately resembles Cargo JSON followed by non-UTF-8 runner
             // output. Neither can announce, suppress or redirect target files.
-            let stdout = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/fake\"]}\n\0\xffopaque test output";
+            let stdout: &[u8] = b"{\"reason\":\"compiler-artifact\",\"filenames\":[\"/outside/fake\"]}\n\0\xffopaque test output";
             for case in 0..4 {
                 let prepared = PreparedArtifacts::new(plan.clone()).unwrap();
                 fs::create_dir_all(prepared.backing().join("debug/deps")).unwrap();

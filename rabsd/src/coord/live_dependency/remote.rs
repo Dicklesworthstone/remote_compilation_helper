@@ -4340,6 +4340,7 @@ mod installed_input_generation_tests {
 mod execution_resource_tests {
     use super::*;
     use rabs_key::live_dependency::{LiveRustcRequest, plan_dependency_action};
+    use rabs_key::typed_digest::compute;
 
     const PACKAGE: &str = "/home/rabs/.cargo/registry/src/test-index/parallel-1.0.0";
     const OUTPUT: &str = "/work/target/debug/deps";

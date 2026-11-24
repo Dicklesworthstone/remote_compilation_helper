@@ -695,7 +695,8 @@ impl VendoredSources {
         let first = sources
             .first()
             .ok_or_else(|| invalid("selected vendor package has no sources"))?;
-        let first = super::captured_metadata_path(image, root, &Value::String((*first).into()))?;
+        let source_path = Value::String((*first).into());
+        let first = super::captured_metadata_path(image, root, &source_path)?;
         let relative = first
             .strip_prefix(root)
             .map_err(|_| invalid("selected vendor source escapes the captured anchor"))?;
