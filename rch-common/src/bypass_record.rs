@@ -2585,7 +2585,7 @@ mod tests {
             expires_unix_ms: None,
         };
         store.upsert(record.clone()).unwrap();
-        let reloaded = AdminDisableStore::try_load(&path).unwrap();
+        let mut reloaded = AdminDisableStore::try_load(&path).unwrap();
         let held = reloaded.effective_disable("held").unwrap();
         assert_eq!(held, record);
         let stale_at = 1000 + ADMIN_DISABLE_STALE_AFTER_SECS * 1000;

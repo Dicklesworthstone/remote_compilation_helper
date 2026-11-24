@@ -343,7 +343,7 @@ pub(super) fn validate_profile(
             .unwrap_or(1)
             .try_into()
             .map_err(|_| invalid("nextest build-job bound exceeds u32"))?;
-        rabs_sandbox::cargo_artifacts::nextest::execution_slots(&selection, build_jobs)?;
+        rabs_sandbox::cargo_artifacts::nextest::execution_slots(selection, build_jobs)?;
     }
     placement(profile)?;
     manifest(profile)?;
@@ -1230,7 +1230,7 @@ mod tests {
             vec!["run"],
             vec!["test"],
             vec!["bench"],
-            vec!["nextest", "run"],
+            vec!["nextest", "run", "--test-threads", "2"],
         ] {
             let mut options = options(&arguments);
             let closed = specification(&profile, &options).unwrap();
@@ -1243,6 +1243,19 @@ mod tests {
                     "version":"source-file-stdin-v1", "path":"inputs/request.bin",
                 })
             );
+            if arguments[0] == "nextest" {
+                assert_eq!(request["jobserver_grant"], 1);
+                assert_eq!(request["artifacts"]["cargo"]["build_jobs"], 1);
+                assert_eq!(
+                    request["artifacts"]["cargo"]["selection"]["test_threads"],
+                    2
+                );
+                assert_eq!(
+                    rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&request)
+                        .unwrap(),
+                    Some(2)
+                );
+            }
             request.as_object_mut().unwrap().remove("captured_stdin");
             assert_eq!(
                 request, closed,
