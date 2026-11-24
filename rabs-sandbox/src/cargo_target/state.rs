@@ -1067,6 +1067,233 @@ mod tests {
     }
 
     #[test]
+    fn nextest_compilation_family_restores_real_cargo_tests_without_replaying_outcomes() {
+        use crate::cargo_artifacts::{
+            CargoArtifactMode,
+            nextest::{NextestTree, PROGRAM},
+        };
+        use crate::cargo_check::{CompilationCommand, CompilationSelection};
+        use crate::cargo_target::compatible_arguments;
+        use std::process::{Command, Stdio};
+
+        // Run real Cargo/rustc and the resulting test binaries through the
+        // production private snapshot/timestamp helpers. This verifies the
+        // compilation phase shared by Nextest selections, not a native Nextest
+        // invocation, authenticated worker, or kernel namespace.
+        let owner = private();
+        let source = private();
+        write(
+            source.path(),
+            "Cargo.toml",
+            b"[package]\nname='nextest_seed_fixture'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        write(
+            source.path(),
+            "Cargo.lock",
+            b"version=4\n[[package]]\nname='nextest_seed_fixture'\nversion='0.1.0'\n",
+        );
+        write(
+            source.path(),
+            ".config/nextest.toml",
+            b"[profile.ci]\n[profile.nightly]\n",
+        );
+        write(
+            source.path(),
+            "src/lib.rs",
+            br#"
+#[cfg(test)]
+fn record(value: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true)
+        .open(std::env::var_os("RABS_TEST_EVENT_LOG").unwrap()).unwrap();
+    writeln!(file, "{value}").unwrap();
+}
+#[test]
+fn passing() { record("pass"); }
+#[test]
+fn failing() { record("fail"); panic!("current test failure"); }
+"#,
+        );
+        let manifest = manifest(
+            source.path(),
+            &[
+                "Cargo.toml",
+                "Cargo.lock",
+                ".config/nextest.toml",
+                "src/lib.rs",
+            ],
+        );
+        let times = SourceTimestamps::capture(source.path(), &manifest, &|| false).unwrap();
+        let source_snapshot =
+            PrivateTreeSnapshot::capture(source.path(), 64 * 1024, &|| false).unwrap();
+        let base = CompilationSelection {
+            lib: true,
+            test_threads: Some(1),
+            ..Default::default()
+        };
+        let selections = [
+            (
+                CompilationSelection {
+                    no_run: true,
+                    ..base.clone()
+                },
+                None,
+            ),
+            (
+                CompilationSelection {
+                    runner_profile: Some("ci".into()),
+                    partition: Some("hash:1/2".into()),
+                    filtersets: vec!["test(passing)".into()],
+                    ..base.clone()
+                },
+                Some(("passing", 0)),
+            ),
+            (
+                CompilationSelection {
+                    runner_profile: Some("nightly".into()),
+                    partition: Some("hash:2/2".into()),
+                    filtersets: vec!["test(failing)".into()],
+                    ..base.clone()
+                },
+                Some(("failing", 101)),
+            ),
+            (
+                CompilationSelection {
+                    test_filter: Some("passing".into()),
+                    test_args: vec!["--exact".into()],
+                    ..base
+                },
+                Some(("passing", 0)),
+            ),
+        ];
+        let cargo = Path::new(env!("CARGO"));
+        let workspace = owner.path().join("workspace");
+        let target = owner.path().join("target");
+        let log = owner.path().join("executed-tests");
+        let mut family = None;
+        let mut seed: Option<(PrivateTreeSnapshot, std::path::PathBuf)> = None;
+        for (index, (selection, runtime)) in selections.into_iter().enumerate() {
+            let contract = NextestTree::new("Cargo.toml".into(), selection, 1).unwrap();
+            let mode = if contract.selection.no_run {
+                CargoArtifactMode::NextestCompilation
+            } else {
+                CargoArtifactMode::NextestExecution
+            };
+            let current =
+                compatible_arguments(PROGRAM, &contract.arguments().unwrap(), mode).unwrap();
+            if let Some(expected) = &family {
+                assert_eq!(&current, expected);
+            } else {
+                family = Some(current);
+            }
+            for root in [&workspace, &target] {
+                fs::create_dir(root).unwrap();
+                fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            source_snapshot
+                .restore_into(source.path(), &workspace, &|| false)
+                .unwrap();
+            // A new upload has new timestamps. Restore them only on the
+            // verified private copy, before asking Cargo to recheck its units.
+            stamp(&workspace.join("src/lib.rs"), SystemTime::now());
+            times
+                .restore_exact(&workspace, &manifest, &|| false)
+                .unwrap();
+            if let Some((snapshot, path)) = &seed {
+                snapshot.restore_into(path, &target, &|| false).unwrap();
+            }
+            let build = contract.selection.nextest_build_selection().unwrap();
+            let output = Command::new(cargo)
+                .args(build.cargo_arguments(CompilationCommand::Test).unwrap())
+                .args([
+                    "--locked",
+                    "--offline",
+                    "--message-format=json",
+                    "--jobs=1",
+                    "--manifest-path",
+                ])
+                .arg(workspace.join("Cargo.toml"))
+                .arg("--target-dir")
+                .arg(&target)
+                .current_dir(&workspace)
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env("RUSTC", cargo.with_file_name("rustc"))
+                .env("RUSTFLAGS", "-C debuginfo=0")
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_PROFILE_DEV_DEBUG", "0")
+                .env("CARGO_PROFILE_TEST_DEBUG", "0")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let records = output
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+                .filter(|record| record["reason"] == "compiler-artifact")
+                .collect::<Vec<_>>();
+            assert!(!records.is_empty());
+            assert!(
+                records.iter().all(|record| record["fresh"] == (index != 0)),
+                "Cargo freshness after restore: {records:?}"
+            );
+            let executable = records
+                .iter()
+                .find_map(|record| record["executable"].as_str())
+                .expect("actual compiled test executable");
+            if let Some((filter, expected_status)) = runtime {
+                let output = Command::new(executable)
+                    .args([filter, "--exact", "--test-threads=1"])
+                    .env("RABS_TEST_EVENT_LOG", &log)
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected_status),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            } else {
+                assert!(!log.exists(), "compile-only never executes test bodies");
+            }
+            // Retaining private compilation state after the real failing test
+            // must not change that status or replay it as the next test result.
+            let snapshot =
+                PrivateTreeSnapshot::capture(&target, 64 * 1024 * 1024, &|| false).unwrap();
+            let path = owner.path().join(format!("seed-{index}"));
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            snapshot.restore_into(&target, &path, &|| false).unwrap();
+            seed = Some((snapshot, path));
+            fs::rename(
+                &target,
+                owner.path().join(format!("finished-target-{index}")),
+            )
+            .unwrap();
+            fs::rename(
+                &workspace,
+                owner.path().join(format!("finished-workspace-{index}")),
+            )
+            .unwrap();
+        }
+        assert_eq!(fs::read_to_string(log).unwrap(), "pass\nfail\npass\n");
+        assert_eq!(
+            SourceTimestamps::capture(source.path(), &manifest, &|| false).unwrap(),
+            times
+        );
+    }
+
+    #[test]
     fn source_edits_dirty_changed_inputs_and_membership_without_touching_other_packages() {
         let original = private();
         write(original.path(), "Cargo.toml", b"manifest");

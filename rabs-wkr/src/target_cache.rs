@@ -157,6 +157,8 @@ pub(crate) fn target_key(
 /// This secondary key never changes action identity or permits result replay:
 /// the current command executes with its original argv and artifact contract.
 /// Unknown argument forms retain exact-key reuse only.
+/// Nextest has its own complete-source family: runner selection may change,
+/// but Cargo's selected compilation units and every source byte remain exact.
 pub(crate) fn target_compatibility_key(
     scope: TargetCacheScope,
     request: &CanonicalExecRequest,
@@ -171,14 +173,17 @@ pub(crate) fn target_compatibility_key(
     };
     let mut value = target_key_description(scope, request, inputs, spec, support, plan, grant)?;
     let clippy = request.program == "/__rabs/toolchain/bin/cargo-clippy";
-    value["version"] = serde_json::json!(if clippy {
+    let nextest = plan.cargo_mode().is_some_and(|mode| mode.is_nextest());
+    value["version"] = serde_json::json!(if nextest {
+        "rabs.private-nextest-compilation.v1"
+    } else if clippy {
         "rabs.private-clippy-commands.v2"
     } else {
         "rabs.private-cargo-selections.v2"
     });
     value["args"] = serde_json::json!(args);
     value["cargo_mode"] = serde_json::json!("current-cargo-contract-required-v1");
-    if let Some(source) = source_edits::metadata_context_identity(inputs, spec) {
+    if !nextest && let Some(source) = source_edits::metadata_context_identity(inputs, spec) {
         // This is only a private Cargo seed family, never an action key.
         // Actual changed bytes remain in the exact key and current manifest.
         value["version"] = serde_json::json!(if clippy {

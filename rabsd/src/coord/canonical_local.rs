@@ -2329,7 +2329,10 @@ impl TargetReuseContext<'_> {
             .iter()
             .take_while(|arg| arg.as_str() != "--")
             .any(|arg| arg == "--no-run");
+        let nextest = self.program == CARGO_NEXTEST;
         let mode = match self.args.first().map(String::as_str) {
+            Some("nextest") if nextest && no_run => CargoArtifactMode::NextestCompilation,
+            Some("nextest") if nextest => CargoArtifactMode::NextestExecution,
             Some("test") if !no_run => CargoArtifactMode::TestExecution,
             Some("bench") if !no_run => CargoArtifactMode::BenchExecution,
             Some("run") => CargoArtifactMode::RunExecution,
@@ -2366,7 +2369,11 @@ impl TargetReuseContext<'_> {
         ro.sort();
         rw.sort();
         let identity = json!({
-            "version":"canonical-private-cargo-target-v1",
+            "version":if nextest {
+                "canonical-private-nextest-compilation-v1"
+            } else {
+                "canonical-private-cargo-target-v1"
+            },
             "runtime_epoch":config.runtime_epoch,
             "driver":self.build_identity, "wrapper":self.wrapper,
             "source_family":source,
@@ -3159,12 +3166,16 @@ mod tests {
             profile.validate_logical().unwrap();
             assert_eq!(profile.execution_slots().unwrap(), expected);
             let arguments = profile.compilation_args().unwrap();
-            assert!(arguments.windows(2).any(|pair| {
-                pair == ["--build-jobs".to_owned(), build_jobs.to_string()]
-            }));
-            assert!(arguments.windows(2).any(|pair| {
-                pair == ["--test-threads".to_owned(), test_threads.to_string()]
-            }));
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| { pair == ["--build-jobs".to_owned(), build_jobs.to_string()] })
+            );
+            assert!(
+                arguments.windows(2).any(|pair| {
+                    pair == ["--test-threads".to_owned(), test_threads.to_string()]
+                })
+            );
         }
         profile.selection = None;
         // The original wire intent remains readable for retained operations.
@@ -3357,7 +3368,10 @@ mod tests {
             profile.source_selection = SourceSelection::UnitGraph;
             profile.vendor = Some("vendor".into());
             profile.selection = Some(CompilationSelection {
-                no_run: matches!(command, CompilationCommand::Test | CompilationCommand::Nextest),
+                no_run: matches!(
+                    command,
+                    CompilationCommand::Test | CompilationCommand::Nextest
+                ),
                 ..Default::default()
             });
             profile.validate_logical().unwrap();
@@ -3372,13 +3386,19 @@ mod tests {
             assert!(request.get("publication_authorized").is_none());
             profile.cargo_home_source = Some("/unapproved-cargo-home".into());
             assert!(
-                profile.validate_logical().unwrap_err().to_string()
+                profile
+                    .validate_logical()
+                    .unwrap_err()
+                    .to_string()
                     .contains("choose vendor or cargo_home_source")
             );
             profile.cargo_home_source = None;
             profile.vendor = Some("../vendor".into());
             assert!(
-                profile.validate_logical().unwrap_err().to_string()
+                profile
+                    .validate_logical()
+                    .unwrap_err()
+                    .to_string()
                     .contains("vendor must be an ordinary relative path")
             );
         }
@@ -5080,20 +5100,25 @@ fn consume_current_input() {
             fs::write(root.join("signal-ready"), b"owned").unwrap();
             let mut later_signal_sent = false;
             let drained = process
-                .wait_with_bounded_drain_budget(&DrainLimits::default(), 4096, || {
-                    if cancellation.stopped.load(Ordering::Acquire) && !later_signal_sent {
-                        later_signal_sent = true;
-                        // The first cancellation stays authoritative while a
-                        // different signal arrives during descendant cleanup.
-                        let later = if mode == "cancel-term" {
-                            rustix::process::Signal::HUP
-                        } else {
-                            rustix::process::Signal::TERM
-                        };
-                        rustix::process::kill_process(rustix::process::getpid(), later).unwrap();
-                    }
-                    cancellation.stopped.load(Ordering::Acquire)
-                })
+                .wait_with_bounded_drain_budget(
+                    &DrainLimits::new(root.join("diagnostics")),
+                    4096,
+                    || {
+                        if cancellation.stopped.load(Ordering::Acquire) && !later_signal_sent {
+                            later_signal_sent = true;
+                            // The first cancellation stays authoritative while a
+                            // different signal arrives during descendant cleanup.
+                            let later = if mode == "cancel-term" {
+                                rustix::process::Signal::HUP
+                            } else {
+                                rustix::process::Signal::TERM
+                            };
+                            rustix::process::kill_process(rustix::process::getpid(), later)
+                                .unwrap();
+                        }
+                        cancellation.stopped.load(Ordering::Acquire)
+                    },
+                )
                 .unwrap();
             assert_eq!(drained.residual_group_members, 0);
             assert!(later_signal_sent);
@@ -5629,6 +5654,196 @@ fn consume_current_input() {
             );
             fixture
         }
+
+        fn nextest(selection: CompilationSelection) -> Self {
+            let mut profile = application_environment_profile();
+            profile.command = CompilationCommand::Nextest;
+            profile.selection = Some(selection);
+            profile.jobs = 2;
+            let mut fixture = Self::new();
+            fixture.program = profile.program();
+            fixture.args = profile.compilation_args().unwrap();
+            fixture.closed_dependency_execution = true;
+            fixture
+        }
+    }
+
+    #[test]
+    fn nextest_private_targets_share_runner_choices_but_keep_compilation_and_sources_exact() {
+        let selection = CompilationSelection {
+            workspace: true,
+            test_threads: Some(1),
+            ..Default::default()
+        };
+        let original = ReuseKeyFixture::nextest(selection.clone()).key();
+        for selected in [
+            CompilationSelection {
+                no_run: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                partition: Some("hash:1/4".into()),
+                runner_profile: Some("ci".into()),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                partition: Some("hash:2/4".into()),
+                runner_profile: Some("nightly".into()),
+                test_threads: Some(8),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                filtersets: vec!["test(roundtrip)".into()],
+                test_filter: Some("roundtrip".into()),
+                test_args: vec!["--exact".into()],
+                no_fail_fast: true,
+                ..selection.clone()
+            },
+        ] {
+            assert_eq!(ReuseKeyFixture::nextest(selected).key(), original);
+        }
+        for selected in [
+            CompilationSelection {
+                profile: Some("release".into()),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                packages: vec!["app".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                features: vec!["extra".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                tests: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                target: vec!["x86_64-unknown-linux-gnu".into()],
+                ..selection.clone()
+            },
+        ] {
+            assert_ne!(ReuseKeyFixture::nextest(selected).key(), original);
+        }
+        for change in [
+            "source",
+            "toolchain",
+            "env",
+            "jobs",
+            "unknown",
+            "wrapper",
+            "epoch",
+            "peer",
+        ] {
+            let mut current = ReuseKeyFixture::nextest(selection.clone());
+            match change {
+                "source" => {
+                    current.source = reuse_source(b"pub const VALUE:u8=2;", b"manifest", None)
+                }
+                "toolchain" => {
+                    current.request["toolchain_identity"]["sha256"] = json!("cd".repeat(32))
+                }
+                "env" => current.spec.env.push(("INPUT".into(), "different".into())),
+                "jobs" => *current.args.last_mut().unwrap() = "3".into(),
+                "unknown" => current.args.push("--unknown-compilation-option".into()),
+                "wrapper" => current.wrapper = [6; 32],
+                "epoch" => current.config.runtime_epoch = "other-host".into(),
+                "peer" => current.authenticated_edge_pin = Some([1; 32]),
+                _ => unreachable!(),
+            }
+            assert_ne!(current.key(), original, "changed {change}");
+        }
+        assert_ne!(ReuseKeyFixture::new().key(), original);
+    }
+
+    #[test]
+    fn nextest_private_target_restore_uses_shared_family_after_runner_changes() {
+        use crate::coord::live_dependency::canonical::CommittedOutputSeeds;
+        // Exercise the actual local disk store with fixture artifact bytes.
+        // This does not claim a native runner execution or compiler cache hit.
+        let selection = CompilationSelection {
+            no_run: true,
+            workspace: true,
+            ..Default::default()
+        };
+        let fixture = ReuseKeyFixture::nextest(selection);
+        let state = crate::test_util::private_tempdir();
+        let workspace = crate::test_util::private_tempdir();
+        create_private(&workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("Cargo.toml"), b"manifest").unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub const VALUE:u8=1;",
+        )
+        .unwrap();
+        let target = crate::test_util::private_tempdir();
+        fs::write(target.path().join("test-artifact"), b"compiled fixture").unwrap();
+        TargetState::open(
+            state.path(),
+            &fixture.config,
+            fixture.key(),
+            workspace.path(),
+            &fixture.source,
+            &|| false,
+        )
+        .unwrap()
+        .capture(target.path(), &CommittedOutputSeeds::default())
+        .unwrap();
+        let mut current = ReuseKeyFixture::nextest(CompilationSelection {
+            workspace: true,
+            test_threads: Some(1),
+            runner_profile: Some("ci".into()),
+            partition: Some("hash:2/4".into()),
+            filtersets: vec!["test(roundtrip)".into()],
+            ..Default::default()
+        });
+        assert_eq!(current.key(), fixture.key());
+        let restored = crate::test_util::private_tempdir();
+        let mut cache = TargetState::open(
+            state.path(),
+            &current.config,
+            current.key(),
+            workspace.path(),
+            &current.source,
+            &|| false,
+        )
+        .unwrap();
+        assert!(cache.restore(restored.path()).unwrap());
+        assert_eq!(
+            fs::read(restored.path().join("test-artifact")).unwrap(),
+            b"compiled fixture"
+        );
+        fs::write(
+            restored.path().join("test-artifact"),
+            b"private runtime change",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(target.path().join("test-artifact")).unwrap(),
+            b"compiled fixture"
+        );
+        drop(cache);
+        current.source = reuse_source(b"pub const VALUE:u8=2;", b"manifest", None);
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub const VALUE:u8=2;",
+        )
+        .unwrap();
+        let fresh = crate::test_util::private_tempdir();
+        assert!(
+            !TargetState::open(
+                state.path(),
+                &current.config,
+                current.key(),
+                workspace.path(),
+                &current.source,
+                &|| false
+            )
+            .unwrap()
+            .restore(fresh.path())
+            .unwrap()
+        );
     }
 
     #[test]

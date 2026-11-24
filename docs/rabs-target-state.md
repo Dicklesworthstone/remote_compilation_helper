@@ -2,9 +2,9 @@
 
 The canonical worker can retain Cargo target trees after successful builds or
 ordinary completed compile, lint or program failures, then seed later builds with
-independently owned copies. Cargo or Clippy executes on every request and
+independently owned copies. Cargo, Clippy or Nextest executes on every request and
 decides which compilation steps are fresh. This accelerates repeated commands,
-ordinary build/check/test/run/bench transitions, changes to package or target selection,
+ordinary build/check/test/run/bench transitions, Nextest runner-only changes, changes to package or target selection,
 and eligible compiler-only metadata checks across local source and data edits. Every request still executes
 its current command and verifies its current result.
 
@@ -84,7 +84,7 @@ No new Cargo profile field is needed for ordinary target retention. Both the
 direct and durable daemon modes of [canonical Cargo](rabs-canonical-cargo.md)
 can use an enabled worker. Requests
 must have a verified uploaded workspace, captured toolchain, and an explicit
-Cargo artifact-report contract. Dependency-only execution and generic artifact
+Cargo artifact-report or Nextest complete-tree contract. Dependency-only execution and generic artifact
 requests keep their existing behavior.
 
 ### Retain private rustc incremental state
@@ -135,6 +135,8 @@ The coordinator and worker share the command normalization and source-edit
 family planner described below. An eligible edit or a build/check/test/run/bench selection
 change can therefore keep the next build on the worker that ran its predecessor.
 Clippy's separate family preserves its exact selectors and lint controls.
+Nextest's separate family preserves every source byte and Cargo compilation
+selector while sharing affinity across partitions, filters and runner profiles.
 Non-editable inputs, captured dependency-cache contents, toolchain, environment,
 profile, features, target, job grant, required artifacts and other request
 controls still partition the placement hint. Unknown argument forms keep
@@ -230,6 +232,31 @@ The worker gives each eligible execution a fresh HOME and a captured or empty
 Cargo home. Its jobserver has a stable canonical FIFO name but a new private
 FIFO and independent token budget for each execution. The final environment,
 including that actual grant, participates in the match.
+
+### Reuse across Nextest runner selections
+
+The captured `cargo-nextest` runner uses a separate private compilation family.
+With identical source and compiler inputs, `nextest run` can reuse compiled
+tests after changing the partition, filtersets, test-name filter, runner
+`--profile`, test concurrency, failure policy or harness arguments. Its
+`--no-run` and executing forms can share this state. Every request still starts
+the current runner, checks Cargo's fingerprints and executes its selected test
+bodies. Runtime admission reserves the current test concurrency independently
+of the retained compilation state.
+
+All Cargo build selectors remain exact: packages and exclusions, target kinds
+and names, features, target triple, `--cargo-profile` or release selection,
+manifest, target directory and `--build-jobs`. The complete captured source,
+runner configuration, toolchain including Nextest, final environment and runtime
+epoch also remain exact. Source edits cannot reuse a Nextest family through the
+metadata-only policy below. Unknown argument forms receive exact-key reuse only.
+Nextest state is never shared with ordinary Cargo or Clippy families.
+
+The same normal-exit, diagnostic, cancellation, process-drain and private-tree
+verification gates apply to Nextest seeds. A failed test run may leave useful
+compilation state while retaining its actual nonzero status and diagnostics;
+later tests execute again. Its complete-tree output contract still refuses
+private incremental projection, and this feature does not cache test results.
 
 ### Reuse after local source and data edits
 

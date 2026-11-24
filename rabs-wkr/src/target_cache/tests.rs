@@ -139,6 +139,39 @@ fn cargo_request(command: &str, options: &[&str]) -> (CanonicalExecRequest, Arti
     (request, plan)
 }
 
+fn nextest_request(
+    selection: rabs_sandbox::cargo_check::CompilationSelection,
+) -> (CanonicalExecRequest, ArtifactPlan) {
+    use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+    let contract = NextestTree::new("Cargo.toml".into(), selection, 1).unwrap();
+    let mut request = fixture_request();
+    request.program = PROGRAM.into();
+    request.args = contract.arguments().unwrap();
+    request.command_context = CommandContext::new(
+        "/__rabs/workspace",
+        vec![
+            ("CARGO".into(), "/__rabs/toolchain/bin/cargo".into()),
+            ("RUSTC".into(), "/__rabs/toolchain/bin/rustc".into()),
+            ("CARGO_INCREMENTAL".into(), "0".into()),
+        ],
+    )
+    .unwrap();
+    let env: BTreeMap<_, _> = request
+        .command_context
+        .environment()
+        .iter()
+        .cloned()
+        .collect();
+    let plan = crate::artifacts::parse_plan(&serde_json::json!({
+        "program":request.program, "args":request.args, "jobserver_grant":1,
+        "command_context":{"version":"env-cwd-v1", "cwd":"/__rabs/workspace", "env":env},
+        "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1", "cargo":contract},
+    }))
+    .unwrap()
+    .unwrap();
+    (request, plan)
+}
+
 fn fixture_spec(label: &str) -> CanonicalNamespaceSpec {
     let mut spec = CanonicalNamespaceSpec::new();
     spec.ro_binds
@@ -435,6 +468,241 @@ fn compatible_commands_preserve_compilation_settings_and_runtime_identity() {
     assert_ne!(
         target_compatibility_key(scope(), &build, &changed, &spec, &support(), &plan, 1).unwrap(),
         expected
+    );
+}
+
+#[test]
+fn nextest_private_family_preserves_complete_source_and_compiler_identity() {
+    use rabs_sandbox::cargo_check::CompilationSelection;
+    let (source, _, _, _) = small_fixture();
+    let input = inputs(source.path(), &["lib.rs"]);
+    let spec = fixture_spec("nextest");
+    let selection = CompilationSelection {
+        workspace: true,
+        test_threads: Some(1),
+        ..Default::default()
+    };
+    let (first, plan) = nextest_request(selection.clone());
+    let family = |request: &CanonicalExecRequest,
+                  plan: &ArtifactPlan,
+                  input: &WorkspaceInputs,
+                  spec: &CanonicalNamespaceSpec| {
+        target_compatibility_key(scope(), request, input, spec, &support(), plan, 1).unwrap()
+    };
+    let expected = family(&first, &plan, &input, &spec);
+    assert!(expected.is_some());
+    let exact = target_key(scope(), &first, &input, &spec, &support(), &plan, 1).unwrap();
+    for selected in [
+        CompilationSelection {
+            no_run: true,
+            ..selection.clone()
+        },
+        CompilationSelection {
+            partition: Some("hash:2/5".into()),
+            runner_profile: Some("ci".into()),
+            ..selection.clone()
+        },
+        CompilationSelection {
+            filtersets: vec!["test(roundtrip)".into()],
+            test_threads: Some(4),
+            ..selection.clone()
+        },
+        CompilationSelection {
+            test_filter: Some("other".into()),
+            no_fail_fast: true,
+            test_args: vec!["--exact".into()],
+            ..selection.clone()
+        },
+    ] {
+        let (current, plan) = nextest_request(selected);
+        assert_eq!(family(&current, &plan, &input, &spec), expected);
+        assert_ne!(
+            target_key(scope(), &current, &input, &spec, &support(), &plan, 1).unwrap(),
+            exact
+        );
+    }
+    for selected in [
+        CompilationSelection {
+            profile: Some("release".into()),
+            ..selection.clone()
+        },
+        CompilationSelection {
+            features: vec!["parallel".into()],
+            ..selection.clone()
+        },
+        CompilationSelection {
+            packages: vec!["app".into()],
+            ..selection.clone()
+        },
+        CompilationSelection {
+            tests: true,
+            ..selection.clone()
+        },
+        CompilationSelection {
+            target: vec!["x86_64-unknown-linux-gnu".into()],
+            ..selection
+        },
+    ] {
+        let (current, plan) = nextest_request(selected);
+        assert_ne!(family(&current, &plan, &input, &spec), expected);
+    }
+    fs::set_permissions(
+        source.path().join("lib.rs"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(source.path().join("lib.rs"), b"pub fn changed() {}\n").unwrap();
+    let edited = inputs(source.path(), &["lib.rs"]);
+    assert_ne!(
+        family(&first, &plan, &edited, &spec),
+        expected,
+        "Nextest must never inherit metadata-only source-edit normalization"
+    );
+    assert_ne!(
+        family(&first, &plan, &input, &fixture_spec("other-env")),
+        expected
+    );
+    let mut changed = first.clone();
+    changed.toolchain_identity.as_mut().unwrap().sha256[0] ^= 1;
+    assert_ne!(family(&changed, &plan, &input, &spec), expected);
+    assert_ne!(
+        target_compatibility_key(scope(), &first, &input, &spec, &support(), &plan, 2).unwrap(),
+        expected
+    );
+    let (cargo, cargo_plan) = cargo_request("test", &["--workspace"]);
+    assert_ne!(family(&cargo, &cargo_plan, &input, &spec), expected);
+}
+
+#[test]
+fn nextest_partition_seed_survives_restart_as_an_independent_private_copy() {
+    use rabs_sandbox::cargo_check::CompilationSelection;
+    // Real private-tree capture and restore, using fixture bytes rather than
+    // claiming a native Nextest/TLS execution on this test host.
+    let disk = private_directory("rabs-nextest-target-pool-").unwrap();
+    let (source, _, _, _) = small_fixture();
+    let input = inputs(source.path(), &["lib.rs"]);
+    let original_times = SourceTimes::capture(&input, &|| false).unwrap();
+    let spec = fixture_spec("nextest");
+    let selection = CompilationSelection {
+        workspace: true,
+        test_threads: Some(1),
+        partition: Some("hash:1/2".into()),
+        ..Default::default()
+    };
+    let (first, plan) = nextest_request(selection.clone());
+    let cache =
+        Arc::new(TargetCache::open_persistent(4096, disk.path(), "nextest-host-v1").unwrap());
+    let exact = target_key(scope(), &first, &input, &spec, &support(), &plan, 1).unwrap();
+    let compatible =
+        target_compatibility_key(scope(), &first, &input, &spec, &support(), &plan, 1).unwrap();
+    let (attempt, restored) = cache
+        .acquire(
+            exact,
+            compatible,
+            input.clone(),
+            || PreparedArtifacts::new(plan.clone()),
+            1,
+            &|| false,
+        )
+        .unwrap();
+    assert!(restored.is_none());
+    let target = PreparedArtifacts::new(plan).unwrap();
+    fs::create_dir_all(target.backing().join("debug/deps")).unwrap();
+    fs::write(
+        target.backing().join("debug/deps/tests"),
+        b"compiled test fixture",
+    )
+    .unwrap();
+    let captured = target
+        .capture_with_cargo_output(None, &b"opaque nextest diagnostics\n"[..], || false)
+        .unwrap();
+    attempt
+        .stage(&target, &captured, &|| false)
+        .unwrap()
+        .unwrap()
+        .publish();
+    drop(cache);
+
+    let cache =
+        Arc::new(TargetCache::open_persistent(4096, disk.path(), "nextest-host-v1").unwrap());
+    let (current, plan) = nextest_request(CompilationSelection {
+        partition: Some("hash:2/2".into()),
+        runner_profile: Some("ci".into()),
+        filtersets: vec!["test(roundtrip)".into()],
+        ..selection
+    });
+    let key = target_key(scope(), &current, &input, &spec, &support(), &plan, 1).unwrap();
+    assert_ne!(key, exact);
+    let current_family =
+        target_compatibility_key(scope(), &current, &input, &spec, &support(), &plan, 1).unwrap();
+    assert_eq!(current_family, compatible);
+    let (_, restored) = cache
+        .acquire(
+            key,
+            current_family,
+            input.clone(),
+            || PreparedArtifacts::new(plan.clone()),
+            2,
+            &|| false,
+        )
+        .unwrap();
+    let restored = restored.expect("a different partition uses the completed compilation seed");
+    let (_, simultaneous) = cache
+        .acquire(
+            key,
+            current_family,
+            input.clone(),
+            || PreparedArtifacts::new(plan.clone()),
+            3,
+            &|| false,
+        )
+        .unwrap();
+    let simultaneous = simultaneous.unwrap();
+    let name = "debug/deps/tests";
+    let left = fs::metadata(restored.backing().join(name)).unwrap();
+    let right = fs::metadata(simultaneous.backing().join(name)).unwrap();
+    assert_ne!((left.dev(), left.ino()), (right.dev(), right.ino()));
+    fs::write(
+        restored.backing().join(name),
+        b"runtime changed its own copy",
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(simultaneous.backing().join(name)).unwrap(),
+        b"compiled test fixture"
+    );
+    assert_eq!(
+        SourceTimes::capture(&input, &|| false).unwrap(),
+        original_times
+    );
+
+    fs::set_permissions(
+        source.path().join("lib.rs"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(
+        source.path().join("lib.rs"),
+        b"pub fn changed_source() {}\n",
+    )
+    .unwrap();
+    let input = inputs(source.path(), &["lib.rs"]);
+    let key = target_key(scope(), &current, &input, &spec, &support(), &plan, 1).unwrap();
+    let compatible =
+        target_compatibility_key(scope(), &current, &input, &spec, &support(), &plan, 1).unwrap();
+    let (_, restored) = cache
+        .acquire(
+            key,
+            compatible,
+            input,
+            || PreparedArtifacts::new(plan.clone()),
+            4,
+            &|| false,
+        )
+        .unwrap();
+    assert!(
+        restored.is_none(),
+        "changed source starts a cold Nextest compilation family"
     );
 }
 
@@ -1753,97 +2021,111 @@ fn wait_completion(task: &mut ExecutionTask) -> Result<ExecutionCompletion, Stri
 
 #[test]
 fn normal_failure_seed_requires_exact_exit_clean_completion_and_diagnostics() {
-    for outcome in [
-        "failure",
-        "different-failure",
-        "foreign-request",
-        "success",
-        "cancel",
-        "deadline",
-        "session-lost",
-        "lease-expired",
-        "residual",
-        "bad-diagnostics",
-        "unexecuted",
-    ] {
-        let cache = Arc::new(TargetCache::new(1024).unwrap());
-        let (source, _, _, _) = small_fixture();
-        let (_, plan) = cargo_request("test", &[]);
-        let target = PreparedArtifacts::new(plan.clone()).unwrap();
-        fs::write(target.backing().join("dependency"), b"compiled dependency").unwrap();
-        let (attempt, _) = cache
-            .acquire(
-                TargetKey([3; 32]),
-                None,
-                runtime_inputs(source.path(), &["lib.rs"]),
-                || PreparedArtifacts::new(plan.clone()),
-                if outcome == "foreign-request" { 4 } else { 3 },
-                &|| false,
+    for nextest in [false, true] {
+        let exit_code = if nextest { 100 } else { 101 };
+        for outcome in [
+            "failure",
+            "different-failure",
+            "foreign-request",
+            "success",
+            "cancel",
+            "deadline",
+            "session-lost",
+            "lease-expired",
+            "residual",
+            "bad-diagnostics",
+            "unexecuted",
+        ] {
+            let cache = Arc::new(TargetCache::new(1024).unwrap());
+            let (source, _, _, _) = small_fixture();
+            let (_, plan) = if nextest {
+                nextest_request(rabs_sandbox::cargo_check::CompilationSelection {
+                    test_threads: Some(1),
+                    ..Default::default()
+                })
+            } else {
+                cargo_request("test", &[])
+            };
+            let target = PreparedArtifacts::new(plan.clone()).unwrap();
+            fs::write(target.backing().join("dependency"), b"compiled dependency").unwrap();
+            let (attempt, _) = cache
+                .acquire(
+                    TargetKey([3; 32]),
+                    None,
+                    runtime_inputs(source.path(), &["lib.rs"]),
+                    || PreparedArtifacts::new(plan.clone()),
+                    if outcome == "foreign-request" { 4 } else { 3 },
+                    &|| false,
+                )
+                .unwrap();
+            let pending = attempt
+                .stage_failed(
+                    &target,
+                    std::process::ExitStatus::from_raw(exit_code << 8),
+                    &|| false,
+                )
+                .unwrap()
+                .unwrap();
+            let mut task = ExecutionTask::spawn_with_artifacts(
+                3,
+                Duration::from_secs(10),
+                plan,
+                move |control| {
+                    control.retain_target_seed(pending).unwrap();
+                    if outcome == "bad-diagnostics" {
+                        control
+                            .retain_outputs(Err("lost diagnostic bytes".into()))
+                            .unwrap();
+                    }
+                    let stop = match outcome {
+                        "cancel" => Some(StopReason::Cancelled),
+                        "deadline" => Some(StopReason::DeadlineExceeded),
+                        "session-lost" => Some(StopReason::SessionLost),
+                        "lease-expired" => Some(StopReason::LeaseExpired),
+                        _ => None,
+                    };
+                    if let Some(stop) = stop {
+                        control.cancel(stop);
+                    }
+                    ExecResult {
+                        request_id: 3,
+                        exit_code: match outcome {
+                            "success" => 0,
+                            "different-failure" => 1,
+                            _ => exit_code,
+                        },
+                        stdout_sha256: crate::session::sha256_hex(b""),
+                        stderr_sha256: crate::session::sha256_hex(b""),
+                        executed: outcome != "unexecuted",
+                        residual_group_members: u32::from(outcome == "residual"),
+                        stdout_spill_bytes: 0,
+                        stderr_spill_bytes: 0,
+                        stdout_spill_path: None,
+                        stderr_spill_path: None,
+                    }
+                },
             )
             .unwrap();
-        let pending = attempt
-            .stage_failed(
-                &target,
-                std::process::ExitStatus::from_raw(101 << 8),
-                &|| false,
-            )
-            .unwrap()
-            .unwrap();
-        let mut task =
-            ExecutionTask::spawn_with_artifacts(3, Duration::from_secs(10), plan, move |control| {
-                control.retain_target_seed(pending).unwrap();
-                if outcome == "bad-diagnostics" {
-                    control
-                        .retain_outputs(Err("lost diagnostic bytes".into()))
-                        .unwrap();
-                }
-                let stop = match outcome {
-                    "cancel" => Some(StopReason::Cancelled),
-                    "deadline" => Some(StopReason::DeadlineExceeded),
-                    "session-lost" => Some(StopReason::SessionLost),
-                    "lease-expired" => Some(StopReason::LeaseExpired),
-                    _ => None,
-                };
-                if let Some(stop) = stop {
-                    control.cancel(stop);
-                }
-                ExecResult {
-                    request_id: 3,
-                    exit_code: match outcome {
-                        "success" => 0,
-                        "different-failure" => 1,
-                        _ => 101,
-                    },
-                    stdout_sha256: crate::session::sha256_hex(b""),
-                    stderr_sha256: crate::session::sha256_hex(b""),
-                    executed: outcome != "unexecuted",
-                    residual_group_members: u32::from(outcome == "residual"),
-                    stdout_spill_bytes: 0,
-                    stderr_spill_bytes: 0,
-                    stdout_spill_path: None,
-                    stderr_spill_path: None,
-                }
-            })
-            .unwrap();
-        let completion = wait_completion(&mut task);
-        assert_eq!(
-            completion.is_err(),
-            matches!(outcome, "success" | "residual" | "bad-diagnostics"),
-            "{outcome}"
-        );
-        if let Ok(completion) = completion {
-            assert!(completion.artifacts.is_none(), "{outcome}");
-            assert_ne!(completion.result.exit_code, 0, "{outcome}");
+            let completion = wait_completion(&mut task);
+            assert_eq!(
+                completion.is_err(),
+                matches!(outcome, "success" | "residual" | "bad-diagnostics"),
+                "{outcome}"
+            );
+            if let Ok(completion) = completion {
+                assert!(completion.artifacts.is_none(), "{outcome}");
+                assert_ne!(completion.result.exit_code, 0, "{outcome}");
+            }
+            drop(task);
+            let state = cache.state.lock().unwrap();
+            assert_eq!(
+                state.entries.len(),
+                usize::from(outcome == "failure"),
+                "{outcome}"
+            );
+            assert_eq!(state.reservations, 0, "{outcome}");
+            assert_eq!(state.reserved_bytes, 0, "{outcome}");
         }
-        drop(task);
-        let state = cache.state.lock().unwrap();
-        assert_eq!(
-            state.entries.len(),
-            usize::from(outcome == "failure"),
-            "{outcome}"
-        );
-        assert_eq!(state.reservations, 0, "{outcome}");
-        assert_eq!(state.reserved_bytes, 0, "{outcome}");
     }
 }
 

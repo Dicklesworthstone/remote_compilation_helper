@@ -270,7 +270,25 @@ Every requested test run executes afresh, including after private target reuse.
 Tests, setup scripts and test-pass results receive no action-cache authority;
 the existing isolated dependency-compilation boundary still applies. The
 complete captured source and toolchain, including nextest itself, remain part
-of private target identity. `--no-run` compiles without running test bodies and
+of private target identity. With target retention enabled, local and shared
+canonical execution and direct workers can reuse compiled tests across changes
+to partitions, filtersets, name filters, runner profiles, test concurrency,
+failure policy and harness arguments. `--no-run` and executing requests share
+this private compilation family too. Cargo still checks its fingerprints and
+the current runner receives every original argument. Fresh admission reserves
+the current compiler and test concurrency even when a seed is available.
+
+Nextest uses a separate family from ordinary Cargo and Clippy. Its complete
+source capture, environment, toolchain, build job count, selected packages and
+targets, features, target triple, and Cargo compilation profile remain exact.
+Changing the runner `--profile` can reuse compilation; changing
+`--cargo-profile` or `--release` starts a different family. Source edits also
+start a different family, including changes to data and runner configuration.
+Unknown argument forms keep only exact-invocation reuse. Ordinary completed
+failures may retain private compilation state through the existing completion
+checks, while the failed run keeps its native status and diagnostics.
+
+`--no-run` compiles without running test bodies and
 delivers the completed target tree. Nextest defaults to closed stdin; an executing
 runner may receive an existing captured input file. This supplies input to the
 runner, without changing its handling of child processes: ordinary nextest test
@@ -802,7 +820,9 @@ Compatibility uses the same source and command planner as the worker's
 source and data edits, additions, removals and renames may retain affinity.
 Cargo `build`, `check`, `test`, `run` and `bench` can share it across package
 and target selections. Clippy remains a separate family with exact selectors
-and lint controls. Cargo manifests, lockfiles, configuration, executable inputs,
+and lint controls. Nextest's separate family keeps the entire source and Cargo
+compilation selection exact while sharing affinity across runner-only changes,
+including partitions, filters and runner profiles. Cargo manifests, lockfiles, configuration, executable inputs,
 vendored packages and captured Cargo-home cache contents remain exact, as do
 the toolchain, environment, compilation profile, target, features, job grant,
 output location, required artifacts, private-state projection and other request
@@ -865,6 +885,9 @@ allowing Cargo to skip compilation it considers fresh. An exact invocation is
 preferred; compatible `build`, `check`, `test`, `run` and `bench` commands can
 share a target when their other compilation settings match. Cargo still executes
 each current request, including its selected programs and runtime arguments.
+Nextest has its own complete-source family with exact Cargo selectors and
+`--build-jobs`; runner-only changes can restore its completed compilation state.
+Every current runner still executes and receives a fresh runtime slot reservation.
 Ordinary local source and data edits can retain compiler metadata from an
 eligible check. The complete retained target must contain only metadata,
 dep-info and recognized Cargo bookkeeping. Changed inputs and their surviving
@@ -3935,6 +3958,10 @@ source-edit family. Identical captured inputs can also reuse compatible build,
 package and feature selections; toolchain, target/profile,
 runtime epoch, lockfile, manifest, configuration and captured dependency changes
 separate the seed family. Immutable registry/Git/vendor inputs remain exact.
+Nextest keeps all source bytes and compilation selectors exact in its own family,
+but can restore the same compiled tests after changing partitions, filters,
+runner profiles or other runner-only controls. A compilation-only Nextest request
+can seed a later executing request; the selected tests still run afresh.
 This allows workspace crates to stay fresh without granting them action-cache
 publication or skipping Cargo's current command.
 

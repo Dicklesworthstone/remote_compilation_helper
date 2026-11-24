@@ -140,6 +140,8 @@ pub fn source_edit_identity(
 /// Cargo fingerprints feature-selected units and build-script environments;
 /// unchanged dependencies can therefore survive feature-selection changes.
 /// Clippy keeps every selection, feature and lint control in a separate family.
+/// Nextest keeps its complete Cargo build selection and strips only runner
+/// controls in a separate family; its callers must keep all source bytes exact.
 /// Documentation keeps exact-argument, complete-source reuse: rustdoc assets
 /// and configuration are not modeled by ordinary rustc fingerprint families.
 #[must_use]
@@ -148,6 +150,9 @@ pub fn compatible_arguments(
     args: &[String],
     mode: CargoArtifactMode,
 ) -> Option<Vec<String>> {
+    if program == crate::cargo_artifacts::nextest::PROGRAM {
+        return nextest_compilation_arguments(args, mode);
+    }
     let command = args.first()?.as_str();
     let clippy = match (program, command, mode) {
         ("/__rabs/toolchain/bin/cargo", "build" | "check" | "test" | "run" | "bench", _) => false,
@@ -306,6 +311,63 @@ pub fn compatible_arguments(
         CargoArtifactMode::BenchExecution if command == "bench" && !no_run => Some(normalized),
         _ => None,
     }
+}
+
+/// Accept the shared Nextest selector's literal spelling only. Validation of
+/// its complete execution contract precedes this optional seed lookup. Keep
+/// every compiler selector, manifest, output root and build budget exact;
+/// runner profiles are distinct from Cargo's `--cargo-profile`.
+fn nextest_compilation_arguments(args: &[String], mode: CargoArtifactMode) -> Option<Vec<String>> {
+    if !mode.is_nextest() || args.first()? != "nextest" || args.get(1)? != "run" {
+        return None;
+    }
+    let mut normalized = vec!["nextest-private-compilation-v1".to_owned()];
+    let mut no_run = false;
+    let mut name_filter = false;
+    let mut at = 2;
+    while at < args.len() {
+        let argument = &args[at];
+        match argument.as_str() {
+            // The validated contract places emulated harness arguments after
+            // every driver control. They cannot become Cargo build options.
+            "--" => break,
+            "--no-run" if !no_run => no_run = true,
+            "--no-fail-fast" => {}
+            "--profile" | "--test-threads" | "--partition" | "--filterset" => {
+                at += 1;
+                let value = args.get(at)?;
+                if value.is_empty() || value.starts_with('-') {
+                    return None;
+                }
+            }
+            "--workspace"
+            | "--all-features"
+            | "--no-default-features"
+            | "--lib"
+            | "--bins"
+            | "--tests"
+            | "--examples"
+            | "--benches"
+            | "--all-targets"
+            | "--release"
+            | "--locked"
+            | "--offline" => normalized.push(argument.clone()),
+            "--package" | "--exclude" | "--features" | "--bin" | "--test" | "--example"
+            | "--bench" | "--target" | "--cargo-profile" | "--manifest-path" | "--target-dir"
+            | "--build-jobs" => {
+                at += 1;
+                let value = args.get(at)?;
+                if value.is_empty() || value.starts_with('-') {
+                    return None;
+                }
+                normalized.extend([argument.clone(), value.clone()]);
+            }
+            _ if !argument.starts_with('-') && !name_filter => name_filter = true,
+            _ => return None,
+        }
+        at += 1;
+    }
+    (no_run == (mode == CargoArtifactMode::NextestCompilation)).then_some(normalized)
 }
 
 #[cfg(test)]
@@ -609,6 +671,246 @@ mod tests {
             .chain(tail.iter().copied())
             .map(str::to_owned)
             .collect()
+    }
+
+    fn nextest_invocation(
+        selection: crate::cargo_check::CompilationSelection,
+    ) -> (Vec<String>, CargoArtifactMode) {
+        use crate::cargo_artifacts::nextest::NextestTree;
+        let mode = if selection.no_run {
+            CargoArtifactMode::NextestCompilation
+        } else {
+            CargoArtifactMode::NextestExecution
+        };
+        (
+            NextestTree::new("Cargo.toml".into(), selection, 2)
+                .unwrap()
+                .arguments()
+                .unwrap(),
+            mode,
+        )
+    }
+
+    #[test]
+    fn nextest_runner_controls_share_compilation_without_changing_original_arguments() {
+        use crate::cargo_artifacts::nextest::PROGRAM;
+        use crate::cargo_check::CompilationSelection;
+        let selection = CompilationSelection {
+            workspace: true,
+            test_threads: Some(1),
+            ..Default::default()
+        };
+        let (args, mode) = nextest_invocation(selection.clone());
+        let expected = compatible_arguments(PROGRAM, &args, mode).unwrap();
+        for changed in [
+            CompilationSelection {
+                no_run: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                no_fail_fast: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                runner_profile: Some("ci".into()),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                test_threads: Some(4),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                partition: Some("hash:2/5".into()),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                partition: Some("slice:3/5".into()),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                filtersets: vec!["test(roundtrip)".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                test_filter: Some("roundtrip".into()),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                test_args: vec!["--exact".into(), "--profile=opaque-harness-value".into()],
+                ..selection
+            },
+        ] {
+            let (current, mode) = nextest_invocation(changed);
+            let original = current.clone();
+            assert_ne!(current, args);
+            assert_eq!(
+                compatible_arguments(PROGRAM, &current, mode),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                current, original,
+                "lookup must not rewrite the executing request"
+            );
+        }
+        assert_ne!(
+            compatible_arguments(
+                "/__rabs/toolchain/bin/cargo",
+                &invocation("test", &["--no-run"]),
+                CargoArtifactMode::Compilation,
+            ),
+            Some(expected),
+            "Nextest has a separate private compilation family",
+        );
+    }
+
+    #[test]
+    fn nextest_compiler_selectors_and_driver_inputs_remain_exact() {
+        use crate::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+        use crate::cargo_check::CompilationSelection;
+        let selection = CompilationSelection {
+            test_threads: Some(1),
+            ..Default::default()
+        };
+        let (args, mode) = nextest_invocation(selection.clone());
+        let expected = compatible_arguments(PROGRAM, &args, mode).unwrap();
+        for changed in [
+            CompilationSelection {
+                workspace: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                packages: vec!["core".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                workspace: true,
+                exclude: vec!["app".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                features: vec!["parallel".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                all_features: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                no_default_features: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                lib: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                bins: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                tests: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                examples: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                benches: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                all_targets: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                bin: vec!["app".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                test: vec!["roundtrip".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                example: vec!["sample".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                bench: vec!["throughput".into()],
+                ..selection.clone()
+            },
+            CompilationSelection {
+                release: true,
+                ..selection.clone()
+            },
+            CompilationSelection {
+                profile: Some("release".into()),
+                ..selection.clone()
+            },
+            CompilationSelection {
+                target: vec!["x86_64-unknown-linux-gnu".into()],
+                ..selection.clone()
+            },
+        ] {
+            let (current, mode) = nextest_invocation(changed);
+            let actual = compatible_arguments(PROGRAM, &current, mode);
+            assert!(actual.is_some(), "{current:?}");
+            assert_ne!(actual, Some(expected.clone()), "{current:?}");
+        }
+        for (manifest, jobs) in [("nested/Cargo.toml", 2), ("Cargo.toml", 3)] {
+            let contract = NextestTree::new(manifest.into(), selection.clone(), jobs).unwrap();
+            assert_ne!(
+                compatible_arguments(PROGRAM, &contract.arguments().unwrap(), mode),
+                Some(expected.clone()),
+            );
+        }
+        let mut other_output = args.clone();
+        *other_output
+            .iter_mut()
+            .find(|arg| *arg == "/__rabs/out/cargo")
+            .unwrap() = "/__rabs/out/other".into();
+        assert_ne!(
+            compatible_arguments(PROGRAM, &other_output, mode),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn nextest_unknown_options_and_mismatched_modes_do_not_get_a_compilation_family() {
+        use crate::cargo_artifacts::nextest::PROGRAM;
+        use crate::cargo_check::CompilationSelection;
+        let (args, mode) = nextest_invocation(CompilationSelection::default());
+        for extra in [
+            "--future-build-option",
+            "--config-file=other.toml",
+            "--cargo-profile=release",
+            "--jobs=2",
+            "--target",
+        ] {
+            let mut changed = args.clone();
+            changed.push(extra.into());
+            assert!(
+                compatible_arguments(PROGRAM, &changed, mode).is_none(),
+                "{extra}"
+            );
+        }
+        for mode in [
+            CargoArtifactMode::Compilation,
+            CargoArtifactMode::TestExecution,
+            CargoArtifactMode::NextestCompilation,
+        ] {
+            assert!(compatible_arguments(PROGRAM, &args, mode).is_none());
+        }
+        let (compile, _) = nextest_invocation(CompilationSelection {
+            no_run: true,
+            ..Default::default()
+        });
+        assert!(
+            compatible_arguments(PROGRAM, &compile, CargoArtifactMode::NextestExecution).is_none()
+        );
+        let mut other_command = args;
+        other_command[1] = "list".into();
+        assert!(compatible_arguments(PROGRAM, &other_command, mode).is_none());
     }
 
     #[test]

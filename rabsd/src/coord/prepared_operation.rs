@@ -518,8 +518,11 @@ fn cargo_compatibility_fingerprint(request: &Value) -> io::Result<Option<[u8; 32
     intent["request_id"] = serde_json::json!("allocate");
     intent["args"] = serde_json::json!(arguments);
     intent["artifacts"]["cargo"] = serde_json::json!("current-cargo-contract-required-v1");
-    if let Some(source_family) =
-        source_edit_identity(workspace, source.digest(), projection.as_ref())
+    // Nextest keeps its complete source capture, including configuration and
+    // data that compiled tests or setup scripts may read without Cargo tracking.
+    if !mode.is_nextest()
+        && let Some(source_family) =
+            source_edit_identity(workspace, source.digest(), projection.as_ref())
     {
         intent["source_manifest"] = serde_json::json!(source_family);
     }
@@ -527,7 +530,11 @@ fn cargo_compatibility_fingerprint(request: &Value) -> io::Result<Option<[u8; 32
     // object so an unknown extension cannot collide with an internal hint field.
     let encoded = serde_json::to_vec(&(intent, private_roots))?;
     let mut hash = Sha256::new();
-    hash.update(b"rabs.prepared-operation.cargo-compatible-locality.v1\0");
+    hash.update(if mode.is_nextest() {
+        b"rabs.prepared-operation.nextest-compilation-locality.v1\0".as_slice()
+    } else {
+        b"rabs.prepared-operation.cargo-compatible-locality.v1\0".as_slice()
+    });
     hash.update((encoded.len() as u64).to_le_bytes());
     hash.update(encoded);
     Ok(Some(hash.finalize().into()))

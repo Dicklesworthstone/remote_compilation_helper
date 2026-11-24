@@ -1713,7 +1713,7 @@ mod tests {
                 }
                 Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    super::UnconfirmedCleanup("unresolved descendants".into()),
+                    super::super::UnconfirmedCleanup("unresolved descendants".into()),
                 ))
             })),
         };
@@ -1744,7 +1744,12 @@ mod tests {
         );
         assert!(!state.cleanup_confirmed());
         let error = server.join().unwrap().unwrap_err();
-        assert!(error.get_ref().unwrap().is::<super::UnconfirmedCleanup>());
+        assert!(
+            error
+                .get_ref()
+                .unwrap()
+                .is::<super::super::UnconfirmedCleanup>()
+        );
     }
 
     fn full_caller_pipe() -> (std::os::fd::OwnedFd, File) {

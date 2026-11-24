@@ -68,6 +68,21 @@ impl Fixture {
         })
     }
 
+    fn nextest_template(
+        selection: rabs_sandbox::cargo_check::CompilationSelection,
+        jobs: u32,
+    ) -> Value {
+        use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
+        let contract = NextestTree::new("Cargo.toml".into(), selection, jobs).unwrap();
+        let mut request = Self::cargo_template("test");
+        request["program"] = json!(PROGRAM);
+        request["args"] = json!(contract.arguments().unwrap());
+        request["jobserver_grant"] = json!(jobs);
+        request["command_context"]["env"]["CARGO_INCREMENTAL"] = json!("0");
+        request["artifacts"]["cargo"] = json!(contract);
+        request
+    }
+
     fn capture(request: Value) -> Self {
         let owner = tempfile::tempdir().unwrap();
         let root = owner.path().canonicalize().unwrap();
@@ -415,6 +430,133 @@ fn runtime_locality_survives_restart_but_never_reuses_an_execution_result() {
             assert_eq!(claim.request()["artifacts"], request["artifacts"]);
             no_dispatch(claim);
         }
+    }
+}
+
+#[test]
+fn nextest_locality_survives_runner_changes_and_restart_without_reusing_results() {
+    use rabs_sandbox::cargo_check::CompilationSelection;
+    let previous = CompilationSelection {
+        workspace: true,
+        test_threads: Some(1),
+        partition: Some("hash:1/2".into()),
+        ..Default::default()
+    };
+    for exit_code in [0, 100] {
+        for selection in [
+            CompilationSelection {
+                partition: Some("hash:2/2".into()),
+                runner_profile: Some("ci".into()),
+                ..previous.clone()
+            },
+            CompilationSelection {
+                filtersets: vec!["test(roundtrip)".into()],
+                test_threads: Some(4),
+                ..previous.clone()
+            },
+            CompilationSelection {
+                test_filter: Some("other".into()),
+                test_args: vec!["--exact".into()],
+                ..previous.clone()
+            },
+            CompilationSelection {
+                no_run: true,
+                ..previous.clone()
+            },
+        ] {
+            let fixture = Fixture::capture(Fixture::nextest_template(previous.clone(), 2));
+            let store = fixture.open();
+            let original = store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+            completed(
+                store.claim_next().unwrap().unwrap(),
+                9001,
+                exit_code,
+                Value::Null,
+                true,
+            );
+            drop(store);
+            let request = Fixture::nextest_template(selection, 2);
+            let mut next = fixture.spec(2, 2);
+            next.bundle = fixture.root.join("current-runner-capture");
+            prepare_source_template(&fixture.root.join("source"), &request, &next.bundle).unwrap();
+            let store = fixture.open();
+            let selected = store.submit_allocated_pool(next).unwrap();
+            assert_eq!(selected.worker, "worker-2");
+            assert_ne!(selected.request_sha256, original.request_sha256);
+            assert_eq!(selected.mode, "execute");
+            assert!(!selected.outputs_installed);
+            let claim = store.claim_next().unwrap().unwrap();
+            assert!(claim.needs_request_allocation());
+            assert_eq!(claim.request()["args"], request["args"]);
+            assert_eq!(claim.request()["artifacts"], request["artifacts"]);
+            assert_eq!(
+                rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(claim.request())
+                    .unwrap(),
+                rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&request).unwrap()
+            );
+            no_dispatch(claim);
+        }
+    }
+}
+
+#[test]
+fn nextest_locality_keeps_source_compilation_and_execution_environment_exact() {
+    use rabs_sandbox::cargo_check::CompilationSelection;
+    for change in [
+        "source",
+        "features",
+        "package",
+        "target",
+        "cargo-profile",
+        "jobs",
+        "environment",
+        "toolchain",
+        "extension",
+    ] {
+        let selection = CompilationSelection {
+            workspace: true,
+            test_threads: Some(1),
+            ..Default::default()
+        };
+        let fixture = Fixture::capture(Fixture::nextest_template(selection.clone(), 2));
+        let store = fixture.open();
+        store.submit_allocated(fixture.singleton(1, 2)).unwrap();
+        completed(
+            store.claim_next().unwrap().unwrap(),
+            9001,
+            0,
+            Value::Null,
+            true,
+        );
+        let source = fixture.root.join("source");
+        let mut current = selection;
+        let mut jobs = 2;
+        match change {
+            "source" => {
+                fs::write(source.join("lib.rs"), b"pub fn value() -> u32 { 43 }\n").unwrap()
+            }
+            "features" => current.features.push("extra".into()),
+            "package" => current.packages.push("pool-fixture".into()),
+            "target" => current.target.push("x86_64-unknown-linux-gnu".into()),
+            "cargo-profile" => current.profile = Some("release".into()),
+            "jobs" => jobs = 3,
+            _ => {}
+        }
+        let mut request = Fixture::nextest_template(current, jobs);
+        match change {
+            "environment" => request["command_context"]["env"]["APP_MODE"] = json!("different"),
+            "toolchain" => request["toolchain_identity"]["sha256"] = json!("cd".repeat(32)),
+            "extension" => request["future_execution_control"] = json!(true),
+            _ => {}
+        }
+        let mut next = fixture.spec(2, 2);
+        next.bundle = fixture.root.join("different-compilation");
+        prepare_source_template(&source, &request, &next.bundle).unwrap();
+        assert_eq!(
+            store.submit_allocated_pool(next).unwrap().worker,
+            "worker-1",
+            "changed {change}"
+        );
     }
 }
 
