@@ -22,6 +22,87 @@ const DIAGNOSTIC_REPLAY_BUDGET: Duration = Duration::from_secs(300);
 
 mod live;
 
+/// Own process interruption through both worker cleanup and the final console
+/// writes. Runtime signal handlers can outlive their last receiver, so returning
+/// from authenticated delivery does not restore the process default actions.
+#[cfg(target_os = "linux")]
+struct ReportSignals {
+    cancellation: super::OperationCancellation,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    first_signal: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    handle: signal_hook::iterator::Handle,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ReportSignals {
+    fn start() -> io::Result<Self> {
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
+        let handle = signals.handle();
+        let cancellation = super::OperationCancellation::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let first_signal = Arc::new(AtomicI32::new(0));
+        let child_cancellation = cancellation.clone();
+        let child_stopped = Arc::clone(&stopped);
+        let child_signal = Arc::clone(&first_signal);
+        let thread = std::thread::Builder::new()
+            .name("rabs-direct-report-signals".into())
+            .spawn(move || {
+                let observe = |signal| {
+                    if child_signal
+                        .compare_exchange(0, signal, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        child_stopped.store(true, Ordering::Release);
+                        child_cancellation.cancel();
+                    }
+                };
+                for signal in signals.forever() {
+                    observe(signal);
+                }
+                // Closing the iterator must not discard a signal already
+                // delivered while the last console write was completing.
+                for signal in signals.pending() {
+                    observe(signal);
+                }
+            })?;
+        Ok(Self {
+            cancellation,
+            stopped,
+            first_signal,
+            handle,
+            thread: Some(thread),
+        })
+    }
+
+    fn join(&mut self) {
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn finish(mut self) -> Option<i32> {
+        self.join();
+        match self.first_signal.load(std::sync::atomic::Ordering::Acquire) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ReportSignals {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.join();
+    }
+}
+
 /// Carries the original exclusive worker admission from allocation to transport.
 /// Allocation is not authentication or execution authority. Only the normal
 /// pinned TLS/challenge path can grant those. The prepared request is bound
@@ -494,9 +575,79 @@ impl PreparedBuild<'_> {
         Ok((delivery, Some(installed)))
     }
 
+    #[cfg(target_os = "linux")]
+    fn execute_with_report_signals(
+        &self,
+        signals: &ReportSignals,
+        reserved: Option<ReservedWorkerAdmission>,
+    ) -> Result<(Delivery, Option<InstalledOutputs>), DeliveryFailure> {
+        let request = self.request()?;
+        let mut on_listening = |address: std::net::SocketAddr| {
+            // Cancellation must also release a blocked listener announcement,
+            // before accept or an authenticated request can acquire ownership.
+            let mut stderr = rabsd::ControlledOutput::new(
+                &io::stderr(),
+                &signals.stopped,
+                Instant::now() + super::ACCEPT_BUDGET,
+            )?;
+            writeln!(
+                stderr,
+                "{}",
+                json!({
+                    "kind":"worker-exec-listening", "address":address.to_string(),
+                    "expected_worker":self.worker, "expected_worker_spki_sha256":self.pin,
+                    "request_id":request["request_id"], "transport":"mutual-tls-atp",
+                    "operation":if self.mode == DeliveryMode::Resume { "result-resume" } else { "canonical-exec" },
+                    "authentication_required":true,
+                })
+            )?;
+            stderr.flush()
+        };
+        self.execute_bound(
+            &request,
+            Some(TlsOperationControl {
+                cancellation: signals.cancellation.clone(),
+                preview: None,
+                on_listening: &mut on_listening,
+            }),
+            reserved,
+        )
+    }
+
     fn report(&self, replay_diagnostics: bool, reserved: Option<ReservedWorkerAdmission>) -> i32 {
+        let uninterrupted = std::sync::atomic::AtomicBool::new(false);
+        #[cfg(target_os = "linux")]
+        let signals = match self.pin.map(|_| ReportSignals::start()).transpose() {
+            Ok(signals) => signals,
+            Err(error) => {
+                let error = self.failure(error.to_string());
+                crate::prepared_jobs::report_client_error(json!({
+                    "kind":"worker-build-error", "directory":error.directory,
+                    "output_directory":self.output, "detail":error.detail,
+                    "execution_may_have_run":error.execution_may_have_run, "reexecute":false,
+                    "diagnostics_may_have_been_exposed":false,
+                }));
+                return 1;
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let stopped = signals
+            .as_ref()
+            .map_or(&uninterrupted, |signals| signals.stopped.as_ref());
+        #[cfg(not(target_os = "linux"))]
+        let stopped = &uninterrupted;
+        #[cfg(target_os = "linux")]
+        let execution = match &signals {
+            Some(signals) => self.execute_with_report_signals(signals, reserved),
+            None => self.execute(reserved),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let execution = self.execute(reserved);
+
         let mut diagnostics_may_have_been_exposed = false;
-        let result = self.execute(reserved).and_then(|(delivery, installed)| {
+        #[cfg(target_os = "linux")]
+        let mut console_interrupted = false;
+        let result = execution.and_then(|(delivery, installed)| {
             let report = self.report_value(&delivery, installed.as_ref());
             let failed = |error: io::Error| DeliveryFailure {
                 directory: self.directory.to_path_buf(),
@@ -519,7 +670,13 @@ impl PreparedBuild<'_> {
             } else {
                 None
             };
-            emit_client_report(&report, diagnostics, &deadline).map_err(failed)?;
+            emit_client_report(&report, diagnostics, &deadline, stopped).map_err(|error| {
+                #[cfg(target_os = "linux")]
+                {
+                    console_interrupted = error.kind() == io::ErrorKind::Interrupted;
+                }
+                failed(error)
+            })?;
             let code = delivery.receipt["exit_code"]
                 .as_i64()
                 .and_then(|code| i32::try_from(code).ok())
@@ -530,6 +687,25 @@ impl PreparedBuild<'_> {
                 code
             })
         });
+        #[cfg(target_os = "linux")]
+        if let Some(signal_number) = signals.and_then(ReportSignals::finish) {
+            // All transport/output owners have returned before native relay.
+            // An uncertain worker result or failed verification stays an error;
+            // only a settled delivery (or a proven pre-dispatch stop) can relay.
+            if result.is_ok()
+                || console_interrupted
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| !error.execution_may_have_run)
+            {
+                rabsd::coord::canonical_local::exit_like(
+                    rabs_protocol::subscriber_interest::ChildTermination::Signaled {
+                        signal_number,
+                    },
+                );
+            }
+        }
         match result {
             Ok(code) => code,
             Err(error) => {
@@ -559,6 +735,7 @@ fn emit_client_report(
     report: &Value,
     diagnostics: Option<DiagnosticSnapshot>,
     deadline: &ClientDeadline,
+    stopped: &std::sync::atomic::AtomicBool,
 ) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -568,11 +745,12 @@ fn emit_client_report(
             &io::stdout(),
             &io::stderr(),
             deadline,
-            &std::sync::atomic::AtomicBool::new(false),
+            stopped,
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = stopped;
         emit_report(
             report,
             diagnostics,
@@ -1165,6 +1343,447 @@ mod tests {
                     "cancelled replay cannot duplicate diagnostics or emit success"
                 );
             });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod signal_reporting {
+        use super::*;
+        use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
+        use rabsd::coord::worker_delivery::{WorkerAuthentication, WorkerPeer, receive_execution};
+        use std::collections::VecDeque;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Child, Command, ExitStatus, Stdio};
+
+        const PIN: [u8; 32] = [0xab; 32];
+        const STDOUT: &[u8] = b"compiler stdout\0\xff\n";
+        const STDERR: &[u8] = b"compiler stderr\0\xfe";
+        const ARTIFACT: &[u8] = b"A\0\xffB";
+        const MANIFEST: &str = "548324c3a5c96511944c6ec6af94ee9bbb6683170bb0143f9d99cd192f80bfd6";
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        fn hash(bytes: &[u8]) -> String {
+            hex(&Sha256::digest(bytes))
+        }
+
+        fn request_bundle(root: &Path) -> Value {
+            let manifest = SourceManifest::new(vec![SourceFile {
+                path: "lib.rs".into(),
+                len: 1,
+                sha256: Sha256::digest(b"x").into(),
+                executable: false,
+            }])
+            .unwrap();
+            let request = json!({
+                "kind":"canonical-exec", "request_id":7, "program":"fixture-only",
+                "args":["lib.rs"], "toolchain_backing":"/tc",
+                "source_manifest":{"manifest_sha256":hex(&manifest.digest()),
+                    "files":[{"path":"lib.rs", "bytes":1, "sha256":hash(b"x"), "executable":false}]},
+                "artifacts":{"unit":"dep", "files":["a"]},
+            });
+            fs::create_dir(root.join("bundle")).unwrap();
+            fs::write(
+                root.join("bundle/request.json"),
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+            request
+        }
+
+        fn chunk(name: &str, bytes: &[u8], artifact: bool) -> Value {
+            let mut chunk = json!({
+                "kind":if artifact { "artifact-chunk" } else { "output-chunk" },
+                "request_id":7, "offset":0, "next_offset":bytes.len(),
+                "total_bytes":bytes.len(), "sha256":hash(bytes), "chunk_sha256":hash(bytes),
+                "eof":true, "data_hex":hex(bytes),
+            });
+            chunk[if artifact { "name" } else { "stream" }] = json!(name);
+            if artifact {
+                chunk["executable"] = json!(false);
+                chunk["manifest_sha256"] = json!(MANIFEST);
+            }
+            chunk
+        }
+
+        fn retained_delivery(root: &Path, exit: i32) -> Value {
+            // The real receiver creates the receipt from bounded fixture frames.
+            // This tests retained delivery and native process I/O, not TLS
+            // authentication, a compiler, a sandbox, or a production fleet.
+            struct Peer {
+                replies: VecDeque<Value>,
+                executions: usize,
+            }
+            impl WorkerPeer for Peer {
+                fn send(&mut self, frame: &Value) -> io::Result<()> {
+                    if frame["kind"] == "canonical-exec" {
+                        self.executions += 1;
+                    }
+                    Ok(())
+                }
+                fn receive(&mut self) -> io::Result<Value> {
+                    self.replies
+                        .pop_front()
+                        .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+                }
+                fn authentication(&self) -> Option<WorkerAuthentication> {
+                    Some(WorkerAuthentication {
+                        spki_sha256: PIN,
+                        session_id: 17,
+                        identity_generation: 1,
+                    })
+                }
+            }
+            let request = request_bundle(root);
+            let artifacts = json!({"unit":"dep", "files":[{"name":"a", "bytes":ARTIFACT.len(),
+                "sha256":hash(ARTIFACT), "executable":false}], "total_bytes":ARTIFACT.len(),
+                "manifest_sha256":MANIFEST});
+            let mut peer = Peer {
+                replies: VecDeque::from([
+                    json!({"kind":"worker-hello", "worker_id":"fixture-worker", "canonical":true,
+                        "slots":1, "boot_generation":1, "incarnation":"00000000000000000000000000000001",
+                        "request_high_water":null, "recovery_protocols":["request-journal-v1"],
+                        "output_transfers":["ranges-v1"], "artifact_transfers":["files-v1"]}),
+                    json!({"kind":"exec-result", "request_id":7, "executed":true, "exit_code":exit,
+                        "residual_group_members":0, "stop_reason":null,
+                        "output_transfer":"ranges-v1", "output_ack_required":true,
+                        "stdout_bytes":STDOUT.len(), "stdout_sha256":hash(STDOUT),
+                        "stderr_bytes":STDERR.len(), "stderr_sha256":hash(STDERR),
+                        "artifact_transfer":"files-v1", "artifact_ack_required":exit == 0,
+                        "artifact_manifest":if exit == 0 { artifacts } else { Value::Null }}),
+                    chunk("stdout", STDOUT, false),
+                    chunk("stderr", STDERR, false),
+                ]),
+                executions: 0,
+            };
+            if exit == 0 {
+                peer.replies.push_back(chunk("a", ARTIFACT, true));
+            }
+            peer.replies.push_back(json!({
+                "kind":"output-acknowledged", "request_id":7, "already_released":false,
+            }));
+            if exit == 0 {
+                peer.replies.push_back(json!({
+                    "kind":"artifact-acknowledged", "request_id":7, "already_released":false,
+                }));
+            }
+            let delivery = receive_execution(
+                &mut peer,
+                &request,
+                "fixture-worker",
+                &root.join("delivery"),
+            )
+            .unwrap();
+            assert!(peer.replies.is_empty());
+            assert_eq!(peer.executions, 1);
+            assert!(delivery.acknowledgments_confirmed);
+            delivery.receipt
+        }
+
+        struct ChildOwner(Child);
+        impl Drop for ChildOwner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        impl ChildOwner {
+            fn wait_for(&mut self, path: &Path) {
+                let until = Instant::now() + Duration::from_secs(5);
+                while !path.exists() {
+                    assert!(
+                        self.0.try_wait().unwrap().is_none(),
+                        "child exited before {path:?}"
+                    );
+                    assert!(Instant::now() < until, "child never reached {path:?}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            fn wait(&mut self) -> ExitStatus {
+                let until = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(status) = self.0.try_wait().unwrap() {
+                        return status;
+                    }
+                    assert!(Instant::now() < until, "signal did not release the client");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            fn signal(&self, signal: rustix::process::Signal) {
+                let pid =
+                    rustix::process::Pid::from_raw(i32::try_from(self.0.id()).unwrap()).unwrap();
+                rustix::process::kill_process(pid, signal).unwrap();
+            }
+        }
+
+        fn start(
+            root: &Path,
+            attempt: &str,
+            replay: bool,
+            address: &str,
+            case: &str,
+            stdout: fs::File,
+            stderr: fs::File,
+        ) -> ChildOwner {
+            let test = format!(
+                "{}::report_process",
+                module_path!()
+                    .strip_prefix("rabsd::")
+                    .unwrap_or(module_path!())
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", &test, "--nocapture", "--quiet"])
+                .env("RABS_DIRECT_REPORT_TEST_ROOT", root)
+                .env("RABS_DIRECT_REPORT_TEST_ATTEMPT", attempt)
+                .env("RABS_DIRECT_REPORT_TEST_ADDRESS", address)
+                .env("RABS_DIRECT_REPORT_TEST_CASE", case)
+                .env(
+                    "RABS_DIRECT_REPORT_TEST_REPLAY",
+                    if replay { "1" } else { "0" },
+                )
+                .env("RABS_STATE_DIR", root.join("state"))
+                .env_remove("RABS_COORD_TLS_CA")
+                .env_remove("RABS_COORD_TLS_CERT")
+                .env_remove("RABS_COORD_TLS_KEY")
+                .stdin(Stdio::null())
+                .stdout(stdout)
+                .stderr(stderr);
+            let mut child = ChildOwner(command.spawn().unwrap());
+            child.wait_for(&root.join(format!("ready-{attempt}")));
+            child
+        }
+
+        #[test]
+        fn report_process() {
+            let Some(root) = std::env::var_os("RABS_DIRECT_REPORT_TEST_ROOT") else {
+                return;
+            };
+            let root = PathBuf::from(root);
+            let attempt = std::env::var("RABS_DIRECT_REPORT_TEST_ATTEMPT").unwrap();
+            let before_dispatch =
+                std::env::var("RABS_DIRECT_REPORT_TEST_CASE").unwrap() == "before-dispatch";
+            // Reproduce the completed TLS receive's actual handler lifecycle.
+            // Dropping these streams leaves the runtime dispatcher installed.
+            drop(asupersync::signal::sigint().unwrap());
+            drop(asupersync::signal::sigterm().unwrap());
+            let signals = before_dispatch.then(|| ReportSignals::start().unwrap());
+            io::stdout().flush().unwrap();
+            fs::write(root.join(format!("ready-{attempt}")), b"ready").unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while !root.join(format!("go-{attempt}")).exists() {
+                assert!(Instant::now() < until, "parent did not release the child");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let address = std::env::var("RABS_DIRECT_REPORT_TEST_ADDRESS").unwrap();
+            let pin = hex(&PIN);
+            if let Some(signals) = signals {
+                while !signals.cancellation.is_cancelled() {
+                    assert!(
+                        Instant::now() < until,
+                        "native signal did not cancel the operation"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let bundle = root.join("bundle");
+                let directory = root.join("delivery");
+                let output = root.join("output");
+                let build = PreparedBuild {
+                    address: &address,
+                    worker: "fixture-worker",
+                    pin: Some(&pin),
+                    bundle: &bundle,
+                    directory: &directory,
+                    output: &output,
+                    mode: DeliveryMode::Execute,
+                    resume_from: None,
+                };
+                let error = build
+                    .execute_with_report_signals(&signals, None)
+                    .unwrap_err();
+                assert_eq!(error.detail, "prepared operation cancelled before dispatch");
+                assert!(!error.execution_may_have_run);
+                assert!(!directory.exists() && !output.exists());
+                let signal_number = signals.finish().unwrap();
+                rabsd::coord::canonical_local::exit_like(
+                    rabs_protocol::subscriber_interest::ChildTermination::Signaled {
+                        signal_number,
+                    },
+                );
+            }
+            let mut args = Vec::new();
+            if std::env::var("RABS_DIRECT_REPORT_TEST_REPLAY").unwrap() == "1" {
+                args.push("--replay-diagnostics".to_owned());
+            }
+            args.extend([
+                address,
+                "fixture-worker".into(),
+                pin,
+                root.join("bundle").to_str().unwrap().to_owned(),
+                root.join("delivery").to_str().unwrap().to_owned(),
+                root.join("output").to_str().unwrap().to_owned(),
+            ]);
+            std::process::exit(run_build_tls(&args));
+        }
+
+        fn assert_recovery(root: &Path, address: &str, exit: i32, receipt: &Value) {
+            for replay in [false, true] {
+                let attempt = if replay { "replay" } else { "native" };
+                let stdout = root.join(format!("{attempt}.stdout"));
+                let stderr = root.join(format!("{attempt}.stderr"));
+                let mut child = start(
+                    root,
+                    attempt,
+                    replay,
+                    address,
+                    "report",
+                    fs::File::create(&stdout).unwrap(),
+                    fs::File::create(&stderr).unwrap(),
+                );
+                // The child is gated after libtest's own preamble, before the
+                // production CLI. Exclude only those already observed bytes.
+                let stdout_prefix = fs::metadata(&stdout).unwrap().len() as usize;
+                let stderr_prefix = fs::metadata(&stderr).unwrap().len() as usize;
+                fs::write(root.join(format!("go-{attempt}")), b"go").unwrap();
+                let status = child.wait();
+                assert_eq!(status.signal(), None);
+                assert_eq!(status.code(), Some(exit));
+                let stdout = fs::read(stdout).unwrap();
+                let stderr = fs::read(stderr).unwrap();
+                let stdout = &stdout[stdout_prefix..];
+                let stderr = &stderr[stderr_prefix..];
+                let report: Value = if replay {
+                    assert_eq!(stdout, STDOUT);
+                    assert!(stderr.starts_with(STDERR));
+                    serde_json::from_slice(&stderr[STDERR.len()..]).unwrap()
+                } else {
+                    assert!(stderr.is_empty());
+                    serde_json::from_slice(stdout).unwrap()
+                };
+                assert_eq!(report["kind"], "worker-build");
+                assert_eq!(report["delivery"]["receipt"], *receipt);
+                assert_eq!(report["installed_outputs"].is_null(), exit != 0);
+                assert_eq!(report["publication_authorized"], false);
+                assert_eq!(report["reexecute"], false);
+                assert_eq!(root.join("output").exists(), exit == 0);
+                assert!(!root.join("bundle/source").exists());
+                assert!(!root.join("state").exists());
+            }
+        }
+
+        #[test]
+        fn native_signals_release_full_direct_report_pipes_and_preserve_offline_recovery() {
+            use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+            use rustix::io::Errno;
+            use rustix::pipe::{PipeFlags, pipe_with};
+            use rustix::process::Signal;
+
+            for signal in [Signal::INT, Signal::TERM] {
+                for (replay, stdout_stalls) in [(false, true), (true, true), (true, false)] {
+                    let temporary = tempfile::tempdir().unwrap();
+                    let root = temporary.path().canonicalize().unwrap();
+                    let receipt = retained_delivery(&root, 0);
+                    let retained = fs::read(root.join("delivery/delivery.json")).unwrap();
+                    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    let address = occupied.local_addr().unwrap().to_string();
+                    let (_reader, writer) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+                    let writer = fs::File::from(writer);
+                    let ordinary = tempfile::tempfile().unwrap();
+                    let (stdout, stderr) = if stdout_stalls {
+                        (writer.try_clone().unwrap(), ordinary)
+                    } else {
+                        (ordinary, writer.try_clone().unwrap())
+                    };
+                    let mut child =
+                        start(&root, "blocked", replay, &address, "report", stdout, stderr);
+                    // Fill only after the subprocess entered its test body:
+                    // libtest itself may print to stdout before our CLI starts.
+                    let flags = fcntl_getfl(&writer).unwrap();
+                    fcntl_setfl(&writer, flags | OFlags::NONBLOCK).unwrap();
+                    for bytes in [&[0x5a; 4096][..], &[0x5a][..]] {
+                        loop {
+                            match rustix::io::write(&writer, bytes) {
+                                Ok(count) => assert!(count > 0),
+                                Err(Errno::AGAIN) => break,
+                                result => panic!("unexpected pipe fill: {result:?}"),
+                            }
+                        }
+                    }
+                    assert_eq!(rustix::io::write(&writer, b"x"), Err(Errno::AGAIN));
+                    fcntl_setfl(&writer, flags).unwrap();
+                    fs::write(root.join("go-blocked"), b"go").unwrap();
+                    child.wait_for(&root.join("output/a"));
+                    std::thread::sleep(Duration::from_millis(50));
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "pipe was not stalled"
+                    );
+                    child.signal(signal);
+                    let status = child.wait();
+                    assert_eq!(status.signal(), Some(signal.as_raw()));
+                    assert_eq!(fcntl_getfl(&writer).unwrap(), flags);
+                    assert_eq!(
+                        fs::read(root.join("delivery/delivery.json")).unwrap(),
+                        retained
+                    );
+                    assert_eq!(
+                        fs::read(root.join("delivery/diagnostics/stdout")).unwrap(),
+                        STDOUT
+                    );
+                    assert_eq!(
+                        fs::read(root.join("delivery/diagnostics/stderr")).unwrap(),
+                        STDERR
+                    );
+                    assert_eq!(fs::read(root.join("output/a")).unwrap(), ARTIFACT);
+                    assert_recovery(&root, &address, 0, &receipt);
+                }
+            }
+        }
+
+        #[test]
+        fn ordinary_high_exit_codes_remain_exit_codes_with_native_report_signals_installed() {
+            for exit in [101, 137, 143] {
+                let temporary = tempfile::tempdir().unwrap();
+                let root = temporary.path().canonicalize().unwrap();
+                let receipt = retained_delivery(&root, exit);
+                let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                assert_recovery(
+                    &root,
+                    &occupied.local_addr().unwrap().to_string(),
+                    exit,
+                    &receipt,
+                );
+            }
+        }
+
+        #[test]
+        fn native_stop_before_dispatch_needs_no_source_credentials_or_listener() {
+            for signal in [rustix::process::Signal::INT, rustix::process::Signal::TERM] {
+                let temporary = tempfile::tempdir().unwrap();
+                let root = temporary.path().canonicalize().unwrap();
+                request_bundle(&root);
+                let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let mut child = start(
+                    &root,
+                    "cancel",
+                    false,
+                    &occupied.local_addr().unwrap().to_string(),
+                    "before-dispatch",
+                    tempfile::tempfile().unwrap(),
+                    tempfile::tempfile().unwrap(),
+                );
+                child.signal(signal);
+                fs::write(root.join("go-cancel"), b"go").unwrap();
+                assert_eq!(child.wait().signal(), Some(signal.as_raw()));
+                assert!(!root.join("delivery").exists());
+                assert!(!root.join("output").exists());
+                assert!(!root.join("state").exists());
+                assert!(!root.join("bundle/source").exists());
+            }
         }
     }
 
