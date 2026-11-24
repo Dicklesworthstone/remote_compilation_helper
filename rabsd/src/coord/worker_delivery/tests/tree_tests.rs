@@ -274,6 +274,47 @@ fn private_incremental_cargo_refuses_injected_and_reported_state_before_artifact
 }
 
 #[test]
+fn cargo_doc_refuses_successful_dependency_metadata_before_acknowledging() {
+    let mut request = cargo_request();
+    request["args"][0] = json!("doc");
+    request["command_context"] = json!({"version":COMMAND_CONTEXT_VERSION, "cwd":"/__rabs/workspace",
+        "env":{"RUSTC":"/__rabs/toolchain/bin/rustc","RUSTDOC":"/__rabs/toolchain/bin/rustdoc"}});
+    let stdout = format!(
+        "{}\n{}\n",
+        json!({"reason":"compiler-artifact", "target":{"kind":["lib"],"name":"dep"},
+            "filenames":["/__rabs/out/cargo/deps/f0001"], "executable":null}),
+        json!({"reason":"build-finished", "success":true})
+    );
+    let owner = tempfile::tempdir().unwrap();
+    let destination = owner.path().join("incomplete-doc");
+    let mut peer = cargo_fixture(&destination, stdout.as_bytes());
+    // Simulate a retained index from an earlier build. The complete manifest
+    // and offered chunks agree, but the current Cargo report never announced it.
+    let manifest = &mut peer.replies[1]["artifact_manifest"];
+    manifest["files"][2]["name"] = json!("doc/dep/index.html");
+    refresh_manifest(manifest);
+    let digest = manifest["manifest_sha256"].clone();
+    assert!(verified_artifact_names(&request, manifest).is_ok());
+    for frame in &mut peer.replies {
+        if frame["kind"] == "artifact-chunk" {
+            frame["manifest_sha256"] = digest.clone();
+            if frame["name"] == "deps/f0002" {
+                frame["name"] = json!("doc/dep/index.html");
+            }
+        }
+    }
+    let failure = receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+    assert!(
+        failure.detail.contains("documented target"),
+        "{}",
+        failure.detail
+    );
+    assert!(failure.execution_may_have_run);
+    assert!(no_ack(&peer));
+    assert!(!destination.join("delivery.json").exists());
+}
+
+#[test]
 fn cargo_artifact_report_is_checked_before_ack_and_again_during_recovery() {
     let owner = tempfile::tempdir().unwrap();
     let destination = owner.path().join("cargo");
