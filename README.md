@@ -68,8 +68,8 @@ The output is returned to that exact path, including when `CARGO_TARGET_DIR` is
 set. Common build flags such as `-p`, `-tags`, `-trimpath`, and `-race` are
 supported, as are linker stripping flags (`-ldflags '-s -w'`) and `-X` variable
 definitions. Builds require the durable Unix execution path and a local Go
-installation. Both endpoints must report empty effective `GOFLAGS` and the
-dispatcher's native `GOOS`/`GOARCH`. The caller's selected Go version, CGO
+installation. Both endpoints must report empty effective `GOFLAGS`. Executable
+outputs require the dispatcher's native `GOOS`/`GOARCH`. The caller's selected Go version, CGO
 configuration, experiments, and architecture tuning settings are captured
 before upload and must match the worker exactly before compilation starts.
 Ordinary builds with CGO enabled remain supported when those settings match.
@@ -84,8 +84,19 @@ Directory outputs, symlinks or symlinked output parents, cross compilation,
 native-library modes such as `c-shared`/`c-archive`, and low-level flags that can
 create extra files are outside this output contract. Implicit forms such as
 `go build`, `go build .`, and `go build ./...` use Go's own package query to
-prove that exactly one main package is selected and bind its executable name
-before execution.
+select their output behavior before execution. One main package binds its
+exact executable name and uses the file delivery path above.
+
+Library builds and builds selecting multiple packages also run remotely within
+an admitted module or workspace, including ordinary `go build ./...` gates.
+They preserve Go's original arguments and produce no project output file. Both
+endpoints must observe the same package names and import paths before the build
+starts; a worker selecting a different package or an unexpected executable is
+refused. Compilation uses the worker's managed caches, and the original exit
+status and diagnostics are returned. The durable job records the explicit
+no-file result contract, so interrupted recovery can complete without inventing
+an executable or rerunning compilation. A pattern matching no packages follows
+Go's own warning and exit behavior.
 
 Compile-only tests also return an exact binary: for example, `go test -c ./package`
 or `go test -c -o bin/package.test ./package`. Without `-o`, both endpoints bind

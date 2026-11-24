@@ -1,4 +1,4 @@
-//! Exact Go executable/test-binary selection and fresh-file execution.
+//! Exact Go output selection and guarded build/test execution.
 //!
 //! `go list` exposes the install Target built by the same DefaultExecName
 //! method that `go build` uses for its implicit output. Only its basename is
@@ -22,6 +22,7 @@ const MAX_PROBE_BYTES: usize = 65_536;
 const MAX_SOURCE_ANCESTORS: usize = 128;
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const PACKAGE_FORMAT: &str = "{{.Name}}{{\"\\n\"}}{{.ImportPath}}{{\"\\n\"}}{{.Target}}";
+const BUILD_PACKAGES_FORMAT: &str = "{{.Name}}{{\"\\n\"}}{{.ImportPath}}";
 const TEST_PACKAGE_FORMAT: &str =
     "{{.ImportPath}}{{\"\\n\"}}{{len .TestGoFiles}}{{\"\\n\"}}{{len .XTestGoFiles}}";
 const IMPLICIT_TEST_PACKAGE_FORMAT: &str = "{{.ImportPath}}{{\"\\n\"}}{{.Name}}{{\"\\n\"}}{{len .TestGoFiles}}{{\"\\n\"}}{{len .XTestGoFiles}}";
@@ -31,6 +32,64 @@ enum GoCompileMode {
     Build,
     Test,
     Coverage,
+}
+
+/// Go emits an implicit executable only for one selected main package.
+/// Keep the actual package census: an empty, library, or multiple-package
+/// build must execute its original arguments without injecting an output.
+/// This observation is also persisted so recovery need not query Go again.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::hook) struct GoCompilationOnly {
+    packages: String,
+}
+
+impl GoCompilationOnly {
+    fn discover(bytes: &[u8]) -> Result<Option<Self>> {
+        ensure!(
+            bytes.len() <= MAX_PROBE_BYTES,
+            "Go package census exceeds its bound"
+        );
+        let packages = std::str::from_utf8(bytes).context("non-UTF-8 Go package census")?;
+        let fields: Vec<_> = if packages.is_empty() {
+            Vec::new()
+        } else {
+            packages
+                .strip_suffix('\n')
+                .context("unterminated Go package census")?
+                .split('\n')
+                .collect()
+        };
+        ensure!(
+            fields.len().is_multiple_of(2)
+                && fields
+                    .iter()
+                    .all(|field| !field.is_empty() && !field.chars().any(char::is_control)),
+            "invalid Go package census"
+        );
+        if fields.len() == 2 && fields[0] == "main" {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            packages: packages.to_owned(),
+        }))
+    }
+
+    pub(in crate::hook) fn validate(&self) -> Result<()> {
+        ensure!(
+            Self::discover(self.packages.as_bytes())?.as_ref() == Some(self),
+            "Go compilation-only selection promises an executable"
+        );
+        Ok(())
+    }
+
+    fn worker_check(&self) -> String {
+        let packages = shell_escape::escape(self.packages.as_str().into());
+        format!(
+            "if [ \"$rch_go_package\" != {packages} ]; then \
+               printf '%s\\n' 'RCH: worker Go build package selection differs from the dispatcher' >&2; exit 113; fi; "
+        )
+    }
 }
 
 /// Read from the completed supervisor stderr log. A failed compiler may
@@ -355,6 +414,13 @@ async fn metadata_json(
 pub(in crate::hook) struct DiscoveredGoSource {
     plan: GoSourcePlan,
     streaming_settings: Option<String>,
+    compilation_only: Option<GoCompilationOnly>,
+}
+
+impl DiscoveredGoSource {
+    pub(in crate::hook) fn compilation_only(&self) -> Option<&GoCompilationOnly> {
+        self.compilation_only.as_ref()
+    }
 }
 
 impl std::ops::Deref for DiscoveredGoSource {
@@ -510,11 +576,18 @@ pub(in crate::hook) async fn discover_go_source(
             }
         }
     }
-    let streaming_settings = if invocation(command).is_none() {
-        // Streaming test and vet commands skip the file-output planner. Bind
-        // the effective compiler environment here, before the source upload.
+    let selected = invocation(command);
+    let implicit_build = selected.as_ref().filter(|invocation| {
+        invocation.mode == GoCompileMode::Build && invocation.output.is_none()
+    });
+    let mut compilation_only = None;
+    let streaming_settings = if selected.is_none() || implicit_build.is_some() {
+        // Streaming commands and builds without a file skip the output
+        // planner. Bind compiler settings and actual package selection here,
+        // before upload; the worker must repeat these same observations.
         let workspace =
-            local_workspace_environment(command, invocation_root, &plan, &runtime, deadline).await?;
+            local_workspace_environment(command, invocation_root, &plan, &runtime, deadline)
+                .await?;
         let depth = source_ancestor_depth(invocation_root, &plan.source_root)?;
         let prefix = format!(
             "{}{workspace}{}{}",
@@ -522,8 +595,30 @@ pub(in crate::hook) async fn discover_go_source(
             capture_function(),
             module_cache_check(depth)
         );
-        let (settings, _) =
+        let (settings, values) =
             capture_build_settings(command, invocation_root, &prefix, deadline).await?;
+        if let Some(invocation) = implicit_build {
+            ensure!(
+                readonly_package_discovery_supported(&values["GOVERSION"]),
+                "implicit Go build discovery requires Go with readonly package loading"
+            );
+            let query = shell_command(
+                command,
+                format!(
+                    "{prefix}{}{}printf '%s' \"$rch_go_package\"",
+                    environment_check(&settings),
+                    package_query_with_format(
+                        invocation,
+                        plan.workspace.is_some(),
+                        BUILD_PACKAGES_FORMAT
+                    )
+                ),
+                &[],
+            )
+            .context("Go package selection has unsupported wrappers")?;
+            compilation_only =
+                GoCompilationOnly::discover(&probe(&query, invocation_root, deadline).await?)?;
+        }
         Some(settings)
     } else {
         None
@@ -531,6 +626,7 @@ pub(in crate::hook) async fn discover_go_source(
     Ok(Some(DiscoveredGoSource {
         plan,
         streaming_settings,
+        compilation_only,
     }))
 }
 
@@ -875,10 +971,30 @@ pub(in crate::hook) fn go_source_execution_command(
     let depth = source_ancestor_depth(invocation_root, source_root)?;
     let runtime = managed_runtime_assignments(Some(managed_runtime))
         .context("Go command lost its managed runtime")?;
+    let build_check = if let Some(compilation) = &plan.compilation_only {
+        compilation.validate()?;
+        let invocation =
+            invocation(command).context("Go build lost its compilation-only grammar")?;
+        ensure!(
+            invocation.mode == GoCompileMode::Build && invocation.output.is_none(),
+            "Go compilation-only execution cannot replace a file output"
+        );
+        format!(
+            "{}{}",
+            package_query_with_format(&invocation, plan.workspace.is_some(), BUILD_PACKAGES_FORMAT),
+            compilation.worker_check()
+        )
+    } else {
+        ensure!(
+            invocation(command).is_none(),
+            "Go file output requires its output contract"
+        );
+        String::new()
+    };
     shell_command(
         command,
         format!(
-            "{runtime}{}{}export GOWORK=off; {}{}{}\"$rch_go\" \"$@\"",
+            "{runtime}{}{}export GOWORK=off; {}{}{}{build_check}\"$rch_go\" \"$@\"",
             build_temporary_directory(depth, None),
             capture_function(),
             module_cache_check(depth),
@@ -1270,6 +1386,19 @@ fn package_query_preflight(source_ancestors: usize) -> String {
 }
 
 fn package_query(invocation: &GoCompileInvocation, workspace: bool) -> String {
+    let format = match invocation.mode {
+        GoCompileMode::Build => PACKAGE_FORMAT,
+        GoCompileMode::Test if invocation.output.is_none() => IMPLICIT_TEST_PACKAGE_FORMAT,
+        GoCompileMode::Test | GoCompileMode::Coverage => TEST_PACKAGE_FORMAT,
+    };
+    package_query_with_format(invocation, workspace, format)
+}
+
+fn package_query_with_format(
+    invocation: &GoCompileInvocation,
+    workspace: bool,
+    format: &str,
+) -> String {
     let implicit_test = invocation.mode == GoCompileMode::Test && invocation.output.is_none();
     let mut args = vec!["list".to_owned()];
     args.extend_from_slice(&invocation.build_flags);
@@ -1280,12 +1409,7 @@ fn package_query(invocation: &GoCompileInvocation, workspace: bool) -> String {
         "-find".to_owned(),
         "-buildvcs=false".to_owned(),
         "-f".to_owned(),
-        match invocation.mode {
-            GoCompileMode::Build => PACKAGE_FORMAT,
-            GoCompileMode::Test if implicit_test => IMPLICIT_TEST_PACKAGE_FORMAT,
-            GoCompileMode::Test | GoCompileMode::Coverage => TEST_PACKAGE_FORMAT,
-        }
-        .to_owned(),
+        format.to_owned(),
     ]);
     args.extend_from_slice(&invocation.packages);
     let query = shell_words::join(args);
@@ -1546,7 +1670,10 @@ pub(in crate::hook) async fn validate_go_build_output_in_source(
     } else {
         String::new()
     };
-    let prefix = format!("{}{workspace_environment}{initial_paths}", runtime.assignments);
+    let prefix = format!(
+        "{}{workspace_environment}{initial_paths}",
+        runtime.assignments
+    );
     let (settings, values) =
         capture_build_settings(command, project_root, &prefix, deadline).await?;
     let (goos, goarch) = native_go_target().context("unsupported native Go target")?;
@@ -1834,6 +1961,84 @@ pub(in crate::hook) fn go_build_execution_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compilation_only_selection_requires_a_complete_non_executable_census() {
+        for packages in [
+            "",
+            "library\nexample.invalid/library\n",
+            "main\nexample.invalid/first\nmain\nexample.invalid/second\n",
+            "library\nexample.invalid/library\nmain\nexample.invalid/server\n",
+        ] {
+            let selection = GoCompilationOnly::discover(packages.as_bytes())
+                .unwrap()
+                .unwrap();
+            selection.validate().unwrap();
+            let recovered: GoCompilationOnly =
+                serde_json::from_slice(&serde_json::to_vec(&selection).unwrap()).unwrap();
+            assert_eq!(recovered, selection);
+            recovered.validate().unwrap();
+        }
+        assert!(
+            GoCompilationOnly::discover(b"main\nexample.invalid/server\n")
+                .unwrap()
+                .is_none()
+        );
+        for invalid in [
+            b"library".as_slice(),
+            b"library\n",
+            b"library\n\n",
+            b"library\nexample.invalid/lib\nmain\n",
+            b"library\nexample.invalid/lib\r\n",
+            b"library\nexample.invalid/\0lib\n",
+            b"library\n\xff\n",
+        ] {
+            assert!(GoCompilationOnly::discover(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(GoCompilationOnly::discover(&vec![b'x'; MAX_PROBE_BYTES + 1]).is_err());
+        let forged: GoCompilationOnly = serde_json::from_value(serde_json::json!({
+            "packages": "main\nexample.invalid/server\n"
+        }))
+        .unwrap();
+        assert!(forged.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compilation_only_worker_census_rejects_changed_package_selection_before_payload() {
+        let expected = GoCompilationOnly::discover(b"library\nexample.invalid/library\n")
+            .unwrap()
+            .unwrap();
+        for (packages, status) in [
+            ("library\nexample.invalid/library\n", 0),
+            ("main\nexample.invalid/library\n", 113),
+            ("library\nexample.invalid/other\n", 113),
+            (
+                "library\nexample.invalid/library\nmain\nexample.invalid/server\n",
+                113,
+            ),
+            ("library\nexample.invalid/library", 113),
+        ] {
+            let packages = shell_escape::escape(packages.into());
+            let script = format!(
+                "rch_go_package={packages}; {}printf '%s' payload",
+                expected.worker_check()
+            );
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(status), "{output:?}");
+            assert_eq!(
+                output.stdout,
+                if status == 0 {
+                    b"payload".as_slice()
+                } else {
+                    b""
+                }
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2263,7 +2468,10 @@ mod tests {
         // sibling module and its overridden local dependency.
         let query = shell_command(
             &command,
-            format!("{}{workspace}\"$rch_go\" list -buildvcs=false -deps .", runtime.assignments),
+            format!(
+                "{}{workspace}\"$rch_go\" list -buildvcs=false -deps .",
+                runtime.assignments
+            ),
             &[],
         )
         .unwrap();
@@ -2431,6 +2639,99 @@ mod tests {
                 "vendoring query changed source"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires Go and a compiled rch-wkr via RCH_WKR_BIN"]
+    async fn real_go_compilation_only_builds_preserve_status_and_reject_new_executables() {
+        assert!(
+            std::env::var_os("RCH_WKR_BIN").is_some(),
+            "set RCH_WKR_BIN to the native worker verifier"
+        );
+        let fixture = WorkspaceFixture::new();
+        std::fs::create_dir(fixture.source.join("app/library")).unwrap();
+        std::fs::write(
+            fixture.source.join("app/library/library.go"),
+            "package library\nconst Value = 42\n",
+        )
+        .unwrap();
+        let before = source_tree(&fixture.source);
+        let runtime = fixture.runtime();
+
+        for (name, relative, arguments) in [
+            (
+                "library-worker",
+                "library with spaces",
+                vec!["build", "-p=1", "."],
+            ),
+            ("multiple-worker", "app", vec!["build", "-p=1", "./..."]),
+            ("empty-worker", "app", vec!["build", "-p=1", "./missing..."]),
+        ] {
+            let cwd = fixture.source.join(relative);
+            let command = fixture.command(&arguments);
+            let plan = discover_go_source(&command, &cwd, &fixture.topology)
+                .await
+                .unwrap()
+                .unwrap();
+            plan.compilation_only().unwrap().validate().unwrap();
+            let guarded =
+                go_source_execution_command(&command, &cwd, &fixture.source, &plan, &runtime)
+                    .unwrap();
+            let worker = fixture.materialize(name, &before);
+            let output = run_fixture(&guarded, &worker.join(relative)).await;
+            assert!(output.status.success(), "{name}: {output:?}");
+            assert_eq!(
+                source_tree(&worker),
+                before,
+                "{name} wrote a project output"
+            );
+        }
+
+        let cwd = fixture.source.join("app/library");
+        let command = fixture.command(&["build", "-p=1", "."]);
+        let plan = discover_go_source(&command, &cwd, &fixture.topology)
+            .await
+            .unwrap()
+            .unwrap();
+        let guarded =
+            go_source_execution_command(&command, &cwd, &fixture.source, &plan, &runtime).unwrap();
+        let mut changed = before.clone();
+        changed.insert(
+            PathBuf::from("app/library/library.go"),
+            b"package main\nfunc main() {}\n".to_vec(),
+        );
+        let worker = fixture.materialize("became-main-worker", &changed);
+        let refused = run_fixture(&guarded, &worker.join("app/library")).await;
+        assert_eq!(refused.status.code(), Some(113), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("package selection differs"));
+        assert_eq!(source_tree(&worker), changed, "unplanned compiler output");
+
+        // A normal compiler error keeps Go's own status and diagnostic. The
+        // package identity remains valid, so admission must not hide it.
+        let mut invalid = before.clone();
+        invalid.insert(
+            PathBuf::from("app/library/library.go"),
+            b"package library\nvar Value int = \"not an integer\"\n".to_vec(),
+        );
+        let worker = fixture.materialize("compile-error-worker", &invalid);
+        let failed = run_fixture(&guarded, &worker.join("app/library")).await;
+        assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("cannot use"));
+        assert_eq!(source_tree(&worker), invalid);
+
+        // A selected main package still requires its exact file-output path.
+        let command = fixture.command(&["build", "-p=1", "."]);
+        let plan = discover_go_source(&command, &fixture.cwd(), &fixture.topology)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(plan.compilation_only().is_none());
+        assert!(
+            go_source_execution_command(&command, &fixture.cwd(), &fixture.source, &plan, &runtime)
+                .is_err()
+        );
+        assert_eq!(source_tree(&fixture.source), before);
     }
 
     #[cfg(unix)]

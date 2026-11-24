@@ -18,8 +18,8 @@ mod go_build;
 #[cfg(test)]
 pub(in crate::hook) use go_build::validate_go_build_output;
 pub(in crate::hook) use go_build::{
-    GoCoverageCapture, discover_go_source, go_build_execution_command, go_source_execution_command,
-    validate_go_build_output_in_source, verify_go_source_selection,
+    GoCompilationOnly, GoCoverageCapture, discover_go_source, go_build_execution_command,
+    go_source_execution_command, validate_go_build_output_in_source, verify_go_source_selection,
 };
 
 /// Every file a supported native command promises to its caller. Persist this

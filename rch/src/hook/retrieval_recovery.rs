@@ -1,7 +1,8 @@
 //! Durable source ownership and identity-bound collection. Never replays a command.
 use super::super::artifact_patterns::build_system::{BuildSystemOutputDiscovery, merge_patterns};
 use super::super::artifact_patterns::direct_compiler::{
-    GoCoverageCapture, NativeOutputContract, NativeOutputPlatform, native_output_contract,
+    GoCompilationOnly, GoCoverageCapture, NativeOutputContract, NativeOutputPlatform,
+    native_output_contract,
 };
 use super::super::artifact_patterns::{cargo_retrieval_exclusions_apply, cargo_retrieval_patterns};
 use super::super::cargo_output_contract::{
@@ -99,6 +100,10 @@ pub(crate) struct RecoveryRecipe {
     /// an old file still present in the worker source tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     go_coverage_capture: Option<GoCoverageCapture>,
+    /// Compiler-observed selection promises no executable. This is explicit
+    /// authority to finish without retrieval, not an empty file-output glob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    go_compilation_only: Option<GoCompilationOnly>,
     /// A required source-qualified dependency phase must be accepted before
     /// execution. Recovery retains this binding but never reconstructs a
     /// source receipt from post-workload files or ordinary delivery success.
@@ -802,8 +807,36 @@ impl RecoveryRecipe {
         Ok(phase)
     }
 
+    fn validate_go_compilation_only(&self) -> anyhow::Result<()> {
+        let Some(compilation) = &self.go_compilation_only else {
+            return Ok(());
+        };
+        compilation.validate()?;
+        anyhow::ensure!(
+            self.prepared
+                && self.kind == Some(CompilationKind::GoBuild)
+                && self.phases.is_empty()
+                && self.go_coverage_capture.is_none()
+                && self.cargo_output_capture.is_none()
+                && self.build_system_output_capture.is_none()
+                && self.result_destination.is_none()
+                && self.fresh_job_results.is_none()
+                && !WorkerPlatform::from_worker(&self.worker).is_windows(),
+            "Go compilation-only execution conflicts with a file-output contract"
+        );
+        Ok(())
+    }
+
     fn validate_go_delivery(&self, returned: Option<i32>) -> anyhow::Result<()> {
+        self.validate_go_compilation_only()?;
         if self.kind == Some(CompilationKind::GoBuild) {
+            if self.go_compilation_only.is_some() {
+                anyhow::ensure!(
+                    returned != Some(0) || (self.execution_started && self.exit_code == Some(0)),
+                    "Go compilation-only success requires a completed execution"
+                );
+                return Ok(());
+            }
             if returned == Some(0) {
                 let phase = self.go_output_phase()?;
                 anyhow::ensure!(
@@ -1849,6 +1882,7 @@ impl RecoverySession {
             cargo_output_capture: None,
             build_system_output_capture: None,
             go_coverage_capture: None,
+            go_compilation_only: None,
             prepared_dependencies: None,
             cargo_stdout: None,
             cargo_stderr: None,
@@ -2086,6 +2120,7 @@ impl RecoverySession {
                     graph_available: false,
                 }),
             go_coverage_capture: None,
+            go_compilation_only: None,
             prepared_dependencies: None,
             cargo_stdout: None,
             cargo_stderr: None,
@@ -3055,6 +3090,7 @@ impl RecoverySession {
                 && self.recipe.exit_code.is_none()
                 && !self.recipe.sources_released
                 && !self.recipe.retired
+                && self.recipe.go_compilation_only.is_none()
                 && !self.recipe.phases.iter().any(|phase| phase.custom_target)
                 && contract.required_files.len() == 1,
             "Go output binding requires an unconsumed project-output session"
@@ -3088,6 +3124,57 @@ impl RecoverySession {
         phase.patterns = patterns;
         phase.native_outputs = Some(contract);
         next.go_output_phase()?;
+        self.persist_next_recipe(next)
+    }
+
+    /// Bind a compiler-observed build which creates no project file. The
+    /// initial empty phase is only a placeholder: consume it before execution
+    /// and persist the observation, so recovery never guesses or reruns Go.
+    pub(crate) fn require_go_compilation_only(
+        &mut self,
+        compilation: GoCompilationOnly,
+    ) -> anyhow::Result<()> {
+        compilation.validate()?;
+        anyhow::ensure!(
+            self.recipe.kind == Some(CompilationKind::GoBuild)
+                && self.recipe.prepared
+                && !self.recipe.execution_started
+                && !self.recipe.preparation_cancelled
+                && self.recipe.exit_code.is_none()
+                && !self.recipe.sources_released
+                && !self.recipe.retired,
+            "Go compilation-only binding requires an unconsumed prepared session"
+        );
+        if let Some(existing) = &self.recipe.go_compilation_only {
+            anyhow::ensure!(
+                existing == &compilation,
+                "Go compilation-only selection changed after admission"
+            );
+            return self.recipe.validate_go_compilation_only();
+        }
+        let [phase] = self.recipe.phases.as_slice() else {
+            anyhow::bail!("Go compilation-only binding requires one empty project phase");
+        };
+        anyhow::ensure!(
+            phase.name == "project"
+                && phase.local == self.recipe.project_root
+                && phase.result_dir.is_none()
+                && !phase.custom_target
+                && !phase.complete
+                && phase.patterns.is_empty()
+                && phase.native_outputs.is_none()
+                && phase.cargo_outputs.is_none()
+                && phase.pending.is_none()
+                && phase.published.is_empty()
+                && phase.baseline.is_empty()
+                && phase.publication_journal.is_none()
+                && phase.missing_result.is_none(),
+            "Go compilation-only binding cannot replace an existing output selection"
+        );
+        let mut next = self.recipe.clone();
+        next.phases.clear();
+        next.go_compilation_only = Some(compilation);
+        next.validate_go_compilation_only()?;
         self.persist_next_recipe(next)
     }
 
@@ -3461,7 +3548,10 @@ impl RecoverySession {
                     .is_none_or(|required| { required.attestation_digest.is_some() }),
             "execution requires an unconsumed prepared source grant"
         );
-        if self.recipe.kind == Some(CompilationKind::GoBuild) {
+        self.recipe.validate_go_compilation_only()?;
+        if self.recipe.kind == Some(CompilationKind::GoBuild)
+            && self.recipe.go_compilation_only.is_none()
+        {
             self.recipe.go_output_phase()?;
         }
         self.recipe.validate_go_coverage_contract()?;
@@ -9528,6 +9618,142 @@ mod tests {
                 assert!(output.status.success(), "{output:?}");
                 assert_eq!(output.stdout, b"rustc-delivery-ok\n");
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_compilation_only_binding_survives_recovery_without_a_file_phase() {
+        let _guard = test_guard!();
+        for (packages, exit) in [
+            ("", 0),
+            ("library\nexample.invalid/library\n", 0),
+            (
+                "main\nexample.invalid/first\nmain\nexample.invalid/second\n",
+                0,
+            ),
+            ("library\nexample.invalid/library\n", 1),
+        ] {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (_owner, writer, worker) = preparation_fixture_with_identity(&identity);
+            let base = writer.path.parent().unwrap();
+            let local = base.join("checkout");
+            let unrelated_target = base.join("cargo-target");
+            std::fs::create_dir(&local).unwrap();
+            std::fs::create_dir(&unrelated_target).unwrap();
+            std::fs::write(local.join("source.go"), b"source sentinel").unwrap();
+            std::fs::write(unrelated_target.join("sentinel"), b"unrelated target").unwrap();
+            let pipeline = TransferPipeline::new(
+                local.clone(),
+                "go-compilation-only".into(),
+                identity.clone(),
+                TransferConfig::default(),
+            )
+            .with_remote_path_override("/data/projects/source-recovery");
+            let mut session = RecoverySession::prepare(
+                &writer,
+                &worker,
+                &pipeline,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                local.clone(),
+                Some(&unrelated_target),
+                Some(CompilationKind::GoBuild),
+                "go build ./...",
+                &[],
+                identity,
+            )
+            .unwrap();
+            let load_changed = |session: &RecoverySession, edit: fn(&mut serde_json::Value)| {
+                let mut changed = session.writer.snapshot();
+                edit(changed.recovery.as_mut().unwrap());
+                load_recipe(&DurableLeaseWriter {
+                    path: session.writer.path.clone(),
+                    recovery_ownership: None,
+                    lease: Arc::new(Mutex::new(changed)),
+                })
+            };
+            let selection: GoCompilationOnly = serde_json::from_value(serde_json::json!({
+                "packages": packages
+            }))
+            .unwrap();
+            assert_eq!(session.recipe.phases.len(), 1);
+            let pending = std::fs::read(&writer.path).unwrap();
+            assert!(session.starting_execution().is_err());
+            assert!(session.returned(0).is_err());
+            let main: GoCompilationOnly = serde_json::from_value(serde_json::json!({
+                "packages": "main\nexample.invalid/server\n"
+            }))
+            .unwrap();
+            assert!(session.require_go_compilation_only(main).is_err());
+            assert_eq!(std::fs::read(&writer.path).unwrap(), pending);
+
+            session
+                .require_go_compilation_only(selection.clone())
+                .unwrap();
+            assert!(session.recipe.phases.is_empty());
+            assert!(!session.has_native_output_contract());
+            let bound = std::fs::read(&writer.path).unwrap();
+            session
+                .require_go_compilation_only(selection.clone())
+                .unwrap();
+            assert_eq!(std::fs::read(&writer.path).unwrap(), bound);
+            let changed: GoCompilationOnly = serde_json::from_value(serde_json::json!({
+                "packages": "other\nexample.invalid/other\n"
+            }))
+            .unwrap();
+            assert!(session.require_go_compilation_only(changed).is_err());
+            let executable = NativeOutputContract {
+                required_files: std::collections::BTreeSet::from([PathBuf::from("server")]),
+            };
+            assert!(session.require_go_outputs(executable).is_err());
+            assert!(session.returned(0).is_err());
+            assert_eq!(std::fs::read(&writer.path).unwrap(), bound);
+            session = reload_publication(&session);
+            assert_eq!(
+                session.recipe.go_compilation_only.as_ref(),
+                Some(&selection)
+            );
+            assert!(session.recipe.phases.is_empty());
+            session.starting_execution().unwrap();
+            assert!(session.require_go_compilation_only(selection).is_err());
+            assert!(session.returned(0).is_err());
+
+            // A recovered running build must retain its no-file observation.
+            // Missing or contradictory state cannot downgrade a file contract.
+            assert!(
+                load_changed(&session, |recipe| {
+                    recipe["go_compilation_only"] = serde_json::Value::Null;
+                })
+                .is_err()
+            );
+            assert!(
+                load_changed(&session, |recipe| {
+                    recipe["go_compilation_only"]["packages"] =
+                        "main\nexample.invalid/server\n".into();
+                })
+                .is_err()
+            );
+            session.completed(exit).unwrap();
+            session = reload_publication(&session);
+            if exit != 0 {
+                assert!(session.returned(0).is_err());
+            }
+            session.returned(exit).unwrap();
+            session = reload_publication(&session);
+            assert_eq!(session.recipe.returned, Some(exit));
+            assert!(session.recipe.phases.is_empty());
+            assert_eq!(
+                std::fs::read(local.join("source.go")).unwrap(),
+                b"source sentinel"
+            );
+            assert_eq!(
+                std::fs::read(unrelated_target.join("sentinel")).unwrap(),
+                b"unrelated target"
+            );
         }
     }
 

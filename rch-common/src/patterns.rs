@@ -281,9 +281,10 @@ pub enum CompilationKind {
 
     // Go commands
     //
-    // Builds require a proven file output and durable artifact delivery.
-    // Even ./... can select one main package and emit an implicit executable.
-    /// `go build` (explicit or discovered required output uses staged retrieval)
+    // Builds require a proven output selection and durable completion.
+    // Even ./... can select one main package and emit an implicit executable;
+    // library/multiple-package builds retain their explicit no-file selection.
+    /// `go build` (required files use staged retrieval; compile-only gates stream)
     GoBuild,
     /// `go test ./...`
     GoTest,
@@ -2602,9 +2603,9 @@ pub struct GoBuildOutput {
 /// Literal arguments of a Go build eligible for output planning.
 ///
 /// An implicit invocation is only a candidate: the executor must ask the same
-/// compiler to prove that it selects exactly one main package and identify
-/// that package's default executable before offloading it. A package spelling
-/// alone does not establish either fact.
+/// compiler whether it selects one main package, then bind that executable
+/// or an explicit no-file compilation result. A package spelling alone does
+/// not establish either output contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoBuildInvocation {
     /// An explicit project-relative output, when the command contains `-o`.

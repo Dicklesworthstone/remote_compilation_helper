@@ -1407,7 +1407,13 @@ async fn execute_remote_compilation_inner(
     let go_test_output = kind == Some(CompilationKind::GoTest)
         && (rch_common::patterns::go_test_invocation(command).is_some()
             || rch_common::patterns::go_coverage_invocation(command).is_some());
-    let go_build_environment = if kind == Some(CompilationKind::GoBuild) || go_test_output {
+    let go_compilation_only = go_source_plan
+        .as_ref()
+        .and_then(|plan| plan.compilation_only());
+    let go_build_environment = if (kind == Some(CompilationKind::GoBuild)
+        && go_compilation_only.is_none())
+        || go_test_output
+    {
         anyhow::ensure!(
             !worker_is_windows
                 && durable_lease.is_some()
@@ -2978,6 +2984,12 @@ async fn execute_remote_compilation_inner(
         if let Some(capture) = environment.coverage_capture() {
             session.require_go_coverage(capture)?;
         }
+    }
+    if let Some(compilation) = go_compilation_only {
+        recovery_session
+            .as_mut()
+            .context("Go compilation-only execution has no admitted recovery session")?
+            .require_go_compilation_only(compilation.clone())?;
     }
     if kind == Some(CompilationKind::Rustc)
         && let Some(session) = recovery_session.as_mut()
