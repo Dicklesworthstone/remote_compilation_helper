@@ -191,7 +191,7 @@ rch_scope_launch_child() {
     __sl_record=$1; __sl_control=$2; __sl_marker=$3; __sl_build=$4
     __sl_parent=$5; __sl_parent_start=$6; __sl_limit=$7
     rch_launch_nice=$8; rch_launch_slice=$9; shift 9
-    rch_launch_manager=$1; shift
+    rch_launch_manager=$1; rch_observation_deadline=$2; shift 2
     [ -z "$rch_launch_nice" ] || rch_policy_valid_nice "$rch_launch_nice" || exit 125
     [ -z "$rch_launch_slice" ] || rch_policy_valid_slice "$rch_launch_slice" || exit 125
     case "$rch_launch_manager" in user|system) ;; *) exit 125;; esac
@@ -202,21 +202,24 @@ rch_scope_launch_child() {
         [ -n "$rch_policy_nice$rch_policy_slice" ] || return 0
         rch_policy_enforce
     }
-    rch_observation_clock_checked || exit 125
-    rch_timing_budget 6000
-    rch_observation_deadline=$((rch_observation_now + rch_timing_scaled))
+    rch_control_in_budget || exit 125
     rch_remote_record "$__sl_record" "$__sl_build" || exit 125
     rch_scope_launch_binding_matches || exit 125
-    unset rch_observation_deadline rch_observation_last_clock
     __sl_cancelled=0
     trap '__sl_cancelled=1' HUP INT TERM
-    while [ ! -f "$__sl_control/go" ]; do
-        if [ "$__sl_cancelled" = 1 ] || ! rch_scope_launch_parent_alive; then
+    __sl_gate_clock=-1
+    while :; do
+        if [ "$__sl_cancelled" = 1 ] || ! rch_scope_launch_parent_alive ||
+            ! rch_control_in_budget || [ "$rch_observation_now" -le "$__sl_gate_clock" ]; then
+            unset rch_observation_deadline rch_observation_last_clock
             rch_scope_launch_kill_self
             exit 255
         fi
+        [ ! -f "$__sl_control/go" ] || break
+        __sl_gate_clock=$rch_observation_now
         sleep 0.1 || exit 255
     done
+    unset rch_observation_deadline rch_observation_last_clock
     rch_scope_launch_clock || exit 255
     __sl_started=$rch_launch_now
     # Watchdog survives supervisor loss and remains armed after payload exit
@@ -365,6 +368,9 @@ rch_scope_launch_supervise() {
         return 125
     }
     __sl_parent_start=$rch_launch_birth
+    __sl_setup_started=$rch_launch_now
+    rch_timing_budget 6000
+    __sl_setup_deadline=$((__sl_setup_started + rch_timing_scaled))
     __sl_uid=$(id -u) || return 125
     __sl_cancelled=0
     trap '__sl_cancelled=1' HUP INT TERM
@@ -377,7 +383,7 @@ rch_scope_launch_supervise() {
 rch_scope_launch_child \"\$@\"" rch-scoped-child \
         "$__sl_record" "$__sl_control" "$__sl_marker" "$__sl_build" \
         "$$" "$__sl_parent_start" "$__sl_limit" \
-        "$rch_launch_nice" "$rch_launch_slice" "$rch_launch_manager" "$@" '"$__sl_input_redirect"' &'
+        "$rch_launch_nice" "$rch_launch_slice" "$rch_launch_manager" "$__sl_setup_deadline" "$@" '"$__sl_input_redirect"' &'
     __sl_child=$!
     # Silence asynchronous shell notices after child stream inheritance. Route
     # bounded diagnostics via stdout to original stderr; preserve closed stderr.
@@ -394,11 +400,7 @@ rch_scope_launch_finish() {
     rch_scope_launch_close_input
     __sl_child_start=; __sl_admitted=0; __sl_admission_record=; __sl_reason=setup
     __sl_admission_observations=0
-    rch_scope_launch_clock || return 255
-    __sl_setup_started=$rch_launch_now
-    rch_timing_budget 6000
-    __sl_setup_deadline=$((__sl_setup_started + rch_timing_scaled))
-    __sl_last_clock=$((rch_launch_now - 1))
+    __sl_last_clock=$((__sl_setup_started - 1))
     while :; do
         rch_scope_launch_process "$__sl_child"
         __sl_live=$?
