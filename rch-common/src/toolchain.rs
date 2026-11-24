@@ -79,9 +79,10 @@ impl std::fmt::Display for ToolchainInfo {
 }
 
 /// A literal toolchain pin on the command being executed. Rustup gives an
-/// immediate Cargo +toolchain selector precedence over environment settings.
-/// Only leading assignments belong to that environment; assignment-looking
-/// Cargo arguments and nested shell commands are not toolchain declarations.
+/// immediate Cargo or rustc +toolchain selector precedence over environment
+/// settings. Only leading assignments belong to that environment;
+/// assignment-looking arguments and nested shell commands are not toolchain
+/// declarations.
 ///
 /// # Errors
 /// Returns an error when expansion or an opaque prefix makes the pin unknown.
@@ -141,7 +142,7 @@ fn command_toolchain(command: &str) -> Option<CommandToolchain> {
         return None;
     }
     let mut selector = None;
-    if program.rsplit('/').next() == Some("cargo")
+    if matches!(program.rsplit('/').next(), Some("cargo" | "rustc"))
         && next_shell_token_span(command, executable_end).is_some()
     {
         let (start, end) = next_command_prefix_token(command, executable_end)?;
@@ -318,10 +319,10 @@ fn literal_shell_word(word: &str) -> Option<Cow<'_, str>> {
 /// Wrap a command to run with a specific toolchain.
 ///
 /// If toolchain is provided, wraps the command with `rustup run <toolchain>`.
-/// A literal command pin takes precedence, and an immediate Cargo selector is
-/// consumed by that handoff. Opaque commands remain unchanged; callers must
-/// reject unresolved Rust toolchains before admission. Without a toolchain,
-/// the original command retains its selector for the proxy. An explicit
+/// A literal command pin takes precedence, and an immediate Cargo or rustc
+/// selector is consumed by that handoff. Opaque commands remain unchanged;
+/// callers must reject unresolved Rust toolchains before admission. Without a
+/// toolchain, the original command retains its selector for the proxy. An explicit
 /// `RCH_RABS_WORKER_CACHE=1` on the command-building process additionally
 /// prepares worker-local RABS for literal Cargo commands. Preparation runs
 /// after environment prefixes, preserving the original toolchain runner and
@@ -353,8 +354,8 @@ fn wrap_command_with_toolchain_policy(
     {
         return command.to_owned();
     }
-    // Rustup run executes toolchain Cargo directly. The + argument belongs to
-    // its proxy, not to Cargo or an authenticated direct toolchain shim.
+    // Rustup run executes the toolchain binary directly. The + argument belongs
+    // to its proxy, not to Cargo, rustc, or an authenticated direct toolchain shim.
     let command = if let Some(selector) = explicit.as_ref().and_then(|pin| pin.selector.as_ref()) {
         Cow::Owned(format!(
             "{}{}",
@@ -691,6 +692,23 @@ mod tests {
     fn command_pin_uses_rustup_precedence_and_only_leading_assignments() {
         for (command, expected) in [
             ("cargo build", None),
+            ("rustc main.rs", None),
+            ("rustc +nightly main.rs", Some("nightly")),
+            (
+                "RUSTUP_TOOLCHAIN=stable rustc +nightly main.rs",
+                Some("nightly"),
+            ),
+            (
+                "env -u RUSTUP_TOOLCHAIN /usr/bin/rustc +1.80.0 main.rs",
+                Some("1.80.0"),
+            ),
+            (
+                "env -i 'rustc' '+nightly-2026-08-31' src/lib.rs",
+                Some("nightly-2026-08-31"),
+            ),
+            ("RUSTUP_TOOLCHAIN=beta rustc main.rs", Some("beta")),
+            ("rustc --cfg '+payload' main.rs", None),
+            ("rustc main.rs +payload", None),
             (
                 "RUSTUP_TOOLCHAIN=--help cargo +nightly build",
                 Some("nightly"),
@@ -739,6 +757,12 @@ mod tests {
         let tc = ToolchainInfo::new("stable", None, "");
         for command in [
             "cargo +",
+            "rustc +",
+            "rustc +--help main.rs",
+            "rustc +$CHANNEL main.rs",
+            "rustc \"+$CHANNEL\" main.rs",
+            "env -u RUSTUP_TOOLCHAIN rustc main.rs",
+            "rustc\n+nightly main.rs",
             "sh -c 'cargo +nested build'",
             "env env RUSTUP_TOOLCHAIN=nightly cargo +beta build",
             "RUSTUP_TOOLCHAIN=stable env env cargo +beta build",
@@ -819,6 +843,46 @@ mod tests {
                 command,
                 "the proxy still owns its selector without a Rustup handoff"
             );
+        }
+    }
+
+    #[test]
+    fn rustc_handoff_consumes_only_the_immediate_proxy_selector() {
+        let tc = ToolchainInfo::new("wrong-ambient", None, "");
+        for (command, expected) in [
+            (
+                "RUSTUP_TOOLCHAIN=stable rustc +nightly --crate-type lib src/lib.rs",
+                "RUSTUP_TOOLCHAIN=stable rustup run nightly rustc --crate-type lib src/lib.rs",
+            ),
+            (
+                "env -u RUSTUP_TOOLCHAIN 'rustc' '+1.80.0' main.rs -o 'result dir/app'",
+                "env -u RUSTUP_TOOLCHAIN rustup run 1.80.0 'rustc' main.rs -o 'result dir/app'",
+            ),
+            (
+                "'/tools with spaces/rustc' '+custom' --cfg '+payload' main.rs",
+                "rustup run custom '/tools with spaces/rustc' --cfg '+payload' main.rs",
+            ),
+            (
+                "rustc +nightly main.rs +payload",
+                "rustup run nightly rustc main.rs +payload",
+            ),
+            (
+                "RUSTUP_TOOLCHAIN=beta rustc --cfg '+payload' main.rs",
+                "RUSTUP_TOOLCHAIN=beta rustup run beta rustc --cfg '+payload' main.rs",
+            ),
+        ] {
+            for cache in [false, true] {
+                assert_eq!(
+                    wrap_command_with_toolchain_policy(command, Some(&tc), cache),
+                    expected,
+                    "{command}"
+                );
+                assert_eq!(
+                    wrap_command_with_toolchain_policy(command, None, cache),
+                    command,
+                    "the rustc proxy retains its selector without a Rustup handoff"
+                );
+            }
         }
     }
 

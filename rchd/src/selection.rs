@@ -7144,7 +7144,10 @@ mod tests {
 
         let rejected = selector.select(&pool, &request).await;
         assert!(rejected.worker.is_none());
-        assert_eq!(rejected.reason, SelectionReason::AllWorkersFailedPreflight);
+        assert_eq!(
+            rejected.reason,
+            SelectionReason::NoAdmissibleWorkers("missing_toolchain_component=1".into())
+        );
         assert!(
             rejected.diagnostics.unwrap().workers[0]
                 .reason_codes

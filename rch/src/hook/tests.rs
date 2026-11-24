@@ -909,6 +909,12 @@ async fn clean_overlay_subdirectory_discovers_only_selected_ancestor_toolchains(
     for (command, expected) in [
         ("cargo check", "beta"),
         ("cargo +1.80.0 check", "1.80.0"),
+        ("rustc main.rs", "beta"),
+        ("rustc +1.80.0 main.rs", "1.80.0"),
+        (
+            "RUSTUP_TOOLCHAIN=stable rustc +nightly-2026-08-31 main.rs",
+            "nightly-2026-08-31",
+        ),
         (
             "env RUSTUP_TOOLCHAIN=nightly-2026-08-25 cargo check",
             "nightly-2026-08-25",
