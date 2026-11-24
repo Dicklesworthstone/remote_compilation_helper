@@ -344,8 +344,8 @@ fn bind_file_generation(digest: &mut blake3::Hasher, identity: &FileIdentity) {
     digest.update(&modified.subsec_nanos().to_le_bytes());
 }
 
-/// Include every executable candidate, not only the first mode-bit match:
-/// ACLs and effective credentials can make execvp skip an earlier candidate.
+/// Include every candidate executable by the effective credentials, not only
+/// the first PATH match. Later candidates may be shebang interpreter inputs.
 /// Missing candidates remain an absence observation even if an installer
 /// creates an otherwise unrelated node_modules/.bin parent during its run.
 #[cfg(unix)]
@@ -448,7 +448,7 @@ fn capture_toolchain(
     project: &Path,
     values: &[(OsString, OsString)],
 ) -> Result<std::collections::BTreeMap<PathBuf, Option<Resolution>>> {
-    use std::os::unix::fs::PermissionsExt;
+    use rustix::fs::{Access, AtFlags, CWD, accessat};
     let mut pending = BTreeSet::new();
     for program in ["node", "bun", "npm", "pnpm", "yarn", "corepack"] {
         pending.extend(toolchain_candidates(project, values, program)?);
@@ -463,7 +463,23 @@ fn capture_toolchain(
             "dependency toolchain exceeds path limit"
         );
         let executable = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            Ok(metadata) if metadata.is_file() => {
+                // A mode bit for another identity does not make this user's
+                // launcher executable. Match execvp's effective credentials,
+                // including ACLs, before reading a candidate it would skip.
+                match accessat(CWD, &path, Access::EXEC_OK, AtFlags::EACCESS) {
+                    Ok(()) => true,
+                    Err(
+                        rustix::io::Errno::ACCESS
+                        | rustix::io::Errno::NOENT
+                        | rustix::io::Errno::NOTDIR,
+                    ) => false,
+                    Err(error) => {
+                        return Err(error).context("check dependency launcher execution access");
+                    }
+                }
+            }
+            Ok(_) => false,
             Err(error)
                 if matches!(
                     error.kind(),
@@ -1348,6 +1364,59 @@ mod tests {
         let changed = fixture.capture();
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_ne!(before.digest, changed.unwrap().digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_capture_matches_effective_execute_access_and_later_path_selection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root may execute a regular file with any execute bit. The owner
+        // permission precedence exercised here requires ordinary credentials.
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let mut fixture = ConfigFixture::new();
+        let private = fixture.project.join("private-tools");
+        let usable = fixture.project.join("usable-tools");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::create_dir(&usable).unwrap();
+        let skipped = private.join("node");
+        launcher(&skipped, b"#!/bin/sh\nprintf private-tool\n");
+        launcher(&usable.join("node"), b"#!/bin/sh\nprintf usable-tool\n");
+        let path = std::env::join_paths([&private, &usable]).unwrap();
+        fixture.set("PATH", &path);
+        // The owner cannot read or execute this file, although another
+        // identity's execute bit is set. Metadata itself remains readable.
+        std::fs::set_permissions(&skipped, std::fs::Permissions::from_mode(0o001)).unwrap();
+        assert_ne!(
+            std::fs::metadata(&skipped).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        let selected = || {
+            let output = std::process::Command::new("node")
+                .current_dir(&fixture.project)
+                .env_clear()
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty());
+            output.stdout
+        };
+        assert_eq!(selected(), b"usable-tool");
+        let before = fixture.capture().unwrap();
+
+        launcher(&usable.join("node"), b"#!/bin/sh\nprintf updated-tool\n");
+        assert_eq!(selected(), b"updated-tool");
+        let changed = fixture.capture().unwrap();
+        assert_ne!(before.digest, changed.digest);
+
+        // Permission changes must invalidate the retained environment before
+        // the formerly skipped candidate can become the actual launcher.
+        std::fs::set_permissions(&skipped, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(selected(), b"private-tool");
+        assert_ne!(changed.digest, fixture.capture().unwrap().digest);
     }
 
     #[cfg(unix)]
