@@ -38,8 +38,9 @@ rch shim uninstall                      # remove the shim and restore wrapped to
   everything else (`cargo fmt`, `cargo install`, `cargo metadata`, …) goes to
   the real cargo untouched.
 - Any `--message-format*` argument (rust-analyzer / IDE tooling) runs locally.
-- Loop-safe: rch sets `RCH_CARGO_WRAPPER_BYPASS=1` on its own local-fallback
-  re-exec, and the shim honors it → real cargo. If `rch` is not on PATH the
+- Loop-safe: rch sets `RCH_CARGO_WRAPPER_BYPASS=1` together with
+  `RCH_CARGO_WRAPPER_ORIGIN=rch` on its own local-fallback re-exec, and the
+  shim honors that pair → real cargo. If `rch` is not on PATH the
   shim also passes through (never blocks a build).
 - Refuses to install on a box whose config says `general.role = "worker"` — a
   worker *is* the compute; wrapping its cargo would recurse into the fleet.

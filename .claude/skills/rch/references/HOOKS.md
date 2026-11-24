@@ -111,7 +111,8 @@ Observed against 1.0.58 (`scripts/protocol_test.sh` reproduces):
 Inline `RCH_*=…` prefixes are **part of the command text**, not the hook's
 environment — `RCH_ENABLED=0 cargo build` is rewritten like any other build.
 To keep a build local from inside an agent, use `.rch/config.toml`
-`[general] force_local = true` (plus `RCH_CARGO_WRAPPER_BYPASS=1` for the shim).
+`[general] force_local = true`; the cargo shim honors it too. Do not add
+`RCH_CARGO_WRAPPER_BYPASS=1`, which the shim refuses.
 
 ## What the Hook Never Does
 

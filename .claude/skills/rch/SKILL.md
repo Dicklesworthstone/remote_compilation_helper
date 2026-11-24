@@ -167,7 +167,7 @@ Run in order; stop at the first failing stage.
 | Multiple agents racing on fleet ops | `scripts/multi_agent_safety.sh <cmd>` + Agent Mail reservations |
 | `--target *-pc-windows-msvc` / `*-apple-*` won't offload | needs a worker declaring `os = "windows"` / `"darwin"` — `references/WORKERS.md`; without one it correctly runs local |
 | Cross-platform worker taking the wrong jobs | it has no `os =` set; add it, and roll rchd out first (older builds ignore the key silently) |
-| Build must run **locally on purpose** (release binary for this host) | `.rch/config.toml` → `[general] force_local = true`, plus `RCH_CARGO_WRAPPER_BYPASS=1` if the shim is installed; inline `RCH_ENABLED=0` does **not** bypass the hook |
+| Build must run **locally on purpose** (release binary for this host) | project-scoped `.rch/config.toml` → `[general] force_local = true` (remove it afterwards); the hook and the cargo shim both honor it, even under `RCH_REQUIRE_REMOTE=1`. Do **not** prefix `RCH_CARGO_WRAPPER_BYPASS=1`: the shim refuses it (`references/SHIM.md`). Inline `RCH_ENABLED=0` does **not** bypass the hook |
 | Need a runbook, not a guess | `rch doctor --runbook-list`; `rch doctor --runbook RCH-R006` |
 | Need full environment diagnosis | `rch doctor --json`, `rch config doctor` |
 

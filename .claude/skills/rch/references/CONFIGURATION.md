@@ -303,7 +303,9 @@ Other runtime: `RCH_CONFIG_DIR`, `RCH_STATE_HOME` (default `$XDG_STATE_HOME/rch`
 (`pretty|json|compact`), `RCH_LOG_FILE`, `RCH_LOG_TARGETS`, `RCH_LOG_MAX_FILES` (7),
 `RCH_JSON`, `RCH_HOOK_MODE`, `RCH_OUTPUT_FORMAT`, `TOON_DEFAULT_FORMAT`,
 `NO_COLOR`/`FORCE_COLOR`/`CLICOLOR_FORCE`, `RCH_NO_UPDATE_CHECK`,
-`RCH_CARGO_WRAPPER_BYPASS` (shim loop-break / bypass), `RCH_OTEL_*`,
+`RCH_CARGO_WRAPPER_BYPASS` (rch's internal shim loop-break, paired with
+`RCH_CARGO_WRAPPER_ORIGIN=rch`; the shim refuses a caller-set value while
+`RCH_REQUIRE_REMOTE` is on), `RCH_OTEL_*`,
 `RCH_DISABLE_CONFIG_CACHE`, `RCH_MOCK_SSH` (tests).
 
 Worker-side: `RCH_WORKER_ID` (falls back to `HOSTNAME`), `RCH_WKR_CANONICAL_ROOT`,

@@ -249,7 +249,7 @@ Use cancellation when builds are wedged or backlog pressure is starving high-pri
 | Chain cargo commands in a shell string (`rch exec -- bash -lc "cargo a && cargo b"`) | Refused with `RCH-E301`; rch can't bind the output path | Separate `rch exec -- cargo …` invocations |
 | `rch daemon restart -y` while `rch queue` shows active builds | 1.0.58: it interrupts them (`-y` only skips the warning); the daemon may answer `shutdown_blocked`. 2.0.0: it refuses unless `--drain` or `--force` | Wait for 0 active builds (2.0.0: `--drain`) or `rch cancel` first |
 | Uninstall the shim because a build exited 103 | 103 means the *fleet* had nothing admissible | `rch status --remediation`, fix, retry |
-| Prefix `RCH_ENABLED=0` inside an agent command to "go local" | The hook rewrites it anyway | `.rch/config.toml` `force_local = true` + `RCH_CARGO_WRAPPER_BYPASS=1` (`SHIM.md`) |
+| Prefix `RCH_ENABLED=0` inside an agent command to "go local" | The hook rewrites it anyway | `.rch/config.toml` `[general] force_local = true`, project-scoped and removed afterwards (`SHIM.md`); never `RCH_CARGO_WRAPPER_BYPASS=1` |
 | Hand-tune `priority`/`total_slots` | Inverts capacity silently | Benchmark, verify scores differ, then set (`SKILL.md`) |
 
 ---
