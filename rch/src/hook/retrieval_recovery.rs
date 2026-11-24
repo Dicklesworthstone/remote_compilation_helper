@@ -2007,16 +2007,26 @@ impl RecoverySession {
             .map(|phase| phase.patterns.as_slice())
             .unwrap_or(&[]);
         let restricted = cargo_retrieval_exclusions_apply(delivery_kind);
-        let cargo_output_capture = CargoOutputCapture::for_retrieval_policy(
-            kind,
-            command,
-            target_baseline,
-            if restricted {
-                &transfer.cargo_retrieval_exclude_dirs
+        let excluded_directories: &[String] = if restricted {
+            &transfer.cargo_retrieval_exclude_dirs
+        } else {
+            &[]
+        };
+        // Complete default-output proof uses the Unix publication contract.
+        // Preserve Windows' existing named-capture lane until its transfer
+        // supports that proof. Explicit exclusions still require the complete
+        // contract and are refused by validation on Windows.
+        let cargo_output_capture =
+            if WorkerPlatform::from_worker(worker).is_windows() && excluded_directories.is_empty() {
+                CargoOutputCapture::for_command(kind, command)
             } else {
-                &[]
-            },
-        )?;
+                CargoOutputCapture::for_retrieval_policy(
+                    kind,
+                    command,
+                    target_baseline,
+                    excluded_directories,
+                )?
+            };
         for phase in phases
             .iter_mut()
             .filter(|phase| restricted && phase.custom_target)
@@ -12463,6 +12473,95 @@ func TestValue(t *testing.T) {{
                 assert!(target.output_gate);
                 assert_eq!(target.patterns, expected, "{command}");
                 recipe.validate_cargo_retrieval_policy().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn windows_cargo_preparation_preserves_existing_capture_and_refuses_exclusions() {
+        for (kind, command) in [
+            (CompilationKind::CargoBuild, "cargo build"),
+            (CompilationKind::CargoBuild, "cargo build --workspace"),
+            (CompilationKind::CargoTest, "cargo test --no-run"),
+            (CompilationKind::CargoBench, "cargo bench --no-run"),
+            (CompilationKind::CargoBuild, "cargo build --bin app"),
+            (
+                CompilationKind::CargoBuild,
+                "cargo build --bin app --message-format=json",
+            ),
+            (
+                CompilationKind::CargoBuild,
+                "cargo build --message-format=json",
+            ),
+        ] {
+            for with_exclusions in [false, true] {
+                let (directory, writer, mut worker) = admitted_preparation_fixture();
+                worker.tags.push("os:windows".into());
+                assert!(WorkerPlatform::from_worker(&worker).is_windows());
+                let mut transfer = TransferConfig::default();
+                if with_exclusions {
+                    transfer.cargo_retrieval_exclude_dirs = vec!["incremental".into()];
+                }
+                RecoverySession::begin(
+                    &writer,
+                    &worker,
+                    vec!["/data/projects/source-recovery".into()],
+                    None,
+                    None,
+                    None,
+                    transfer.clone(),
+                    directory.path().to_owned(),
+                    "abc123".into(),
+                )
+                .unwrap();
+                let source_intent = writer.snapshot().recovery;
+                let pipeline = TransferPipeline::new(
+                    directory.path().to_owned(),
+                    "windows-cargo-capture".into(),
+                    "abc123".into(),
+                    transfer.clone(),
+                )
+                .with_remote_path_override("/data/projects/source-recovery")
+                .with_remote_cargo_target_dir_override("/worker/target");
+                let result = RecoverySession::prepare(
+                    &writer,
+                    &worker,
+                    &pipeline,
+                    vec!["/data/projects/source-recovery".into()],
+                    None,
+                    None,
+                    None,
+                    transfer,
+                    directory.path().to_owned(),
+                    Some(&directory.path().join("target")),
+                    Some(kind),
+                    command,
+                    &[],
+                    "abc123".into(),
+                );
+                if with_exclusions {
+                    assert!(result.is_err(), "{command}");
+                    assert_eq!(writer.snapshot().recovery, source_intent, "{command}");
+                    continue;
+                }
+                let session = result.unwrap();
+                let restored = reload_publication(&session);
+                let expected_capture = CargoOutputCapture::for_command(Some(kind), command);
+                let expected_patterns =
+                    get_custom_target_artifact_patterns(Some(kind), Some(command));
+                for recipe in [&session.recipe, &restored.recipe] {
+                    assert_eq!(recipe.cargo_output_capture, expected_capture, "{command}");
+                    assert!(
+                        recipe
+                            .cargo_output_capture
+                            .as_ref()
+                            .is_none_or(|capture| !capture.automatic_complete_outputs()),
+                        "{command}"
+                    );
+                    let target = recipe.phases.iter().find(|phase| phase.custom_target).unwrap();
+                    assert_eq!(target.patterns, expected_patterns, "{command}");
+                    recipe.validate_cargo_retrieval_policy().unwrap();
+                }
             }
         }
     }
