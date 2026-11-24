@@ -4661,12 +4661,13 @@ struct ReapSurfaceConfig {
 }
 
 impl ReapSurfaceConfig {
-    fn roots_for(&self, worker: &rch_common::WorkerConfig) -> &rch_common::gc_roots::GcRootSet {
-        if transfer::WorkerPlatform::from_worker(worker).is_windows() {
-            &self.windows_roots
+    fn roots_for(&self, worker: &rch_common::WorkerConfig) -> rch_common::gc_roots::GcRootSet {
+        let roots = if transfer::WorkerPlatform::from_worker(worker).is_windows() {
+            self.windows_roots.clone()
         } else {
-            &self.roots
-        }
+            self.roots.clone()
+        };
+        roots.with_worker_remote_base(worker)
     }
 
     fn fleet_roots(
@@ -5253,9 +5254,14 @@ async fn handle_gc(
         let surface = surface_ref;
         let windows = transfer::WorkerPlatform::from_worker(worker).is_windows();
         let mut output_budget = GC_OUTPUT_LIMIT;
+        let configured_roots = surface.roots_for(worker);
         let (roots, root_discovery) = discover_worker_gc_roots(
-            worker, surface.roots_for(worker), deadline, &mut output_budget,
-        ).await;
+            worker,
+            &configured_roots,
+            deadline,
+            &mut output_budget,
+        )
+        .await;
         let bases = roots.scan_bases();
         if bases.is_empty() {
             return serde_json::json!({
@@ -6238,13 +6244,9 @@ async fn handle_cache_status(
         let surface = surface_ref;
         let windows = transfer::WorkerPlatform::from_worker(worker).is_windows();
         let mut output_budget = GC_OUTPUT_LIMIT;
-        let (roots, root_discovery) = discover_worker_gc_roots(
-            worker,
-            surface.roots_for(worker),
-            deadline,
-            &mut output_budget,
-        )
-        .await;
+        let configured_roots = surface.roots_for(worker);
+        let (roots, root_discovery) =
+            discover_worker_gc_roots(worker, &configured_roots, deadline, &mut output_budget).await;
         let worker_bases = roots.scan_bases();
         let scan = scan_cache_status_roots(
             &worker_bases,
@@ -7703,6 +7705,58 @@ mod tests {
                 "exceeded"
             }));
         }
+    }
+
+    #[test]
+    fn gc_surfaces_keep_each_workers_staging_root_separate() {
+        use rch_common::gc_roots::{derive_gc_roots, derive_windows_gc_roots};
+        let pooled = rch_common::remediation_config::PooledTargetConfig::default();
+        let surface = ReapSurfaceConfig {
+            roots: derive_gc_roots(&pooled, &[]),
+            windows_roots: derive_windows_gc_roots(&pooled, &[]),
+            policy: rch_common::stale_target_reap::GcPolicy {
+                idle_secs: 1,
+                pooled_idle_secs: None,
+                cache_idle_secs: None,
+            },
+            idle_hours: 1,
+            pooled_idle_hours: 0,
+            cache_idle_days: 0,
+            max_cache_kb: None,
+        };
+        let first = rch_common::WorkerConfig {
+            remote_base: Some("/mnt/worker-one/rch".into()),
+            ..Default::default()
+        };
+        let second = rch_common::WorkerConfig {
+            remote_base: Some("/mnt/worker-two/rch".into()),
+            ..Default::default()
+        };
+        let windows = rch_common::WorkerConfig {
+            tags: vec!["os:windows".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            surface.roots_for(&first).scan_bases(),
+            ["/data/projects", "/mnt/worker-one/rch"]
+        );
+        assert_eq!(
+            surface.roots_for(&second).scan_bases(),
+            ["/data/projects", "/mnt/worker-two/rch"]
+        );
+        assert_eq!(surface.roots_for(&windows).scan_bases(), ["C:/rch"]);
+        let fleet = surface.fleet_roots(&[first, second, windows]);
+        for expected in ["/mnt/worker-one/rch", "/mnt/worker-two/rch", "C:/rch"] {
+            assert!(fleet.iter().any(|root| root.path == expected));
+        }
+        assert_eq!(surface.roots.scan_bases(), ["/data/projects"]);
+        let unsupported = rch_common::WorkerConfig {
+            remote_base: Some("/mnt/Build Disk/rch".into()),
+            ..Default::default()
+        };
+        let rejected = surface.fleet_rejections(&[unsupported]);
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].path, "/mnt/Build Disk/rch");
     }
 
     #[test]

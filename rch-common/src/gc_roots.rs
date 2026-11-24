@@ -223,6 +223,8 @@ pub enum GcRootSource {
     PooledRemoteBase,
     /// `[remediation.pooled_target] store_base` — a relocated pooled store.
     PooledStoreBase,
+    /// A worker's isolated/off-root staging base from `workers.toml`.
+    WorkerRemoteBase,
     /// `[remediation.pooled_target] gc_extra_roots` — operator-configured.
     ConfiguredExtra,
     /// A `--root` flag on this invocation.
@@ -242,6 +244,7 @@ impl GcRootSource {
             Self::WindowsRemoteBase => "windows_remote_base",
             Self::PooledRemoteBase => "pooled_remote_base",
             Self::PooledStoreBase => "pooled_store_base",
+            Self::WorkerRemoteBase => "worker_remote_base",
             Self::ConfiguredExtra => "configured_extra",
             Self::CommandLine => "command_line",
             Self::SourceClaimRegistry => "source_claim_registry",
@@ -256,6 +259,7 @@ impl GcRootSource {
             Self::WindowsRemoteBase => "Windows transfer base",
             Self::PooledRemoteBase => "[remediation.pooled_target] remote_base",
             Self::PooledStoreBase => "[remediation.pooled_target] store_base",
+            Self::WorkerRemoteBase => "[[workers]] remote_base",
             Self::ConfiguredExtra => "[remediation.pooled_target] gc_extra_roots",
             Self::CommandLine => "--root",
             Self::SourceClaimRegistry => "worker source-claim registry (discovery only)",
@@ -328,13 +332,62 @@ impl std::fmt::Display for GcRootRejection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcRootSet {
     /// Roots to scan, in a stable order: pooled remote base, pooled store
-    /// base, configured extras, `--root` flags, then the worker temp base.
+    /// base, configured extras, `--root` flags, worker staging, then worker temp.
     pub roots: Vec<GcRoot>,
     /// Roots that failed validation and will NOT be scanned.
     pub rejected: Vec<GcRootRejection>,
 }
 
 impl GcRootSet {
+    /// Include the exact staging base of this worker without replacing shared
+    /// mirrors or borrowing another worker's storage. Staging accepts a wider
+    /// pathname domain than the current GC shell protocol; report unsupported
+    /// spellings explicitly rather than changing collection's safety gates.
+    #[must_use]
+    pub fn with_worker_remote_base(mut self, worker: &crate::WorkerConfig) -> Self {
+        let Some(raw) = worker.remote_base.as_deref() else {
+            return self;
+        };
+        let os = crate::types::declared_os(&worker.tags);
+        let resolved = crate::types::validate_worker_remote_base(raw, os.as_deref())
+            .and_then(|path| {
+                if is_safe_reap_base(&path) {
+                    Ok(path)
+                } else {
+                    Err("worker staging path is unsupported by the GC shell protocol; collection requires an absolute path built from [A-Za-z0-9/._-]".to_string())
+                }
+            });
+        match resolved {
+            Ok(path) => {
+                if !self.roots.iter().any(|root| root.path == path) {
+                    let position = self
+                        .roots
+                        .iter()
+                        .position(GcRoot::is_worker_resolved)
+                        .unwrap_or(self.roots.len());
+                    self.roots.insert(
+                        position,
+                        GcRoot {
+                            path,
+                            source: GcRootSource::WorkerRemoteBase,
+                        },
+                    );
+                }
+            }
+            Err(reason) => {
+                let rejection = GcRootRejection {
+                    path: raw.to_owned(),
+                    source: GcRootSource::WorkerRemoteBase,
+                    reason,
+                };
+                if !self.rejected.contains(&rejection) {
+                    self.rejected.push(rejection);
+                }
+            }
+        }
+        self
+    }
+
     /// Add authenticated discovery hints without broadening them to ancestors.
     /// Keep nested roots: the normal root walk has a depth limit, so a deeply
     /// nested registered mirror may still be invisible beneath a configured
@@ -564,6 +617,84 @@ mod tests {
 
     fn cfg() -> PooledTargetConfig {
         PooledTargetConfig::default()
+    }
+
+    #[test]
+    fn worker_staging_roots_preserve_shared_roots_and_worker_boundaries() {
+        let config = PooledTargetConfig {
+            store_base: Some("/mnt/warm-pools".into()),
+            gc_extra_roots: vec!["/srv/old-rch".into()],
+            ..cfg()
+        };
+        let shared = derive_gc_roots(&config, &["/opt/rch".into()]);
+        let mut worker = crate::WorkerConfig {
+            remote_base: Some("/mnt/worker-one/rch/".into()),
+            ..Default::default()
+        };
+        let roots = shared.clone().with_worker_remote_base(&worker);
+        assert_eq!(
+            roots.scan_bases(),
+            [
+                "/data/projects",
+                "/mnt/warm-pools",
+                "/srv/old-rch",
+                "/opt/rch",
+                "/mnt/worker-one/rch",
+            ]
+        );
+        assert!(roots.rejected.is_empty());
+        assert!(roots.roots.last().unwrap().is_worker_resolved());
+        assert_eq!(
+            roots
+                .attribute("/mnt/worker-one/rch/project/.rch-target-w-pool-x")
+                .unwrap()
+                .source,
+            GcRootSource::WorkerRemoteBase
+        );
+        assert!(roots.attribute("/mnt/worker-one/unrelated").is_none());
+        assert_eq!(roots.clone().with_worker_remote_base(&worker), roots);
+        worker.remote_base = Some("/mnt/worker-two/rch".into());
+        let other = shared.clone().with_worker_remote_base(&worker);
+        assert!(other.scan_bases().contains(&"/mnt/worker-two/rch".into()));
+        assert!(!other.scan_bases().contains(&"/mnt/worker-one/rch".into()));
+        worker.remote_base = Some("/mnt/warm-pools/".into());
+        assert_eq!(shared.clone().with_worker_remote_base(&worker), shared);
+        worker.remote_base = None;
+        assert_eq!(shared.clone().with_worker_remote_base(&worker), shared);
+    }
+
+    #[test]
+    fn unsupported_worker_staging_roots_are_reported_without_changing_scan_scope() {
+        let shared = derive_gc_roots(&cfg(), &[]);
+        for raw in [
+            "/",
+            "/mnt/../etc",
+            "~/rch",
+            "/mnt/Build Disk/rch",
+            "/mnt/$(touch injected)/rch",
+            "/mnt/rch'quoted",
+        ] {
+            let worker = crate::WorkerConfig {
+                remote_base: Some(raw.into()),
+                ..Default::default()
+            };
+            let roots = shared.clone().with_worker_remote_base(&worker);
+            assert_eq!(roots.roots, shared.roots, "{raw}");
+            assert_eq!(roots.rejected.len(), 1, "{raw}");
+            assert_eq!(roots.rejected[0].path, raw);
+            assert_eq!(roots.rejected[0].source, GcRootSource::WorkerRemoteBase);
+            assert_eq!(roots.clone().with_worker_remote_base(&worker), roots);
+        }
+        let windows = derive_windows_gc_roots(&cfg(), &[]);
+        let worker = crate::WorkerConfig {
+            tags: vec!["os:WiNdOwS".into()],
+            remote_base: Some("/mnt/posix-rch".into()),
+            ..Default::default()
+        };
+        let roots = windows.clone().with_worker_remote_base(&worker);
+        assert_eq!(roots.roots, windows.roots);
+        assert_eq!(roots.rejected.len(), 1);
+        assert!(roots.rejected[0].reason.contains("POSIX worker"));
     }
 
     #[test]

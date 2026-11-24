@@ -365,6 +365,13 @@ impl StaleTargetReaper {
     /// and normalization as `rch gc`. Reject the complete set on any invalid
     /// root before a caller can dispatch a partially configured sweep.
     fn scan_roots(&self) -> anyhow::Result<GcRootSet> {
+        self.scan_roots_for(None)
+    }
+
+    fn scan_roots_for(
+        &self,
+        worker: Option<&rch_common::WorkerConfig>,
+    ) -> anyhow::Result<GcRootSet> {
         let pooled = rch_common::remediation_config::PooledTargetConfig {
             remote_base: self.config.remote_base.clone(),
             store_base: self.config.store_base.clone(),
@@ -372,6 +379,10 @@ impl StaleTargetReaper {
             ..Default::default()
         };
         let roots = rch_common::gc_roots::derive_gc_roots(&pooled, &[]);
+        let roots = match worker {
+            Some(worker) => roots.with_worker_remote_base(worker),
+            None => roots,
+        };
         anyhow::ensure!(
             roots.rejected.is_empty(),
             "invalid stale-target sweep roots: {}",
@@ -407,7 +418,7 @@ impl StaleTargetReaper {
         // Validate the complete configured-only command before any network
         // request. Supplemental discovery can fail on an older or busy worker;
         // that must not disable the configured roots or produce a partial set.
-        let configured_roots = self.scan_roots()?;
+        let configured_roots = self.scan_roots_for(Some(&config))?;
         let configured_bases = configured_roots.scan_bases();
         let build_command = |bases: &[String]| {
             stale_target_reap::worker_sweep_command_for_roots_under_pressure(
@@ -1106,6 +1117,44 @@ mod tests {
         assert!(!worker.reserve_slots(1).await);
         worker.open_circuit().await;
         assert!(!reaper.is_worker_sweepable(&worker, &worker_id).await);
+    }
+
+    #[test]
+    fn worker_staging_roots_are_included_before_optional_registry_discovery() {
+        let reaper = StaleTargetReaper::new(
+            WorkerPool::new(),
+            StaleTargetReapConfig {
+                remote_base: "/data/projects".into(),
+                store_base: Some("/mnt/pools".into()),
+                ..Default::default()
+            },
+        );
+        let mut worker = rch_common::WorkerConfig {
+            remote_base: Some("/mnt/worker-staging/rch".into()),
+            ..Default::default()
+        };
+        let roots = reaper.scan_roots_for(Some(&worker)).unwrap();
+        assert_eq!(
+            roots.scan_bases(),
+            ["/data/projects", "/mnt/pools", "/mnt/worker-staging/rch"]
+        );
+        let command = stale_target_reap::worker_sweep_command_for_roots_under_pressure(
+            &roots.scan_bases(),
+            720,
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(command.contains("/mnt/worker-staging/rch"));
+        assert_eq!(
+            reaper.scan_bases().unwrap(),
+            ["/data/projects", "/mnt/pools"],
+            "one worker's staging base must not mutate the shared sweep policy"
+        );
+        worker.remote_base = Some("/mnt/unsupported root/rch".into());
+        let error = reaper.scan_roots_for(Some(&worker)).unwrap_err();
+        assert!(error.to_string().contains("worker_remote_base"));
     }
 
     #[test]
