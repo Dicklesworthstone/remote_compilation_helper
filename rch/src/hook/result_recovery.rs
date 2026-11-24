@@ -135,8 +135,21 @@ fn parse_probe(output: &Output, token: &str) -> anyhow::Result<Presence> {
     }
 }
 
+fn granted_probe_command(
+    namespace: SourceAuthorityNamespace,
+    identity: &str,
+    root: &str,
+    directory: &Path,
+    token: &str,
+) -> anyhow::Result<String> {
+    let prefix = namespace.activity_prefix(identity, false)?;
+    let probe = probe_command(root, directory, token)?;
+    Ok(format!("{prefix} sh -c {}", shell_escape::escape(probe.into())))
+}
+
 async fn probe_directory(
     worker: &WorkerConfig,
+    namespace: SourceAuthorityNamespace,
     source_identity: &str,
     root: &str,
     directory: &Path,
@@ -147,8 +160,7 @@ async fn probe_directory(
         return Ok(Presence::Present);
     }
     let token = format!("RCH_RESULT_DIRECTORY_V2:{}", uuid::Uuid::new_v4().simple());
-    let command = probe_command(root, directory, &token)?;
-    let command = crate::hook::ssh::wrap_remote_source_activity(&command, source_identity)?;
+    let command = granted_probe_command(namespace, source_identity, root, directory, &token)?;
     let output =
         crate::hook::ssh::run_offload_ssh_command(worker, &command, Duration::from_secs(20))
             .await?;
@@ -175,10 +187,16 @@ pub(super) async fn collect_result(
         .as_deref()
         .context("not a result-directory phase")?;
     let identity = session.recipe.identity.clone();
+    // Recovery has already located and reacquired this exact worker grant.
+    // The probe and the subsequent rsync must serialize on the same lock.
+    let namespace = session
+        .recipe
+        .source_authority_namespace
+        .context("result collection has no bound source authority namespace")?;
     settle_result_phase(
         session,
         index,
-        probe_directory(worker, &identity, &phase.remote, directory),
+        probe_directory(worker, namespace, &identity, &phase.remote, directory),
         async {
             pipeline
                 .retrieve_result_dir(worker, directory)
@@ -393,6 +411,73 @@ mod tests {
                 "{relative}: {output:?}"
             );
             assert!(parse_probe(&output, "other-token").is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn result_probe_observes_only_under_the_recovered_source_grant() {
+        use sha2::{Digest as _, Sha256};
+
+        let source = tempfile::tempdir().unwrap();
+        let worker = crate::transfer::native_control_worker_for_test();
+        for (namespace, registry) in [
+            (
+                SourceAuthorityNamespace::Current,
+                "/var/tmp/rch-source-authority-locks/claims-v1",
+            ),
+            (
+                SourceAuthorityNamespace::Legacy,
+                "/tmp/rch-source-authority-locks/claims-v1",
+            ),
+        ] {
+            let private = tempfile::tempdir().unwrap();
+            let identity = "cab1";
+            let command = granted_probe_command(
+                namespace,
+                identity,
+                source.path().to_str().unwrap(),
+                Path::new("reports"),
+                "result-token",
+            )
+            .unwrap();
+            // Redirect only the selected registry and lock operands. Run the
+            // real flock and digest check without touching either host registry.
+            let lock = format!("{identity}.activity.lock");
+            let mut args = shell_words::split(&command).unwrap();
+            let registry_lock = format!("{registry}/{lock}");
+            let mut relocated = 0;
+            for word in &mut args {
+                if *word == registry {
+                    *word = private.path().display().to_string();
+                    relocated += 1;
+                } else if *word == registry_lock {
+                    *word = private.path().join(&lock).display().to_string();
+                    relocated += 1;
+                }
+            }
+            assert_eq!(relocated, 2, "wrong authority in {command}");
+            let run = || {
+                std::process::Command::new(&args[0])
+                    .args(&args[1..])
+                    .env("RCH_WKR_BIN", &worker)
+                    .output()
+                    .unwrap()
+            };
+            assert!(!run().status.success());
+            let roots = format!("{}\n", source.path().display());
+            let digest: String = Sha256::digest(roots.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let claim = private.path().join(format!("{identity}.{digest}.claim"));
+            std::fs::write(&claim, roots).unwrap();
+            assert_eq!(
+                parse_probe(&run(), "result-token").unwrap(),
+                Presence::Absent
+            );
+            std::fs::hard_link(&claim, claim.with_extension("cancelling")).unwrap();
+            assert!(!run().status.success());
         }
     }
 
