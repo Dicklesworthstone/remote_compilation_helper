@@ -122,6 +122,9 @@ pub struct WorkerStatusFromApi {
     /// on the transient-eligibility axis (bd-session-history-remediation-ocv9i.1.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bypass: Option<BypassRecord>,
+    /// Persistent administrative intent, independent of observed connectivity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_disable: Option<rch_common::bypass_record::AdminDisableRecord>,
 }
 
 /// Worker capabilities information from API.
@@ -526,7 +529,9 @@ pub(crate) fn admission_test_snapshot(closed: bool) -> rch_common::RestartAdmiss
 /// Whether a worker can currently accept remote work according to status-level
 /// signals that mirror the daemon's hard admission blockers.
 pub fn worker_has_remote_admission_capacity(worker: &WorkerStatusFromApi) -> bool {
-    worker.status == "healthy" && worker.pressure_state.as_deref() != Some("critical")
+    worker.admin_disable.is_none()
+        && worker.status == "healthy"
+        && worker.pressure_state.as_deref() != Some("critical")
 }
 
 /// Count workers that should be eligible for remote admission from the status surface.
@@ -583,9 +588,49 @@ pub fn source_topology_remediation(
 
 /// Generate remediation hints for worker health and mapping-specific exclusions.
 pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<RemediationHint> {
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    generate_worker_remediations_at(workers, now_unix_ms)
+}
+
+fn generate_worker_remediations_at(
+    workers: &[WorkerStatusFromApi],
+    now_unix_ms: u64,
+) -> Vec<RemediationHint> {
     let mut hints = Vec::new();
 
     for w in workers {
+        if w.status == "disabled" || w.admin_disable.is_some() {
+            let stale = w
+                .admin_disable
+                .as_ref()
+                .is_some_and(|record| record.is_stale(now_unix_ms));
+            let detail = w.admin_disable.as_ref().map_or_else(
+                || {
+                    "disable age and reason unavailable; inspect the daemon's administrative state"
+                        .to_string()
+                },
+                |record| record.describe(now_unix_ms),
+            );
+            hints.push(RemediationHint {
+                reason_code: if stale {
+                    "admin_disable_stale"
+                } else {
+                    "admin_disabled"
+                }
+                .into(),
+                severity: "warning".into(),
+                message: format!("Worker {} is administratively disabled: {detail}", w.id),
+                suggested_action: format!(
+                    "Review the recorded reason; rch workers probe {} --verify-disabled <connectivity|cpu-v3|disk> checks a selected condition without enabling the worker",
+                    w.id
+                ),
+                worker_id: Some(w.id.clone()),
+            });
+            // Administrative disables stop telemetry polling. Stale pressure
+            // and circuit history cannot be repaired by waiting or restarting
+            // the daemon and must not obscure the operator's actual decision.
+            continue;
+        }
         hints.extend(
             w.source_topology_mismatches
                 .iter()
@@ -1409,6 +1454,7 @@ mod tests {
         assert_eq!(worker.total_slots, 16);
         assert_eq!(worker.speed_score, 85.5);
         assert!(worker.last_error.is_none());
+        assert!(worker.admin_disable.is_none());
     }
 
     #[test]
@@ -1885,7 +1931,53 @@ mod tests {
             pressure_telemetry_age_secs: None,
             pressure_telemetry_fresh: None,
             bypass: None,
+            admin_disable: None,
         }
+    }
+
+    #[test]
+    fn admin_disable_remediation_keeps_intent_ahead_of_stale_health() {
+        use rch_common::bypass_record::{ADMIN_DISABLE_STALE_AFTER_SECS, AdminDisableRecord};
+
+        let mut worker = make_worker("held", "disabled", "open");
+        worker.pressure_state = Some("telemetry_gap".into());
+        worker.admin_disable = Some(AdminDisableRecord {
+            worker_id: worker.id.clone(),
+            reason: Some("CPU capability needs review".into()),
+            disabled_unix_ms: 1_000,
+            expires_unix_ms: None,
+        });
+        let stale_at = 1_000 + ADMIN_DISABLE_STALE_AFTER_SECS * 1_000;
+        for (now, code) in [
+            (stale_at - 1, "admin_disabled"),
+            (stale_at, "admin_disable_stale"),
+        ] {
+            let hints = generate_worker_remediations_at(std::slice::from_ref(&worker), now);
+            assert_eq!(hints.len(), 1);
+            assert_eq!(hints[0].reason_code, code);
+            assert!(hints[0].message.contains("CPU capability needs review"));
+            assert!(hints[0].suggested_action.contains("--verify-disabled"));
+            assert!(!hints[0].suggested_action.contains("restart"));
+        }
+        let encoded = serde_json::to_value(&worker).unwrap();
+        let decoded: WorkerStatusFromApi = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.admin_disable, worker.admin_disable);
+
+        // A retained disable wins even if an older lifecycle snapshot says
+        // healthy; status cannot count the worker as available capacity.
+        worker.status = "healthy".into();
+        assert!(!worker_has_remote_admission_capacity(&worker));
+        assert_eq!(remote_admissible_worker_count(&[worker]), 0);
+    }
+
+    #[test]
+    fn legacy_disabled_status_does_not_suggest_impossible_telemetry_recovery() {
+        let mut worker = make_worker("held", "disabled", "half_open");
+        worker.pressure_state = Some("telemetry_gap".into());
+        let hints = generate_worker_remediations_at(&[worker], 1_000);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].reason_code, "admin_disabled");
+        assert!(hints[0].message.contains("age and reason unavailable"));
     }
 
     #[test]

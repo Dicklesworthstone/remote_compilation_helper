@@ -527,6 +527,7 @@ mod tests {
         let workers = vec![
             WorkerInfo {
                 source_topology_mismatches: Vec::new(),
+                admin_disable: None,
                 id: "w1".to_string(),
                 host: "host1".to_string(),
                 user: "u1".to_string(),
@@ -538,6 +539,7 @@ mod tests {
             },
             WorkerInfo {
                 source_topology_mismatches: Vec::new(),
+                admin_disable: None,
                 id: "w2".to_string(),
                 host: "host2".to_string(),
                 user: "u2".to_string(),
@@ -571,6 +573,9 @@ mod tests {
             daemon_refresh: None,
             source_topology: None,
             missing_components: Vec::new(),
+            admin_disable: None,
+            admin_disable_status_known: false,
+            disable_review: None,
             disk: Default::default(),
         };
         let json = serde_json::to_value(&result).unwrap();
@@ -595,6 +600,9 @@ mod tests {
             daemon_refresh: None,
             source_topology: None,
             missing_components: Vec::new(),
+            admin_disable: None,
+            admin_disable_status_known: false,
+            disable_review: None,
             disk: Default::default(),
         };
         let json = serde_json::to_value(&result).unwrap();

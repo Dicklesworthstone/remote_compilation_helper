@@ -34,9 +34,12 @@ use super::helpers::{
     ssh_error_code, urlencoding_encode,
 };
 use super::helpers::{config_dir, load_workers_from_config};
+#[cfg(any(unix, test))]
+use super::types::{DisableReviewOutcome, WorkerDisableReview};
 use super::types::{
-    WorkerActionResponse, WorkerBenchmarkResult, WorkerDiskInfo, WorkerInfo, WorkerProbeResult,
-    WorkerProbeSummary, WorkersCapabilitiesReport, WorkersListResponse, WorkersProbeResponse,
+    DisabledWorkerCheck, WorkerActionResponse, WorkerBenchmarkResult, WorkerDiskInfo, WorkerInfo,
+    WorkerProbeResult, WorkerProbeSummary, WorkersCapabilitiesReport, WorkersListResponse,
+    WorkersProbeResponse,
 };
 
 use crate::hook::required_runtime_for_kind;
@@ -434,6 +437,249 @@ async fn query_worker_disk_status() -> Option<DaemonFullStatusResponse> {
     }
 }
 
+fn review_time_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(any(unix, test))]
+fn matching_worker_status<'a>(
+    worker: &WorkerConfig,
+    status: Option<&'a DaemonFullStatusResponse>,
+) -> Option<&'a WorkerStatusFromApi> {
+    status?.workers.iter().find(|live| {
+        live.id == worker.id.as_str() && live.host == worker.host && live.user == worker.user
+    })
+}
+
+#[cfg(any(unix, test))]
+fn validate_disable_review(
+    check: Option<DisabledWorkerCheck>,
+    min_free_gib: Option<f64>,
+) -> Result<()> {
+    match (check, min_free_gib) {
+        (Some(DisabledWorkerCheck::Disk), Some(minimum))
+            if minimum.is_finite() && minimum > 0.0 =>
+        {
+            Ok(())
+        }
+        (Some(DisabledWorkerCheck::Disk), _) => {
+            anyhow::bail!("--verify-disabled disk requires a finite positive --min-free-gib")
+        }
+        (_, Some(_)) => anyhow::bail!("--min-free-gib requires --verify-disabled disk"),
+        (_, None) => Ok(()),
+    }
+}
+
+/// The operator selects the criterion. Free-form reason text never chooses a
+/// probe or grants permission to change administrative intent.
+#[cfg(any(unix, test))]
+fn evaluate_disable_condition(
+    check: DisabledWorkerCheck,
+    min_free_gib: Option<f64>,
+    result: &WorkerProbeResult,
+) -> (DisableReviewOutcome, String) {
+    use DisableReviewOutcome::{ConditionCleared, ConditionPresent, Unknown};
+    if check == DisabledWorkerCheck::Connectivity {
+        return if result.latency_ms.is_some() {
+            (
+                ConditionCleared,
+                "SSH and the worker health command answered this probe".into(),
+            )
+        } else {
+            (
+                ConditionPresent,
+                "this probe did not establish working SSH and worker health".into(),
+            )
+        };
+    }
+    let Some(capabilities) = result
+        .capabilities
+        .as_ref()
+        .filter(|_| result.latency_ms.is_some())
+    else {
+        return (
+            Unknown,
+            "no fresh worker capability result; cached daemon evidence is not used".into(),
+        );
+    };
+    match check {
+        DisabledWorkerCheck::Connectivity => unreachable!("handled above"),
+        DisabledWorkerCheck::CpuV3 => match capabilities.cpu_microarch_level {
+            Some(1 | 2) => (
+                ConditionPresent,
+                "fresh CPU evidence does not satisfy x86-64-v3".into(),
+            ),
+            Some(level @ (3 | 4)) => (
+                ConditionCleared,
+                format!(
+                    "fresh CPU evidence satisfies x86-64-v{level}; this does not diagnose every possible SIGILL cause"
+                ),
+            ),
+            _ => (
+                Unknown,
+                "x86-64 baseline is unknown or unsupported; no CPU capability conclusion".into(),
+            ),
+        },
+        DisabledWorkerCheck::Disk => {
+            let Some(minimum) = min_free_gib.filter(|value| value.is_finite() && *value > 0.0)
+            else {
+                return (
+                    Unknown,
+                    "disk verification has no valid free-space requirement".into(),
+                );
+            };
+            let mounts = [
+                (
+                    "tightest filesystem",
+                    capabilities.disk_free_gb,
+                    capabilities.disk_total_gb,
+                ),
+                (
+                    "build filesystem",
+                    capabilities.build_disk_free_gb,
+                    capabilities.build_disk_total_gb,
+                ),
+                (
+                    "temporary filesystem",
+                    capabilities.tmp_disk_free_gb,
+                    capabilities.tmp_disk_total_gb,
+                ),
+            ];
+            let mut missing = Vec::new();
+            for (name, free, total) in mounts {
+                match free.zip(total).filter(|(free, total)| {
+                    free.is_finite()
+                        && total.is_finite()
+                        && *free >= 0.0
+                        && *total > 0.0
+                        && free <= total
+                }) {
+                    Some((free, _)) if free < minimum => {
+                        return (
+                            ConditionPresent,
+                            format!(
+                                "{name} has {free:.2} GiB free, below the requested {minimum:.2} GiB"
+                            ),
+                        );
+                    }
+                    Some(_) => {}
+                    None => missing.push(name),
+                }
+            }
+            if missing.is_empty() {
+                (
+                    ConditionCleared,
+                    format!(
+                        "all three fresh filesystem measurements meet {minimum:.2} GiB; this is not admission for an unbudgeted build"
+                    ),
+                )
+            } else {
+                (
+                    Unknown,
+                    format!(
+                        "fresh measurements missing or invalid for {}; cached pressure is not substituted",
+                        missing.join(", ")
+                    ),
+                )
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+fn attach_disable_review(
+    worker: &WorkerConfig,
+    before: Option<&WorkerStatusFromApi>,
+    after: Option<&WorkerStatusFromApi>,
+    check: Option<DisabledWorkerCheck>,
+    min_free_gib: Option<f64>,
+    result: &mut WorkerProbeResult,
+    now_unix_ms: u64,
+) {
+    let same_endpoint = |live: &&WorkerStatusFromApi| {
+        live.id == worker.id.as_str() && live.host == worker.host && live.user == worker.user
+    };
+    let before = before.filter(same_endpoint);
+    let after = after.filter(same_endpoint);
+    result.admin_disable_status_known = after.is_some_and(|live| {
+        live.admin_disable
+            .as_ref()
+            .is_some_and(|record| record.worker_id == live.id)
+            || (live.admin_disable.is_none()
+                && matches!(
+                    live.status.as_str(),
+                    "healthy" | "degraded" | "unreachable" | "draining" | "drained"
+                ))
+    });
+    // Keep an older hold visible when the current daemon snapshot is unavailable
+    // or incomplete, but mark its currency unknown. A successful SSH probe cannot
+    // silently erase it. An affirmative current no-hold snapshot clears history.
+    result.admin_disable = after
+        .and_then(|live| {
+            live.admin_disable
+                .as_ref()
+                .filter(|record| record.worker_id == live.id)
+                .cloned()
+        })
+        .or_else(|| {
+            if result.admin_disable_status_known {
+                None
+            } else {
+                before.and_then(|live| {
+                    live.admin_disable
+                        .as_ref()
+                        .filter(|record| record.worker_id == live.id)
+                        .cloned()
+                })
+            }
+        });
+    if matches!(result.status.as_str(), "ok" | "healthy")
+        && after.is_some_and(|live| {
+            live.status == "disabled"
+                || live
+                    .admin_disable
+                    .as_ref()
+                    .is_some_and(|record| record.worker_id == live.id)
+        })
+    {
+        // Older daemons can report the hold without its durable record. Keep
+        // that worker out of the healthy count even though its review is unknown.
+        result.status = "disabled".to_owned();
+    } else if matches!(result.status.as_str(), "ok" | "healthy")
+        && !result.admin_disable_status_known
+    {
+        result.status = "administrative_state_unknown".to_owned();
+    }
+    let Some(check) = check else { return };
+    let (outcome, detail) = if !result.admin_disable_status_known {
+        (
+            DisableReviewOutcome::Unknown,
+            "current administrative state is unavailable or inconsistent; no enable recommendation"
+                .into(),
+        )
+    } else if before.map(|live| &live.admin_disable) != after.map(|live| &live.admin_disable) {
+        (DisableReviewOutcome::Unknown, "administrative intent changed or was unavailable during the probe; repeat the explicit review".into())
+    } else if result.admin_disable.is_none() {
+        (
+            DisableReviewOutcome::NotDisabled,
+            "the matching current daemon snapshot has no administrative hold".into(),
+        )
+    } else {
+        evaluate_disable_condition(check, min_free_gib, result)
+    };
+    result.disable_review = Some(WorkerDisableReview {
+        check,
+        outcome,
+        reviewed_unix_ms: now_unix_ms,
+        min_free_gib,
+        detail,
+    });
+}
+
 fn valid_disk_free(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && *value >= 0.0)
 }
@@ -550,6 +796,10 @@ fn worker_info_with_status(
     info.source_topology_mismatches = live
         .map(|worker| worker.source_topology_mismatches.clone())
         .unwrap_or_default();
+    info.admin_disable = live
+        .filter(|live| live.host == worker.host && live.user == worker.user)
+        .and_then(|live| live.admin_disable.clone())
+        .filter(|record| record.worker_id == worker.id.as_str());
     info
 }
 
@@ -854,6 +1104,12 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
 
         println!("{}", stats_line);
         println!("    {}", format_worker_disk(&info.disk));
+        if let Some(disabled) = info.admin_disable.as_ref() {
+            println!(
+                "    {}",
+                style.warning(&disabled.describe(review_time_unix_ms()))
+            );
+        }
         for warning in source_topology_warnings(&info.id, &info.source_topology_mismatches) {
             println!("    {}", style.warning(&warning));
         }
@@ -1075,6 +1331,8 @@ pub async fn workers_capabilities(
 pub async fn workers_probe(
     _worker_id: Option<String>,
     _all: bool,
+    _verify_disabled: Option<DisabledWorkerCheck>,
+    _min_free_gib: Option<f64>,
     _ctx: &OutputContext,
 ) -> Result<()> {
     Err(PlatformError::UnixOnly {
@@ -1087,8 +1345,11 @@ pub async fn workers_probe(
 pub async fn workers_probe(
     worker_id: Option<String>,
     all: bool,
+    verify_disabled: Option<DisabledWorkerCheck>,
+    min_free_gib: Option<f64>,
     ctx: &OutputContext,
 ) -> Result<()> {
+    validate_disable_review(verify_disabled, min_free_gib)?;
     let workers = load_workers_from_config()?;
     let style = ctx.theme();
     let project_root = std::env::current_dir().ok();
@@ -1242,6 +1503,9 @@ pub async fn workers_probe(
                             daemon_refresh: daemon_refresh.clone(),
                             source_topology: Some(source_topology.clone()),
                             missing_components: missing_components.clone(),
+                            admin_disable: None,
+                            admin_disable_status_known: false,
+                            disable_review: None,
                             disk: disk.clone(),
                         });
                         if !ctx.is_json() {
@@ -1322,6 +1586,9 @@ pub async fn workers_probe(
                             daemon_refresh: None,
                             source_topology: None,
                             missing_components: Vec::new(),
+                            admin_disable: None,
+                            admin_disable_status_known: false,
+                            disable_review: None,
                             disk: disk_info_from_probe(None, daemon_worker),
                         });
                         if !ctx.is_json() {
@@ -1347,6 +1614,9 @@ pub async fn workers_probe(
                             daemon_refresh: None,
                             source_topology: None,
                             missing_components: Vec::new(),
+                            admin_disable: None,
+                            admin_disable_status_known: false,
+                            disable_review: None,
                             disk: disk_info_from_probe(None, daemon_worker),
                         });
                         if !ctx.is_json() {
@@ -1377,6 +1647,9 @@ pub async fn workers_probe(
                     daemon_refresh: None,
                     source_topology: None,
                     missing_components: Vec::new(),
+                    admin_disable: None,
+                    admin_disable_status_known: false,
+                    disable_review: None,
                     disk: disk_info_from_probe(None, daemon_worker),
                 });
                 if !ctx.is_json() {
@@ -1392,6 +1665,70 @@ pub async fn workers_probe(
         }
     }
 
+    // Reload after probing, so an enable/re-disable or endpoint replacement
+    // cannot turn old evidence into a current review of a different hold.
+    let after_status = query_worker_disk_status().await;
+    let reviewed_unix_ms = review_time_unix_ms();
+    for result in &mut results {
+        let Some(worker) = workers
+            .iter()
+            .find(|worker| worker.id.as_str() == result.id)
+        else {
+            continue;
+        };
+        attach_disable_review(
+            worker,
+            matching_worker_status(worker, daemon_status.as_ref()),
+            matching_worker_status(worker, after_status.as_ref()),
+            verify_disabled,
+            min_free_gib,
+            result,
+            reviewed_unix_ms,
+        );
+        if !ctx.is_json() {
+            if let Some(disabled) = result.admin_disable.as_ref() {
+                println!(
+                    "  {}: {}",
+                    style.highlight(&result.id),
+                    style.warning(&disabled.describe(reviewed_unix_ms))
+                );
+                if !result.admin_disable_status_known {
+                    println!(
+                        "    Administrative snapshot is from before the probe; current state is unknown."
+                    );
+                }
+            } else if result.status == "disabled" {
+                println!(
+                    "  {}: administratively disabled; durable reason and age are unavailable.",
+                    style.highlight(&result.id)
+                );
+            } else if result.status == "administrative_state_unknown" {
+                println!(
+                    "  {}: direct checks passed; current administrative eligibility is unknown.",
+                    style.highlight(&result.id)
+                );
+            }
+            if let Some(review) = result.disable_review.as_ref() {
+                let outcome = match review.outcome {
+                    DisableReviewOutcome::ConditionPresent => "selected condition still present",
+                    DisableReviewOutcome::ConditionCleared => "selected condition cleared",
+                    DisableReviewOutcome::Unknown => "verification inconclusive",
+                    DisableReviewOutcome::NotDisabled => "no administrative hold",
+                };
+                println!(
+                    "    {}: {} — {}",
+                    style.highlight(&result.id),
+                    outcome,
+                    review.detail
+                );
+                if result.admin_disable.is_some() {
+                    println!(
+                        "    Administrative disable remains unchanged; review the full reason before an explicit enable."
+                    );
+                }
+            }
+        }
+    }
     let summary = summarize_probe_results(&results);
 
     if ctx.is_json() {
@@ -1414,6 +1751,9 @@ pub(crate) fn summarize_probe_results(results: &[WorkerProbeResult]) -> WorkerPr
     };
     for result in results {
         match result.status.as_str() {
+            "disabled" => summary.admin_disabled += 1,
+            "administrative_state_unknown" => summary.admin_unknown += 1,
+            "ok" | "healthy" if result.admin_disable.is_some() => summary.admin_disabled += 1,
             "ok" | "healthy" => summary.healthy += 1,
             "unhealthy" | "topology_incompatible" => summary.unhealthy += 1,
             "capability_missing" | "capability_unknown" => summary.capability_missing += 1,
@@ -1443,6 +1783,18 @@ fn format_probe_summary_line(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("{} healthy", summary.healthy));
+    if summary.admin_disabled > 0 {
+        parts.push(format!(
+            "{} reachable but administratively disabled",
+            summary.admin_disabled
+        ));
+    }
+    if summary.admin_unknown > 0 {
+        parts.push(format!(
+            "{} administrative state unknown",
+            summary.admin_unknown
+        ));
+    }
     if summary.capability_missing > 0 {
         parts.push(format!(
             "{} capability missing/unknown",
@@ -2567,6 +2919,9 @@ mod probe_summary_tests {
             daemon_refresh: None,
             source_topology: None,
             missing_components: Vec::new(),
+            admin_disable: None,
+            admin_disable_status_known: false,
+            disable_review: None,
             disk: WorkerDiskInfo::default(),
         }
     }
@@ -2786,6 +3141,363 @@ mod probe_summary_tests {
         let stdout = SharedOutputBuffer::new().as_writer(true);
         let stderr = SharedOutputBuffer::new().as_writer(true);
         OutputContext::with_writers(config, stdout, stderr)
+    }
+
+    fn held_status() -> DaemonFullStatusResponse {
+        let mut status = make_daemon_status();
+        status.workers[0].status = "disabled".into();
+        status.workers[0].admin_disable = Some(rch_common::bypass_record::AdminDisableRecord {
+            worker_id: "builder-1".into(),
+            reason: Some("operator review: do not infer a check from this text".into()),
+            disabled_unix_ms: 1000,
+            expires_unix_ms: None,
+        });
+        status
+    }
+
+    #[test]
+    fn disabled_review_requires_an_explicit_valid_disk_floor() {
+        assert!(validate_disable_review(None, None).is_ok());
+        assert!(validate_disable_review(Some(DisabledWorkerCheck::Connectivity), None).is_ok());
+        assert!(validate_disable_review(Some(DisabledWorkerCheck::CpuV3), None).is_ok());
+        assert!(validate_disable_review(Some(DisabledWorkerCheck::Disk), Some(16.0)).is_ok());
+        for invalid in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            assert!(validate_disable_review(Some(DisabledWorkerCheck::Disk), invalid).is_err());
+        }
+        for check in [
+            None,
+            Some(DisabledWorkerCheck::Connectivity),
+            Some(DisabledWorkerCheck::CpuV3),
+        ] {
+            assert!(validate_disable_review(check, Some(16.0)).is_err());
+        }
+    }
+
+    #[test]
+    fn disabled_review_reports_fresh_cpu_evidence_without_changing_the_hold() {
+        let worker = make_worker();
+        let status = held_status();
+        let before = status.workers[0].admin_disable.clone();
+        let mut result = mk("ok", None, None);
+        result.latency_ms = Some(5);
+        result.capabilities = Some(WorkerCapabilities {
+            cpu_microarch_level: Some(3),
+            ..Default::default()
+        });
+        attach_disable_review(
+            &worker,
+            Some(&status.workers[0]),
+            Some(&status.workers[0]),
+            Some(DisabledWorkerCheck::CpuV3),
+            None,
+            &mut result,
+            45 * 86_400_000,
+        );
+        assert_eq!(
+            result.disable_review.as_ref().unwrap().outcome,
+            DisableReviewOutcome::ConditionCleared
+        );
+        assert!(result.admin_disable_status_known);
+        assert_eq!(result.admin_disable, before);
+        assert_eq!(status.workers[0].admin_disable, before);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["disable_review"]["check"], "cpu_v3");
+        assert_eq!(json["disable_review"]["outcome"], "condition_cleared");
+        assert_eq!(json["admin_disable"]["disabled_unix_ms"], 1000);
+        let summary = summarize_probe_results(&[result]);
+        assert_eq!(summary.healthy, 0);
+        assert_eq!(summary.admin_disabled, 1);
+        let inventory = worker_info_with_status(&worker, Some(&status));
+        assert_eq!(inventory.admin_disable, before);
+        assert!(
+            inventory
+                .admin_disable
+                .unwrap()
+                .describe(45 * 86_400_000)
+                .contains("stale hold")
+        );
+    }
+
+    #[test]
+    fn disabled_cpu_and_connectivity_reviews_do_not_substitute_cached_evidence() {
+        let mut result = mk("ok", None, None);
+        result.latency_ms = Some(5);
+        for (level, expected) in [
+            (None, DisableReviewOutcome::Unknown),
+            (Some(0), DisableReviewOutcome::Unknown),
+            (Some(1), DisableReviewOutcome::ConditionPresent),
+            (Some(2), DisableReviewOutcome::ConditionPresent),
+            (Some(3), DisableReviewOutcome::ConditionCleared),
+            (Some(4), DisableReviewOutcome::ConditionCleared),
+            (Some(5), DisableReviewOutcome::Unknown),
+        ] {
+            result.capabilities = Some(WorkerCapabilities {
+                cpu_microarch_level: level,
+                ..Default::default()
+            });
+            assert_eq!(
+                evaluate_disable_condition(DisabledWorkerCheck::CpuV3, None, &result).0,
+                expected
+            );
+        }
+        result.capabilities = None;
+        assert_eq!(
+            evaluate_disable_condition(DisabledWorkerCheck::CpuV3, None, &result).0,
+            DisableReviewOutcome::Unknown
+        );
+        assert_eq!(
+            evaluate_disable_condition(DisabledWorkerCheck::Connectivity, None, &result).0,
+            DisableReviewOutcome::ConditionCleared
+        );
+        result.latency_ms = None;
+        result.capabilities = Some(WorkerCapabilities {
+            cpu_microarch_level: Some(4),
+            ..Default::default()
+        });
+        assert_eq!(
+            evaluate_disable_condition(DisabledWorkerCheck::CpuV3, None, &result).0,
+            DisableReviewOutcome::Unknown
+        );
+        assert_eq!(
+            evaluate_disable_condition(DisabledWorkerCheck::Connectivity, None, &result).0,
+            DisableReviewOutcome::ConditionPresent
+        );
+    }
+
+    #[test]
+    fn disabled_disk_review_requires_every_fresh_mount_and_preserves_low_space_failure() {
+        let mut result = mk("ok", None, None);
+        result.latency_ms = Some(5);
+        let complete = WorkerCapabilities {
+            disk_free_gb: Some(16.0),
+            disk_total_gb: Some(100.0),
+            build_disk_free_gb: Some(16.0),
+            build_disk_total_gb: Some(100.0),
+            tmp_disk_free_gb: Some(16.0),
+            tmp_disk_total_gb: Some(100.0),
+            ..Default::default()
+        };
+        result.capabilities = Some(complete.clone());
+        assert_eq!(
+            evaluate_disable_condition(DisabledWorkerCheck::Disk, Some(16.0), &result).0,
+            DisableReviewOutcome::ConditionCleared
+        );
+        for free in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(-1.0),
+            Some(101.0),
+        ] {
+            result.capabilities = Some(WorkerCapabilities {
+                tmp_disk_free_gb: free,
+                ..complete.clone()
+            });
+            assert_eq!(
+                evaluate_disable_condition(DisabledWorkerCheck::Disk, Some(16.0), &result).0,
+                DisableReviewOutcome::Unknown
+            );
+        }
+        result.capabilities = Some(WorkerCapabilities {
+            disk_free_gb: None,
+            tmp_disk_free_gb: Some(8.0),
+            ..complete
+        });
+        assert_eq!(
+            evaluate_disable_condition(DisabledWorkerCheck::Disk, Some(16.0), &result).0,
+            DisableReviewOutcome::ConditionPresent
+        );
+        result.capabilities = None;
+        result.disk.disk_free_gb = Some(1000.0);
+        result.disk.disk_pressure_state = Some("healthy".into());
+        result.disk.disk_measurement_source = Some("daemon");
+        assert_eq!(
+            evaluate_disable_condition(DisabledWorkerCheck::Disk, Some(16.0), &result).0,
+            DisableReviewOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn disabled_review_refuses_changed_or_unknown_administrative_ownership() {
+        let worker = make_worker();
+        let before = held_status();
+        let mut changed_reason = before.workers[0].clone();
+        changed_reason.admin_disable.as_mut().unwrap().reason =
+            Some("new operator decision".into());
+        let mut changed_time = before.workers[0].clone();
+        changed_time
+            .admin_disable
+            .as_mut()
+            .unwrap()
+            .disabled_unix_ms += 1;
+        let mut changed_endpoint = before.workers[0].clone();
+        changed_endpoint.host = "replacement".into();
+        let mut invalid_record = before.workers[0].clone();
+        invalid_record.admin_disable.as_mut().unwrap().worker_id = "different-worker".into();
+        let mut legacy_disabled = before.workers[0].clone();
+        legacy_disabled.admin_disable = None;
+        for after in [
+            None,
+            Some(&changed_reason),
+            Some(&changed_time),
+            Some(&changed_endpoint),
+            Some(&invalid_record),
+            Some(&legacy_disabled),
+        ] {
+            let mut result = mk("ok", None, None);
+            result.latency_ms = Some(5);
+            attach_disable_review(
+                &worker,
+                Some(&before.workers[0]),
+                after,
+                Some(DisabledWorkerCheck::Connectivity),
+                None,
+                &mut result,
+                2000,
+            );
+            assert_eq!(
+                result.disable_review.as_ref().unwrap().outcome,
+                DisableReviewOutcome::Unknown
+            );
+            if !result.admin_disable_status_known {
+                assert_eq!(
+                    result.admin_disable, before.workers[0].admin_disable,
+                    "the earlier hold must remain visible as historical evidence"
+                );
+            }
+        }
+        let mut result = mk("ok", None, None);
+        result.latency_ms = Some(5);
+        attach_disable_review(
+            &worker,
+            None,
+            Some(&before.workers[0]),
+            Some(DisabledWorkerCheck::Connectivity),
+            None,
+            &mut result,
+            2000,
+        );
+        assert_eq!(
+            result.disable_review.as_ref().unwrap().outcome,
+            DisableReviewOutcome::Unknown
+        );
+        attach_disable_review(
+            &worker,
+            Some(&before.workers[0]),
+            None,
+            Some(DisabledWorkerCheck::Connectivity),
+            None,
+            &mut result,
+            2000,
+        );
+        assert!(!result.admin_disable_status_known);
+        assert!(
+            result.admin_disable.is_some(),
+            "an unavailable daemon cannot silently erase the earlier hold"
+        );
+        let mut unavailable = mk("ok", None, None);
+        unavailable.latency_ms = Some(5);
+        attach_disable_review(
+            &worker,
+            Some(&before.workers[0]),
+            None,
+            None,
+            None,
+            &mut unavailable,
+            2000,
+        );
+        assert_eq!(unavailable.status, "administrative_state_unknown");
+        assert_eq!(unavailable.admin_disable, before.workers[0].admin_disable);
+        let summary = summarize_probe_results(&[unavailable]);
+        assert_eq!(summary.healthy, 0);
+        assert_eq!(summary.admin_disabled, 0);
+        assert_eq!(summary.admin_unknown, 1);
+        let healthy = make_daemon_status();
+        attach_disable_review(
+            &worker,
+            Some(&healthy.workers[0]),
+            Some(&healthy.workers[0]),
+            Some(DisabledWorkerCheck::Connectivity),
+            None,
+            &mut result,
+            2000,
+        );
+        assert_eq!(
+            result.disable_review.as_ref().unwrap().outcome,
+            DisableReviewOutcome::NotDisabled
+        );
+        assert!(result.admin_disable.is_none());
+        let mut legacy = mk("ok", None, None);
+        legacy.latency_ms = Some(5);
+        attach_disable_review(
+            &worker,
+            Some(&legacy_disabled),
+            Some(&legacy_disabled),
+            None,
+            None,
+            &mut legacy,
+            2000,
+        );
+        assert_eq!(legacy.status, "disabled");
+        assert!(!legacy.admin_disable_status_known);
+        let summary = summarize_probe_results(&[legacy]);
+        assert_eq!(summary.healthy, 0);
+        assert_eq!(summary.admin_disabled, 1);
+
+        let mut unknown = mk("ok", None, None);
+        unknown.latency_ms = Some(5);
+        attach_disable_review(&worker, None, None, None, None, &mut unknown, 2000);
+        assert_eq!(unknown.status, "administrative_state_unknown");
+        let summary = summarize_probe_results(&[unknown]);
+        assert_eq!(summary.healthy, 0);
+        assert_eq!(summary.admin_unknown, 1);
+
+        for lifecycle in ["", "unknown", "new_state"] {
+            let mut unrecognized = healthy.workers[0].clone();
+            unrecognized.status = lifecycle.into();
+            let mut result = mk("ok", None, None);
+            result.latency_ms = Some(5);
+            attach_disable_review(
+                &worker,
+                Some(&unrecognized),
+                Some(&unrecognized),
+                Some(DisabledWorkerCheck::Connectivity),
+                None,
+                &mut result,
+                2000,
+            );
+            assert!(!result.admin_disable_status_known);
+            assert!(result.admin_disable.is_none());
+            assert_eq!(result.status, "administrative_state_unknown");
+            assert_eq!(
+                result.disable_review.as_ref().unwrap().outcome,
+                DisableReviewOutcome::Unknown
+            );
+            let summary = summarize_probe_results(&[result]);
+            assert_eq!(summary.healthy, 0);
+            assert_eq!(summary.admin_unknown, 1);
+
+            let mut historical = mk("ok", None, None);
+            historical.latency_ms = Some(5);
+            attach_disable_review(
+                &worker,
+                Some(&before.workers[0]),
+                Some(&unrecognized),
+                None,
+                None,
+                &mut historical,
+                2000,
+            );
+            assert!(!historical.admin_disable_status_known);
+            assert_eq!(historical.status, "administrative_state_unknown");
+            assert_eq!(historical.admin_disable, before.workers[0].admin_disable);
+        }
     }
 
     #[test]

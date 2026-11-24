@@ -78,6 +78,14 @@ fn parse_worker_disable_duration(value: &str) -> std::result::Result<u64, String
     })
 }
 
+fn parse_worker_probe_free_gib(value: &str) -> std::result::Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "--min-free-gib requires a finite positive number".to_owned())
+}
+
 #[cfg(test)]
 mod exact_runtime_cli_tests;
 
@@ -1401,13 +1409,28 @@ enum WorkersAction {
         #[arg(long)]
         command: Option<String>,
     },
-    /// Probe worker connectivity
+    /// Probe worker connectivity and optionally review an administrative hold
+    #[command(after_help = r#"EXAMPLES:
+    rch workers probe css
+    rch workers probe css --verify-disabled connectivity
+    rch workers probe css --verify-disabled cpu-v3
+    rch workers probe css --verify-disabled disk --min-free-gib 16
+
+Verification checks only the selected condition using fresh probe evidence.
+It never changes the recorded disable or enables a worker. The recorded reason
+remains available for the operator to decide whether all conditions are resolved."#)]
     Probe {
         /// Worker ID to probe, or --all for all workers
         worker: Option<String>,
         /// Probe all workers
         #[arg(short = 'a', long)]
         all: bool,
+        /// Review this explicit condition; never infer it from the reason text
+        #[arg(long, value_enum)]
+        verify_disabled: Option<commands::types::DisabledWorkerCheck>,
+        /// Required free GiB on every observed build/temp filesystem (disk only)
+        #[arg(long, requires = "verify_disabled", required_if_eq("verify_disabled", "disk"), value_parser = parse_worker_probe_free_gib)]
+        min_free_gib: Option<f64>,
     },
     /// Run speed benchmarks against one or more workers (br-ifq7s)
     #[command(after_help = r#"EXAMPLES:
@@ -4247,8 +4270,13 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
         WorkersAction::Capabilities { refresh, command } => {
             commands::workers_capabilities(command, refresh, ctx).await?;
         }
-        WorkersAction::Probe { worker, all } => {
-            commands::workers_probe(worker, all, ctx).await?;
+        WorkersAction::Probe {
+            worker,
+            all,
+            verify_disabled,
+            min_free_gib,
+        } => {
+            commands::workers_probe(worker, all, verify_disabled, min_free_gib, ctx).await?;
         }
         WorkersAction::Benchmark {
             worker_id,
@@ -9519,7 +9547,7 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "workers", "probe", "css"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
-                action: WorkersAction::Probe { worker, all },
+                action: WorkersAction::Probe { worker, all, .. },
             }) => {
                 assert_eq!(worker, Some("css".to_string()));
                 assert!(!all);
@@ -9534,12 +9562,99 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "workers", "probe", "--all"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
-                action: WorkersAction::Probe { worker, all },
+                action: WorkersAction::Probe { worker, all, .. },
             }) => {
                 assert!(worker.is_none());
                 assert!(all);
             }
             _ => fail_expected("Expected workers probe command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_explicit_disabled_worker_reviews_and_rejects_invalid_disk_floors() {
+        let _guard = test_guard!();
+        for (value, expected) in [
+            (
+                "connectivity",
+                commands::types::DisabledWorkerCheck::Connectivity,
+            ),
+            ("cpu-v3", commands::types::DisabledWorkerCheck::CpuV3),
+        ] {
+            let cli =
+                Cli::try_parse_from(["rch", "workers", "probe", "css", "--verify-disabled", value])
+                    .unwrap();
+            let Some(Commands::Workers {
+                action:
+                    WorkersAction::Probe {
+                        verify_disabled,
+                        min_free_gib,
+                        ..
+                    },
+            }) = cli.command
+            else {
+                panic!("expected worker probe");
+            };
+            assert_eq!(verify_disabled, Some(expected));
+            assert_eq!(min_free_gib, None);
+        }
+        let cli = Cli::try_parse_from([
+            "rch",
+            "workers",
+            "probe",
+            "--all",
+            "--verify-disabled",
+            "disk",
+            "--min-free-gib",
+            "16.5",
+        ])
+        .unwrap();
+        let Some(Commands::Workers {
+            action:
+                WorkersAction::Probe {
+                    verify_disabled,
+                    min_free_gib,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected worker probe");
+        };
+        assert_eq!(
+            verify_disabled,
+            Some(commands::types::DisabledWorkerCheck::Disk)
+        );
+        assert_eq!(min_free_gib, Some(16.5));
+        assert!(
+            Cli::try_parse_from([
+                "rch",
+                "workers",
+                "probe",
+                "css",
+                "--verify-disabled",
+                "disk"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["rch", "workers", "probe", "css", "--min-free-gib", "16"])
+                .is_err()
+        );
+        for invalid in ["0", "-1", "NaN", "inf", "1e999", "16GiB"] {
+            assert!(
+                Cli::try_parse_from([
+                    "rch",
+                    "workers",
+                    "probe",
+                    "css",
+                    "--verify-disabled",
+                    "disk",
+                    "--min-free-gib",
+                    invalid
+                ])
+                .is_err(),
+                "accepted {invalid}"
+            );
         }
     }
 

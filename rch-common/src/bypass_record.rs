@@ -746,7 +746,7 @@ impl BypassRecordStore {
 /// a permanent admin disable has no recovery probing or auto-rejoin. Only an
 /// explicit operator deadline permits the daemon to replace that disable with
 /// durable quarantine and fresh recovery probes; expiry is not health evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AdminDisableRecord {
     /// Worker id (the store's key).
     pub worker_id: String,
@@ -761,12 +761,71 @@ pub struct AdminDisableRecord {
     pub expires_unix_ms: Option<u64>,
 }
 
+/// An old administrative hold deserves operator review, never automatic removal.
+pub const ADMIN_DISABLE_STALE_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
+
 impl AdminDisableRecord {
     /// A malformed or backward deadline cannot authorize automatic recovery.
     #[must_use]
     pub fn expiry_due(&self, now_unix_ms: u64) -> bool {
         self.expires_unix_ms
             .is_some_and(|deadline| deadline > self.disabled_unix_ms && now_unix_ms >= deadline)
+    }
+
+    /// Age from the durable event, not from the most recent daemon restart.
+    /// Missing or future timestamps cannot establish an age or a stale hold.
+    #[must_use]
+    pub fn age_secs(&self, now_unix_ms: u64) -> Option<u64> {
+        if self.disabled_unix_ms == 0 {
+            return None;
+        }
+        now_unix_ms
+            .checked_sub(self.disabled_unix_ms)
+            .map(|elapsed| elapsed / 1000)
+    }
+
+    #[must_use]
+    pub fn is_stale(&self, now_unix_ms: u64) -> bool {
+        self.age_secs(now_unix_ms)
+            .is_some_and(|age| age >= ADMIN_DISABLE_STALE_AFTER_SECS)
+    }
+
+    /// Plain terminal-safe review guidance shared by status and inventory.
+    #[must_use]
+    pub fn describe(&self, now_unix_ms: u64) -> String {
+        let age = self.age_secs(now_unix_ms).map_or_else(
+            || "age unknown".to_owned(),
+            |seconds| {
+                format!(
+                    "{}d {}h {}m",
+                    seconds / 86_400,
+                    seconds % 86_400 / 3600,
+                    seconds % 3600 / 60
+                )
+            },
+        );
+        let stale = if self.is_stale(now_unix_ms) {
+            "; stale hold: review recommended"
+        } else {
+            ""
+        };
+        let reason = self.reason.as_deref().unwrap_or("no reason recorded");
+        let deadline = self.expires_unix_ms.map_or_else(
+            || "explicit enable required".to_owned(),
+            |deadline| {
+                if self.expiry_due(now_unix_ms) {
+                    "expiry reached; fresh recovery checks still required".to_owned()
+                } else if deadline > self.disabled_unix_ms {
+                    format!(
+                        "recovery eligible in {}s",
+                        deadline.saturating_sub(now_unix_ms).div_ceil(1000)
+                    )
+                } else {
+                    "invalid expiry; explicit review required".to_owned()
+                }
+            },
+        );
+        format!("Administratively disabled ({age}{stale}); reason: {reason:?}; {deadline}")
     }
 }
 
@@ -2512,6 +2571,62 @@ mod tests {
                 .is_some()
         );
         assert!(!permit.is_current());
+    }
+
+    #[test]
+    fn admin_disable_age_and_review_survive_restart_without_granting_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let mut store = AdminDisableStore::with_path(&path);
+        let record = AdminDisableRecord {
+            worker_id: "held".into(),
+            reason: Some("CPU diagnosis\nneeds review\u{1b}[31m".into()),
+            disabled_unix_ms: 1000,
+            expires_unix_ms: None,
+        };
+        store.upsert(record.clone()).unwrap();
+        let reloaded = AdminDisableStore::try_load(&path).unwrap();
+        let held = reloaded.effective_disable("held").unwrap();
+        assert_eq!(held, record);
+        let stale_at = 1000 + ADMIN_DISABLE_STALE_AFTER_SECS * 1000;
+        assert!(!held.is_stale(stale_at - 1));
+        assert!(held.is_stale(stale_at));
+        assert_eq!(held.age_secs(stale_at), Some(7 * 86_400));
+        let description = held.describe(stale_at);
+        assert!(description.contains("7d 0h 0m"));
+        assert!(description.contains("stale hold"));
+        assert!(description.contains("explicit enable required"));
+        assert!(!description.contains('\n'));
+        assert!(!description.contains('\u{1b}'));
+        assert!(reloaded.automatic_network_permit("held").is_none());
+        assert_eq!(reloaded.effective_disable("held"), Some(record));
+    }
+
+    #[test]
+    fn admin_disable_unknown_age_and_due_expiry_never_claim_rejoin() {
+        for disabled_unix_ms in [0, 2000] {
+            let record = AdminDisableRecord {
+                worker_id: "held".into(),
+                reason: None,
+                disabled_unix_ms,
+                expires_unix_ms: None,
+            };
+            assert_eq!(record.age_secs(1000), None);
+            assert!(!record.is_stale(1000));
+            assert!(record.describe(1000).contains("age unknown"));
+        }
+        let timed = AdminDisableRecord {
+            worker_id: "held".into(),
+            reason: Some("maintenance".into()),
+            disabled_unix_ms: 1000,
+            expires_unix_ms: Some(2000),
+        };
+        assert!(timed.describe(1999).contains("recovery eligible in 1s"));
+        assert!(
+            timed
+                .describe(2000)
+                .contains("fresh recovery checks still required")
+        );
     }
 
     #[test]

@@ -918,6 +918,7 @@ mod tests {
             pressure_telemetry_age_secs: None,
             pressure_telemetry_fresh: None,
             bypass: None,
+            admin_disable: None,
         }
     }
 

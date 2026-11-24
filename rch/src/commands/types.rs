@@ -50,6 +50,9 @@ pub struct WorkerInfo {
     /// Source-root pairs this worker has refused; not a global health failure.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub source_topology_mismatches: Vec<rch_common::SourceTopologyMismatch>,
+    /// Current durable administrative intent, independent of worker health.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_disable: Option<rch_common::bypass_record::AdminDisableRecord>,
 }
 
 impl From<&WorkerConfig> for WorkerInfo {
@@ -64,6 +67,7 @@ impl From<&WorkerConfig> for WorkerInfo {
             speedscore: None,
             disk: WorkerDiskInfo::default(),
             source_topology_mismatches: Vec::new(),
+            admin_disable: None,
         }
     }
 }
@@ -73,6 +77,38 @@ impl From<&WorkerConfig> for WorkerInfo {
 pub struct WorkersListResponse {
     pub workers: Vec<WorkerInfo>,
     pub count: usize,
+}
+
+/// An explicit observation requested by the operator, never inferred from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DisabledWorkerCheck {
+    /// Check that SSH and the worker health command answer now.
+    Connectivity,
+    /// Check the complete x86-64-v3 CPU baseline, including AVX2.
+    CpuV3,
+    /// Check fresh build, temporary, and tightest-filesystem free space.
+    Disk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisableReviewOutcome {
+    ConditionPresent,
+    ConditionCleared,
+    Unknown,
+    NotDisabled,
+}
+
+/// Fresh evidence for one chosen criterion. This never changes admission intent.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerDisableReview {
+    pub check: DisabledWorkerCheck,
+    pub outcome: DisableReviewOutcome,
+    pub reviewed_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_free_gib: Option<f64>,
+    pub detail: String,
 }
 
 /// Worker probe result.
@@ -108,6 +144,12 @@ pub struct WorkerProbeResult {
     /// must not report the worker as ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_components: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_disable: Option<rch_common::bypass_record::AdminDisableRecord>,
+    /// A matching daemon snapshot was obtained after the direct probe.
+    pub admin_disable_status_known: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_review: Option<WorkerDisableReview>,
     #[serde(flatten)]
     pub disk: WorkerDiskInfo,
 }
@@ -119,6 +161,10 @@ pub struct WorkerProbeSummary {
     pub total: usize,
     /// Workers that passed connectivity, runtime and applicable namespace checks.
     pub healthy: usize,
+    /// Workers that pass direct checks but remain administratively held.
+    pub admin_disabled: usize,
+    /// Workers that pass direct checks without a current administrative snapshot.
+    pub admin_unknown: usize,
     /// Reachable workers that failed health or dispatcher namespace checks.
     pub unhealthy: usize,
     /// Reachable workers missing a project-declared toolchain component.

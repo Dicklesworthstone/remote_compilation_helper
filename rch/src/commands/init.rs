@@ -75,7 +75,7 @@ pub async fn init_wizard(yes: bool, skip_test: bool, ctx: &OutputContext) -> Res
 
     // Step 4: Probe worker connectivity
     println!("{}", style.highlight("Step 4/8: Probe worker connectivity"));
-    workers_probe(None, true, ctx).await?;
+    workers_probe(None, true, None, None, ctx).await?;
     println!();
 
     // Step 5: Deploy worker binary

@@ -377,6 +377,10 @@ pub struct WorkerStatusInfo {
     /// and auto-rejoin criteria (bd-session-history-remediation-ocv9i.1.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bypass: Option<BypassRecord>,
+    /// Effective administrative intent from the daemon's live durable store.
+    /// A successful health probe does not clear this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_disable: Option<rch_common::bypass_record::AdminDisableRecord>,
 }
 
 /// Active build information (placeholder).
@@ -5549,6 +5553,7 @@ fn worker_issue(
 /// tailnet API (`http_api::create_api_router`), so it is crate-visible.
 pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     let workers = ctx.pool.all_workers().await;
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
 
     // Current temporary-bypass records, persisted across daemon restarts. The
     // store file is the single source of truth; a missing/corrupt file yields an
@@ -5564,7 +5569,6 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
     let mut issues = Vec::new();
 
     for worker in &workers {
-        let status = worker.status().await;
         let (worker_id, host, user) = {
             let config = worker.config.read().await;
             (
@@ -5572,6 +5576,21 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
                 config.host.clone(),
                 config.user.clone(),
             )
+        };
+        // Include failed-persistence intent as well as the persisted record.
+        // Snapshot intent and lifecycle in the same administration -> worker
+        // lock order as enable/disable; release both before reading other facts.
+        let (admin_disable, lifecycle_status) = match &ctx.admin_disable_store {
+            Some(store) => {
+                let store = store.lock().await;
+                (store.effective_disable(&worker_id), worker.status().await)
+            }
+            None => (None, worker.status().await),
+        };
+        let status = if admin_disable.is_some() {
+            WorkerStatus::Disabled
+        } else {
+            lifecycle_status
         };
         let total_slots = worker.effective_total_slots().await;
         let used_slots = worker.used_slots();
@@ -5620,18 +5639,19 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
         // Report the actual transport deadline, including a configured long
         // cooldown. A default-config estimate claimed recovery in 30 seconds
         // even when the operator requested fifteen minutes.
-        let recovery_in_secs =
-            if status == WorkerStatus::Unreachable && worker.transport_is_down().await {
-                Some(
-                    worker
-                        .next_health_probe_in()
-                        .await
-                        .unwrap_or_default()
-                        .as_secs(),
-                )
-            } else {
-                circuit_stats.recovery_remaining_secs(&ctx.worker_selector.circuit_config)
-            };
+        let recovery_in_secs = if status == WorkerStatus::Disabled {
+            None
+        } else if status == WorkerStatus::Unreachable && worker.transport_is_down().await {
+            Some(
+                worker
+                    .next_health_probe_in()
+                    .await
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+        } else {
+            circuit_stats.recovery_remaining_secs(&ctx.worker_selector.circuit_config)
+        };
 
         worker_infos.push(WorkerStatusInfo {
             id: worker_id.clone(),
@@ -5661,6 +5681,7 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
             pressure_telemetry_age_secs: pressure.telemetry_age_secs,
             pressure_telemetry_fresh: pressure.telemetry_fresh,
             bypass: bypass_store.get(&worker_id).cloned(),
+            admin_disable: admin_disable.clone(),
         });
 
         // Generate issues based on worker state
@@ -5672,7 +5693,19 @@ pub(crate) async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatu
                 worker_id: Some(worker_id.clone()),
             });
         }
-        if let Some(issue) = worker_issue(
+        if let Some(disabled) = &admin_disable {
+            issues.push(Issue {
+                severity: "warning".to_string(),
+                summary: format!(
+                    "Worker '{worker_id}' is administratively disabled: {}",
+                    disabled.describe(now_unix_ms)
+                ),
+                remediation: Some(format!(
+                    "Review the recorded reason; run rch workers probe {worker_id} --verify-disabled <connectivity|cpu-v3|disk> for the relevant condition. Enable only after an operator confirms the reason no longer applies."
+                )),
+                worker_id: Some(worker_id.clone()),
+            });
+        } else if let Some(issue) = worker_issue(
             &worker_id,
             status,
             circuit_state,
@@ -11456,6 +11489,7 @@ mod tests {
             pressure_telemetry_age_secs: Some(7),
             pressure_telemetry_fresh: true,
             bypass: None,
+            admin_disable: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"id\":\"worker1\""));
@@ -15802,6 +15836,93 @@ mod tests {
         assert_eq!(status.daemon.slots_total, 12); // 8 + 4
         assert_eq!(status.daemon.version, "0.1.0");
         assert_eq!(status.daemon.pid, 1234);
+    }
+
+    #[tokio::test]
+    async fn status_preserves_effective_admin_disable_and_never_reenables() {
+        use rch_common::bypass_record::{AdminDisableRecord, AdminDisableStore};
+
+        let _guard = test_guard!();
+        for persistence_failure in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let parent = directory.path().join("state");
+            if persistence_failure {
+                std::fs::write(&parent, b"unrelated file").unwrap();
+            } else {
+                std::fs::create_dir(&parent).unwrap();
+            }
+            let path = parent.join("administrative.json");
+            let record = AdminDisableRecord {
+                worker_id: "worker1".into(),
+                reason: Some("operator review required".into()),
+                disabled_unix_ms: 1_000,
+                // An elapsed deadline authorizes the separate recovery owner;
+                // status itself must never consume or rewrite the decision.
+                expires_unix_ms: Some(2_000),
+            };
+            let mut store = AdminDisableStore::with_path(&path);
+            assert_eq!(store.upsert(record.clone()).is_err(), persistence_failure);
+            let store = Arc::new(tokio::sync::Mutex::new(store));
+            let pool = WorkerPool::new().with_admin_disable_store(Arc::clone(&store));
+            pool.add_worker(make_test_worker("worker1", 8)).await;
+            pool.add_worker(make_test_worker("worker2", 4)).await;
+            let mut ctx = make_test_context(pool);
+            ctx.admin_disable_store = Some(Arc::clone(&store));
+            ctx.pool
+                .get(&WorkerId::new("worker1"))
+                .await
+                .unwrap()
+                .open_circuit()
+                .await;
+
+            for _ in 0..2 {
+                let status = handle_status(&ctx).await.unwrap();
+                let disabled = status.workers.iter().find(|w| w.id == "worker1").unwrap();
+                assert_eq!(disabled.admin_disable.as_ref(), Some(&record));
+                assert_eq!(disabled.status, "disabled");
+                assert_eq!(disabled.recovery_in_secs, None);
+                assert!(
+                    status
+                        .workers
+                        .iter()
+                        .find(|w| w.id == "worker2")
+                        .unwrap()
+                        .admin_disable
+                        .is_none()
+                );
+                assert_eq!(status.daemon.workers_healthy, 1);
+                assert_eq!(status.daemon.slots_available, 4);
+                let issue = status
+                    .issues
+                    .iter()
+                    .find(|issue| {
+                        issue.worker_id.as_deref() == Some("worker1")
+                            && issue.summary.contains("administratively disabled")
+                    })
+                    .unwrap();
+                assert!(issue.summary.contains("operator review required"));
+                assert!(issue.summary.contains("stale"));
+                assert!(
+                    issue
+                        .remediation
+                        .as_ref()
+                        .unwrap()
+                        .contains("--verify-disabled")
+                );
+                assert_eq!(
+                    store.lock().await.effective_disable("worker1"),
+                    Some(record.clone())
+                );
+            }
+            if persistence_failure {
+                assert_eq!(std::fs::read(&parent).unwrap(), b"unrelated file");
+            } else {
+                assert_eq!(
+                    AdminDisableStore::try_load(&path).unwrap().get("worker1"),
+                    Some(&record)
+                );
+            }
+        }
     }
 
     #[tokio::test]

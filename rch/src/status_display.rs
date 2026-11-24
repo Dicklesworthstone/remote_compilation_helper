@@ -505,29 +505,40 @@ fn render_workers_table_to<W: Write>(
         "────────────", "────────", "──────────", "──────", "──────────", "────────"
     )?;
 
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
     for worker in &status.workers {
-        let status_display = match worker.status.as_str() {
-            "healthy" => style.success("healthy"),
-            "degraded" => style.warning("degraded"),
-            "draining" => style.warning("draining"),
-            "drained" => style.info("drained"),
-            "unreachable" | "unhealthy" => style.error("unreachable"),
-            "disabled" => style.muted("disabled"),
-            _ => style.muted(&worker.status),
+        let administratively_disabled =
+            worker.status == "disabled" || worker.admin_disable.is_some();
+        let status_display = if administratively_disabled {
+            style.muted("disabled")
+        } else {
+            match worker.status.as_str() {
+                "healthy" => style.success("healthy"),
+                "degraded" => style.warning("degraded"),
+                "draining" => style.warning("draining"),
+                "drained" => style.info("drained"),
+                "unreachable" | "unhealthy" => style.error("unreachable"),
+                "disabled" => style.muted("disabled"),
+                _ => style.muted(&worker.status),
+            }
         };
 
         // Enhanced circuit display with recovery timing
-        let circuit_display = match worker.circuit_state.as_str() {
-            "closed" => style.success("closed"),
-            "open" => {
-                if let Some(secs) = worker.recovery_in_secs {
-                    style.error(&format!("open ({}s)", secs))
-                } else {
-                    style.error("open")
+        let circuit_display = if administratively_disabled {
+            style.muted(&worker.circuit_state)
+        } else {
+            match worker.circuit_state.as_str() {
+                "closed" => style.success("closed"),
+                "open" => {
+                    if let Some(secs) = worker.recovery_in_secs {
+                        style.error(&format!("open ({}s)", secs))
+                    } else {
+                        style.error("open")
+                    }
                 }
+                "half_open" => style.warning("half-open"),
+                _ => style.muted(&worker.circuit_state),
             }
-            "half_open" => style.warning("half-open"),
-            _ => style.muted(&worker.circuit_state),
         };
         let slots = format!("{}/{}", worker.used_slots, worker.total_slots);
         let speed = format!("{:.1}", worker.speed_score);
@@ -543,6 +554,26 @@ fn render_workers_table_to<W: Write>(
             style.muted(&worker.user),
             style.info(&worker.host)
         )?;
+
+        if let Some(disabled) = &worker.admin_disable {
+            writeln!(
+                out,
+                "    {} {}",
+                style.muted("Administrative disable:"),
+                style.warning(&disabled.describe(now_unix_ms))
+            )?;
+            continue;
+        }
+        if administratively_disabled {
+            writeln!(
+                out,
+                "    {}",
+                style.muted(
+                    "Administrative disable: age and reason unavailable; operator review required"
+                )
+            )?;
+            continue;
+        }
 
         // Show detailed circuit info for workers with issues
         if worker.circuit_state != "closed" {
@@ -1402,6 +1433,7 @@ mod tests {
                     pressure_telemetry_age_secs: None,
                     pressure_telemetry_fresh: None,
                     bypass: None,
+                    admin_disable: None,
                 },
                 WorkerStatusFromApi {
                     source_topology_mismatches: Vec::new(),
@@ -1431,6 +1463,7 @@ mod tests {
                     pressure_telemetry_age_secs: None,
                     pressure_telemetry_fresh: None,
                     bypass: None,
+                    admin_disable: None,
                 },
             ],
             active_builds: vec![ActiveBuildFromApi {
@@ -1699,6 +1732,33 @@ mod tests {
         assert!(output.contains("unreachable"));
         assert!(output.contains("open (30s)"));
         info!("PASS: workers and circuit states rendered");
+    }
+
+    #[test]
+    fn status_worker_table_surfaces_stale_admin_decision_without_recovery_noise() {
+        let _guard = test_guard!();
+        let mut status = sample_status();
+        status.workers.truncate(1);
+        let worker = &mut status.workers[0];
+        worker.status = "disabled".into();
+        worker.circuit_state = "open".into();
+        worker.recovery_in_secs = Some(30);
+        worker.pressure_state = Some("telemetry_gap".into());
+        worker.admin_disable = Some(rch_common::bypass_record::AdminDisableRecord {
+            worker_id: worker.id.clone(),
+            reason: Some("review CPU\ncondition\u{1b}[31m".into()),
+            disabled_unix_ms: 1_000,
+            expires_unix_ms: None,
+        });
+        let mut output = Vec::new();
+        render_workers_table_to(&mut output, &status, &Theme::new(false, true, false)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Administrative disable:"));
+        assert!(output.contains("stale"));
+        assert!(output.contains("review CPU\\ncondition"));
+        assert!(!output.contains('\u{1b}'));
+        assert!(!output.contains("telemetry_gap"));
+        assert!(!output.contains("open (30s)"));
     }
 
     #[test]
