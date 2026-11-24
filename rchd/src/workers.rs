@@ -754,6 +754,20 @@ pub(crate) fn ensure_posix_gc_worker(config: &WorkerConfig) -> anyhow::Result<()
     Ok(())
 }
 
+/// Resolve the staging root used by this worker's isolated jobs.
+/// The worker override replaces the fallback; selecting it does not authorize
+/// broader scans or waive the source ownership and activity checks.
+pub(crate) fn staging_gc_base(config: &WorkerConfig, fallback: &str) -> anyhow::Result<String> {
+    ensure_posix_gc_worker(config)?;
+    let base = config.remote_base.as_deref().unwrap_or(fallback);
+    rch_common::types::validate_worker_remote_base(base, None).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid staging cleanup root for worker {}: {error}",
+            config.id
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 struct RegistryStoragePressureEvidence {
     reason: RegistryStoragePressure,
@@ -9271,6 +9285,67 @@ mod tests {
             tags: vec![],
             tools: Vec::new(),
             remote_base: None,
+        }
+    }
+
+    #[test]
+    fn staging_gc_base_prefers_worker_override_and_preserves_literal_path() {
+        let _guard = rch_common::test_guard!();
+        let mut config = test_config("gc-root");
+        assert_eq!(
+            staging_gc_base(&config, "/data/tmp/rch/").unwrap(),
+            "/data/tmp/rch"
+        );
+
+        config.remote_base = Some("/Volumes/Build Disk/rch///".into());
+        assert_eq!(
+            staging_gc_base(&config, "/").unwrap(),
+            "/Volumes/Build Disk/rch"
+        );
+
+        let literal = "/srv/$HOME/rch'cache";
+        config.remote_base = Some(literal.into());
+        assert_eq!(staging_gc_base(&config, "/data/tmp/rch").unwrap(), literal);
+    }
+
+    #[test]
+    fn staging_gc_base_rejects_unsafe_override_and_fallback() {
+        let _guard = rch_common::test_guard!();
+        let mut config = test_config("gc-root");
+        for root in [
+            "",
+            "/",
+            "/tmp",
+            "relative/rch",
+            "~/rch",
+            "/data/../rch",
+            "/data/./rch",
+            "/data//rch",
+            "/data/rch\nother",
+            "/data\\rch/cache",
+        ] {
+            config.remote_base = Some(root.into());
+            assert!(
+                staging_gc_base(&config, "/data/tmp/rch").is_err(),
+                "unsafe worker root accepted: {root:?}"
+            );
+            config.remote_base = None;
+            assert!(
+                staging_gc_base(&config, root).is_err(),
+                "unsafe fallback root accepted: {root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_gc_base_keeps_windows_collection_disabled() {
+        let _guard = rch_common::test_guard!();
+        let mut config = test_config("windows-gc-root");
+        config.tags = vec!["os:WiNdOwS".into()];
+        for remote_base in [None, Some("/srv/rch".to_string())] {
+            config.remote_base = remote_base;
+            let error = staging_gc_base(&config, "/data/tmp/rch").unwrap_err();
+            assert!(error.to_string().contains("Windows collection"), "{error}");
         }
     }
 

@@ -17,7 +17,7 @@
 
 use crate::disk_pressure::{PressureAssessment, PressureState};
 use crate::history::{ActiveBuildState, BuildHistory};
-use crate::workers::{WorkerPool, WorkerState};
+use crate::workers::{WorkerPool, WorkerState, staging_gc_base};
 use rch_common::{SshClient, SshOptions, WorkerId, WorkerStatus};
 use serde::Serialize;
 use std::sync::Arc;
@@ -56,7 +56,7 @@ pub struct ReclaimConfig {
     pub min_idle_minutes: u64,
     /// Protected path prefixes (relative to remote_base) that must never be reclaimed.
     pub protected_prefixes: Vec<String>,
-    /// Remote base directory for RCH caches.
+    /// Fallback staging root; a worker's remote_base override takes precedence.
     pub remote_base: String,
 }
 
@@ -501,11 +501,9 @@ impl ReclaimExecutor {
         let config = worker_state.config.read().await.clone();
         let worker_id = config.id.clone();
 
-        let escaped_base =
-            rch_common::ssh_utils::shell_escape_path_with_home(&self.config.remote_base)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Invalid remote_base: contains control characters")
-                })?;
+        let remote_base = staging_gc_base(&config, &self.config.remote_base)?;
+        let escaped_base = rch_common::ssh_utils::shell_escape_path_with_home(&remote_base)
+            .ok_or_else(|| anyhow::anyhow!("Invalid remote_base: contains control characters"))?;
 
         let threshold_kb = (self.config.max_reclaim_bytes / 1024).max(1);
         let max_freed_kb = self.config.max_reclaim_bytes / 1024;
@@ -1039,6 +1037,44 @@ mod tests {
     // =====================================================================
     // Executor Integration Tests (no SSH, logic-only)
     // =====================================================================
+
+    #[tokio::test]
+    async fn executor_rejects_unsafe_or_windows_roots_before_ssh() {
+        for mode in [ReclaimMode::Observe, ReclaimMode::Enforce] {
+            for (windows, reason) in [
+                (false, "invalid staging cleanup root"),
+                (true, "Windows collection"),
+            ] {
+                let pool = WorkerPool::new();
+                let mut config = create_test_worker_config("guarded-reclaim");
+                config.remote_base = Some("/".into());
+                if windows {
+                    config.tags = vec!["os:WiNdOwS".into()];
+                }
+                let worker_id = config.id.clone();
+                pool.add_worker(config).await;
+                let worker = pool.get(&worker_id).await.unwrap();
+                worker
+                    .set_pressure_assessment(make_critical_assessment())
+                    .await;
+                let executor = ReclaimExecutor::new(
+                    pool,
+                    Arc::new(BuildHistory::new(10)),
+                    ReclaimConfig {
+                        mode,
+                        // A regression must fail locally rather than open SSH.
+                        remote_base: "/invalid\nroot".into(),
+                        ..Default::default()
+                    },
+                );
+
+                let error = executor.evaluate_worker(&worker).await.unwrap_err();
+                assert!(error.to_string().contains(reason), "{error}");
+                assert!(worker.background_probe().await.is_some());
+                assert_eq!(worker.status().await, WorkerStatus::Healthy);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn executor_skips_healthy_worker() {

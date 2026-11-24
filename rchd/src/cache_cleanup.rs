@@ -6,7 +6,7 @@
 #![allow(dead_code)] // Scaffold code - will be wired into main.rs
 
 use crate::config::CacheCleanupConfig;
-use crate::workers::{WorkerPool, WorkerState, ensure_posix_gc_worker};
+use crate::workers::{WorkerPool, WorkerState, staging_gc_base};
 use rch_common::timing::scale_duration;
 use rch_common::{SshClient, SshOptions, WorkerId};
 use std::collections::HashMap;
@@ -684,7 +684,7 @@ impl CacheCleanupScheduler {
             .ok_or_else(|| anyhow::anyhow!("worker background connections are suspended"))?;
         let start = Instant::now();
         let config = worker_state.config.read().await.clone();
-        ensure_posix_gc_worker(&config)?;
+        let remote_base = staging_gc_base(&config, &self.config.remote_base)?;
 
         info!(
             "Starting cache cleanup on worker {} (max_age={}h, min_free={}GB)",
@@ -694,8 +694,7 @@ impl CacheCleanupScheduler {
         // Build cleanup command:
         // - baseline prune by age
         // - when below disk threshold, escalate and prune oldest caches until threshold is met
-        let remote_base = &self.config.remote_base;
-        let escaped_base = rch_common::ssh_utils::shell_escape_path_with_home(remote_base)
+        let escaped_base = rch_common::ssh_utils::shell_escape_path_with_home(&remote_base)
             .ok_or_else(|| anyhow::anyhow!("Invalid remote_base: contains control characters"))?;
         let cleanup_script = build_cleanup_command(
             escaped_base.as_ref(),
@@ -1190,6 +1189,34 @@ mod tests {
         assert!(error.to_string().contains("Windows collection"), "{error}");
         assert!(scheduler.last_cleanup.read().await.is_empty());
         assert!(scheduler.idle_since.read().await.is_empty());
+        assert!(worker.background_probe().await.is_some());
+        assert_eq!(worker.status().await, WorkerStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn manual_cleanup_rejects_unsafe_worker_root_before_ssh() {
+        let pool = WorkerPool::new();
+        let mut config = create_test_worker_config("unsafe-cleanup-root");
+        config.remote_base = Some("/".into());
+        let worker_id = config.id.clone();
+        pool.add_worker(config).await;
+        let worker = pool.get(&worker_id).await.unwrap();
+        let scheduler = CacheCleanupScheduler::new(
+            pool,
+            CacheCleanupConfig {
+                // A regression must fail locally rather than open SSH.
+                remote_base: "/invalid\nroot".into(),
+                ..Default::default()
+            },
+        );
+
+        let error = scheduler.cleanup_worker_now(&worker_id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("invalid staging cleanup root"),
+            "{error}"
+        );
+        assert!(error.to_string().contains(worker_id.as_str()), "{error}");
+        assert!(scheduler.last_cleanup.read().await.is_empty());
         assert!(worker.background_probe().await.is_some());
         assert_eq!(worker.status().await, WorkerStatus::Healthy);
     }

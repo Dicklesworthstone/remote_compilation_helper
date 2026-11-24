@@ -334,7 +334,8 @@ pub struct CacheCleanupConfig {
     #[serde(default = "default_idle_threshold")]
     pub idle_threshold_secs: u64,
 
-    /// Remote base directory for cache (must match transfer.remote_base).
+    /// Fallback staging root (must match transfer.remote_base).
+    /// A worker's remote_base override takes precedence for that worker.
     #[serde(default = "default_remote_base")]
     pub remote_base: String,
 }
