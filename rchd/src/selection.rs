@@ -13,8 +13,7 @@ use crate::admission::{AdmissionGate, ExecutionRequirements, TOOLCHAIN_PREFLIGHT
 #[cfg(test)]
 use crate::admission::{
     required_component_toolchain, required_rustup_component, required_tool_capability_mismatch,
-    rustup_component_capability_mismatch, toolchain_capability_mismatch,
-    toolchain_from_command_text,
+    rustup_component_capability_mismatch, toolchain_from_command_text,
 };
 use crate::disk_pressure::{
     DiskHeadroomAdmission, DiskHeadroomAvailability, DiskHeadroomRejection, PressureState,
@@ -1955,7 +1954,6 @@ impl WorkerSelector {
 
             let runtime_available = capabilities.has_runtime(requirements.required_runtime());
 
-            let toolchain_mismatch = requirements.toolchain_mismatch(&capabilities);
             let component_mismatch = requirements.component_mismatch(&capabilities);
             let tool_mismatch = requirements.tool_mismatch(&capabilities);
             let cached_toolchain_failure = if let Some(toolchain_name) =
@@ -2108,9 +2106,6 @@ impl WorkerSelector {
                 (WorkerSelectionDiagnosticDecision::Deny, reason)
             } else if let Some(reason) = component_mismatch {
                 push_reason_code(&mut reason_codes, "toolchain.component_missing");
-                (WorkerSelectionDiagnosticDecision::Deny, reason)
-            } else if let Some(reason) = toolchain_mismatch {
-                push_reason_code(&mut reason_codes, "toolchain.version_mismatch");
                 (WorkerSelectionDiagnosticDecision::Deny, reason)
             } else if let Some(reason) = cached_toolchain_failure {
                 push_reason_code(&mut reason_codes, "toolchain.preflight_failed");
@@ -2676,13 +2671,6 @@ impl WorkerSelector {
                 component_excluded.push(Arc::clone(&worker));
                 continue;
             }
-            if let Some(reason) = requirements.toolchain_mismatch(&capabilities) {
-                debug!("Worker {} excluded: {}", worker_id, reason);
-                metrics::inc_reliability_error("selection", "toolchain_version_mismatch");
-                filtered_by_hard_preflight += 1;
-                continue;
-            }
-
             if let Some(reason) = self
                 .toolchain_preflight_failure(worker.as_ref(), &requirements)
                 .await
@@ -4951,9 +4939,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_toolchain_probe_checks_both_cargo_routes_with_managed_environment() {
-        // The second value also verifies that a toolchain name remains data
+        // The last value also verifies that a toolchain name remains data
         // through every shell invocation, including the environment export.
         for toolchain in [
+            "stable",
+            "1.97.0",
+            "1.97.0-x86_64-unknown-linux-gnu",
             "nightly-2026-08-31",
             "nightly with spaces'$(printf INJECTED)",
         ] {
@@ -7019,45 +7010,159 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_toolchain_capability_mismatch_for_floating_channels() {
-        let local = ToolchainInfo {
-            channel: "nightly".to_string(),
-            date: None,
-            full_version: "rustc 1.97.0-nightly (abcdef 2026-05-01)".to_string(),
-        };
-        let caps = WorkerCapabilities {
-            rustc_version: Some("rustc 1.95.0-nightly (abcdef 2026-03-01)".to_string()),
-            ..Default::default()
-        };
-        assert!(toolchain_capability_mismatch(Some(&local), &caps).is_none());
+    #[tokio::test]
+    async fn selected_toolchain_preflight_governs_nondefault_toolchain_admission() {
+        let _guard = test_guard!();
+        for toolchain in [
+            ToolchainInfo::new("stable", None, "rustc 1.97.0 (fixture)"),
+            ToolchainInfo::new("beta", None, "rustc 1.98.0-beta.1 (fixture)"),
+            ToolchainInfo::new("1.97.0", None, "rustc 1.97.0 (fixture)"),
+            ToolchainInfo::new(
+                "1.97.0-x86_64-unknown-linux-gnu",
+                None,
+                "rustc 1.97.0 (fixture)",
+            ),
+            ToolchainInfo::new(
+                "nightly",
+                Some("2026-10-01".into()),
+                "rustc 1.99.0-nightly (fixture 2026-10-01)",
+            ),
+        ] {
+            let name = toolchain.rustup_toolchain();
+            let pool = WorkerPool::new();
+            let worker = make_worker("multi-toolchain", 8, 50.0);
+            worker
+                .set_capabilities(WorkerCapabilities {
+                    rustc_version: Some("rustc 1.98.0-nightly (worker default)".into()),
+                    rustup_toolchains: vec![name.clone()],
+                    ..Default::default()
+                })
+                .await;
+            pool.add_worker_state(worker).await;
+            let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
+            let worker = pool.get(&WorkerId::new("multi-toolchain")).await.unwrap();
+            let mut request = pinned_component_request("toolchain-project", "cargo build");
+            request.command = Some(format!("cargo +{name} build"));
+            request.toolchain = Some(toolchain);
+            let requirements = ExecutionRequirements::new(&request);
+            let endpoint = worker.endpoint_snapshot().await;
 
-        let stable = ToolchainInfo {
-            channel: "stable".to_string(),
-            ..local.clone()
-        };
-        assert!(toolchain_capability_mismatch(Some(&stable), &caps).is_some());
+            // These are execution-evidence doubles, not live installed tools.
+            // An inventory name and another toolchain's positive verdict must
+            // never authorize reservation for this exact compiler selection.
+            worker
+                .record_toolchain_preflight("nightly".into(), true, None)
+                .await;
+            assert!(
+                worker
+                    .reserve_slots_for_selection(1, &endpoint, &requirements, None)
+                    .await
+                    .is_none(),
+                "unprobed toolchain {name} must not reserve slots"
+            );
+            assert!(
+                toolchain_preflight_with(&worker, &name, |_, _| std::future::ready(Ok(())))
+                    .await
+                    .is_none()
+            );
 
-        let dated = ToolchainInfo {
-            date: Some("2026-05-01".to_string()),
-            ..local
-        };
-        assert!(toolchain_capability_mismatch(Some(&dated), &caps).is_none());
+            let selected = selector.select(&pool, &request).await;
+            assert_eq!(selected.reason, SelectionReason::Success, "{name}");
+            assert!(Arc::ptr_eq(&worker, selected.worker.as_ref().unwrap()));
+            let diagnostics = selector
+                .build_selection_diagnostics(&pool, &request, &HashSet::new())
+                .await;
+            assert_eq!(
+                diagnostics.workers[0].final_decision,
+                WorkerSelectionDiagnosticDecision::Allow,
+                "{name}: {:?}",
+                diagnostics.workers[0]
+            );
+            assert!(
+                worker
+                    .reserve_slots_for_selection(
+                        1,
+                        &endpoint,
+                        &requirements,
+                        selected.circuit_permit.as_ref(),
+                    )
+                    .await
+                    .is_some(),
+                "successful exact preflight must admit {name} despite the unrelated default"
+            );
+            worker.release_slots(1).await;
+
+            // The next reservation and selection must reject a new negative
+            // verdict even though default Rust and the inventory remain healthy.
+            worker
+                .record_toolchain_preflight(
+                    name.clone(),
+                    false,
+                    Some("toolchain_preflight_command_failed:1:selected toolchain missing".into()),
+                )
+                .await;
+            assert!(
+                worker
+                    .reserve_slots_for_selection(1, &endpoint, &requirements, None)
+                    .await
+                    .is_none()
+            );
+            let rejected = selector.select(&pool, &request).await;
+            assert!(rejected.worker.is_none(), "{name}");
+            assert_eq!(rejected.reason, SelectionReason::AllWorkersFailedPreflight);
+            assert!(
+                rejected.diagnostics.unwrap().workers[0]
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "toolchain.preflight_failed")
+            );
+            assert_eq!(worker.used_slots(), 0);
+        }
     }
 
-    #[test]
-    fn test_toolchain_capability_mismatch_skips_channel_only_toolchain_file() {
-        let local = ToolchainInfo {
-            channel: "nightly".to_string(),
-            date: None,
-            full_version: "nightly".to_string(),
-        };
-        let caps = WorkerCapabilities {
-            rustc_version: Some("rustc 1.95.0-nightly (abcdef 2026-03-01)".to_string()),
-            ..Default::default()
-        };
+    #[tokio::test]
+    async fn nondefault_toolchain_preflight_does_not_replace_component_admission() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let worker = make_worker("missing-clippy", 8, 50.0);
+        worker
+            .set_capabilities(WorkerCapabilities {
+                rustc_version: Some("rustc 1.98.0-nightly (worker default)".into()),
+                rustup_toolchains: vec!["stable-x86_64-unknown-linux-gnu".into()],
+                rustup_components: vec!["nightly-x86_64-unknown-linux-gnu:clippy".into()],
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(worker).await;
+        let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
+        let worker = pool.get(&WorkerId::new("missing-clippy")).await.unwrap();
+        let mut request = pinned_component_request("toolchain-project", "cargo +stable clippy");
+        request.toolchain = Some(ToolchainInfo::new("stable", None, "rustc 1.97.0 (fixture)"));
+        worker
+            .record_toolchain_preflight("stable".into(), true, None)
+            .await;
 
-        assert!(toolchain_capability_mismatch(Some(&local), &caps).is_none());
+        let rejected = selector.select(&pool, &request).await;
+        assert!(rejected.worker.is_none());
+        assert_eq!(rejected.reason, SelectionReason::AllWorkersFailedPreflight);
+        assert!(
+            rejected.diagnostics.unwrap().workers[0]
+                .reason_codes
+                .iter()
+                .any(|code| code == "toolchain.component_missing")
+        );
+        assert!(
+            worker
+                .reserve_slots_for_selection(
+                    1,
+                    &worker.endpoint_snapshot().await,
+                    &ExecutionRequirements::new(&request),
+                    None,
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(worker.used_slots(), 0);
     }
 
     fn pinned_component_request(project: &str, command: &str) -> SelectionRequest {
@@ -7901,10 +8006,9 @@ mod tests {
         .await;
         pool.add_worker_state(pressure_critical).await;
 
-        // A floating `nightly` channel deliberately matches ANY worker nightly
-        // (see test_toolchain_capability_mismatch_for_floating_channels), so
-        // the mismatch row must come from a worker on a different CHANNEL for
-        // the golden to keep exercising the toolchain.version_mismatch deny.
+        // A working default compiler does not prove the requested toolchain
+        // works. Preserve the rejected row using its exact failed preflight,
+        // rather than inferring failure from a different default channel.
         let toolchain_mismatch = make_worker("toolchain-mismatch", 4, 55.0);
         prepare_fixture_worker(
             &toolchain_mismatch,
@@ -7913,6 +8017,13 @@ mod tests {
             "pressure.ok",
         )
         .await;
+        toolchain_mismatch
+            .record_toolchain_preflight(
+                "nightly".to_string(),
+                false,
+                Some("toolchain_preflight_command_failed:1:nightly not installed".to_string()),
+            )
+            .await;
         pool.add_worker_state(toolchain_mismatch).await;
 
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
@@ -12587,7 +12698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_last_success_fallback_rechecks_toolchain_version_during_contention() {
+    async fn test_last_success_fallback_admits_probed_nondefault_toolchain_during_contention() {
         let _guard = test_guard!();
         let (pool, selector, _last_success, mut request) = last_success_contention_fixture().await;
         request.toolchain = Some(ToolchainInfo {
@@ -12605,10 +12716,12 @@ mod tests {
                 .await;
         }
 
-        assert_last_success_contention_refused(
-            selector.select(&pool, &request).await,
-            "toolchain.version_mismatch",
-        );
+        let selected = selector
+            .select(&pool, &request)
+            .await
+            .worker
+            .expect("the exact stable toolchain is usable on the nightly-default worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "last-success");
     }
 
     #[tokio::test]

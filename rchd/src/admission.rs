@@ -109,47 +109,18 @@ impl<'a> ExecutionRequirements<'a> {
             .then(|| format!("capability_missing:rustup_component:{toolchain}:{component}"))
     }
 
-    pub(crate) fn toolchain_mismatch(&self, capabilities: &WorkerCapabilities) -> Option<String> {
-        toolchain_capability_mismatch(self.request.toolchain.as_ref(), capabilities)
-    }
-
+    /// Runtime inventory proves Rust is available, not which compiler a named
+    /// rustup toolchain runs. Selection and final reservation separately require
+    /// a fresh successful preflight for the exact requested toolchain; the
+    /// worker's default rustc version cannot reject an installed alternative.
     pub(crate) fn capabilities_satisfied(&self, capabilities: &WorkerCapabilities) -> bool {
         capabilities.has_runtime(self.required_runtime())
             && self.tool_mismatch(capabilities).is_none()
             && self.component_mismatch(capabilities).is_none()
-            && self.toolchain_mismatch(capabilities).is_none()
             && self.source_topology.is_none_or(|topology| {
                 capabilities.is_topology_healthy_for(Some(topology)) != Some(false)
             })
     }
-}
-
-pub(crate) fn toolchain_capability_mismatch(
-    toolchain: Option<&ToolchainInfo>,
-    capabilities: &WorkerCapabilities,
-) -> Option<String> {
-    let toolchain = toolchain?;
-    if toolchain.date.is_some()
-        || toolchain.full_version.trim().is_empty()
-        || toolchain.full_version.trim().eq(toolchain.channel.as_str())
-    {
-        return None;
-    }
-
-    let worker_raw = capabilities.rustc_version.as_deref()?;
-    let channel = toolchain.channel.trim();
-    if is_floating_rust_channel(channel) {
-        return (!worker_rustc_matches_channel(worker_raw, channel)).then(|| {
-            format!(
-                "rustc_channel_mismatch:local={channel}:worker={}",
-                rustc_version_key(worker_raw).unwrap_or_else(|| worker_raw.to_string())
-            )
-        });
-    }
-
-    let local = rustc_version_key(&toolchain.full_version)?;
-    let worker = rustc_version_key(worker_raw)?;
-    (local != worker).then(|| format!("rustc_version_mismatch:local={local}:worker={worker}"))
 }
 
 pub(crate) fn required_rustup_component(request: &SelectionRequest) -> Option<&'static str> {
@@ -246,34 +217,6 @@ pub(crate) fn rustup_component_capability_mismatch(
     capabilities: &WorkerCapabilities,
 ) -> Option<String> {
     ExecutionRequirements::new(request).component_mismatch(capabilities)
-}
-
-fn is_floating_rust_channel(channel: &str) -> bool {
-    matches!(channel, "stable" | "beta" | "nightly")
-}
-
-fn worker_rustc_matches_channel(worker_raw: &str, channel: &str) -> bool {
-    let Some(worker) = rustc_version_key(worker_raw) else {
-        return false;
-    };
-    match channel {
-        "nightly" => worker.contains("-nightly"),
-        "beta" => worker.contains("-beta"),
-        "stable" => !worker.contains("-nightly") && !worker.contains("-beta"),
-        _ => false,
-    }
-}
-
-fn rustc_version_key(value: &str) -> Option<String> {
-    let mut parts = value.split_whitespace();
-    let first = parts.next()?;
-    let version = if first.eq("rustc") {
-        parts.next()?
-    } else {
-        first
-    };
-    let version = version.trim();
-    (!version.is_empty()).then(|| version.to_string())
 }
 
 // =========================================================================

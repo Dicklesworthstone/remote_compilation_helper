@@ -150,8 +150,8 @@
         "estimated_cores": 2,
         "active_project_excluded": false,
         "final_decision": "deny",
-        "final_reason": "rustc_channel_mismatch:local=nightly:worker=1.95.0",
-        "reason_codes": ["toolchain.version_mismatch"]
+        "final_reason": "toolchain_preflight_command_failed:1:nightly not installed",
+        "reason_codes": ["toolchain.preflight_failed"]
       }
     ]
   }
