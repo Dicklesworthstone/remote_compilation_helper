@@ -68,6 +68,8 @@ impl QuarantineEndpoint {
                 .into_iter()
                 .collect(),
             tools: Vec::new(),
+            // Transport identity does not select or relocate source storage.
+            remote_base: None,
         }
     }
 }

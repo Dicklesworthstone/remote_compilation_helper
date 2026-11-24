@@ -281,6 +281,7 @@ mod tests {
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         };
         let writer = DurableLeaseWriter {
             path: directory.path().join("lease.json"),

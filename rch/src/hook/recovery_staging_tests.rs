@@ -95,6 +95,7 @@ async fn recover_partial_publication(ram_caller: bool) {
         priority: 100,
         tags: Vec::new(),
         tools: Vec::new(),
+        remote_base: None,
     };
     let writer =
         DurableLeaseWriter::create_in(&root.join("journals"), "make all", true, false).unwrap();

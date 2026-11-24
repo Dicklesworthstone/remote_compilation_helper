@@ -4902,6 +4902,7 @@ fn test_selected_worker_to_config() {
         host: "192.168.1.100".to_string(),
         user: "ubuntu".to_string(),
         identity_file: "~/.ssh/id_rsa".to_string(),
+        remote_base: None,
         slots_available: 8,
         reserved_slots: Some(2),
         speed_score: 75.5,
@@ -5124,6 +5125,7 @@ async fn test_daemon_query_missing_socket() {
         false,
         &[],
         None,
+        false,
     )
     .await;
     assert!(result.is_err());
@@ -5947,6 +5949,7 @@ async fn retry_selection_selected_response_stays_pending_until_new_admission() {
                 host: "not-contacted.invalid".into(),
                 user: "test".into(),
                 identity_file: "/unused/key".into(),
+                remote_base: None,
                 slots_available: 4,
                 reserved_slots: Some(2),
                 speed_score: 90.0,
@@ -6334,6 +6337,7 @@ async fn retry_failover_socket_preserves_endpoint_and_admission_constraints() {
             true,
             &["git".into(), "cmake".into()],
             &rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default()),
+            false,
             &writer,
             true,
             &HookReporter::new(OutputVisibility::None),
@@ -6467,6 +6471,7 @@ async fn topology_retry_sequence_reaches_compatible_worker_and_stops_when_fleet_
                         host: "not-contacted.invalid".into(),
                         user: "test".into(),
                         identity_file: "/unused/key".into(),
+                        remote_base: None,
                         slots_available: 16,
                         reserved_slots: Some(2),
                         speed_score: 90.0,
@@ -6512,6 +6517,7 @@ async fn topology_retry_sequence_reaches_compatible_worker_and_stops_when_fleet_
                 true,
                 &[],
                 &rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default()),
+                false,
                 &writer,
                 true,
                 &HookReporter::new(OutputVisibility::None),
@@ -6560,6 +6566,7 @@ async fn topology_retry_sequence_reaches_compatible_worker_and_stops_when_fleet_
                 true,
                 &[],
                 &rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default()),
+                false,
                 &writer,
                 true,
                 &HookReporter::new(OutputVisibility::None),
@@ -6601,7 +6608,7 @@ async fn retry_budget_exhaustion_and_receipt_mode_do_not_query_the_daemon() {
                 &mut budget, &fault, socket.to_str().unwrap(), "project", 1, 0,
                 "true", None, RequiredRuntime::None, CommandPriority::Normal,
                 &[], &[], true, &[],
-                &topology, &writer, true, &reporter,
+                &topology, false, &writer, true, &reporter,
             ) => result.unwrap(),
             _ = listener.accept() => panic!("exhausted or single-shot retry contacted the daemon"),
         };
@@ -6664,6 +6671,7 @@ async fn queued_selection_lost_or_malformed_response_never_reaches_recovery() {
                 false,
                 &[],
                 None,
+                false,
             )
             .await
         };
@@ -6737,6 +6745,7 @@ async fn queued_selection_preconnect_failure_preserves_recovery() {
             false,
             &[],
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -6791,6 +6800,7 @@ async fn test_daemon_query_protocol() {
                 host: "mock.host.local".to_string(),
                 user: "mockuser".to_string(),
                 identity_file: "~/.ssh/mock_key".to_string(),
+                remote_base: None,
                 slots_available: 16,
                 reserved_slots: Some(4),
                 speed_score: 95.0,
@@ -6836,6 +6846,7 @@ async fn test_daemon_query_protocol() {
         false,
         &[],
         None,
+        false,
     )
     .await;
 
@@ -6883,6 +6894,7 @@ async fn test_daemon_query_sends_preferred_workers() {
                 host: "mock.host.local".to_string(),
                 user: "mockuser".to_string(),
                 identity_file: "~/.ssh/mock_key".to_string(),
+                remote_base: None,
                 slots_available: 16,
                 reserved_slots: Some(4),
                 speed_score: 95.0,
@@ -6930,6 +6942,7 @@ async fn test_daemon_query_sends_preferred_workers() {
         false,
         &[],
         None,
+        false,
     )
     .await;
 
@@ -6973,6 +6986,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
                     host: "mock.host.local".to_string(),
                     user: "mockuser".to_string(),
                     identity_file: "~/.ssh/mock_key".to_string(),
+                    remote_base: None,
                     slots_available: 6,
                     reserved_slots: Some(2),
                     speed_score: 90.0,
@@ -7038,6 +7052,7 @@ async fn test_daemon_query_releases_worker_outside_requested_set() {
         false,
         &[],
         None,
+        false,
     )
     .await
     .expect("query should return a structured refusal");
@@ -7080,6 +7095,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
                     host: "mock.host.local".to_string(),
                     user: "mockuser".to_string(),
                     identity_file: "~/.ssh/mock_key".to_string(),
+                    remote_base: None,
                     slots_available: 6,
                     reserved_slots: Some(2),
                     speed_score: 90.0,
@@ -7142,6 +7158,7 @@ async fn test_daemon_query_surfaces_unacknowledged_unrequested_worker_release() 
         false,
         &[],
         None,
+        false,
     )
     .await
     .expect_err("an unacknowledged release must not look like a safe ordinary refusal (9ec9b32f)");
@@ -7199,6 +7216,7 @@ async fn test_daemon_query_wait_parameters() {
                 host: "mock.host.local".to_string(),
                 user: "mockuser".to_string(),
                 identity_file: "~/.ssh/mock_key".to_string(),
+                remote_base: None,
                 slots_available: 16,
                 reserved_slots: Some(4),
                 speed_score: 95.0,
@@ -7242,6 +7260,7 @@ async fn test_daemon_query_wait_parameters() {
         false,
         &[],
         None,
+        false,
     )
     .await;
 
@@ -7284,6 +7303,7 @@ async fn test_daemon_query_url_encoding() {
                 host: "h".to_string(),
                 user: "u".to_string(),
                 identity_file: "i".to_string(),
+                remote_base: None,
                 slots_available: 1,
                 reserved_slots: Some(1),
                 speed_score: 1.0,
@@ -7319,6 +7339,7 @@ async fn test_daemon_query_url_encoding() {
         false,
         &[],
         None,
+        false,
     )
     .await;
     daemon_handle.await.expect("Daemon task");
@@ -7413,6 +7434,7 @@ async fn test_process_hook_remote_success_mocked() {
             host: "mock.host.local".to_string(),
             user: "mockuser".to_string(),
             identity_file: "~/.ssh/mock_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 90.0,
@@ -7496,6 +7518,7 @@ async fn test_force_local_allows_even_when_remote_available() {
             host: "mock.host.local".to_string(),
             user: "mockuser".to_string(),
             identity_file: "~/.ssh/mock_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 90.0,
@@ -7567,6 +7590,7 @@ async fn test_force_remote_bypasses_confidence_threshold() {
             host: "mock.host.local".to_string(),
             user: "mockuser".to_string(),
             identity_file: "~/.ssh/mock_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 90.0,
@@ -7757,6 +7781,7 @@ async fn test_process_hook_remote_nonzero_exit_uses_transparent_interception() {
             host: "mock.host.local".to_string(),
             user: "mockuser".to_string(),
             identity_file: "~/.ssh/mock_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 90.0,
@@ -7811,6 +7836,7 @@ fn test_worker_config_from_selected_worker() {
         host: "alpha.example.com".to_string(),
         user: "deploy".to_string(),
         identity_file: "/keys/deploy.pem".to_string(),
+        remote_base: Some("/Users/builder/.cache/rch".into()),
         slots_available: 32,
         reserved_slots: Some(4),
         speed_score: 88.8,
@@ -7825,6 +7851,10 @@ fn test_worker_config_from_selected_worker() {
     assert_eq!(config.host, "alpha.example.com");
     assert_eq!(config.user, "deploy");
     assert_eq!(config.identity_file, "/keys/deploy.pem");
+    assert_eq!(
+        config.remote_base.as_deref(),
+        Some("/Users/builder/.cache/rch")
+    );
     assert_eq!(config.total_slots, 32);
     assert_eq!(config.priority, 100); // Default priority
     assert!(config.tags.is_empty()); // Default empty tags
@@ -8607,6 +8637,7 @@ async fn namespace_preflight_failure_retries_only_after_confirmed_release() {
                         host: "not-contacted.invalid".into(),
                         user: "test".into(),
                         identity_file: "/unused/key".into(),
+                        remote_base: None,
                         slots_available: 4,
                         reserved_slots: Some(2),
                         speed_score: 90.0,
@@ -9828,6 +9859,7 @@ fn changed_pool_requires_one_owner_confirmed_cold_readmission_before_launch() {
         host: "worker.example".into(),
         user: "builder".into(),
         identity_file: "/test/key".into(),
+        remote_base: None,
         slots_available: 8,
         reserved_slots: Some(4),
         speed_score: 50.0,
@@ -11511,6 +11543,7 @@ fn make_test_worker_config(id: &str) -> WorkerConfig {
         host: "worker.host".to_string(),
         user: "ubuntu".to_string(),
         identity_file: "~/.ssh/id_ed25519".to_string(),
+        remote_base: None,
         total_slots: 8,
         priority: 100,
         tags: Vec::new(),
@@ -13590,6 +13623,7 @@ async fn native_budget_refusal_precedes_transfer_and_does_not_blame_the_worker()
         host: "not-contacted.invalid".to_string(),
         user: "unused".to_string(),
         identity_file: "unused".to_string(),
+        remote_base: None,
         slots_available: 64,
         reserved_slots: None,
         speed_score: 90.0,
@@ -13706,6 +13740,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         host: "unused.invalid".to_string(),
         user: "unused".to_string(),
         identity_file: "unused".to_string(),
+        remote_base: None,
         slots_available: 1,
         reserved_slots: Some(1),
         speed_score: 1.0,
@@ -13837,6 +13872,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         host: "mock.host.local".to_string(),
         user: "mockuser".to_string(),
         identity_file: "~/.ssh/mock_key".to_string(),
+        remote_base: None,
         slots_available: 8,
         reserved_slots: Some(4),
         speed_score: 90.0,
@@ -13951,6 +13987,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         host: "mock.host.local".to_string(),
         user: "mockuser".to_string(),
         identity_file: "~/.ssh/mock_key".to_string(),
+        remote_base: None,
         slots_available: 8,
         reserved_slots: Some(4),
         speed_score: 90.0,
@@ -14152,6 +14189,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         host: "mock.host.local".to_string(),
         user: "mockuser".to_string(),
         identity_file: "~/.ssh/mock_key".to_string(),
+        remote_base: None,
         slots_available: 8,
         reserved_slots: Some(4),
         speed_score: 90.0,
@@ -14266,6 +14304,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         host: "mock.host.local".to_string(),
         user: "mockuser".to_string(),
         identity_file: "~/.ssh/mock_key".to_string(),
+        remote_base: None,
         slots_available: 8,
         reserved_slots: Some(4),
         speed_score: 90.0,
@@ -14697,6 +14736,7 @@ async fn test_cargo_test_remote_build_failure() {
             host: "test.host.local".to_string(),
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 85.0,
@@ -14762,6 +14802,7 @@ async fn test_cargo_test_with_filter() {
             host: "test.host.local".to_string(),
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 85.0,
@@ -14827,6 +14868,7 @@ async fn test_cargo_test_with_test_threads() {
             host: "test.host.local".to_string(),
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 85.0,
@@ -14897,6 +14939,7 @@ async fn test_cargo_test_signal_killed() {
             host: "test.host.local".to_string(),
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 85.0,
@@ -14967,6 +15010,7 @@ async fn test_cargo_test_signal_killed_with_toolchain_path_does_not_fallback_loc
             host: "test.host.local".to_string(),
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 85.0,
@@ -15031,6 +15075,7 @@ async fn test_cargo_test_toolchain_fallback() {
             host: "test.host.local".to_string(),
             user: "testuser".to_string(),
             identity_file: "~/.ssh/test_key".to_string(),
+            remote_base: None,
             slots_available: 8,
             reserved_slots: Some(4),
             speed_score: 85.0,
@@ -16393,6 +16438,7 @@ async fn test_daemon_query_connect_timeout_fail_open() {
         false,
         &[],
         None,
+        false,
     )
     .await;
 
@@ -16513,6 +16559,7 @@ async fn test_daemon_query_partial_response_timeout() {
         false,
         &[],
         None,
+        false,
     )
     .await;
 

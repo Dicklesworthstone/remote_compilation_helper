@@ -1036,6 +1036,7 @@ mod tests {
             priority: 50,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         })
         .await;
         // Newly-added workers default to `Healthy` (see `WorkerState::new`), so

@@ -2590,6 +2590,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
 
         let result = check_worker_health(&Arc::new(worker), &HealthConfig::default(), None).await;
@@ -2616,12 +2617,14 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             }
         }
 
         fn make_request(project: &str, cores: u32) -> SelectionRequest {
             SelectionRequest {
                 source_topology: None,
+                isolated_source: false,
                 job_mode: false,
                 project: project.to_string(),
                 command: None,
@@ -2824,6 +2827,7 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             })
             .await;
             pool.add_worker(WorkerConfig {
@@ -2835,6 +2839,7 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             })
             .await;
             pool.add_worker(WorkerConfig {
@@ -2846,6 +2851,7 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             })
             .await;
 
@@ -3278,6 +3284,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: vec![],
+            remote_base: None,
         };
         pool.add_worker(config.clone()).await;
         let mut peer = config.clone();
@@ -3400,6 +3407,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: vec![],
+            remote_base: None,
         })
         .await;
         let worker = pool.get(&worker_id).await.unwrap();
@@ -3447,6 +3455,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         })
         .await;
 
@@ -3497,6 +3506,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
 
         let result = probe_worker(&worker).await;
@@ -3522,6 +3532,7 @@ mod tests {
             priority: 50,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
 
         let result = probe_worker(&worker).await;
@@ -3552,6 +3563,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
@@ -3803,6 +3815,7 @@ mod tests {
             priority: 50,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
@@ -3832,6 +3845,7 @@ mod tests {
             priority: 50,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let worker = Arc::new(WorkerState::new(worker_config));
 
@@ -3906,6 +3920,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
 
         // When mock is not enabled, is_mock_transport returns false
@@ -3927,6 +3942,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
 
         set_mock_enabled_override(Some(true));

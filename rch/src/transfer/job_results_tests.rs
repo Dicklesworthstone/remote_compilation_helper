@@ -14,6 +14,7 @@ fn worker() -> WorkerConfig {
         priority: 1,
         tags: Vec::new(),
         tools: Vec::new(),
+        remote_base: None,
     }
 }
 

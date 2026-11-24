@@ -1006,6 +1006,7 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             })
             .await;
         }
@@ -1250,6 +1251,7 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             };
             pool.add_worker(config.clone()).await;
             let worker = pool.get(&config.id).await.unwrap();
@@ -1320,6 +1322,7 @@ mod tests {
                 priority: 100,
                 tags,
                 tools: Vec::new(),
+                remote_base: None,
             })
             .await;
         }

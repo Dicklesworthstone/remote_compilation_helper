@@ -1341,6 +1341,11 @@ total_slots = 32
 priority = 100
 tags = ["fast", "ssd"]
 
+# Optional literal absolute POSIX staging base for this worker. Isolated
+# `--clean-overlay`, source-receipt and off-root jobs use this instead of
+# [transfer].remote_base. Shared canonical mirrors keep [path_topology].
+# remote_base = "/mnt/build-storage/rch"
+
 # Verified named tools. Each entry is a FIXED argv the worker runs as the
 # configured user; a zero exit marks the tool present, anything else marks it
 # absent. Unlike `tags`, which are an unverified naming convention, these are
@@ -1350,6 +1355,26 @@ tools = [
   { name = "ld.lld", command = ["/usr/bin/ld.lld", "--version"] },
 ]
 ```
+
+For a macOS worker, `remote_base = "/Users/builder/rch-staging"` lets isolated
+jobs use writable host storage without requiring the dispatcher's Linux paths.
+The path must be literal and absolute with at least two components; `~`, relative
+paths, traversal, and Windows-worker overrides are rejected. Spaces are allowed,
+and the dispatcher's environment is never used to expand the value. Omit it to
+retain the global staging base. An explicit pooled Cargo `store_base` still
+takes precedence for target storage.
+
+Selection, source preflight, and durable admission use the same resolved root.
+A live reload affects new admissions; a running or recoverable job keeps its
+original worker endpoint, source namespace, target paths, and output locations.
+Changing this setting does not relocate existing namespaces or clear topology
+failures recorded for an old root. `rch admit` previews the same placement rule.
+This setting applies to isolated/off-root execution, not canonical shared
+mirrors, Windows staging, or the separate cache-warm and cleanup configurations.
+Worker capacity telemetry still uses the configured capability roots. Existing
+global disk-pressure and unknown-capacity refusals remain in force, even if a
+different staging volume has space. The native job supervisor checks the actual
+selected source and output filesystems before launching the workload.
 
 Names must be ASCII letters, digits, `-`, `_`, `.` or `+`: a name carrying a
 space or `=` could not survive the probe's fact format and would be read back

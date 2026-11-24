@@ -77,6 +77,7 @@ fn load_worker_from_env() -> Option<WorkerConfig> {
         priority: 100,
         tags: Vec::new(),
         tools: Vec::new(),
+        remote_base: None,
     })
 }
 

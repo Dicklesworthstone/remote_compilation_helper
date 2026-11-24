@@ -197,6 +197,11 @@ pub struct SelectionRequest {
     /// pair of roots must not make an otherwise compatible worker ineligible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_topology: Option<SourceTopology>,
+    /// Source closure uses an invocation-owned or off-root staging namespace.
+    /// Only these requests may select a worker-specific staging base; ordinary
+    /// shared mirrors retain their explicitly requested canonical/alias roots.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolated_source: bool,
     /// Process ID of the hook (for active build tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_pid: Option<u32>,
@@ -247,6 +252,28 @@ impl SourceTopology {
         };
         topology.validate().map_err(str::to_owned)?;
         Ok(topology)
+    }
+
+    /// Resolve an isolated placement against one worker's configured storage.
+    /// The returned value is the exact physical-root identity persisted at
+    /// admission and compared with native preflight and recovery evidence.
+    pub fn for_worker_remote_base(
+        &self,
+        isolated_source: bool,
+        remote_base: Option<&str>,
+    ) -> Result<Self, String> {
+        self.validate().map_err(str::to_owned)?;
+        if !isolated_source {
+            return Ok(self.clone());
+        }
+        if self.canonical_root != self.alias_root {
+            return Err("isolated source placement requires one staging root".into());
+        }
+        let root = validate_worker_remote_base(remote_base.unwrap_or(&self.canonical_root), None)?;
+        Ok(Self {
+            canonical_root: root.clone(),
+            alias_root: root,
+        })
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -980,6 +1007,14 @@ pub struct SelectedWorker {
     /// wire-compatible.
     #[serde(default)]
     pub declared_os: Option<String>,
+    /// Exact worker staging override bound to this isolated admission. Retried
+    /// or recovered operations retain this value rather than rereading config.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_worker_remote_base",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remote_base: Option<String>,
     /// The worker project lane this build holds (bd-sgvod). 0 is the
     /// canonical mirror; k > 0 means every remote root is `<root>.rch-lane-<k>`.
     /// Old daemons never send it, so old and new hooks both read 0.
@@ -1225,6 +1260,15 @@ pub struct WorkerConfig {
     /// `--require-tool` gate selection on evidence instead of on a promise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<WorkerToolProbe>,
+    /// Optional absolute POSIX staging root for isolated/off-root jobs. Shared
+    /// canonical mirrors keep their own path topology. Never expanded against
+    /// the dispatcher's HOME or applied to the Windows transport.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_worker_remote_base",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remote_base: Option<String>,
 }
 
 /// One operator-declared tool probe as it appears in `workers.toml`.
@@ -1286,6 +1330,7 @@ impl Default for WorkerConfig {
             priority: default_priority(),
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 }
@@ -4150,6 +4195,46 @@ pub fn validate_remote_base(path: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+/// Validate an operator's worker-local POSIX staging path without consulting
+/// the dispatcher's filesystem or expanding its environment. Existing source
+/// namespace ownership and native preflight remain authoritative on the host.
+pub fn validate_worker_remote_base(
+    path: &str,
+    declared_os: Option<&str>,
+) -> Result<String, String> {
+    if declared_os.is_some_and(|os| os.trim().eq_ignore_ascii_case("windows")) {
+        return Err("worker remote_base overrides require a POSIX worker; Windows uses its native staging layout".into());
+    }
+    if !path.starts_with('/')
+        || path.len() > 4096
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+    {
+        return Err("worker remote_base must be a literal bounded absolute POSIX path".into());
+    }
+    let normalized = validate_remote_base(path)?;
+    SourceTopology {
+        canonical_root: normalized.clone(),
+        alias_root: normalized.clone(),
+    }
+    .validate()
+    .map_err(str::to_owned)?;
+    Ok(normalized)
+}
+
+/// Share literal-path validation across worker configuration, admission replies
+/// and retained recovery snapshots. Platform admission is checked separately.
+pub fn deserialize_worker_remote_base<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .map(|path| validate_worker_remote_base(path, None))
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
 fn default_recovery_probe_interval_secs() -> u64 {
     300
 }
@@ -5604,6 +5689,96 @@ retry_max = 2
     }
 
     #[test]
+    fn worker_remote_base_resolves_only_isolated_source_namespaces() {
+        let mirrored = SourceTopology {
+            canonical_root: "/data/projects".into(),
+            alias_root: "/dp".into(),
+        };
+        let staged = SourceTopology {
+            canonical_root: "/data/tmp/rch".into(),
+            alias_root: "/data/tmp/rch".into(),
+        };
+        let worker_base = "/Users/builder/rch-staging";
+        assert_eq!(
+            mirrored
+                .for_worker_remote_base(false, Some(worker_base))
+                .unwrap(),
+            mirrored
+        );
+        assert!(
+            mirrored
+                .for_worker_remote_base(true, Some(worker_base))
+                .is_err()
+        );
+        assert_eq!(staged.for_worker_remote_base(true, None).unwrap(), staged);
+        assert!(
+            SourceTopology {
+                canonical_root: "/tmp".into(),
+                alias_root: "/tmp".into(),
+            }
+            .for_worker_remote_base(true, None)
+            .is_err()
+        );
+        let resolved = staged
+            .for_worker_remote_base(true, Some(worker_base))
+            .unwrap();
+        assert_eq!(resolved.canonical_root, worker_base);
+        assert_eq!(resolved.alias_root, worker_base);
+        assert_eq!(staged.canonical_root, "/data/tmp/rch");
+        // Native preflight still reports just the exact pair of physical roots.
+        let native: SourceTopology = serde_json::from_value(serde_json::json!({
+            "canonical_root": worker_base, "alias_root": worker_base
+        }))
+        .unwrap();
+        assert_eq!(resolved, native);
+    }
+
+    #[test]
+    fn worker_remote_base_requires_literal_safe_posix_storage() {
+        for path in [
+            "",
+            "/",
+            "/tmp",
+            "relative/rch",
+            "~/rch",
+            "$HOME/rch",
+            "/data/../rch",
+            "/data/./rch",
+            "/data//rch",
+            "/data/rch\\other",
+            "/data/rch\nother",
+            "C:/rch",
+            "//server/rch",
+        ] {
+            assert!(validate_worker_remote_base(path, None).is_err(), "{path:?}");
+        }
+        assert!(validate_worker_remote_base(&format!("/data/{}", "a".repeat(4096)), None).is_err());
+        assert!(validate_worker_remote_base("/data/rch", Some("WINDOWS")).is_err());
+        for os in [None, Some("linux"), Some("darwin")] {
+            assert_eq!(
+                validate_worker_remote_base("/Volumes/Build Disk/rch///", os).unwrap(),
+                "/Volumes/Build Disk/rch"
+            );
+        }
+        let original = WorkerConfig {
+            remote_base: Some("/Users/builder/rch-staging".into()),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&original).unwrap();
+        let restored: WorkerConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored.remote_base, original.remote_base);
+        let mut invalid = wire;
+        invalid["remote_base"] = serde_json::json!("~/dispatcher-home");
+        assert!(serde_json::from_value::<WorkerConfig>(invalid).is_err());
+        assert!(
+            serde_json::to_value(WorkerConfig::default())
+                .unwrap()
+                .get("remote_base")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn source_topology_capability_verdict_requires_scoped_physical_evidence() {
         let mut capabilities = WorkerCapabilities {
             projects_root_ok: Some(false),
@@ -5794,6 +5969,7 @@ retry_max = 2
                 reserved_slots: Some(2),
                 speed_score: 75.0,
                 declared_os: None,
+                remote_base: None,
                 project_lane: 0,
                 disk_budget: None,
             }),
@@ -5891,6 +6067,7 @@ retry_max = 2
                 reserved_slots: Some(3),
                 speed_score: 90.5,
                 declared_os: None,
+                remote_base: None,
                 project_lane: 0,
                 disk_budget: BuildDiskBudget::cold_for_command("cargo test --workspace"),
             }),

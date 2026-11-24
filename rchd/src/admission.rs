@@ -48,6 +48,7 @@ pub(crate) struct ExecutionRequirements<'a> {
     component: Option<&'static str>,
     component_toolchain: Option<String>,
     preflight_toolchain: Option<String>,
+    source_topology: Option<&'a rch_common::SourceTopology>,
 }
 
 impl<'a> ExecutionRequirements<'a> {
@@ -68,7 +69,15 @@ impl<'a> ExecutionRequirements<'a> {
                 .toolchain
                 .as_ref()
                 .map(ToolchainInfo::rustup_toolchain),
+            source_topology: None,
         }
+    }
+
+    /// Bind the exact candidate namespace at final reservation, rather than
+    /// the client fallback root that other workers may override differently.
+    pub(crate) fn with_source_topology(mut self, topology: &'a rch_common::SourceTopology) -> Self {
+        self.source_topology = Some(topology);
+        self
     }
 
     pub(crate) fn required_runtime(&self) -> RequiredRuntime {
@@ -109,6 +118,9 @@ impl<'a> ExecutionRequirements<'a> {
             && self.tool_mismatch(capabilities).is_none()
             && self.component_mismatch(capabilities).is_none()
             && self.toolchain_mismatch(capabilities).is_none()
+            && self.source_topology.is_none_or(|topology| {
+                capabilities.is_topology_healthy_for(Some(topology)) != Some(false)
+            })
     }
 }
 

@@ -59,6 +59,7 @@ async fn preparation_does_not_fingerprint_a_reused_local_output_inventory() {
         priority: 100,
         tags: Vec::new(),
         tools: Vec::new(),
+        remote_base: None,
     };
     let writer = DurableLeaseWriter::create_in(
         &directory.path().join("journals"),
@@ -501,6 +502,7 @@ fn prepared_suitability_session(
         priority: 100,
         tags: Vec::new(),
         tools: Vec::new(),
+        remote_base: None,
     };
     let writer = DurableLeaseWriter::create_in(
         &directory.path().join("journals"),

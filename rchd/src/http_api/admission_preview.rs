@@ -275,6 +275,7 @@ async fn observe(
                     host: config.host.clone(),
                     user: config.user.clone(),
                     identity_file: config.identity_file.clone(),
+                    remote_base: config.remote_base.clone(),
                     slots_available,
                     reserved_slots: None,
                     speed_score,
@@ -328,6 +329,7 @@ mod tests {
     fn input() -> PreviewRequest {
         PreviewRequest {
             source_topology: None,
+            isolated_source: false,
             protocol_version: PROTOCOL_VERSION,
             project: "http-preview-fixture".into(),
             command: "make".into(),
@@ -353,6 +355,7 @@ mod tests {
                 priority: 100,
                 tags: Vec::new(),
                 tools: Vec::new(),
+                remote_base: None,
             })
             .await;
             pool.get(&WorkerId::new(id))

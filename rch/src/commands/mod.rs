@@ -457,6 +457,7 @@ mod tests {
             priority: 50,
             tags: vec!["fast".to_string(), "ssd".to_string()],
             tools: Vec::new(),
+            remote_base: None,
         };
         let info = WorkerInfo::from(&config);
         assert_eq!(info.id, "test-worker");
@@ -479,6 +480,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let info = WorkerInfo::from(&config);
         assert!(info.tags.is_empty());
@@ -496,6 +498,7 @@ mod tests {
             priority: 75,
             tags: vec!["gpu".to_string()],
             tools: Vec::new(),
+            remote_base: None,
         };
         let info = WorkerInfo::from(&config);
         let json = serde_json::to_value(&info).unwrap();
@@ -1256,6 +1259,7 @@ mod tests {
             reserved_slots: None,
             speed_score: 1.5,
             declared_os: None,
+            remote_base: None,
             project_lane: 0,
             disk_budget: None,
         };

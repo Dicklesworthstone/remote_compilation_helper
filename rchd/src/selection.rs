@@ -719,6 +719,20 @@ impl WorkerSelector {
             .unwrap_or(&self.default_source_topology)
     }
 
+    /// Resolve an isolated request against this candidate's staging root.
+    /// Mirrored projects retain their explicit or daemon-default namespace.
+    pub(crate) fn source_topology_for_worker(
+        &self,
+        request: &SelectionRequest,
+        config: &rch_common::WorkerConfig,
+    ) -> Result<rch_common::SourceTopology, String> {
+        if request.isolated_source && request.source_topology.is_none() {
+            return Err("isolated source selection requires an explicit source topology".into());
+        }
+        self.source_topology_for(request)
+            .for_worker_remote_base(request.isolated_source, config.remote_base.as_deref())
+    }
+
     /// Use the same guarded job allowance in placement and authoritative
     /// admission. A declaration is a minimum, not permission to underfund a
     /// known large build. Generic worker-list previews have no build budget.
@@ -847,9 +861,8 @@ impl WorkerSelector {
     async fn source_topology_mismatch(
         &self,
         worker: &WorkerState,
-        request: &SelectionRequest,
+        topology: &rch_common::SourceTopology,
     ) -> Option<rch_common::SourceTopologyMismatch> {
-        let topology = self.source_topology_for(request);
         if let Some(history) = self.build_history.as_ref() {
             let config = worker.config.read().await;
             if let Some(fence) = history.source_topology_fences().into_iter().find(|fence| {
@@ -873,9 +886,13 @@ impl WorkerSelector {
         let mut considered = false;
         let required_os = required_os_for_request(request);
         for worker in pool.all_workers().await {
-            let (id, declared_os) = {
+            let (id, declared_os, topology) = {
                 let config = worker.config.read().await;
-                (config.id.clone(), rch_common::declared_os(&config.tags))
+                (
+                    config.id.clone(),
+                    rch_common::declared_os(&config.tags),
+                    self.source_topology_for_worker(request, &config),
+                )
             };
             if !request.preferred_workers.is_empty() && !request.preferred_workers.contains(&id) {
                 continue;
@@ -888,10 +905,11 @@ impl WorkerSelector {
                 continue;
             }
             considered = true;
-            if self
-                .source_topology_mismatch(&worker, request)
-                .await
-                .is_none()
+            if let Ok(topology) = topology
+                && self
+                    .source_topology_mismatch(&worker, &topology)
+                    .await
+                    .is_none()
             {
                 return false;
             }
@@ -1545,10 +1563,12 @@ impl WorkerSelector {
         if !requirements.capabilities_satisfied(&capabilities) {
             return None;
         }
-        if capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)))
-            == Some(false)
+        let topology = self
+            .source_topology_for_worker(request, &*worker.config.read().await)
+            .ok()?;
+        if capabilities.is_topology_healthy_for(Some(&topology)) == Some(false)
             || self
-                .source_topology_mismatch(&worker, request)
+                .source_topology_mismatch(&worker, &topology)
                 .await
                 .is_some()
         {
@@ -1907,6 +1927,7 @@ impl WorkerSelector {
             let config = worker.config.read().await;
             let worker_id = config.id.clone();
             let declared_os = rch_common::declared_os(&config.tags);
+            let topology = self.source_topology_for_worker(request, &config);
             drop(config);
 
             let total_slots = worker.effective_total_slots().await;
@@ -1915,9 +1936,13 @@ impl WorkerSelector {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
             let available_slots = worker.available_slots().await;
             let capabilities = worker.capabilities().await;
-            let source_topology_mismatch = self.source_topology_mismatch(&worker, request).await;
-            let topology_healthy =
-                capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)));
+            let source_topology_mismatch = match &topology {
+                Ok(topology) => self.source_topology_mismatch(&worker, topology).await,
+                Err(_) => None,
+            };
+            let topology_healthy = topology.as_ref().map_or(Some(false), |topology| {
+                capabilities.is_topology_healthy_for(Some(topology))
+            });
             let pressure = worker.pressure_assessment().await;
             let disk_availability = self
                 .disk_headroom_availability(&worker, worker_id.as_str(), request)
@@ -1984,6 +2009,9 @@ impl WorkerSelector {
                     WorkerSelectionDiagnosticDecision::Deny,
                     "not in the requested worker set".to_string(),
                 )
+            } else if let Err(error) = topology {
+                push_reason_code(&mut reason_codes, "topology.source_incompatible");
+                (WorkerSelectionDiagnosticDecision::Deny, error)
             } else if let Some(mismatch) = source_topology_mismatch {
                 push_reason_code(&mut reason_codes, "topology.source_incompatible");
                 (
@@ -2541,9 +2569,13 @@ impl WorkerSelector {
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
-            let (worker_id, declared_os) = {
+            let (worker_id, declared_os, topology) = {
                 let config = worker.config.read().await;
-                (config.id.clone(), rch_common::declared_os(&config.tags))
+                (
+                    config.id.clone(),
+                    rch_common::declared_os(&config.tags),
+                    self.source_topology_for_worker(request, &config),
+                )
             };
 
             // An explicit worker request is an allow-set, not a scoring hint.
@@ -2555,8 +2587,12 @@ impl WorkerSelector {
             }
             matched_preferred_worker = true;
 
+            let Ok(topology) = topology else {
+                filtered_by_hard_preflight += 1;
+                continue;
+            };
             if self
-                .source_topology_mismatch(&worker, request)
+                .source_topology_mismatch(&worker, &topology)
                 .await
                 .is_some()
             {
@@ -2735,9 +2771,7 @@ impl WorkerSelector {
             }
 
             // Filter by load-per-core threshold (bd-3eaa)
-            if let Some(false) =
-                capabilities.is_topology_healthy_for(Some(self.source_topology_for(request)))
-            {
+            if let Some(false) = capabilities.is_topology_healthy_for(Some(&topology)) {
                 let reason = capabilities
                     .projects_root_issue
                     .clone()
@@ -5018,6 +5052,7 @@ mod tests {
             priority: 100,
             tags: os.map(rch_common::os_tag).into_iter().collect(),
             tools: Vec::new(),
+            remote_base: None,
         };
         let state = WorkerState::new(config);
         state.set_speed_score(speed);
@@ -5167,6 +5202,7 @@ mod tests {
             let worker = make_worker("test", 16, 80.0);
             let request = SelectionRequest {
                 source_topology: None,
+                isolated_source: false,
                 disk_observation_version: 0,
                 job_mode: false,
                 project: "myproject".to_string(),
@@ -5206,6 +5242,7 @@ mod tests {
         }
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "disk-ranking".to_string(),
@@ -5270,6 +5307,7 @@ mod tests {
         }
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "disk-legacy".to_string(),
@@ -5327,6 +5365,7 @@ mod tests {
             let worker = make_worker("zero", 0, 80.0);
             let request = SelectionRequest {
                 source_topology: None,
+                isolated_source: false,
                 disk_observation_version: 0,
                 job_mode: false,
                 project: "myproject".to_string(),
@@ -5369,6 +5408,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -5397,6 +5437,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "metrics-fallback-project".to_string(),
@@ -5468,6 +5509,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -5503,6 +5545,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -5542,6 +5585,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -5585,6 +5629,7 @@ mod tests {
         let selector = WorkerSelector::with_config(SelectionConfig::default(), circuit.clone());
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -5684,6 +5729,7 @@ mod tests {
         selector.record_success("recovering", "probe-race").await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "probe-race".into(),
@@ -5845,6 +5891,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -5902,6 +5949,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -5948,6 +5996,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -5988,6 +6037,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -6024,6 +6074,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -6065,6 +6116,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -6121,6 +6173,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "myproject".to_string(),
@@ -6284,6 +6337,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -6327,6 +6381,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -6451,6 +6506,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -6568,6 +6624,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -6617,6 +6674,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -6664,6 +6722,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -6703,6 +6762,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -6771,6 +6831,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -6812,6 +6873,7 @@ mod tests {
     fn tool_gate_request() -> SelectionRequest {
         SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             project: "tool-gate".to_string(),
             command: None,
@@ -7001,6 +7063,7 @@ mod tests {
     fn pinned_component_request(project: &str, command: &str) -> SelectionRequest {
         SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: project.to_string(),
@@ -7183,6 +7246,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -7223,6 +7287,7 @@ mod tests {
 
         let base_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "proj".to_string(),
@@ -7284,6 +7349,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -7325,6 +7391,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -7381,6 +7448,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -7450,6 +7518,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -7506,6 +7575,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let nix_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -7570,6 +7640,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -7625,6 +7696,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -7719,6 +7791,7 @@ mod tests {
         // RCH_QUEUE_WHEN_BUSY polling queues instead of failing to local.
         let job_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: true,
             project: "sharded".to_string(),
@@ -7742,6 +7815,7 @@ mod tests {
         // Compilation requests keep the immediate NoAdmissibleWorkers verdict.
         let compile_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "sharded".to_string(),
@@ -7844,6 +7918,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "frankenterm".to_string(),
@@ -7909,6 +7984,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "topology-project".to_string(),
@@ -7949,6 +8025,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "topology-project".to_string(),
@@ -7967,6 +8044,126 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
+    }
+
+    #[tokio::test]
+    async fn worker_remote_base_selection_scopes_capabilities_and_durable_fences() {
+        let (pool, mut selector, mut request) = active_project_capacity_fixture().await;
+        request.estimated_cores = 1;
+        request.command = None;
+        request.isolated_source = true;
+        request.source_topology = Some(rch_common::SourceTopology {
+            canonical_root: "/fallback/staging".into(),
+            alias_root: "/fallback/staging".into(),
+        });
+        let worker = pool.get(&WorkerId::new("active-project")).await.unwrap();
+        let peer = pool.get(&WorkerId::new("free-small")).await.unwrap();
+        worker.config.write().await.remote_base = Some("/mnt/storage-a/rch".into());
+        peer.config.write().await.remote_base = Some("/mnt/storage-b/rch".into());
+        let resolved = rch_common::SourceTopology {
+            canonical_root: "/mnt/storage-a/rch".into(),
+            alias_root: "/mnt/storage-a/rch".into(),
+        };
+        let mut caps = worker.capabilities().await;
+        caps.projects_root_ok = Some(false);
+        caps.projects_root_topology = Some(resolved.clone());
+        caps.projects_root_issue = Some("canonical_not_directory".into());
+        worker.set_capabilities(caps.clone()).await;
+        request.preferred_workers = vec![WorkerId::new("active-project")];
+        assert_eq!(
+            selector.select(&pool, &request).await.reason,
+            SelectionReason::SourceTopologyIncompatible,
+            "health must inspect the worker override, not the client's fallback"
+        );
+        assert!(
+            selector
+                .try_fallback(&pool, &request, &HashSet::new())
+                .await
+                .is_none()
+        );
+        request.preferred_workers.clear();
+        assert_eq!(
+            selector
+                .select(&pool, &request)
+                .await
+                .worker
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .as_str(),
+            "free-small"
+        );
+
+        // A refusal under the worker's mirrored namespace cannot condemn an
+        // unrelated isolated volume. Conversely the exact staged refusal must
+        // survive inventory edits and continue excluding its original roots.
+        caps.projects_root_topology = Some(rch_common::SourceTopology {
+            canonical_root: "/data/projects".into(),
+            alias_root: "/dp".into(),
+        });
+        worker.set_capabilities(caps).await;
+        request.preferred_workers = vec![WorkerId::new("active-project")];
+        assert!(selector.select(&pool, &request).await.worker.is_some());
+        let history = Arc::new(crate::history::BuildHistory::new(10));
+        let admission = history
+            .try_start_active_build_in_lanes(
+                "old-staging-owner".into(),
+                "active-project".into(),
+                "cargo check".into(),
+                std::process::id(),
+                Some("old-staging-owner".into()),
+                1,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+                Some(resolved.clone()),
+                1,
+            )
+            .unwrap();
+        let crate::history::ActiveBuildAdmission::Admitted(admitted) = admission else {
+            panic!("staging owner must be admitted");
+        };
+        history
+            .record_source_topology_mismatch(
+                admitted.id,
+                "active-project",
+                Some("old-staging-owner"),
+                &rch_common::SourceTopologyMismatch {
+                    topology: resolved.clone(),
+                    detail: "staging root is not a directory".into(),
+                },
+            )
+            .unwrap();
+        selector.set_build_history(Arc::clone(&history));
+        let refused = selector.select(&pool, &request).await;
+        assert_eq!(refused.reason, SelectionReason::SourceTopologyIncompatible);
+        assert!(
+            refused
+                .diagnostics
+                .unwrap()
+                .workers
+                .iter()
+                .any(|diagnostic| { diagnostic.final_reason.contains("/mnt/storage-a/rch") })
+        );
+        let original = worker.config.read().await.clone();
+        let mut replacement = original.clone();
+        replacement.remote_base = Some("/mnt/repaired/rch".into());
+        worker.update_config(replacement).await;
+        assert!(selector.select(&pool, &request).await.worker.is_some());
+        assert_eq!(history.source_topology_fences().len(), 1);
+        assert_eq!(
+            history.source_topology_fences()[0].mismatch.topology,
+            resolved
+        );
+        worker.update_config(original).await;
+        assert_eq!(
+            selector.select(&pool, &request).await.reason,
+            SelectionReason::SourceTopologyIncompatible,
+            "restoring a configured root must not erase its existing refusal"
+        );
     }
 
     #[tokio::test]
@@ -8150,6 +8347,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "pressure-plus-busy".to_string(),
@@ -8201,6 +8399,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "derated-fleet".to_string(),
@@ -8254,6 +8453,7 @@ mod tests {
             .await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "concurrent-project".to_string(),
@@ -9087,6 +9287,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "degraded-must-respect-pressure".to_string(),
@@ -9149,6 +9350,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "os-gate-hijack".to_string(),
@@ -9232,6 +9434,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "os-gate-plus-pressure".to_string(),
@@ -9275,6 +9478,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "topology-flap".to_string(),
@@ -10467,6 +10671,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "toolchain-project".to_string(),
@@ -10536,6 +10741,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "toolchain-project".to_string(),
@@ -10599,6 +10805,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "pressure-critical".to_string(),
@@ -10650,6 +10857,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "pressure-and-health".to_string(),
@@ -10702,6 +10910,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "pressure-mixed".to_string(),
@@ -10766,6 +10975,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, WorkerSelector::default()).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "pressure-gap".to_string(),
@@ -10822,6 +11032,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -10877,6 +11088,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -10919,6 +11131,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "proj".to_string(),
@@ -10965,6 +11178,7 @@ mod tests {
         // No cache warmth recorded for either worker
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "new-project".to_string(),
@@ -11004,6 +11218,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -11066,6 +11281,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -11110,6 +11326,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -11146,6 +11363,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -11187,6 +11405,7 @@ mod tests {
         selector.record_success("fallback", "test-project").await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -11231,6 +11450,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -11284,6 +11504,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -11339,6 +11560,7 @@ mod tests {
         let selector = WorkerSelector::new();
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -11381,6 +11603,7 @@ mod tests {
                 let mut selector = budgeted_fixture_selector(&pool, WorkerSelector::new()).await;
                 let mut request = SelectionRequest {
                     source_topology: None,
+                    isolated_source: false,
                     disk_observation_version: 0,
                     job_mode,
                     project: "busy-hard-failure".to_string(),
@@ -11678,6 +11901,7 @@ mod tests {
             priority: 1,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(worker_config).await;
         let selector = budgeted_fixture_selector(&pool, selector).await;
@@ -11685,6 +11909,7 @@ mod tests {
         // Make a selection request
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "audit-test-project".to_string(),
@@ -11742,6 +11967,7 @@ mod tests {
         let selector = budgeted_fixture_selector(&pool, selector).await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "poolrepro".to_string(),
@@ -12089,6 +12315,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "project-a".to_string(),
@@ -12533,6 +12760,7 @@ mod tests {
         selector.record_success("worker1", "project-a").await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             project: "project-a".to_string(),
             estimated_cores: 1,
@@ -12585,6 +12813,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "project-a".to_string(),
@@ -12635,6 +12864,7 @@ mod tests {
 
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "project-a".to_string(),
@@ -12723,6 +12953,7 @@ mod tests {
 
                     let request = SelectionRequest {
                         source_topology: None,
+            isolated_source: false,
                         disk_observation_version: 0,
                         project: "worker-status-proptest".to_string(),
                         command: None,
@@ -13345,6 +13576,7 @@ mod tests {
 
             let request = SelectionRequest {
                 source_topology: None,
+                isolated_source: false,
                 disk_observation_version: 0,
                 job_mode: false,
                 project: "reliability-penalty".to_string(),
@@ -13412,6 +13644,7 @@ mod tests {
 
             let request = SelectionRequest {
                 source_topology: None,
+                isolated_source: false,
                 disk_observation_version: 0,
                 job_mode: false,
                 project: "reliability-quarantine".to_string(),
@@ -13505,6 +13738,7 @@ mod tests {
 
             let request = SelectionRequest {
                 source_topology: None,
+                isolated_source: false,
                 disk_observation_version: 0,
                 job_mode: false,
                 project: "reliability-recovery".to_string(),
@@ -13557,6 +13791,7 @@ mod tests {
         fn make_selection_request(project: &str) -> SelectionRequest {
             SelectionRequest {
                 source_topology: None,
+                isolated_source: false,
                 disk_observation_version: 0,
                 job_mode: false,
                 project: project.to_string(),

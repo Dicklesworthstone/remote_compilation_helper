@@ -155,6 +155,7 @@ fn worker_config_changed(old: &WorkerConfig, new: &WorkerConfig) -> bool {
     old.host != new.host
         || old.user != new.user
         || old.identity_file != new.identity_file
+        || old.remote_base != new.remote_base
         || old.total_slots != new.total_slots
         || old.priority != new.priority
         || old.tags != new.tags
@@ -328,6 +329,7 @@ fn load_workers_reload_snapshot(config_path: Option<&Path>) -> Result<WorkersCon
         workers: snapshot.workers,
     };
     config::validate_worker_tool_probes(&config, &path)?;
+    config::validate_worker_remote_bases(&config, &path)?;
     Ok(config)
 }
 
@@ -663,6 +665,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         }];
 
         let diff = compute_worker_diff(&pool, &new_workers).await.unwrap();
@@ -685,6 +688,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial_config).await;
 
@@ -698,6 +702,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let diff = compute_worker_diff(&pool, &[updated_config]).await.unwrap();
@@ -720,6 +725,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(config).await;
 
@@ -746,6 +752,7 @@ mod tests {
                     priority: 100,
                     tags: vec![],
                     tools: Vec::new(),
+                    remote_base: None,
                     os: None,
                     enabled: true,
                 },
@@ -758,6 +765,7 @@ mod tests {
                     priority: 50,
                     tags: vec![],
                     tools: Vec::new(),
+                    remote_base: None,
                     os: None,
                     enabled: true,
                 },
@@ -783,6 +791,7 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
                 os: None,
                 enabled: true,
             }],
@@ -808,6 +817,7 @@ mod tests {
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             }],
             to_update: vec![],
             to_remove: vec![],
@@ -847,6 +857,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial).await;
 
@@ -910,6 +921,7 @@ enabled = true
             job_mode: true,
             required_tools: vec!["clang".into()],
             source_topology: None,
+            isolated_source: false,
             hook_pid: None,
         };
         assert!(
@@ -1142,6 +1154,7 @@ enabled = true
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         })
         .await;
         let worker = pool.get(&id).await.unwrap();
@@ -1204,6 +1217,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial).await;
 
@@ -1292,6 +1306,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             }],
             to_update: vec![],
             to_remove: vec![],
@@ -1313,6 +1328,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             }],
             to_remove: vec![],
         };
@@ -1345,6 +1361,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
                 os: None,
                 enabled: false,
             }],
@@ -1370,6 +1387,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
                 os: None,
                 enabled: true,
             }],
@@ -1449,6 +1467,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             }],
         };
 
@@ -1473,6 +1492,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial).await;
 
@@ -1485,6 +1505,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1507,6 +1528,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial).await;
 
@@ -1519,6 +1541,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1539,6 +1562,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial).await;
 
@@ -1551,6 +1575,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1571,6 +1596,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial).await;
 
@@ -1583,6 +1609,7 @@ enabled = true
             priority: 50, // Changed priority
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1603,6 +1630,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial).await;
 
@@ -1615,6 +1643,7 @@ enabled = true
             priority: 100,
             tags: vec!["gpu".to_string()], // Changed tags
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let diff = compute_worker_diff(&pool, &[updated]).await.unwrap();
@@ -1635,6 +1664,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(config.clone()).await;
 
@@ -1656,6 +1686,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(initial).await;
 
@@ -1670,6 +1701,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             }],
             to_remove: vec![],
         };
@@ -1694,6 +1726,7 @@ enabled = true
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(config).await;
 
@@ -1841,6 +1874,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             };
             pool.add_worker(config).await;
         }
@@ -1856,6 +1890,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             },
             WorkerConfig {
                 id: WorkerId::new("worker3"),
@@ -1866,6 +1901,7 @@ enabled = true
                 priority: 100,
                 tags: vec![],
                 tools: Vec::new(),
+                remote_base: None,
             },
             WorkerConfig {
                 id: WorkerId::new("worker4"),
@@ -1876,6 +1912,7 @@ enabled = true
                 priority: 50,
                 tags: vec!["gpu".to_string()],
                 tools: Vec::new(),
+                remote_base: None,
             },
         ];
 
@@ -1946,6 +1983,74 @@ enabled = true
         assert!(busy.reserve_slots(1).await);
         busy.add_cached_project("retained-project".to_owned()).await;
         pool
+    }
+
+    #[tokio::test]
+    async fn worker_remote_base_reload_updates_only_new_placement_and_refuses_windows() {
+        let _guard = test_guard!();
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("workers.toml");
+        let inventory = |base: Option<&str>, os: &str| {
+            let placement =
+                base.map_or_else(String::new, |base| format!("remote_base = {base:?}\n"));
+            format!(
+                "[[workers]]\nid = \"storage-worker\"\nhost = \"worker.example\"\ntotal_slots = 8\nos = {os:?}\n{placement}"
+            )
+        };
+        std::fs::write(&path, inventory(Some("/mnt/original/rch"), "linux")).unwrap();
+        let pool = WorkerPool::new();
+        assert_eq!(
+            reload_workers(&pool, Some(&path), true)
+                .await
+                .unwrap()
+                .added,
+            1
+        );
+        let worker = pool.get(&WorkerId::new("storage-worker")).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        let original = worker.endpoint_snapshot().await;
+        std::fs::write(&path, inventory(Some("/mnt/replacement/rch///"), "linux")).unwrap();
+        let changed = reload_workers(&pool, Some(&path), true).await.unwrap();
+        assert_eq!(
+            changed.updated, 1,
+            "storage-only edits must not disappear from the diff"
+        );
+        assert_eq!(
+            worker.config.read().await.remote_base.as_deref(),
+            Some("/mnt/replacement/rch")
+        );
+        assert_eq!(
+            original.config.remote_base.as_deref(),
+            Some("/mnt/original/rch")
+        );
+        assert!(!original.source_was_retargeted());
+        assert_eq!(worker.used_slots(), 1);
+
+        // Validation is mandatory even when the optional warning checks are
+        // disabled; a rejected snapshot must leave the active fleet untouched.
+        std::fs::write(&path, inventory(Some("/mnt/windows/rch"), "windows")).unwrap();
+        assert!(reload_workers(&pool, Some(&path), false).await.is_err());
+        assert_eq!(
+            worker.config.read().await.remote_base.as_deref(),
+            Some("/mnt/replacement/rch")
+        );
+        assert_eq!(worker.used_slots(), 1);
+
+        std::fs::write(&path, inventory(None, "linux")).unwrap();
+        assert_eq!(
+            reload_workers(&pool, Some(&path), true)
+                .await
+                .unwrap()
+                .updated,
+            1
+        );
+        assert!(worker.config.read().await.remote_base.is_none());
+        assert_eq!(
+            worker.used_slots(),
+            1,
+            "removing an override preserves existing ownership"
+        );
+        worker.release_slots(1).await;
     }
 
     #[tokio::test]

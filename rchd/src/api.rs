@@ -2281,6 +2281,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut preferred_workers = Vec::new();
     let mut required_tools: Vec<String> = Vec::new();
     let mut source_topology = None;
+    let mut isolated_source = None;
     let mut dry_run = false;
 
     for param in query.split('&') {
@@ -2303,6 +2304,14 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                         .context("invalid source topology requirement")?;
                 topology.validate().map_err(anyhow::Error::msg)?;
                 source_topology = Some(topology);
+            }
+            "isolated_source" => {
+                anyhow::ensure!(isolated_source.is_none(), "duplicate isolated source mode");
+                isolated_source = Some(match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => anyhow::bail!("isolated_source must be true or false"),
+                });
             }
             "command" => command = Some(percent_unescape_query_value(value)),
             "cores" => cores = value.parse::<u32>().ok().filter(|cores| *cores > 0),
@@ -2392,6 +2401,16 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     }
 
     let project = project.ok_or_else(|| anyhow!("Missing 'project' parameter"))?;
+    let isolated_source = isolated_source.unwrap_or(false);
+    if isolated_source {
+        source_topology
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!("isolated source selection requires an explicit source topology")
+            })?
+            .for_worker_remote_base(true, None)
+            .map_err(anyhow::Error::msg)?;
+    }
     let estimated_cores = cores.unwrap_or(1);
     let disk_headroom_gib = disk_headroom_gib.unwrap_or(0);
     anyhow::ensure!(
@@ -2426,6 +2445,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             job_mode,
             required_tools,
             source_topology,
+            isolated_source,
         },
         wait_for_worker,
         wait_timeout_secs,
@@ -2961,6 +2981,7 @@ async fn handle_select_worker_dry_run(
                 host: config.host.clone(),
                 user: config.user.clone(),
                 identity_file: config.identity_file.clone(),
+                remote_base: config.remote_base.clone(),
                 slots_available,
                 reserved_slots: None,
                 speed_score,
@@ -3139,9 +3160,17 @@ async fn handle_select_worker_mode(
         queue_candidates: &mut std::collections::HashSet<String>,
     ) -> Result<SelectionResponse> {
         queue_candidates.clear();
-        let source_topology = ctx.worker_selector.source_topology_for(request);
-        source_topology.validate().map_err(anyhow::Error::msg)?;
-        let execution_requirements = crate::admission::ExecutionRequirements::new(request);
+        let requested_topology = ctx.worker_selector.source_topology_for(request);
+        requested_topology.validate().map_err(anyhow::Error::msg)?;
+        if request.isolated_source {
+            anyhow::ensure!(
+                request.source_topology.is_some(),
+                "isolated source selection requires an explicit source topology"
+            );
+            requested_topology
+                .for_worker_remote_base(true, None)
+                .map_err(anyhow::Error::msg)?;
+        }
         if local_wrapper_id
             .as_deref()
             .is_some_and(|id| ctx.history.wrapper_cancelled(id))
@@ -3213,6 +3242,12 @@ async fn handle_select_worker_mode(
                 })?;
 
                 let selected_endpoint = worker.endpoint_snapshot().await;
+                let source_topology = ctx
+                    .worker_selector
+                    .source_topology_for_worker(request, &selected_endpoint.config)
+                    .map_err(anyhow::Error::msg)?;
+                let execution_requirements = crate::admission::ExecutionRequirements::new(request)
+                    .with_source_topology(&source_topology);
                 let selected_worker_id = selected_endpoint.config.id.clone();
                 if held_worker.as_deref() == Some(selected_worker_id.as_str()) {
                     steered_off_hold = true;
@@ -3409,6 +3444,7 @@ async fn handle_select_worker_mode(
                             host,
                             user,
                             identity_file,
+                            remote_base: selected_endpoint.config.remote_base.clone(),
                             slots_available,
                             reserved_slots: Some(state.slots),
                             speed_score,
@@ -6204,6 +6240,7 @@ mod tests {
         );
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             project: "resume-project".into(),
             command: Some("cargo build".into()),
@@ -6638,6 +6675,58 @@ mod tests {
         assert_ne!(
             queue_selection_digest(&request, Some(30)).unwrap(),
             explicit
+        );
+    }
+
+    #[test]
+    fn isolated_source_selection_requires_one_explicit_root_and_binds_queue_identity() {
+        let topology = rch_common::SourceTopology {
+            canonical_root: "/fallback/staging".into(),
+            alias_root: "/fallback/staging".into(),
+        };
+        let query = format!(
+            "GET /select-worker?project=isolated&cores=1&source_topology={}",
+            urlencoding_encode(&serde_json::to_string(&topology).unwrap()),
+        );
+        let ApiRequest::SelectWorker {
+            request: mirror, ..
+        } = parse_request(&query).unwrap()
+        else {
+            panic!("selection expected");
+        };
+        let ApiRequest::SelectWorker {
+            request: isolated, ..
+        } = parse_request(&format!("{query}&isolated_source=true")).unwrap()
+        else {
+            panic!("selection expected");
+        };
+        assert!(!mirror.isolated_source);
+        assert!(isolated.isolated_source);
+        assert_eq!(isolated.source_topology, Some(topology));
+        assert_ne!(
+            queue_selection_digest(&mirror, Some(30)).unwrap(),
+            queue_selection_digest(&isolated, Some(30)).unwrap(),
+            "a resumed owner cannot change between mirrored and isolated placement"
+        );
+        for suffix in [
+            "isolated_source=1",
+            "isolated_source=",
+            "isolated_source=true&isolated_source=false",
+            "isolated_source=false&isolated_source=false",
+        ] {
+            assert!(parse_request(&format!("{query}&{suffix}")).is_err());
+        }
+        assert!(parse_request("GET /select-worker?project=isolated&isolated_source=true").is_err());
+        let mirrored = rch_common::SourceTopology {
+            canonical_root: "/data/projects".into(),
+            alias_root: "/dp".into(),
+        };
+        assert!(
+            parse_request(&format!(
+                "GET /select-worker?project=isolated&isolated_source=true&source_topology={}",
+                urlencoding_encode(&serde_json::to_string(&mirrored).unwrap()),
+            ))
+            .is_err()
         );
     }
 
@@ -7699,6 +7788,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "dry-run-project".to_string(),
@@ -7746,6 +7836,7 @@ mod tests {
             .fence_live_checkout("inventory-project", "fenced");
         let mut request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "inventory-project".to_string(),
@@ -8626,6 +8717,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 
@@ -8635,6 +8727,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -8672,6 +8765,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -8706,6 +8800,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -8740,6 +8835,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -8782,6 +8878,7 @@ mod tests {
             let wrapper = format!("rchw-{}", Uuid::new_v4());
             let request = SelectionRequest {
                 source_topology: None,
+                isolated_source: false,
                 disk_observation_version: 0,
                 job_mode: false,
                 project: "cancel-queued".into(),
@@ -8914,6 +9011,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -8946,6 +9044,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -8984,6 +9083,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -9019,6 +9119,7 @@ mod tests {
         ctx.admission_barrier.write().await.begin_shutdown();
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "restart-guard".to_string(),
@@ -10152,6 +10253,7 @@ mod tests {
             .await;
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -10186,6 +10288,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-project".to_string(),
@@ -10388,6 +10491,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = |hook_pid| SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "other-project".to_string(),
@@ -10525,6 +10629,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "shared-project".to_string(),
@@ -10551,6 +10656,7 @@ mod tests {
 
         let second_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "shared-project".to_string(),
@@ -11173,6 +11279,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "shared-project".to_string(),
@@ -11199,6 +11306,7 @@ mod tests {
 
         let second_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "shared-project".to_string(),
@@ -11239,6 +11347,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let shard = |pid: u32, job_mode: bool| SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode,
             project: "burst-project".to_string(),
@@ -11292,6 +11401,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let first_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "project-a".to_string(),
@@ -11314,6 +11424,7 @@ mod tests {
 
         let second_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "project-b".to_string(),
@@ -11352,6 +11463,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test".to_string(),
@@ -11378,6 +11490,7 @@ mod tests {
         // handing back worker1.
         let absent_request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "test-absent".to_string(),
@@ -13835,6 +13948,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_remote_base_selection_binds_each_worker_and_retains_mirrors() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        for (id, base) in [
+            ("worker-a", Some("/mnt/fast/rch")),
+            ("worker-b", Some("/srv/storage/rch")),
+            ("worker-default", None),
+        ] {
+            let mut config = make_test_worker(id, 8);
+            config.remote_base = base.map(str::to_owned);
+            pool.add_worker(config).await;
+            set_test_build_disk(&pool, id, 100.0).await;
+        }
+        let ctx = make_test_context(pool.clone());
+        let fallback = rch_common::SourceTopology {
+            canonical_root: "/fallback/staging".into(),
+            alias_root: "/fallback/staging".into(),
+        };
+        let mirrored = rch_common::SourceTopology {
+            canonical_root: "/data/projects".into(),
+            alias_root: "/dp".into(),
+        };
+        for (id, override_base) in [
+            ("worker-a", Some("/mnt/fast/rch")),
+            ("worker-b", Some("/srv/storage/rch")),
+            ("worker-default", None),
+        ] {
+            for isolated in [true, false] {
+                let requested = if isolated { &fallback } else { &mirrored };
+                let ApiRequest::SelectWorker { request, .. } = parse_request(&format!(
+                    "GET /select-worker?project={id}-{isolated}&cores=1&worker={id}&isolated_source={isolated}&source_topology={}",
+                    urlencoding_encode(&serde_json::to_string(requested).unwrap()),
+                )).unwrap() else { panic!("selection expected"); };
+                let selected = handle_select_worker_with_wrapper(
+                    &ctx,
+                    request,
+                    false,
+                    None,
+                    Some(format!("rchw-{}", Uuid::new_v4())),
+                )
+                .await
+                .unwrap();
+                let worker = selected.worker.unwrap();
+                assert_eq!(worker.id.as_str(), id);
+                assert_eq!(worker.remote_base.as_deref(), override_base);
+                let active = ctx
+                    .history
+                    .active_build(selected.build_id.unwrap())
+                    .unwrap();
+                let expected = if isolated {
+                    let base = override_base.unwrap_or("/fallback/staging");
+                    rch_common::SourceTopology {
+                        canonical_root: base.into(),
+                        alias_root: base.into(),
+                    }
+                } else {
+                    mirrored.clone()
+                };
+                assert_eq!(active.requested_source_topology, Some(expected));
+                assert_eq!(
+                    active
+                        .worker_endpoint
+                        .unwrap()
+                        .config
+                        .remote_base
+                        .as_deref(),
+                    override_base
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_remote_base_ownership_survives_reload_and_restart_without_retargeting() {
+        let _guard = test_guard!();
+        for original_base in [None, Some("/mnt/original/rch")] {
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("history.jsonl");
+            let pool = WorkerPool::new();
+            let mut config = make_test_worker("storage-worker", 8);
+            config.remote_base = original_base.map(str::to_owned);
+            pool.add_worker(config).await;
+            set_test_build_disk(&pool, "storage-worker", 100.0).await;
+            let worker = pool.get(&WorkerId::new("storage-worker")).await.unwrap();
+            let mut ctx = make_test_context(pool.clone());
+            replace_test_history(
+                &mut ctx,
+                BuildHistory::new(100).with_persistence(path.clone()),
+            );
+            let topology = rch_common::SourceTopology {
+                canonical_root: "/fallback/staging".into(),
+                alias_root: "/fallback/staging".into(),
+            };
+            let ApiRequest::SelectWorker { request, .. } = parse_request(&format!(
+                "GET /select-worker?project=retained-storage&cores=1&isolated_source=true&source_topology={}",
+                urlencoding_encode(&serde_json::to_string(&topology).unwrap()),
+            )).unwrap() else { panic!("selection expected"); };
+            let wrapper = format!("rchw-{}", Uuid::new_v4());
+            let selected = handle_select_worker_with_wrapper(
+                &ctx,
+                request.clone(),
+                false,
+                None,
+                Some(wrapper.clone()),
+            )
+            .await
+            .unwrap();
+            let build_id = selected.build_id.unwrap();
+            assert_eq!(
+                selected.worker.unwrap().remote_base.as_deref(),
+                original_base
+            );
+            let mut updated = worker.config.read().await.clone();
+            updated.remote_base = Some("/mnt/replacement/rch".into());
+            worker.update_config(updated).await;
+
+            let recovered = BuildHistory::load_from_file(&path, 100).unwrap();
+            let active = recovered.active_build(build_id).unwrap();
+            let expected_root = original_base.unwrap_or("/fallback/staging");
+            assert_eq!(
+                active.requested_source_topology,
+                Some(rch_common::SourceTopology {
+                    canonical_root: expected_root.into(),
+                    alias_root: expected_root.into(),
+                })
+            );
+            assert_eq!(
+                active
+                    .worker_endpoint
+                    .unwrap()
+                    .config
+                    .remote_base
+                    .as_deref(),
+                original_base,
+                "recovery must retain None as well as explicit original overrides"
+            );
+
+            let mut changed = request;
+            changed.project = "retarget-attempt".into();
+            changed.source_topology = Some(rch_common::SourceTopology {
+                canonical_root: "/different/request".into(),
+                alias_root: "/different/request".into(),
+            });
+            let retry =
+                handle_select_worker_with_wrapper(&ctx, changed, false, None, Some(wrapper))
+                    .await
+                    .unwrap();
+            assert!(retry.worker.is_none());
+            assert_eq!(worker.used_slots(), 1);
+            assert_eq!(ctx.history.active_builds().len(), 1);
+            assert!(ctx.history.active_build(build_id).is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn source_topology_refusal_is_durable_scoped_and_reported() {
         let _guard = test_guard!();
         let tmp = tempfile::tempdir().unwrap();
@@ -14952,6 +15220,7 @@ mod tests {
         let wrapper = format!("rchw-{}", Uuid::new_v4());
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "legacy-client-project".to_string(),
@@ -15239,6 +15508,7 @@ mod tests {
                     &ctx,
                     SelectionRequest {
                         source_topology: None,
+                        isolated_source: false,
                         disk_observation_version: 0,
                         job_mode: false,
                         project: "finished-build".into(),
@@ -16289,6 +16559,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "disk-capacity".to_string(),
@@ -16368,6 +16639,7 @@ mod tests {
         let ctx = make_test_context(pool);
         let request = SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             disk_observation_version: 0,
             job_mode: false,
             project: "degraded-busy".to_string(),

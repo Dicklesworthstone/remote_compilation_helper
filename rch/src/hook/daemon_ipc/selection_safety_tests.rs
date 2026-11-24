@@ -53,6 +53,7 @@ async fn query_fixture(
             SelectionQueryIntent::Admit
         },
         None,
+        false,
     );
     let (result, ()) = timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)
@@ -151,6 +152,7 @@ async fn failures_before_connect_do_not_invent_unconfirmed_ownership() {
                 false,
                 &[],
                 None,
+                false,
             )
             .await
             .unwrap_err();
@@ -337,6 +339,7 @@ async fn unrequested_fixture(
             SelectionQueryIntent::Admit
         },
         None,
+        false,
     );
     timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)
@@ -495,6 +498,7 @@ async fn resuming_query_fixture(
             SelectionQueryIntent::Admit
         },
         Some(&topology),
+        false,
     );
     let result = timeout(Duration::from_secs(3), async {
         tokio::join!(client, server)

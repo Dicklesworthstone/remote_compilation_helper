@@ -712,6 +712,7 @@ mod tests {
                         priority,
                         tags,
                         tools: Vec::new(),
+                        remote_base: None,
                     },
                 )
         }
@@ -946,6 +947,7 @@ mod tests {
                 priority: 200,
                 tags: vec!["gpu".to_string(), "high-memory".to_string()],
                 tools: Vec::new(),
+                remote_base: None,
             };
 
             let json = serde_json::to_string(&config).unwrap();

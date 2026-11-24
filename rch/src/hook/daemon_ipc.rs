@@ -417,6 +417,7 @@ pub(crate) async fn query_daemon(
     job_mode: bool,
     required_tools: &[String],
     source_topology: Option<&rch_common::SourceTopology>,
+    isolated_source: bool,
 ) -> anyhow::Result<SelectionResponse> {
     query_daemon_with_mode(
         socket_path,
@@ -436,6 +437,7 @@ pub(crate) async fn query_daemon(
         required_tools,
         SelectionQueryIntent::Admit,
         source_topology,
+        isolated_source,
     )
     .await
 }
@@ -461,6 +463,7 @@ pub(crate) async fn query_daemon_cold(
     job_mode: bool,
     required_tools: &[String],
     source_topology: Option<&rch_common::SourceTopology>,
+    isolated_source: bool,
 ) -> anyhow::Result<SelectionResponse> {
     query_daemon_with_mode(
         socket_path,
@@ -480,6 +483,7 @@ pub(crate) async fn query_daemon_cold(
         required_tools,
         SelectionQueryIntent::ColdRetry,
         source_topology,
+        isolated_source,
     )
     .await
 }
@@ -498,6 +502,7 @@ pub(crate) async fn query_daemon_dry_run(
     required_runtime: RequiredRuntime,
     preferred_workers: &[WorkerId],
     source_topology: Option<&rch_common::SourceTopology>,
+    isolated_source: bool,
 ) -> anyhow::Result<SelectionResponse> {
     query_daemon_with_mode(
         socket_path,
@@ -517,6 +522,7 @@ pub(crate) async fn query_daemon_dry_run(
         &[],
         SelectionQueryIntent::Preview,
         source_topology,
+        isolated_source,
     )
     .await
 }
@@ -574,10 +580,15 @@ async fn query_daemon_with_mode(
     required_tools: &[String],
     intent: SelectionQueryIntent,
     source_topology: Option<&rch_common::SourceTopology>,
+    isolated_source: bool,
 ) -> anyhow::Result<SelectionResponse> {
     let dry_run = intent == SelectionQueryIntent::Preview;
     if let Some(topology) = source_topology {
-        topology.validate().map_err(anyhow::Error::msg)?;
+        topology
+            .for_worker_remote_base(isolated_source, None)
+            .map_err(anyhow::Error::msg)?;
+    } else if isolated_source {
+        anyhow::bail!("isolated source selection requires an explicit staging topology");
     }
     if let Some(refusal) = unresolved_toolchain_refusal(toolchain, required_runtime) {
         return Ok(refusal);
@@ -637,6 +648,9 @@ async fn query_daemon_with_mode(
             "&source_topology={}",
             urlencoding_encode(&serde_json::to_string(topology)?)
         ));
+    }
+    if isolated_source {
+        query.push_str("&isolated_source=true");
     }
 
     if let Some(tc) = toolchain
@@ -1458,6 +1472,7 @@ mod bounded_ipc_tests {
                     false,
                     &[],
                     None,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -1482,6 +1497,7 @@ mod bounded_ipc_tests {
                     false,
                     &[],
                     None,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -1496,6 +1512,7 @@ mod bounded_ipc_tests {
                 RequiredRuntime::None,
                 &[],
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -1566,6 +1583,7 @@ mod bounded_ipc_tests {
                     false,
                     &[],
                     None,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -1591,6 +1609,7 @@ mod bounded_ipc_tests {
                 runtime,
                 &[],
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -1668,6 +1687,7 @@ mod bounded_ipc_tests {
             RequiredRuntime::Rust,
             &[],
             None,
+            false,
         );
         let (response, ()) = timeout(Duration::from_secs(2), async {
             tokio::join!(client, server)
@@ -1697,6 +1717,7 @@ mod bounded_ipc_tests {
             job_mode: true,
             required_tools: vec!["clang".into()],
             source_topology: None,
+            isolated_source: false,
         };
         let server = async {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2137,6 +2158,121 @@ mod bounded_ipc_tests {
     }
 
     #[tokio::test]
+    async fn isolated_source_selection_is_explicit_for_admission_cold_retry_and_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("isolated-topology.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let topology = rch_common::SourceTopology {
+            canonical_root: "/data/tmp/rch".into(),
+            alias_root: "/data/tmp/rch".into(),
+        };
+        let server = async {
+            let mut observed = Vec::new();
+            for _ in 0..6 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut request = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                observed.push(request);
+                writer
+                    .write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"worker\":null,\"reason\":\"no_workers_configured\"}")
+                    .await
+                    .unwrap();
+            }
+            observed
+        };
+        let client = async {
+            for intent in [
+                SelectionQueryIntent::Admit,
+                SelectionQueryIntent::ColdRetry,
+                SelectionQueryIntent::Preview,
+            ] {
+                for isolated_source in [false, true] {
+                    let response = query_daemon_with_mode(
+                        path.to_str().unwrap(),
+                        "project",
+                        1,
+                        0,
+                        "make",
+                        None,
+                        RequiredRuntime::None,
+                        CommandPriority::Normal,
+                        0,
+                        None,
+                        Some("isolated-topology-wrapper"),
+                        false,
+                        &[],
+                        false,
+                        &[],
+                        intent,
+                        Some(&topology),
+                        isolated_source,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.reason, SelectionReason::NoWorkersConfigured);
+                }
+            }
+        };
+        let (observed, ()) = timeout(Duration::from_secs(3), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .unwrap();
+        let encoded_topology = urlencoding_encode(&serde_json::to_string(&topology).unwrap());
+        for (index, request) in observed.iter().enumerate() {
+            assert!(
+                request.contains(&format!("&source_topology={encoded_topology}")),
+                "{request}"
+            );
+            assert_eq!(
+                request.contains("&isolated_source=true"),
+                index % 2 == 1,
+                "{request}"
+            );
+            assert_eq!(request.contains("&dry_run=1"), index >= 4, "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_source_selection_refuses_missing_or_shared_topology_before_connecting() {
+        let shared = rch_common::SourceTopology::from_policy(&PathTopologyPolicy::default());
+        for topology in [None, Some(&shared)] {
+            let error = query_daemon(
+                "/does-not-exist/isolated-selection.sock",
+                "project",
+                1,
+                0,
+                "make",
+                None,
+                RequiredRuntime::None,
+                CommandPriority::Normal,
+                0,
+                None,
+                None,
+                false,
+                &[],
+                false,
+                &[],
+                topology,
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("isolated source"), "{error:#}");
+            assert!(error.downcast_ref::<DaemonError>().is_none());
+            assert!(
+                error
+                    .downcast_ref::<SelectionOutcomeUnconfirmed>()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn source_topology_selection_and_release_carry_the_exact_mapping() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("topology.sock");
@@ -2189,6 +2325,7 @@ mod bounded_ipc_tests {
                 false,
                 &[],
                 Some(&topology),
+                false,
             )
             .await
             .unwrap();

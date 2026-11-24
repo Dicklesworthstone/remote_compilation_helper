@@ -3039,6 +3039,7 @@ mod tests {
             priority: 100,
             tags: vec!["rust".to_string()],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(worker_config).await;
 
@@ -3196,6 +3197,7 @@ mod tests {
             priority: 50,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         context.pool.add_worker(worker_config).await;
 
@@ -3266,6 +3268,7 @@ mod tests {
                 priority: 100 - i as u32,
                 tags: vec![format!("tag-{}", i)],
                 tools: Vec::new(),
+                remote_base: None,
             };
             pool.add_worker(worker_config).await;
         }

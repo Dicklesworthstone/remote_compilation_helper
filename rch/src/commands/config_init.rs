@@ -666,6 +666,7 @@ fn generate_workers_toml(workers: &[WizardWorker]) -> Result<String> {
                 // The wizard has no OS question; leaving it unset keeps the new
                 // worker a candidate for any job, which is the safe default.
                 os: None,
+                remote_base: None,
                 enabled: true,
             })
             .collect(),

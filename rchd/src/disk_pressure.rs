@@ -1952,6 +1952,7 @@ mod tests {
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(config.clone()).await;
         let worker = pool.get(&config.id).await.unwrap();
@@ -2242,6 +2243,7 @@ mod tests {
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(config.clone()).await;
         let worker = pool.get(&config.id).await.unwrap();
@@ -2609,6 +2611,7 @@ mod tests {
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         });
         worker.set_status(rch_common::WorkerStatus::Healthy).await;
         let recovered = swap_resident_telemetry(5);

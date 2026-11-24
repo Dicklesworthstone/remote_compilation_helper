@@ -1934,7 +1934,10 @@ impl WorkerState {
                 .as_ref()
                 .is_some_and(|incarnation| Arc::ptr_eq(incarnation, &self.endpoint_incarnation))
             && endpoint.generation == self.endpoint_incarnation.generation.load(Ordering::Acquire)
-            && same_endpoint(&config, &endpoint.config);
+            && same_endpoint(&config, &endpoint.config)
+            // Changing storage placement does not erase old physical-root
+            // fences, but a new reservation must use its captured placement.
+            && config.remote_base == endpoint.config.remote_base;
         if !endpoint_current
             || !permit.map_or(circuit.state() == CircuitState::Closed, |permit| {
                 circuit.allows_selection(permit)
@@ -4786,6 +4789,7 @@ mod tests {
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 
@@ -4804,6 +4808,7 @@ mod tests {
             job_mode: false,
             required_tools: Vec::new(),
             source_topology: None,
+            isolated_source: false,
             hook_pid: None,
         }
     }
@@ -4994,6 +4999,77 @@ mod tests {
                 .is_none()
         );
         assert_eq!(worker.used_slots(), 3);
+    }
+
+    #[tokio::test]
+    async fn worker_remote_base_reservation_rechecks_placement_and_exact_topology() {
+        let mut config = recovered_worker_config("staging-reservation", 8);
+        config.remote_base = Some("/mnt/original/rch".into());
+        let worker = WorkerState::new(config.clone());
+        let original = worker.endpoint_snapshot().await;
+        let request = execution_request(RequiredRuntime::None);
+        let original_topology = rch_common::SourceTopology {
+            canonical_root: "/mnt/original/rch".into(),
+            alias_root: "/mnt/original/rch".into(),
+        };
+        config.remote_base = Some("/mnt/replacement/rch".into());
+        worker.update_config(config).await;
+        assert!(
+            !original.source_was_retargeted(),
+            "physical endpoint identity is unchanged"
+        );
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(
+                    1,
+                    &original,
+                    &ExecutionRequirements::new(&request).with_source_topology(&original_topology),
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(worker.used_slots(), 0);
+
+        let current = worker.endpoint_snapshot().await;
+        let current_topology = rch_common::SourceTopology {
+            canonical_root: "/mnt/replacement/rch".into(),
+            alias_root: "/mnt/replacement/rch".into(),
+        };
+        let mut caps = WorkerCapabilities {
+            projects_root_ok: Some(false),
+            projects_root_topology: Some(original_topology),
+            projects_root_issue: Some("canonical_not_directory".into()),
+            ..Default::default()
+        };
+        worker.set_capabilities(caps.clone()).await;
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(
+                    1,
+                    &current,
+                    &ExecutionRequirements::new(&request).with_source_topology(&current_topology),
+                )
+                .await
+                .is_some()
+        );
+        caps.projects_root_topology = Some(current_topology.clone());
+        worker.set_capabilities(caps).await;
+        assert!(
+            worker
+                .reserve_slots_for_endpoint(
+                    1,
+                    &current,
+                    &ExecutionRequirements::new(&request).with_source_topology(&current_topology),
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            worker.used_slots(),
+            1,
+            "rejected refresh cannot consume another slot"
+        );
+        worker.release_slots(1).await;
     }
 
     #[tokio::test]
@@ -9194,6 +9270,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 
@@ -9569,6 +9646,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let state = WorkerState::new(config);
@@ -11642,6 +11720,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
         pool.add_worker_state(active).await;
 
@@ -11656,6 +11735,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
         user_drained_empty.drain().await;
         pool.add_worker_state(user_drained_empty).await;
@@ -11671,6 +11751,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
         removed_empty.drain_for_removal().await;
         pool.add_worker_state(removed_empty).await;
@@ -11691,6 +11772,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         });
         assert!(removed_busy.reserve_slots(1).await);
         removed_busy.drain_for_removal().await;

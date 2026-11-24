@@ -51,12 +51,24 @@ pub struct PreviewRequest {
     pub required_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_topology: Option<crate::SourceTopology>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolated_source: bool,
 }
 
 impl PreviewRequest {
     pub fn validate(&self) -> Result<(), PreviewError> {
         if let Some(topology) = &self.source_topology {
             topology.validate().map_err(PreviewError::InvalidRequest)?;
+        }
+        if self.isolated_source
+            && self
+                .source_topology
+                .as_ref()
+                .is_none_or(|topology| topology.for_worker_remote_base(true, None).is_err())
+        {
+            return Err(PreviewError::InvalidRequest(
+                "isolated source preview requires one safe absolute staging root",
+            ));
         }
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(PreviewError::Version(self.protocol_version));
@@ -106,6 +118,7 @@ impl PreviewRequest {
             job_mode: self.job_mode,
             required_tools: self.required_tools,
             source_topology: self.source_topology,
+            isolated_source: self.isolated_source,
             hook_pid: None,
         })
     }
@@ -219,6 +232,7 @@ mod tests {
     fn request() -> PreviewRequest {
         PreviewRequest {
             source_topology: None,
+            isolated_source: false,
             protocol_version: PROTOCOL_VERSION,
             project: "project with spaces".into(),
             command: "env NOTE='a&b=c+%? λ\\n' cargo +nightly check".into(),
@@ -280,6 +294,42 @@ mod tests {
         assert!(selection.hook_pid.is_none());
         assert!(selection.classification_duration_us.is_none());
         assert_eq!(selection.toolchain.unwrap().full_version, "nightly");
+    }
+
+    #[test]
+    fn preview_retains_isolated_source_mode_and_requires_a_single_staging_root() {
+        let mut original = request();
+        assert!(
+            serde_json::to_value(&original)
+                .unwrap()
+                .get("isolated_source")
+                .is_none()
+        );
+        original.isolated_source = true;
+        assert!(original.request_line().is_err());
+        original.source_topology = Some(crate::SourceTopology {
+            canonical_root: "/data/projects".into(),
+            alias_root: "/dp".into(),
+        });
+        assert!(original.request_line().is_err());
+        original.source_topology = Some(crate::SourceTopology {
+            canonical_root: "/tmp".into(),
+            alias_root: "/tmp".into(),
+        });
+        assert!(original.request_line().is_err());
+        original.source_topology = Some(crate::SourceTopology {
+            canonical_root: "/data/tmp/rch".into(),
+            alias_root: "/data/tmp/rch".into(),
+        });
+        let line = original.request_line().unwrap();
+        let query = line.trim_end_matches('\n').split_once('?').unwrap().1;
+        let selection = PreviewRequest::from_query(query)
+            .unwrap()
+            .into_selection()
+            .unwrap();
+        assert!(selection.isolated_source);
+        assert_eq!(selection.source_topology, original.source_topology);
+        assert!(selection.hook_pid.is_none());
     }
 
     #[test]

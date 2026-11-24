@@ -22,6 +22,7 @@ fn docs(count: usize) -> (tempfile::TempDir, RecoverySession) {
         priority: 100,
         tags: Vec::new(),
         tools: Vec::new(),
+        remote_base: None,
     };
     // Use the real descriptor-bound journal owner in every case. Only the
     // already-completed remote execution is fixture input, not journal I/O.

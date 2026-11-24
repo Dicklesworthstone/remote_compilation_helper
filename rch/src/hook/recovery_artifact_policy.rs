@@ -433,6 +433,7 @@ mod tests {
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         };
         writer.admit(41, &worker.id).unwrap();
         let identity = uuid::Uuid::new_v4().simple().to_string();

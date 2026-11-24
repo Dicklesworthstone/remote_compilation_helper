@@ -1117,6 +1117,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let backup = manager.create_backup(&worker, "1.0.0").await.unwrap();
@@ -1140,6 +1141,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let backup1 = manager.create_backup(&worker, "1.0.0").await.unwrap();
@@ -1501,6 +1503,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 

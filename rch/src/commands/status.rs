@@ -874,6 +874,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 job_mode: true,
                 required_tools: rule.required_tools.clone(),
                 source_topology: Some(source_topology),
+                isolated_source: topology_policy.is_off_root(),
             };
             query_admission_preview(&socket_path, &request)
                 .await
@@ -889,6 +890,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 required_runtime,
                 &preferred_workers,
                 Some(&source_topology),
+                topology_policy.is_off_root(),
             )
             .await
         };
@@ -1805,6 +1807,7 @@ pub async fn admit(
                     )
                     .map_err(anyhow::Error::msg)?,
                 ),
+                isolated_source: topology_policy.is_off_root(),
             };
             match query_admission_preview(&config.general.socket_path, &request).await {
                 Ok(preview) => {
@@ -4509,6 +4512,7 @@ mod tests {
                 reserved_slots: Some(2),
                 speed_score: 90.0,
                 declared_os: None,
+                remote_base: None,
                 project_lane: 0,
                 disk_budget: None,
             }),
@@ -4956,6 +4960,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let workers = vec![worker("ovh-a"), worker("hz3"), worker("hz4")];
         let dir = tempfile::tempdir().unwrap();

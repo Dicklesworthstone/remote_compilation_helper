@@ -214,6 +214,7 @@ impl TestWorkerEntry {
             priority: self.priority,
             tags: self.tags.clone(),
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 }

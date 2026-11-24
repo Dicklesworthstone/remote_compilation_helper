@@ -166,6 +166,7 @@ fn fixture() -> (PathBuf, TransferPipeline, WorkerConfig) {
         priority: 100,
         tags: Vec::new(),
         tools: Vec::new(),
+        remote_base: None,
     };
     let config = TransferConfig {
         max_transfer_time_ms: Some(900_000),

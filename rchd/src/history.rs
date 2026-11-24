@@ -3849,6 +3849,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: vec![],
+            remote_base: None,
         });
         let admission = history
             .try_start_active_build_in_lanes(
@@ -4449,6 +4450,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: vec![],
+            remote_base: None,
         })
         .endpoint_snapshot()
         .await

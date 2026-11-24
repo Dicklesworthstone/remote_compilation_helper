@@ -29,6 +29,7 @@ mod tests {
             priority: 1,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let _client = SshClient::new(config, options);

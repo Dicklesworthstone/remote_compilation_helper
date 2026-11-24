@@ -754,8 +754,7 @@ impl RecoveryRecipe {
         let phase = phases
             .next()
             .context("complete Cargo delivery lost its target phase")?;
-        let baseline =
-            capture_baseline.context("Cargo delivery lacks complete output capture")?;
+        let baseline = capture_baseline.context("Cargo delivery lacks complete output capture")?;
         let required = phase.cargo_outputs.as_ref().map(|outputs| {
             outputs
                 .required_files
@@ -2016,17 +2015,18 @@ impl RecoverySession {
         // Preserve Windows' existing named-capture lane until its transfer
         // supports that proof. Explicit exclusions still require the complete
         // contract and are refused by validation on Windows.
-        let cargo_output_capture =
-            if WorkerPlatform::from_worker(worker).is_windows() && excluded_directories.is_empty() {
-                CargoOutputCapture::for_command(kind, command)
-            } else {
-                CargoOutputCapture::for_retrieval_policy(
-                    kind,
-                    command,
-                    target_baseline,
-                    excluded_directories,
-                )?
-            };
+        let cargo_output_capture = if WorkerPlatform::from_worker(worker).is_windows()
+            && excluded_directories.is_empty()
+        {
+            CargoOutputCapture::for_command(kind, command)
+        } else {
+            CargoOutputCapture::for_retrieval_policy(
+                kind,
+                command,
+                target_baseline,
+                excluded_directories,
+            )?
+        };
         for phase in phases
             .iter_mut()
             .filter(|phase| restricted && phase.custom_target)
@@ -6171,6 +6171,7 @@ mod tests {
             host: "unreachable.invalid".into(),
             user: "worker".into(),
             identity_file: "/unused/test-key".into(),
+            remote_base: None,
             total_slots: 1,
             priority: 100,
             tags: Vec::new(),
@@ -6467,9 +6468,16 @@ mod tests {
     }
 
     #[test]
-    fn clean_overlay_subdirectory_recovery_keeps_source_authority_and_cwd_outputs_separate() {
+    fn worker_remote_base_recovery_keeps_source_authority_and_cwd_outputs_separate() {
         let _guard = test_guard!();
-        let (directory, writer, worker) = admitted_preparation_fixture();
+        let (directory, writer, mut worker) = admitted_preparation_fixture();
+        let selected_base = "/Users/builder/.cache/rch";
+        worker.remote_base = Some(selected_base.into());
+        let transfer = TransferConfig {
+            remote_base: selected_base.into(),
+            max_transfer_time_ms: Some(138_000),
+            ..TransferConfig::default()
+        };
         let repository_root = directory.path().join("checkout");
         let spec = CleanOverlaySpec {
             repository_root: repository_root.clone(),
@@ -6484,8 +6492,8 @@ mod tests {
             primary_directory: None,
         };
         std::fs::create_dir_all(spec.invocation_root()).unwrap();
-        let remote_source = "/data/tmp/rch/selected/app";
-        let remote_target = "/data/tmp/rch/targets/subdirectory-pool";
+        let remote_source = "/Users/builder/.cache/rch/selected/app";
+        let remote_target = "/Users/builder/.cache/rch/targets/subdirectory-pool";
         let source_roots = vec![remote_source.to_owned(), remote_target.to_owned()];
         let identity = "0123456789abcdef0123456789abcdef";
         RecoverySession::begin(
@@ -6495,7 +6503,7 @@ mod tests {
             None,
             Some(remote_source.into()),
             None,
-            TransferConfig::default(),
+            transfer.clone(),
             spec.invocation_root(),
             identity.into(),
         )
@@ -6504,7 +6512,7 @@ mod tests {
             repository_root,
             "subdirectory".into(),
             identity.into(),
-            TransferConfig::default(),
+            transfer.clone(),
         )
         .with_build_id(Some(41))
         .with_remote_path_override(remote_source)
@@ -6530,7 +6538,7 @@ mod tests {
             ))
         );
         let local_target = spec.invocation_root().join("../../../returned-target");
-        let session = RecoverySession::prepare(
+        let mut session = RecoverySession::prepare(
             &writer,
             &worker,
             &pipeline,
@@ -6538,7 +6546,7 @@ mod tests {
             None,
             Some(remote_source.into()),
             None,
-            TransferConfig::default(),
+            transfer,
             spec.invocation_root(),
             Some(&local_target),
             Some(CompilationKind::CargoBuild),
@@ -6547,7 +6555,25 @@ mod tests {
             identity.into(),
         )
         .unwrap();
+        // Configuration reloads may extend retrieval time or move local staging,
+        // but must never redirect the old worker grant or its completion marker.
+        worker.remote_base = Some("/Volumes/new-worker-store/rch".into());
+        let current = TransferConfig {
+            remote_base: "/srv/new-dispatcher-store/rch".into(),
+            max_transfer_time_ms: Some(900_000),
+            ..TransferConfig::default()
+        };
+        session.apply_retrieval_config(&current).unwrap();
         let persisted = reload_publication(&session).recipe;
+        assert_eq!(persisted.worker.remote_base.as_deref(), Some(selected_base));
+        assert_ne!(persisted.worker.remote_base, worker.remote_base);
+        assert_eq!(persisted.transfer.remote_base, selected_base);
+        assert_ne!(persisted.transfer.remote_base, current.remote_base);
+        assert_eq!(persisted.transfer.max_transfer_time_ms, Some(900_000));
+        assert_eq!(
+            persisted.completion,
+            format!("{selected_base}/recovery-41-{identity}.done")
+        );
         assert_eq!(persisted.project_root, spec.invocation_root());
         assert_eq!(persisted.source_roots, source_roots);
         assert_eq!(persisted.retire_root.as_deref(), Some(remote_source));
@@ -12329,7 +12355,12 @@ func TestValue(t *testing.T) {{
         };
         let stdout = format!(
             "{}\n{}\n{{\"reason\":\"build-finished\",\"success\":true}}\n",
-            artifact("bin", "app", &["debug/app", "debug/app.pdb"], Some("debug/app")),
+            artifact(
+                "bin",
+                "app",
+                &["debug/app", "debug/app.pdb"],
+                Some("debug/app")
+            ),
             artifact("lib", "model", &["debug/libmodel.rlib"], None),
         )
         .into_bytes();
@@ -12365,9 +12396,19 @@ func TestValue(t *testing.T) {{
             })
             .unwrap();
         let mut session = reload_publication(&session);
-        assert!(session.recipe.transfer.cargo_retrieval_exclude_dirs.is_empty());
+        assert!(
+            session
+                .recipe
+                .transfer
+                .cargo_retrieval_exclude_dirs
+                .is_empty()
+        );
         assert_eq!(
-            session.retained_cargo_artifact_evidence().unwrap().unwrap().stdout,
+            session
+                .retained_cargo_artifact_evidence()
+                .unwrap()
+                .unwrap()
+                .stdout,
             stdout
         );
         assert!(!session.needs_cargo_artifact_evidence());
@@ -12376,7 +12417,11 @@ func TestValue(t *testing.T) {{
             let staged = session.staging_pipeline("target", &pipeline).unwrap();
             let mut retrieve = staged.local_artifact_retrieval_for_test(
                 &worker,
-                if complete { remote.path() } else { partial.path() },
+                if complete {
+                    remote.path()
+                } else {
+                    partial.path()
+                },
                 &patterns,
             );
             let output = retrieve.output().await.unwrap();
@@ -12396,11 +12441,18 @@ func TestValue(t *testing.T) {{
                 assert!(!session.recipe.phases[0].complete);
                 assert!(session.recipe.returned.is_none());
                 for (name, _) in outputs {
-                    assert_eq!(std::fs::read(local.join(name)).unwrap(), b"stale local output");
+                    assert_eq!(
+                        std::fs::read(local.join(name)).unwrap(),
+                        b"stale local output"
+                    );
                 }
                 session = reload_publication(&session);
                 assert_eq!(
-                    session.retained_cargo_artifact_evidence().unwrap().unwrap().stdout,
+                    session
+                        .retained_cargo_artifact_evidence()
+                        .unwrap()
+                        .unwrap()
+                        .stdout,
                     stdout
                 );
             } else {
@@ -12412,7 +12464,11 @@ func TestValue(t *testing.T) {{
                 assert_eq!(recovered.recipe.exit_code, Some(0));
                 assert_eq!(recovered.recipe.phases[0].published.len(), outputs.len());
                 assert_eq!(
-                    recovered.retained_cargo_artifact_evidence().unwrap().unwrap().stdout,
+                    recovered
+                        .retained_cargo_artifact_evidence()
+                        .unwrap()
+                        .unwrap()
+                        .stdout,
                     stdout
                 );
                 for (name, bytes) in outputs {
@@ -12469,7 +12525,11 @@ func TestValue(t *testing.T) {{
                     "{command}"
                 );
                 assert!(recipe.transfer.cargo_retrieval_exclude_dirs.is_empty());
-                let target = recipe.phases.iter().find(|phase| phase.custom_target).unwrap();
+                let target = recipe
+                    .phases
+                    .iter()
+                    .find(|phase| phase.custom_target)
+                    .unwrap();
                 assert!(target.output_gate);
                 assert_eq!(target.patterns, expected, "{command}");
                 recipe.validate_cargo_retrieval_policy().unwrap();
@@ -12558,7 +12618,11 @@ func TestValue(t *testing.T) {{
                             .is_none_or(|capture| !capture.automatic_complete_outputs()),
                         "{command}"
                     );
-                    let target = recipe.phases.iter().find(|phase| phase.custom_target).unwrap();
+                    let target = recipe
+                        .phases
+                        .iter()
+                        .find(|phase| phase.custom_target)
+                        .unwrap();
                     assert_eq!(target.patterns, expected_patterns, "{command}");
                     recipe.validate_cargo_retrieval_policy().unwrap();
                 }
@@ -12644,7 +12708,10 @@ func TestValue(t *testing.T) {{
         ] {
             let mut rejected = original.clone();
             let mut capture = serde_json::to_value(&rejected.cargo_output_capture).unwrap();
-            capture.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+            capture
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
             rejected.cargo_output_capture = Some(serde_json::from_value(capture).unwrap());
             assert!(
                 rejected.validate_cargo_retrieval_policy().is_err(),
@@ -12668,7 +12735,12 @@ func TestValue(t *testing.T) {{
             &["debug/.wrapper-shims".into()],
         )
         .unwrap();
-        assert!(lost_exclusions.transfer.cargo_retrieval_exclude_dirs.is_empty());
+        assert!(
+            lost_exclusions
+                .transfer
+                .cargo_retrieval_exclude_dirs
+                .is_empty()
+        );
         assert!(lost_exclusions.validate_cargo_retrieval_policy().is_err());
         original.validate_cargo_retrieval_policy().unwrap();
     }
@@ -13291,9 +13363,9 @@ func TestValue(t *testing.T) {{
             rejected.cargo_output_capture = Some(serde_json::from_value(encoded).unwrap());
             let error = rejected.validate_cargo_retrieval_policy().unwrap_err();
             assert!(
-                error.to_string().contains(
-                    "Cargo delivery requires a supported complete Cargo output capture"
-                ),
+                error
+                    .to_string()
+                    .contains("Cargo delivery requires a supported complete Cargo output capture"),
                 "{patch}: {error:#}"
             );
         }

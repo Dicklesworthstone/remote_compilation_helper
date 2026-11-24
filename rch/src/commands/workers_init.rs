@@ -297,6 +297,7 @@ pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
         priority: 100,  // Default
         tags: vec![],
         tools: Vec::new(),
+        remote_base: None,
     };
 
     let toml_content = upsert_worker_entry(existing.as_deref(), &new_worker)?;
@@ -406,7 +407,7 @@ fn upsert_worker_entry(existing: Option<&str>, worker: &WorkerConfig) -> Result<
             // Re-initialising a worker must not re-enable one an operator
             // parked, nor drop its declared tool requirements or OS fence.
             let mut replacement = entry.clone();
-            for key in ["enabled", "tools", "os"] {
+            for key in ["enabled", "tools", "os", "remote_base"] {
                 if let (Some(kept), Some(fields)) = (slot.get(key), replacement.as_table_mut()) {
                     fields.insert(key.to_owned(), kept.clone());
                 }
@@ -484,6 +485,7 @@ fn serialize_workers_config(workers: &[WorkerConfig]) -> Result<String> {
                     .cloned()
                     .collect(),
                 tools: worker.tools.clone(),
+                remote_base: worker.remote_base.clone(),
                 enabled: true,
             })
             .collect(),
@@ -765,6 +767,7 @@ enabled = false
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 
@@ -815,6 +818,7 @@ enabled = false
 id = "mac-builder"
 host = "old.example"
 os = "darwin"
+remote_base = "/Volumes/Build Disk/rch"
 enabled = false
 tools = [{ name = "xcode", command = ["/Applications/Xcode Beta.app/Contents/Developer/usr/bin/xcodebuild", "-version"] }]
 "#;
@@ -825,6 +829,7 @@ tools = [{ name = "xcode", command = ["/Applications/Xcode Beta.app/Contents/Dev
         assert_eq!(after.workers[0].host, "10.0.0.9");
         assert_eq!(after.workers[0].tools, before.workers[0].tools);
         assert_eq!(after.workers[0].os.as_deref(), Some("darwin"));
+        assert_eq!(after.workers[0].remote_base, before.workers[0].remote_base);
         assert!(!after.workers[0].enabled);
     }
 
@@ -990,6 +995,7 @@ tools = [{ name = "xcode", command = ["/Applications/Xcode Beta.app/Contents/Dev
             total_slots: 8,
             priority: 100,
             tags: vec!["rust\"fast".to_string(), "gpu\nprod".to_string()],
+            remote_base: Some("/Volumes/Build Disk/rch".into()),
             tools: vec![rch_common::types::WorkerToolProbe {
                 name: "clang".into(),
                 command: vec![
@@ -1007,6 +1013,7 @@ tools = [{ name = "xcode", command = ["/Applications/Xcode Beta.app/Contents/Dev
         assert_eq!(parsed.workers.len(), 1);
         assert_eq!(parsed.workers[0].id, "safe-worker");
         assert_eq!(parsed.workers[0].host, attempted_injection);
+        assert_eq!(parsed.workers[0].remote_base, workers[0].remote_base);
         assert_eq!(parsed.workers[0].user, "ubuntu\"admin");
         assert_eq!(
             parsed.workers[0].identity_file,

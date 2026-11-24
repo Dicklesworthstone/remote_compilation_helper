@@ -2003,6 +2003,7 @@ async fn try_retry_on_bigger_worker(
     job_mode: bool,
     required_tools: &[String],
     source_topology: &rch_common::SourceTopology,
+    isolated_source: bool,
     durable_lease: &DurableLeaseWriter,
     release_acknowledged: bool,
     reporter: &HookReporter,
@@ -2046,6 +2047,7 @@ async fn try_retry_on_bigger_worker(
                 job_mode,
                 required_tools,
                 Some(source_topology),
+                isolated_source,
             )
             .await
         })
@@ -5250,9 +5252,10 @@ pub async fn run_exec(
     // Build path topology policy from loaded config so that any normalization
     // warnings reference the configured roots rather than compiled-in defaults.
     let topology_policy = config.path_topology.to_policy();
+    let isolated_source = clean_overlay || source_content_receipt || topology_policy.is_off_root();
     let source_topology = rch_common::SourceTopology::for_worker_namespace(
         &topology_policy,
-        clean_overlay || source_content_receipt,
+        isolated_source,
         &config.transfer.remote_base,
     )
     .map_err(anyhow::Error::msg)?;
@@ -5472,6 +5475,7 @@ pub async fn run_exec(
         classification.kind == Some(CompilationKind::Job),
         &required_tools,
         Some(&source_topology),
+        isolated_source,
     )
     .await
     {
@@ -5539,6 +5543,7 @@ pub async fn run_exec(
                     classification.kind == Some(CompilationKind::Job),
                     &required_tools,
                     Some(&source_topology),
+                    isolated_source,
                 )
                 .await
                 {
@@ -5665,6 +5670,7 @@ pub async fn run_exec(
             classification.kind == Some(CompilationKind::Job),
             &required_tools,
             Some(&source_topology),
+            isolated_source,
         )
         .await
         {
@@ -6099,6 +6105,7 @@ pub async fn run_exec(
                         classification.kind == Some(CompilationKind::Job),
                         &required_tools,
                         Some(&source_topology),
+                        isolated_source,
                     )
                     .await
                 })
@@ -6667,6 +6674,7 @@ pub async fn run_exec(
             classification.kind == Some(CompilationKind::Job),
             &required_tools,
             &source_topology,
+            isolated_source,
             &durable_lease,
             release_acknowledged,
             &reporter,
@@ -7925,6 +7933,7 @@ fn selected_worker_to_config(worker: &SelectedWorker) -> WorkerConfig {
         host: worker.host.clone(),
         user: worker.user.clone(),
         identity_file: worker.identity_file.clone(),
+        remote_base: worker.remote_base.clone(),
         total_slots: worker.slots_available,
         priority: 100,
         tags,

@@ -83,6 +83,7 @@ mod tests {
     fn select_request(project: &str) -> SelectionRequest {
         SelectionRequest {
             source_topology: None,
+            isolated_source: false,
             job_mode: false,
             project: project.to_string(),
             command: None,

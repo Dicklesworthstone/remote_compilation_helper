@@ -3987,6 +3987,7 @@ exit 37
             priority: 100,
             tags: vec!["rust".to_string()],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let client = SshClient::new(config.clone(), SshOptions::default());
@@ -4015,6 +4016,7 @@ exit 37
             priority: 100,
             tags: vec!["rust".to_string()],
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 

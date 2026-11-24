@@ -13376,6 +13376,7 @@ esac
             priority: 100,
             tags: os.map(rch_common::os_tag).into_iter().collect(),
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 
@@ -15827,6 +15828,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_sync_command(
@@ -15862,6 +15864,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 
@@ -16129,6 +16132,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_sync_command(
@@ -17836,6 +17840,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let root = "/worker/sources/current";
         for mode in ["ungranted", "active", "cleanup"] {
@@ -17935,6 +17940,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let root = pipeline.remote_path();
@@ -18030,6 +18036,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let sync = pipeline.build_sync_command(
@@ -18086,6 +18093,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_retrieve_command(
@@ -18161,6 +18169,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_retrieve_streaming_command(
@@ -19128,6 +19137,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 
@@ -19396,6 +19406,7 @@ Number of files transferred: 42
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_retrieve_streaming_command(
@@ -19862,6 +19873,7 @@ cargo --version\n\"$RCH_TEST_TOOLCHAIN_CARGO\" --version\ncargo test --locked\n"
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut overrides = HashMap::new();
@@ -26745,6 +26757,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_sync_command(
@@ -26784,6 +26797,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_sync_command(
@@ -26827,6 +26841,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_sync_command(
@@ -26872,6 +26887,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_sync_command(
@@ -27444,6 +27460,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         for command in [
@@ -27613,6 +27630,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_sync_streaming_command(
@@ -27667,6 +27685,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let cmd = pipeline.build_sync_streaming_command(
@@ -28000,6 +28019,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let cmd = pipeline.build_result_dir_retrieve_command(
             &worker,
@@ -28123,6 +28143,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
@@ -28203,6 +28224,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
@@ -28263,6 +28285,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,
@@ -28330,6 +28353,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let cmd = pipeline.build_retrieve_streaming_command(
             &worker,
@@ -28381,6 +28405,7 @@ exec /usr/bin/rsync "$@" -e "sh -c 'if [ \"\$1\" = -l ]; then shift 2; fi; shift
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         let cmd = pipeline.build_retrieve_command(
             &worker,

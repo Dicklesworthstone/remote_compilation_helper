@@ -434,6 +434,14 @@ pub struct WorkerEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
 
+    /// Worker-local staging base for isolated/off-root source namespaces.
+    #[serde(
+        default,
+        deserialize_with = "rch_common::types::deserialize_worker_remote_base",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remote_base: Option<String>,
+
     /// Whether this worker is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -465,6 +473,7 @@ impl From<WorkerEntry> for WorkerConfig {
             priority: entry.priority,
             tags,
             tools: entry.tools,
+            remote_base: entry.remote_base,
         }
     }
 }
@@ -627,6 +636,7 @@ pub fn load_workers_config(path: Option<&Path>) -> Result<WorkersConfig> {
         .with_context(|| format!("Failed to parse workers config from {:?}", config_path))?;
 
     validate_worker_tool_probes(&config, &config_path)?;
+    validate_worker_remote_bases(&config, &config_path)?;
 
     info!("Loaded {} worker definitions", config.workers.len());
     Ok(config)
@@ -653,6 +663,33 @@ pub(crate) fn validate_worker_tool_probes(
         }
     }
 
+    Ok(())
+}
+
+/// Startup and hot reload must validate the same worker storage contract.
+pub(crate) fn validate_worker_remote_bases(config: &WorkersConfig, path: &Path) -> Result<()> {
+    for worker in &config.workers {
+        if let Some(base) = &worker.remote_base {
+            let tagged_os = rch_common::declared_os(&worker.tags);
+            rch_common::types::validate_worker_remote_base(
+                base,
+                tagged_os.as_deref().or_else(|| {
+                    worker
+                        .os
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|os| !os.is_empty())
+                }),
+            )
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!(
+                    "worker {:?} in {path:?} declares an unusable remote_base",
+                    worker.id
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -935,6 +972,7 @@ enabled = true
             tags: vec!["rust".to_string()],
             tools: Vec::new(),
             os: None,
+            remote_base: None,
             enabled: true,
         };
 
@@ -942,6 +980,74 @@ enabled = true
         assert_eq!(config.id.as_str(), "worker1");
         assert_eq!(config.host, "192.168.1.100");
         assert_eq!(config.total_slots, 8);
+    }
+
+    #[test]
+    fn worker_remote_base_loads_as_a_literal_host_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workers.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[workers]]
+id = "mac-builder"
+host = "mac.example"
+os = "darwin"
+remote_base = "/Volumes/Build Disk/rch///"
+[[workers]]
+id = "ordinary"
+host = "linux.example"
+"#,
+        )
+        .unwrap();
+        let loaded = load_workers(Some(&path)).unwrap();
+        assert_eq!(
+            loaded[0].remote_base.as_deref(),
+            Some("/Volumes/Build Disk/rch")
+        );
+        assert_eq!(
+            rch_common::declared_os(&loaded[0].tags).as_deref(),
+            Some("darwin")
+        );
+        assert!(loaded[1].remote_base.is_none());
+        let config = load_workers_config(Some(&path)).unwrap();
+        // Hot reload consumes the same validation on its immutable snapshot.
+        validate_worker_remote_bases(&config, &path).unwrap();
+        let rewritten = toml::to_string_pretty(&config).unwrap();
+        let restored: WorkersConfig = toml::from_str(&rewritten).unwrap();
+        assert_eq!(restored.workers[0].remote_base, loaded[0].remote_base);
+    }
+
+    #[test]
+    fn worker_remote_base_invalid_paths_and_windows_never_enter_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workers.toml");
+        for declaration in [
+            "remote_base = '~/rch'",
+            "remote_base = '/tmp'",
+            "remote_base = '/data/../rch'",
+            "remote_base = '/data//rch'",
+            "remote_base = 9",
+            "os = 'windows'\nremote_base = '/data/rch'",
+            "tags = ['os:windows']\nremote_base = '/data/rch'",
+            "os = ''\ntags = ['os:', 'os:WINDOWS']\nremote_base = '/data/rch'",
+            "os = 'darwin'\ntags = ['os:windows']\nremote_base = '/data/rch'",
+        ] {
+            std::fs::write(
+                &path,
+                format!("[[workers]]\nid='worker'\nhost='worker.example'\n{declaration}\n"),
+            )
+            .unwrap();
+            assert!(load_workers(Some(&path)).is_err(), "{declaration}");
+            if let Ok(config) =
+                toml::from_str::<WorkersConfig>(&std::fs::read_to_string(&path).unwrap())
+            {
+                assert!(
+                    validate_worker_remote_bases(&config, &path).is_err(),
+                    "{declaration}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1414,6 +1520,7 @@ tags = ["rust"]
             tags: vec!["tag1".to_string(), "tag2".to_string()],
             tools: Vec::new(),
             os: None,
+            remote_base: Some("/srv/worker-staging".into()),
             enabled: true,
         };
 
@@ -1428,6 +1535,7 @@ tags = ["rust"]
         assert_eq!(config.tags.len(), 2);
         assert_eq!(config.tags[0], "tag1");
         assert_eq!(config.tags[1], "tag2");
+        assert_eq!(config.remote_base.as_deref(), Some("/srv/worker-staging"));
     }
 
     #[test]

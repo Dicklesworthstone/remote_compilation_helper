@@ -792,6 +792,23 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
             })?;
         }
 
+        let remote_base = entry
+            .get("remote_base")
+            .map(|base| {
+                let base = base
+                    .as_str()
+                    .with_context(|| format!("remote_base for worker {id:?} must be a string"))?;
+                rch_common::types::validate_worker_remote_base(
+                    base,
+                    rch_common::declared_os(&tags).as_deref(),
+                )
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!("Invalid remote_base for worker {id:?} in {config_path:?}")
+                })
+            })
+            .transpose()?;
+
         workers.push(WorkerConfig {
             id: WorkerId::new(id),
             host: host.to_string(),
@@ -801,6 +818,7 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
             priority,
             tags,
             tools,
+            remote_base,
         });
     }
 

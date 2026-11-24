@@ -943,6 +943,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new_default(worker_config);
@@ -966,6 +967,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new(
@@ -995,6 +997,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new(worker_config, MockConfig::connection_failure());
@@ -1064,6 +1067,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new(worker_config, MockConfig::no_rustup());
@@ -1086,6 +1090,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new(worker_config, MockConfig::toolchain_install_failure());
@@ -1119,6 +1124,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new(worker_config, MockConfig::toolchain_install_failure());
@@ -1149,6 +1155,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         assert!(is_mock_worker(&mock_worker));
 
@@ -1161,6 +1168,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         assert!(!is_mock_worker(&real_worker));
     }
@@ -1388,6 +1396,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let client = MockSshClient::new_default(worker_config);
@@ -1410,6 +1419,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new(
@@ -1445,6 +1455,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new_default(worker_config);
@@ -1465,6 +1476,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let mut client = MockSshClient::new(
@@ -1488,6 +1500,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let client = MockSshClient::new_default(worker_config);
@@ -1505,6 +1518,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
 
         let client = MockSshClient::new_default(worker_config);

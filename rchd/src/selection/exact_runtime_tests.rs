@@ -14,6 +14,7 @@ async fn versioned_pool() -> WorkerPool {
             priority,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         })
         .await;
         pool.set_status(&WorkerId::new(id), WorkerStatus::Healthy)
@@ -51,6 +52,7 @@ fn versioned_selector(config: SelectionConfig) -> WorkerSelector {
 fn request(runtime: RequiredRuntime, requirement: &str) -> SelectionRequest {
     SelectionRequest {
         source_topology: None,
+        isolated_source: false,
         job_mode: true,
         project: "exact-runtime-fixture".to_owned(),
         command: Some(match runtime {

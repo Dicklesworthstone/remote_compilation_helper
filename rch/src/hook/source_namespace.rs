@@ -711,6 +711,7 @@ mod tests {
             priority: 1,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         for overlap in [
             "RCH: durable source ownership: unfinished overlapping physical source owner\n",
@@ -1040,6 +1041,7 @@ mod tests {
             priority: 1,
             tags: vec![],
             tools: vec![],
+            remote_base: None,
         };
         let busy = b"RCH_SOURCE_NAMESPACE_METADATA_LOCK_BUSY elapsed_ms=5003 lock=/registry/metadata.lock\n";
         let error = namespace_refusal(&worker, &test_policy(), Some(76), busy);
@@ -1082,6 +1084,7 @@ mod tests {
             priority: 1,
             tags: vec![],
             tools: vec![],
+            remote_base: None,
         };
         for status in [None, Some(73), Some(76), Some(137)] {
             for stderr in [b"".as_slice(), b" \n\t".as_slice()] {

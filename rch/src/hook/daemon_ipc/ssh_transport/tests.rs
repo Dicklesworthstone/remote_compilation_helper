@@ -31,6 +31,7 @@ fn worker() -> WorkerConfig {
         priority: 100,
         tags: vec![rch_common::os_tag("linux")],
         tools: Vec::new(),
+        remote_base: None,
     }
 }
 

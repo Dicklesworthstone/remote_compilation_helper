@@ -1076,6 +1076,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         };
         pool.add_worker(config).await;
 
@@ -1100,6 +1101,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: Vec::new(),
+            remote_base: None,
         })
         .await;
         let worker = pool.get(&id).await.unwrap();

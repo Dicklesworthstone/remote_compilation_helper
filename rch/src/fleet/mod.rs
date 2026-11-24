@@ -1354,6 +1354,7 @@ mod tests {
             priority: 100,
             tags: vec![],
             tools: vec![],
+            remote_base: None,
         };
         let no_workers = rollback_targets(&[], None).unwrap_err();
         assert_eq!(

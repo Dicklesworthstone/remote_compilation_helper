@@ -1410,6 +1410,35 @@ pub fn validate_workers_config_file(path: &Path) -> FileValidation {
             validation.error(format!("workers[{}].host cannot be empty", index));
         }
 
+        if let Some(base) = table.get("remote_base") {
+            match base.as_str() {
+                Some(base) => {
+                    let tags: Vec<String> = table
+                        .get("tags")
+                        .and_then(toml::Value::as_array)
+                        .map(|tags| {
+                            tags.iter()
+                                .filter_map(toml::Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let tagged_os = rch_common::declared_os(&tags);
+                    let os = tagged_os.as_deref().or_else(|| {
+                        table
+                            .get("os")
+                            .and_then(toml::Value::as_str)
+                            .map(str::trim)
+                            .filter(|os| !os.is_empty())
+                    });
+                    if let Err(error) = rch_common::types::validate_worker_remote_base(base, os) {
+                        validation.error(format!("workers[{index}].remote_base: {error}"));
+                    }
+                }
+                None => validation.error(format!("workers[{index}].remote_base must be a string")),
+            }
+        }
+
         let user_value = table.get("user");
         let user = match user_value.and_then(|v| v.as_str()) {
             Some(value) => value.trim().to_string(),
@@ -3169,6 +3198,13 @@ pub struct WorkerEntry {
     /// un-fences the worker on the next write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// Worker-local staging base for isolated/off-root source namespaces.
+    #[serde(
+        default,
+        deserialize_with = "rch_common::types::deserialize_worker_remote_base",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remote_base: Option<String>,
     /// Whether this worker is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -3231,6 +3267,24 @@ pub fn load_workers_config(path: Option<&Path>) -> Result<WorkersConfig> {
 
     let config: WorkersConfig = toml::from_str(&contents)
         .with_context(|| format!("Failed to parse workers config from {:?}", config_path))?;
+
+    for worker in &config.workers {
+        if let Some(base) = &worker.remote_base {
+            let tagged_os = rch_common::declared_os(&worker.tags);
+            rch_common::types::validate_worker_remote_base(
+                base,
+                tagged_os.as_deref().or_else(|| {
+                    worker
+                        .os
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|os| !os.is_empty())
+                }),
+            )
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("Invalid remote_base for worker {:?}", worker.id))?;
+        }
+    }
 
     debug!("Loaded {} worker definitions", config.workers.len());
     Ok(config)
@@ -3455,6 +3509,7 @@ tags = ["rust"]
 id = "mac-builder"
 host = "builder.example"
 os = "darwin"
+remote_base = "/Volumes/Build Disk/rch"
 tools = [
     { name = "xcode", command = ["/Applications/Xcode Beta.app/Contents/Developer/usr/bin/xcodebuild", "-version"] },
     { name = "custom", command = ["/opt/tool's bin/probe", 'a\b', '"quoted"'] },
@@ -3480,10 +3535,18 @@ tools = [
         ];
         assert_eq!(parsed.workers[0].tools, expected);
         assert_eq!(parsed.workers[0].os.as_deref(), Some("darwin"));
+        assert_eq!(
+            parsed.workers[0].remote_base.as_deref(),
+            Some("/Volumes/Build Disk/rch")
+        );
         let rewritten = toml::to_string_pretty(&parsed).unwrap();
         let reparsed: WorkersConfig = toml::from_str(&rewritten).unwrap();
         assert_eq!(reparsed.workers[0].tools, expected);
         assert_eq!(reparsed.workers[0].os.as_deref(), Some("darwin"));
+        assert_eq!(
+            reparsed.workers[0].remote_base,
+            parsed.workers[0].remote_base
+        );
     }
 
     #[test]
@@ -3496,12 +3559,52 @@ tools = [
             let parsed: WorkersConfig = toml::from_str(&original).unwrap();
             assert!(parsed.workers[0].tools.is_empty());
             assert!(parsed.workers[0].os.is_none());
+            assert!(parsed.workers[0].remote_base.is_none());
             let rewritten = toml::to_string_pretty(&parsed).unwrap();
             let raw: toml::Value = toml::from_str(&rewritten).unwrap();
             assert!(raw["workers"][0].get("tools").is_none());
+            assert!(raw["workers"][0].get("remote_base").is_none());
             let reparsed: WorkersConfig = toml::from_str(&rewritten).unwrap();
             assert!(reparsed.workers[0].tools.is_empty());
             assert!(reparsed.workers[0].os.is_none());
+        }
+    }
+
+    #[test]
+    fn workers_remote_base_load_preserves_storage_and_rejects_ambiguous_paths() {
+        let _guard = test_guard!();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workers.toml");
+        std::fs::write(&path, "[[workers]]\nid='mac'\nhost='mac.example'\nos='darwin'\nremote_base='/Users/builder/rch-staging/'\n").unwrap();
+        let config = load_workers_config(Some(&path)).unwrap();
+        assert_eq!(
+            config.workers[0].remote_base.as_deref(),
+            Some("/Users/builder/rch-staging")
+        );
+        for declaration in [
+            "remote_base='~/rch'",
+            "remote_base='/data//rch'",
+            "remote_base='/data/../rch'",
+            "remote_base=4",
+            "os='windows'\nremote_base='/data/rch'",
+            "tags=['os:windows']\nremote_base='/data/rch'",
+            "os=''\ntags=['os:', 'os:WINDOWS']\nremote_base='/data/rch'",
+            "os='darwin'\ntags=['os:windows']\nremote_base='/data/rch'",
+        ] {
+            std::fs::write(
+                &path,
+                format!("[[workers]]\nid='worker'\nhost='worker.example'\n{declaration}\n"),
+            )
+            .unwrap();
+            assert!(load_workers_config(Some(&path)).is_err(), "{declaration}");
+            let validation = validate_workers_config_file(&path);
+            assert!(
+                validation
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("remote_base")),
+                "{declaration}"
+            );
         }
     }
 

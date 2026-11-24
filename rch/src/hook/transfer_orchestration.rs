@@ -919,6 +919,35 @@ async fn preflight_artifact_platform(
     }))
 }
 
+/// Freeze the selected worker's staging base for the whole attempt before any
+/// SSH connection or ownership acquisition. Shared mirrors keep the configured
+/// canonical topology; only existing isolated and off-root modes may relocate.
+fn selected_transfer_config(
+    worker: &SelectedWorker,
+    mut transfer_config: TransferConfig,
+    topology_policy: &PathTopologyPolicy,
+    isolated_source: bool,
+) -> anyhow::Result<TransferConfig> {
+    let isolated_source = isolated_source || topology_policy.is_off_root();
+    if let Some(remote_base) = worker.remote_base.as_deref() {
+        rch_common::types::validate_worker_remote_base(remote_base, worker.declared_os.as_deref())
+            .map_err(anyhow::Error::msg)?;
+    }
+    let topology = rch_common::SourceTopology::for_worker_namespace(
+        topology_policy,
+        isolated_source,
+        &transfer_config.remote_base,
+    )
+    .and_then(|topology| {
+        topology.for_worker_remote_base(isolated_source, worker.remote_base.as_deref())
+    })
+    .map_err(anyhow::Error::msg)?;
+    if isolated_source {
+        transfer_config.remote_base = topology.canonical_root;
+    }
+    Ok(transfer_config)
+}
+
 /// Execute a compilation command on a remote worker.
 ///
 /// This function:
@@ -965,6 +994,12 @@ pub(super) async fn execute_remote_compilation(
     // `None` keeps pooled stores inside the project mirror.
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
+    let transfer_config = selected_transfer_config(
+        worker,
+        transfer_config,
+        topology_policy,
+        clean_overlay.is_some() || source_content_receipt,
+    )?;
     let connection_config = transfer_config.clone();
     let operation = async {
         // The pipeline's state machine is large; held inline, debug builds moved
@@ -4620,6 +4655,180 @@ async fn execute_remote_compilation_inner(
 
 #[cfg(test)]
 mod tests {
+    fn staging_worker(remote_base: Option<&str>) -> super::SelectedWorker {
+        super::SelectedWorker {
+            id: super::WorkerId::new("staging-worker"),
+            host: "must-not-connect.invalid".into(),
+            user: "builder".into(),
+            identity_file: "/unused/key".into(),
+            remote_base: remote_base.map(str::to_owned),
+            slots_available: 8,
+            reserved_slots: Some(2),
+            speed_score: 90.0,
+            declared_os: Some("macos".into()),
+            project_lane: 0,
+            disk_budget: None,
+        }
+    }
+
+    #[test]
+    fn selected_remote_base_is_scoped_to_the_worker_and_isolated_attempt() {
+        use super::*;
+
+        let controller = PathTopologyPolicy::default();
+        let original = TransferConfig::default();
+        let mac = staging_worker(Some("/Users/builder/.cache/rch"));
+        let linux = staging_worker(Some("/srv/build/rch"));
+        let mac_attempt = selected_transfer_config(&mac, original.clone(), &controller, true)
+            .expect("selected POSIX staging base");
+        let linux_attempt = selected_transfer_config(&linux, original.clone(), &controller, true)
+            .expect("retry resolves its own worker independently");
+        assert_eq!(mac_attempt.remote_base, "/Users/builder/.cache/rch");
+        assert_eq!(linux_attempt.remote_base, "/srv/build/rch");
+        assert_eq!(original.remote_base, "/data/tmp/rch");
+        assert_eq!(
+            selected_worker_to_config(&mac).remote_base,
+            Some(mac_attempt.remote_base.clone())
+        );
+        assert_eq!(
+            selected_transfer_config(&mac, original.clone(), &controller, false)
+                .unwrap()
+                .remote_base,
+            original.remote_base,
+            "shared mirrors do not silently gain staging semantics"
+        );
+        assert_eq!(
+            selected_transfer_config(&staging_worker(None), original.clone(), &controller, true)
+                .unwrap()
+                .remote_base,
+            original.remote_base,
+            "workers without an override retain the global staging base"
+        );
+
+        for (clean_overlay, source_content_receipt) in [(true, false), (false, true), (true, true)]
+        {
+            let roots = [
+                PathBuf::from(format!("{}/source/job/app", mac_attempt.remote_base)),
+                PathBuf::from(format!("{}/source/job/dependency", mac_attempt.remote_base)),
+            ];
+            let preflight = super::super::ssh::remote_preflight_topology_policy(
+                &controller,
+                clean_overlay,
+                source_content_receipt,
+                &mac_attempt.remote_base,
+                &roots,
+            )
+            .unwrap();
+            assert_eq!(
+                preflight.canonical_root(),
+                Path::new(&mac_attempt.remote_base)
+            );
+            assert_eq!(preflight.alias_root(), preflight.canonical_root());
+            let escaped = [roots[0].clone(), PathBuf::from("/data/projects/dependency")];
+            assert!(
+                super::super::ssh::remote_preflight_topology_policy(
+                    &controller,
+                    clean_overlay,
+                    source_content_receipt,
+                    &mac_attempt.remote_base,
+                    &escaped,
+                )
+                .is_err(),
+                "every dependency must share the selected worker's staging root"
+            );
+        }
+        assert_eq!(
+            pooled_store_base_for(false, None, true, &mac_attempt.remote_base),
+            Some("/Users/builder/.cache/rch")
+        );
+        assert_eq!(
+            pooled_store_base_for(
+                false,
+                Some("/Volumes/build/rch-pools"),
+                true,
+                &mac_attempt.remote_base
+            ),
+            Some("/Volumes/build/rch-pools"),
+            "an explicit target-store policy remains authoritative"
+        );
+    }
+
+    #[test]
+    fn selected_remote_base_maps_offroot_closure_and_project_lanes() {
+        use super::*;
+
+        let controller = PathTopologyPolicy::new(
+            PathBuf::from("/scratch/controller"),
+            PathBuf::from("/scratch/controller.rch-alias"),
+        )
+        .with_off_root(true);
+        let worker = staging_worker(Some("/Users/builder/.cache/rch"));
+        let transfer =
+            selected_transfer_config(&worker, TransferConfig::default(), &controller, false)
+                .expect("off-root source mode uses worker staging automatically");
+        let mut roots = Vec::new();
+        for name in ["app", "dependency"] {
+            let remote = super::super::dependency_closure::map_offroot_sync_root_to_remote_root(
+                &controller.canonical_root().join(name),
+                name,
+                &controller,
+                &transfer.remote_base,
+            )
+            .unwrap();
+            let remote = project_lane_remote_root(&remote, 2);
+            assert!(remote.starts_with("/Users/builder/.cache/rch/offroot/"));
+            assert!(remote.ends_with(&format!("/{name}.rch-lane-2")));
+            roots.push(PathBuf::from(remote));
+        }
+        let preflight = super::super::ssh::remote_preflight_topology_policy(
+            &controller,
+            false,
+            false,
+            &transfer.remote_base,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(preflight.canonical_root(), Path::new(&transfer.remote_base));
+        assert_eq!(preflight.alias_root(), preflight.canonical_root());
+    }
+
+    #[test]
+    fn selected_remote_base_rejects_unsafe_or_windows_overrides_before_ssh() {
+        use super::*;
+
+        let controller = PathTopologyPolicy::default();
+        for invalid in [
+            "/",
+            "/tmp",
+            "~/.cache/rch",
+            "/tmp/rch/../other",
+            "C:/rch",
+            "/tmp/rch\n",
+        ] {
+            assert!(
+                selected_transfer_config(
+                    &staging_worker(Some(invalid)),
+                    TransferConfig::default(),
+                    &controller,
+                    true
+                )
+                .is_err(),
+                "invalid selected staging base {invalid:?}"
+            );
+        }
+        let mut windows = staging_worker(Some("/Users/builder/.cache/rch"));
+        windows.declared_os = Some("windows".into());
+        assert!(
+            selected_transfer_config(&windows, TransferConfig::default(), &controller, true)
+                .is_err()
+        );
+        windows.remote_base = None;
+        assert!(
+            selected_transfer_config(&windows, TransferConfig::default(), &controller, true)
+                .is_ok()
+        );
+    }
+
     fn disk_usage_capture_fixture() -> (super::TransferPipeline, serde_json::Value) {
         use super::*;
 
@@ -5561,6 +5770,7 @@ sys.exit(99)
             host: "fixture.invalid".into(),
             user: "worker".into(),
             identity_file: "/unused/test-key".into(),
+            remote_base: None,
             total_slots: 1,
             priority: 100,
             tags: Vec::new(),
@@ -5768,6 +5978,7 @@ sys.exit(99)
             host: "fixture.invalid".into(),
             user: "worker".into(),
             identity_file: "/unused/test-key".into(),
+            remote_base: None,
             total_slots: 1,
             priority: 100,
             tags: Vec::new(),

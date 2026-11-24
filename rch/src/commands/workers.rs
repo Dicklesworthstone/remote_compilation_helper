@@ -2824,6 +2824,7 @@ mod probe_summary_tests {
             priority: 100,
             tags: Vec::new(),
             tools: Vec::new(),
+            remote_base: None,
         };
         let response = |id: &str, host: &str, user: &str, attempted, live| {
             Ok(WorkerCapabilitiesResponseFromApi {
@@ -3093,6 +3094,7 @@ mod probe_summary_tests {
             priority: 100,
             tags: vec!["rust".to_string()],
             tools: Vec::new(),
+            remote_base: None,
         }
     }
 
