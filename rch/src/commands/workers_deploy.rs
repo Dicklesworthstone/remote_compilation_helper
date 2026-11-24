@@ -447,42 +447,11 @@ pub(super) async fn deploy_via_scp(
             continue;
         }
 
-        // SCP the binary
-        let mut scp_cmd = Command::new("scp");
-        scp_cmd.arg("-o").arg("BatchMode=yes");
-        scp_cmd.arg("-o").arg("ConnectTimeout=30");
-        scp_cmd.arg("-i").arg(&worker.identity_file);
-        if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
-            scp_cmd.args(opts);
-        }
-        scp_cmd.arg(local_binary);
-
-        let remote_target = scp_remote_target(worker, remote_path);
-        scp_cmd.arg(&remote_target);
-
-        let output = scp_cmd.output().await?;
-
-        if output.status.success() {
-            // Make executable
-            let mut chmod_cmd = Command::new("ssh");
-            chmod_cmd.arg("-o").arg("BatchMode=yes");
-            chmod_cmd.arg("-o").arg("ConnectTimeout=10");
-            chmod_cmd.arg("-i").arg(&worker.identity_file);
-            if let Some(opts) = rch_common::ssh_utils::identities_only_args(&worker.identity_file) {
-                chmod_cmd.args(opts);
-            }
-            chmod_cmd.arg(&target);
-            chmod_cmd.arg(remote_chmod_command(remote_path)?);
-
-            let chmod_output = chmod_cmd.output().await?;
-            if !chmod_output.status.success() {
-                failures.push(deploy_failure(remote_path, "chmod", &chmod_output));
-                continue;
-            }
-
-            return Ok(remote_path);
-        } else {
-            failures.push(deploy_failure(remote_path, "scp", &output));
+        // Share the fleet installer's staged checksum/startup checks and
+        // atomic rename. A failed upload must leave the live worker intact.
+        match crate::fleet::copy_binary_via_scp(worker, local_binary, remote_path).await {
+            Ok(()) => return Ok(remote_path),
+            Err(error) => failures.push(format!("{remote_path}: {error:#}")),
         }
     }
 
@@ -503,15 +472,6 @@ pub(super) async fn deploy_via_scp(
 fn remote_mkdir_command(dir: &str) -> Result<String> {
     let escaped_dir = remote_shell_path(dir)?;
     Ok(format!("mkdir -p -- {escaped_dir}"))
-}
-
-fn remote_chmod_command(remote_path: &str) -> Result<String> {
-    let escaped_path = remote_shell_path(remote_path)?;
-    Ok(format!("chmod +x -- {escaped_path}"))
-}
-
-fn scp_remote_target(worker: &WorkerConfig, remote_path: &str) -> String {
-    format!("{}@{}:{remote_path}", worker.user, worker.host)
 }
 
 fn remote_shell_path(path: &str) -> Result<String> {
@@ -589,18 +549,14 @@ mod tests {
             "mkdir -p -- \"$HOME/.local/bin\""
         );
         assert_eq!(
-            remote_chmod_command("~/.local/bin/rch-wkr").expect("chmod command"),
-            "chmod +x -- \"$HOME/.local/bin/rch-wkr\""
-        );
-        assert_eq!(
-            remote_chmod_command("dir with spaces/rch-wkr").expect("chmod command"),
-            "chmod +x -- 'dir with spaces/rch-wkr'"
+            remote_mkdir_command("dir with spaces").expect("mkdir command"),
+            "mkdir -p -- 'dir with spaces'"
         );
     }
 
     #[test]
     fn remote_deploy_shell_commands_reject_control_characters() {
-        let err = remote_chmod_command("bad\npath")
+        let err = remote_mkdir_command("bad\npath")
             .expect_err("control characters should be rejected")
             .to_string();
         assert!(err.contains("control characters"));

@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 pub use audit::{AuditEventType, AuditLogger, DeploymentAuditEntry};
 pub use dry_run::{DryRunResult, PotentialIssue, PredictedAction, WorkerPrediction};
-pub(crate) use executor::run_smoke_worker_scenarios;
+pub(crate) use executor::{copy_binary_via_scp, run_smoke_worker_scenarios};
 pub use executor::{FleetExecutor, FleetResult};
 pub use history::{DeploymentHistoryEntry, HistoryManager};
 pub use plan::{

@@ -527,7 +527,10 @@ impl FleetExecutor {
                     return (idx, worker_id, false, DeploymentStatus::Failed);
                 }
 
-                if let Err(e) = copy_binary_via_scp(&worker_config, &local_binary).await {
+                if let Err(e) =
+                    copy_binary_via_scp(&worker_config, &local_binary, REMOTE_WORKER_BINARY)
+                        .await
+                {
                     progress
                         .worker_failed(&worker_id, &format!("scp failed: {}", e))
                         .await;
@@ -1518,10 +1521,18 @@ async fn ensure_binary_matches_worker(worker: &WorkerConfig, local_binary: &Path
 /// Uploads to a temporary file in the target directory, then atomically renames
 /// it into place. Directly scp'ing onto `rch-wkr` can fail when the worker
 /// binary is currently executing.
-async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Result<()> {
+pub(crate) async fn copy_binary_via_scp(
+    worker: &WorkerConfig,
+    local_binary: &Path,
+    remote_path: &str,
+) -> Result<()> {
     let ssh = SshExecutor::new(worker);
-    let remote_path = REMOTE_WORKER_BINARY;
-    let staging_path = remote_worker_binary_staging_path();
+    let staging_path = remote_worker_binary_staging_path(remote_path);
+    // Freeze the expected bytes before starting SCP. A local rebuild during
+    // transfer must not change which digest the worker is allowed to install.
+    let expected_sha256 = local_file_sha256_hex(local_binary)
+        .map_err(|e| anyhow::anyhow!("hash local binary {}: {}", local_binary.display(), e))?;
+    let finalize_cmd = staged_install_command(&staging_path, remote_path, &expected_sha256)?;
 
     debug!(
         "SCP: {} -> {}@{}:{}",
@@ -1540,9 +1551,6 @@ async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Resu
     // all of that succeeds. `set -e` aborts BEFORE the rename on any failure
     // (truncated/corrupt transfer => checksum mismatch; wrong arch/bad binary
     // => `--version` exec error), so the previously working binary stays live.
-    let expected_sha256 = local_file_sha256_hex(local_binary)
-        .map_err(|e| anyhow::anyhow!("hash local binary {}: {}", local_binary.display(), e))?;
-    let finalize_cmd = staged_install_command(&staging_path, remote_path, &expected_sha256)?;
     let output = ssh
         .run_command(&finalize_cmd)
         .await
@@ -1791,14 +1799,15 @@ async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
     Ok(())
 }
 
-fn remote_worker_binary_staging_path() -> String {
+fn remote_worker_binary_staging_path(remote_path: &str) -> String {
     let counter = STAGED_BINARY_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    let (directory, name) = remote_path.rsplit_once('/').unwrap_or((".", remote_path));
     format!(
-        "~/.local/bin/.rch-wkr.tmp.{}.{}.{}",
+        "{directory}/.{name}.tmp.{}.{}.{}",
         std::process::id(),
         nonce,
         counter
@@ -1833,8 +1842,12 @@ fn staged_install_command(
     }
     Ok(format!(
         "set -e; \
+         [ -f {staged} ] && [ ! -L {staged} ] && [ ! -d {final_path} ] || {{ echo 'invalid worker installation path' >&2; exit 1; }}; \
          chmod +x {staged}; \
-         actual=$(sha256sum {staged} | cut -d' ' -f1); \
+         if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum {staged}); \
+         elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 {staged}); \
+         else echo 'SHA-256 tool unavailable for worker installation' >&2; exit 1; fi; \
+         actual=${{actual%% *}}; \
          [ \"$actual\" = \"{expected_sha256}\" ] || {{ echo \"checksum mismatch: $actual != {expected_sha256}\" >&2; exit 1; }}; \
          {staged} --version >/dev/null 2>&1 || {{ echo \"staged binary failed --version (wrong arch or corrupt)\" >&2; exit 1; }}; \
          mv -f {staged} {final_path}"
@@ -2435,6 +2448,113 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn staged_install_preserves_live_bytes_until_verified_promotion() {
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let old = b"#!/bin/sh\nprintf 'rch-wkr old\\n'\n";
+        let new = b"#!/bin/sh\nprintf 'rch-wkr new\\n'\n";
+        let final_path = directory.path().join("worker with 'quotes");
+        let staged = directory.path().join(".worker-upload");
+        std::fs::write(&final_path, old).unwrap();
+        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(&staged, new).unwrap();
+        let expected = local_file_sha256_hex(&staged).unwrap();
+        let install = |digest: &str| {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(
+                    staged_install_command(
+                        staged.to_str().unwrap(),
+                        final_path.to_str().unwrap(),
+                        digest,
+                    )
+                    .unwrap(),
+                )
+                .output()
+                .unwrap()
+        };
+
+        // A truncated upload and an intact but unusable executable both fail
+        // before the live inode is replaced, including its executable mode.
+        std::fs::write(&staged, &new[..8]).unwrap();
+        assert!(!install(&expected).status.success());
+        std::fs::write(&staged, b"#!/rch-missing-interpreter\n").unwrap();
+        let broken_digest = local_file_sha256_hex(&staged).unwrap();
+        assert!(!install(&broken_digest).status.success());
+        assert_eq!(std::fs::read(&final_path).unwrap(), old);
+        assert_eq!(
+            std::process::Command::new(&final_path)
+                .arg("--version")
+                .output()
+                .unwrap()
+                .stdout,
+            b"rch-wkr old\n"
+        );
+
+        std::fs::write(&staged, new).unwrap();
+        let mut old_reader = std::fs::File::open(&final_path).unwrap();
+        let installed = install(&expected);
+        assert!(installed.status.success(), "{installed:?}");
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), new);
+        let mut original_bytes = Vec::new();
+        old_reader.read_to_end(&mut original_bytes).unwrap();
+        assert_eq!(
+            original_bytes, old,
+            "promotion must replace the inode atomically"
+        );
+        assert_eq!(
+            std::process::Command::new(&final_path)
+                .arg("--version")
+                .output()
+                .unwrap()
+                .stdout,
+            b"rch-wkr new\n"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_install_uses_the_macos_checksum_tool() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let tools = directory.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        // No GNU checksum tool on PATH. All three commands are macOS tools.
+        for (name, source) in [
+            ("chmod", "/bin/chmod"),
+            ("mv", "/bin/mv"),
+            ("shasum", "/usr/bin/shasum"),
+        ] {
+            symlink(source, tools.join(name)).unwrap();
+        }
+        let staged = directory.path().join(".upload");
+        let final_path = directory.path().join("worker");
+        let bytes = b"#!/bin/sh\nprintf 'rch-wkr test\\n'\n";
+        std::fs::write(&staged, bytes).unwrap();
+        let expected = local_file_sha256_hex(&staged).unwrap();
+        let command = staged_install_command(
+            staged.to_str().unwrap(),
+            final_path.to_str().unwrap(),
+            &expected,
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .env("PATH", &tools)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(std::fs::read(&final_path).unwrap(), bytes);
+    }
+
     #[test]
     fn local_file_sha256_matches_known_vector() {
         // SHA-256("") = e3b0c442...; SHA-256("abc") = ba7816bf...
@@ -2584,10 +2704,16 @@ mod tests {
 
     #[test]
     fn remote_worker_binary_staging_path_never_targets_live_binary() {
-        let staging_path = remote_worker_binary_staging_path();
-
-        assert!(staging_path.starts_with("~/.local/bin/.rch-wkr.tmp."));
-        assert_ne!(staging_path, REMOTE_WORKER_BINARY);
+        for (live, prefix) in [
+            (REMOTE_WORKER_BINARY, "~/.local/bin/.rch-wkr.tmp."),
+            ("/usr/local/bin/rch-wkr", "/usr/local/bin/.rch-wkr.tmp."),
+            ("C:/tools/rch-wkr.exe", "C:/tools/.rch-wkr.exe.tmp."),
+        ] {
+            let staging_path = remote_worker_binary_staging_path(live);
+            assert!(staging_path.starts_with(prefix));
+            assert_ne!(staging_path, live);
+            assert_ne!(staging_path, remote_worker_binary_staging_path(live));
+        }
     }
 
     // ========================
