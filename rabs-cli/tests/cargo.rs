@@ -203,6 +203,39 @@ impl Fixture {
         command
     }
 
+    fn worker_command(&self) -> Command {
+        let profile = self.root.join("worker profile.json");
+        new_file(
+            &profile,
+            &serde_json::to_vec(&json!({
+                "version":"canonical-cargo-v1", "source_root":self.source,
+                "toolchain_root":self.toolchain, "operation_root":self.operations,
+                "listen":"127.0.0.1:7443", "worker":"fixture-worker", "worker_spki_sha256":PIN,
+            }))
+            .unwrap(),
+            0o600,
+        );
+        let mut command = Command::new(SUBCOMMAND);
+        command
+            .args(["rabs", "--rabs-canonical"])
+            .arg(&profile)
+            .env("CARGO_RABS_DAEMON", &self.daemon)
+            .env("RABS_CARGO_TEST_REPORT", &self.report)
+            .env("RABS_CARGO_TEST_ORIGINAL", &profile)
+            .stdin(Stdio::null());
+        for key in [
+            "CARGO_RABS_CANONICAL_ACTIVE",
+            "CARGO_RABS_REMOTE_ACTIVE",
+            "RCH_RABS_WORKER_ACTIVE",
+            "CARGO_RABS_ROOT_BUDGET_DIR",
+            "CARGO_RABS_ROOT_CAPACITY",
+            "CARGO_RABS_ROOT_CGROUP",
+        ] {
+            command.env_remove(key);
+        }
+        command
+    }
+
     fn rustup_command(&self, remote: bool) -> Command {
         rewrite_json(if remote { &self.remote } else { &self.local }, |profile| {
             profile.as_object_mut().unwrap().remove("toolchain_root");
@@ -241,10 +274,18 @@ impl Fixture {
     }
 
     fn refused(&self, output: Output) -> String {
+        self.refused_with_prefix(output, "rabs-cargo: refused:")
+    }
+
+    fn refused_subcommand(&self, output: Output) -> String {
+        self.refused_with_prefix(output, "cargo-rabs: refused:")
+    }
+
+    fn refused_with_prefix(&self, output: Output, prefix: &str) -> String {
         assert_eq!(output.status.code(), Some(2), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.contains("rabs-cargo: refused:"), "{stderr}");
+        assert!(stderr.contains(prefix), "{stderr}");
         assert!(!stderr.contains("literal secret fixture"), "{stderr}");
         assert!(
             !self.report.exists(),
@@ -266,6 +307,12 @@ fn native_cargo_driver_fixture() {
         .position(|argument| argument == "--")
         .unwrap();
     let arguments = &arguments[delimiter + 1..];
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--worker-build-tls")
+    {
+        native_worker_cargo_driver_fixture(arguments);
+    }
     assert_eq!(
         arguments.len(),
         2,
@@ -328,6 +375,51 @@ fn native_cargo_driver_fixture() {
             .unwrap();
         panic!("driver signal termination must propagate");
     }
+    std::process::exit(47);
+}
+
+/// Inspect the real frontend's retained direct-worker handoff. This fixture
+/// reads the named source input to verify literal path/bytes only; it does not
+/// claim to perform the worker's immutable capture, sandbox or TLS execution.
+fn native_worker_cargo_driver_fixture(arguments: &[OsString]) -> ! {
+    assert_eq!(arguments.len(), 11);
+    assert_eq!(arguments[1], "--replay-diagnostics");
+    assert_eq!(arguments[2], "--prepare-from");
+    assert_eq!(arguments[5], "127.0.0.1:7443");
+    assert_eq!(arguments[6], "fixture-worker");
+    assert_eq!(arguments[7], PIN);
+    let source = Path::new(&arguments[3]);
+    let retained = Path::new(&arguments[4]);
+    let directory = retained.parent().unwrap();
+    assert_eq!(retained.file_name(), Some(OsStr::new("spec.json")));
+    assert_eq!(
+        fs::symlink_metadata(retained).unwrap().mode() & 0o777,
+        0o400
+    );
+    assert_eq!(
+        fs::symlink_metadata(directory).unwrap().mode() & 0o777,
+        0o700
+    );
+    for (argument, name) in arguments[8..].iter().zip(["bundle", "delivery", "outputs"]) {
+        assert_eq!(Path::new(argument), directory.join(name));
+        assert!(!Path::new(argument).exists());
+    }
+    let spec: Value = serde_json::from_slice(&fs::read(retained).unwrap()).unwrap();
+    let operation: Value =
+        serde_json::from_slice(&fs::read(directory.join("operation.json")).unwrap()).unwrap();
+    assert_eq!(operation["automatic_retry"], false);
+    assert_eq!(operation["publication_authorized"], false);
+    let input = spec["captured_stdin"]["path"]
+        .as_str()
+        .map(|path| fs::read(source.join(path)).unwrap());
+    new_file(
+        Path::new(&std::env::var_os("RABS_CARGO_TEST_REPORT").unwrap()),
+        &serde_json::to_vec(&json!({
+            "spec":spec, "operation":operation, "source_input":input,
+            "pid":std::process::id(), "active":std::env::var("CARGO_RABS_CANONICAL_ACTIVE").unwrap(),
+        })).unwrap(),
+        0o600,
+    );
     std::process::exit(47);
 }
 
@@ -484,6 +576,231 @@ fn cargo_subcommand_canonical_aliases_keep_check_defaults_and_explicit_literal_s
             );
         }
     }
+}
+
+#[test]
+fn cargo_subcommand_inherited_input_keeps_binary_bytes_process_and_literal_tail() {
+    let fixture = Fixture::new();
+    let input = b"\0literal stdin\xff\n";
+    let mut child = fixture
+        .command_using(false, Path::new(SUBCOMMAND))
+        .env("CARGO_RABS_DAEMON", &fixture.daemon)
+        .args([
+            "--rabs-stdin=inherit",
+            "--",
+            "test",
+            "--test",
+            "reader",
+            "--",
+            "--rabs-stdin-file",
+            "",
+            "literal α",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let report = fixture.handed_off(child.wait_with_output().unwrap());
+    assert_eq!(report["pid"], pid);
+    assert_eq!(report["stdin"], json!(input));
+    assert_eq!(report["profile"]["stdin"], "inherit");
+    assert_eq!(
+        report["profile"]["selection"]["test_args"],
+        json!(["--rabs-stdin-file", "", "literal α"])
+    );
+}
+
+#[test]
+fn cargo_subcommand_canonical_input_overrides_saved_policy_for_each_runtime_command() {
+    for remote in [false, true] {
+        for cargo in [
+            vec!["run"],
+            vec!["test"],
+            vec!["nextest", "run", "--test-threads", "2"],
+            vec!["bench"],
+        ] {
+            for captured in [false, true] {
+                let fixture = Fixture::new();
+                if cargo[0] == "nextest" {
+                    new_file(
+                        &fixture.toolchain.join("bin/cargo-nextest"),
+                        b"unused captured runner fixture",
+                        0o700,
+                    );
+                }
+                let original = if remote {
+                    &fixture.remote
+                } else {
+                    &fixture.local
+                };
+                rewrite_json(original, |profile| {
+                    let settings = if remote {
+                        &mut profile["settings"]
+                    } else {
+                        profile
+                    };
+                    if captured {
+                        settings["stdin"] = "inherit".into();
+                    } else {
+                        settings["stdin_file"] = "inputs/old.bin".into();
+                    }
+                });
+                let before = fs::read(original).unwrap();
+                let mut command = fixture.command_using(remote, Path::new(SUBCOMMAND));
+                command.env("CARGO_RABS_DAEMON", &fixture.daemon);
+                if captured {
+                    command.args(["--rabs-stdin-file", "inputs/request.bin"]);
+                } else {
+                    command.arg("--rabs-stdin=closed");
+                }
+                command.arg("--").args(&cargo);
+                let report = fixture.handed_off(command.output().unwrap());
+                let settings = if remote {
+                    &report["profile"]["settings"]
+                } else {
+                    &report["profile"]
+                };
+                assert_eq!(settings["command"], cargo[0]);
+                if cargo[0] == "nextest" {
+                    assert_eq!(settings["selection"]["test_threads"], 2);
+                    assert_eq!(settings["jobs"], 2);
+                }
+                if captured {
+                    assert_eq!(settings["stdin_file"], "inputs/request.bin");
+                    assert!(settings.get("stdin").is_none());
+                } else {
+                    assert_eq!(settings["stdin"], "closed");
+                    assert!(settings.get("stdin_file").is_none());
+                }
+                assert_eq!(fs::read(original).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn cargo_subcommand_worker_captured_input_reaches_the_single_native_handoff() {
+    for cargo in [
+        vec!["run"],
+        vec!["test"],
+        vec!["nextest", "run", "--test-threads", "2"],
+        vec!["bench"],
+    ] {
+        let fixture = Fixture::new();
+        if cargo[0] == "nextest" {
+            new_file(
+                &fixture.toolchain.join("bin/cargo-nextest"),
+                b"unused captured runner fixture",
+                0o700,
+            );
+        }
+        let path = "inputs/request α.bin";
+        let input = b"\0captured source input\xff\n";
+        new_file(&fixture.source.join(path), input, 0o600);
+        let child = fixture
+            .worker_command()
+            .arg(format!("--rabs-stdin-file={path}"))
+            .arg("--")
+            .args(&cargo)
+            .args(["--", "--rabs-stdin=closed", ""])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(47), "{output:?}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("retained worker operation")
+        );
+        let report = fixture.report();
+        assert_eq!(report["pid"], pid);
+        assert_eq!(report["active"], "1");
+        assert_eq!(report["source_input"], json!(input));
+        assert_eq!(report["spec"]["captured_stdin"]["path"], path);
+        assert_eq!(
+            report["spec"]["captured_stdin"]["version"],
+            "source-file-stdin-v1"
+        );
+        let args = report["spec"]["args"].as_array().unwrap();
+        assert_eq!(args[0], cargo[0]);
+        if cargo[0] == "nextest" {
+            assert_eq!(report["spec"]["jobserver_grant"], 1);
+            assert_eq!(report["spec"]["artifacts"]["cargo"]["build_jobs"], 1);
+            assert_eq!(
+                report["spec"]["artifacts"]["cargo"]["selection"]["test_threads"],
+                2
+            );
+        }
+        assert_eq!(
+            &args[args.len() - 3..],
+            &[json!("--"), json!("--rabs-stdin=closed"), json!("")]
+        );
+        assert_eq!(fs::read(fixture.source.join(path)).unwrap(), input);
+        assert_eq!(fs::read_dir(&fixture.operations).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn cargo_subcommand_input_does_not_bypass_native_route_or_execution_restrictions() {
+    for route in ["local", "remote", "worker"] {
+        let mut rejected = vec![
+            vec!["--rabs-stdin", "unknown", "run"],
+            vec!["--rabs-stdin-file", "../outside", "run"],
+            vec!["--rabs-stdin-file", "inputs/request.bin", "check"],
+            vec![
+                "--rabs-stdin-file",
+                "inputs/request.bin",
+                "test",
+                "--no-run",
+            ],
+            vec![
+                "--rabs-stdin-file",
+                "inputs/request.bin",
+                "nextest",
+                "run",
+                "--no-run",
+            ],
+            vec![
+                "--rabs-stdin",
+                "closed",
+                "--rabs-stdin-file",
+                "inputs/request.bin",
+                "run",
+            ],
+            vec!["--", "run", "--rabs-stdin", "closed"],
+        ];
+        if route != "local" {
+            rejected.push(vec!["--rabs-stdin", "inherit", "run"]);
+        }
+        for args in rejected {
+            let fixture = Fixture::new();
+            let mut command = if route == "worker" {
+                fixture.worker_command()
+            } else {
+                fixture.command_using(route == "remote", Path::new(SUBCOMMAND))
+            };
+            command.env("CARGO_RABS_DAEMON", &fixture.daemon).args(args);
+            fixture.refused_subcommand(command.output().unwrap());
+        }
+    }
+    let fixture = Fixture::new();
+    rewrite_json(&fixture.local, |profile| {
+        profile["service_socket"] = json!(fixture.root.join("canonical.sock"));
+    });
+    fixture.refused_subcommand(
+        fixture
+            .command_using(false, Path::new(SUBCOMMAND))
+            .env("CARGO_RABS_DAEMON", &fixture.daemon)
+            .args(["--rabs-stdin", "inherit", "run"])
+            .output()
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -895,9 +1212,7 @@ fn nextest_unknown_runtime_concurrency_refuses_before_native_handoff() {
                 b"unused captured runner fixture",
                 0o700,
             );
-            let stderr = fixture.refused(
-                fixture.command(remote).args(arguments).output().unwrap(),
-            );
+            let stderr = fixture.refused(fixture.command(remote).args(arguments).output().unwrap());
             assert!(
                 stderr.contains("test-threads") || stderr.contains("concurrency"),
                 "{stderr}"
@@ -999,23 +1314,41 @@ fn selected_vendor_intent_reaches_local_and_remote_drivers_unchanged() {
     for remote in [false, true] {
         for binary in [BINARY, SUBCOMMAND] {
             let fixture = Fixture::new();
-            let profile = if remote { &fixture.remote } else { &fixture.local };
+            let profile = if remote {
+                &fixture.remote
+            } else {
+                &fixture.local
+            };
             rewrite_json(profile, |profile| {
-                let settings = if remote { &mut profile["settings"] } else { profile };
+                let settings = if remote {
+                    &mut profile["settings"]
+                } else {
+                    profile
+                };
                 settings["vendor"] = json!("vendor");
                 settings["source_selection"] = json!("cargo-unit-graph-v1");
             });
             let mut command = fixture.command_using(remote, Path::new(binary));
-            command
-                .env("CARGO_RABS_DAEMON", &fixture.daemon)
-                .args(["--", "check", "--package", "selected-package"]);
+            command.env("CARGO_RABS_DAEMON", &fixture.daemon).args([
+                "--",
+                "check",
+                "--package",
+                "selected-package",
+            ]);
             let report = fixture.handed_off(command.output().unwrap());
             let retained = &report["profile"];
-            let settings = if remote { &retained["settings"] } else { retained };
+            let settings = if remote {
+                &retained["settings"]
+            } else {
+                retained
+            };
             assert_eq!(settings["vendor"], "vendor");
             assert_eq!(settings["source_selection"], "cargo-unit-graph-v1");
             assert_eq!(settings["command"], "check");
-            assert_eq!(settings["selection"]["packages"], json!(["selected-package"]));
+            assert_eq!(
+                settings["selection"]["packages"],
+                json!(["selected-package"])
+            );
             assert!(settings.get("cargo_home_source").is_none());
         }
     }

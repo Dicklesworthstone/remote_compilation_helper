@@ -26,9 +26,9 @@ use std::process::ExitCode;
 const HELP: &str = "Run Cargo through native RABS cache preparation or remote execution.
 
 Usage: cargo rabs [OPTIONS] [--] [CARGO ARGS...]
-       cargo rabs --rabs-canonical-local PROFILE [--] [COMMAND ARGS...]
-       cargo rabs --rabs-canonical-remote PROFILE [--] [COMMAND ARGS...]
-       cargo rabs --rabs-canonical PROFILE [--] [COMMAND ARGS...]
+       cargo rabs --rabs-canonical-local PROFILE [INPUT OPTIONS] [--] [COMMAND ARGS...]
+       cargo rabs --rabs-canonical-remote PROFILE [INPUT OPTIONS] [--] [COMMAND ARGS...]
+       cargo rabs --rabs-canonical PROFILE [INPUT OPTIONS] [--] [COMMAND ARGS...]
        cargo rabs --rabs-recover DIRECTORY [RECOVERY OPTIONS]
 
 Options:
@@ -38,6 +38,8 @@ Options:
   --rabs-canonical-local PROFILE   Existing native local canonical driver
   --rabs-canonical-remote PROFILE  Existing pinned-TLS canonical coordinator
   --rabs-canonical PROFILE         Existing direct-worker or daemon-owned pool driver
+  --rabs-stdin closed|inherit      Canonical input policy, before the Cargo command
+  --rabs-stdin-file RELATIVE       Captured source-relative input for canonical execution
   --rabs-recover DIRECTORY         Resume/wait for retained results without recompiling
   -h, --help            Print help without starting any operation
   --version             Print version
@@ -58,6 +60,12 @@ Linux and preserve the native profile, input, retained-result and authentication
 checks. CARGO_RABS_DAEMON selects the native driver. Without an explicit Cargo
 command, canonical local/remote select check and canonical worker selects build.
 Use rabs-cargo when the profile's saved command/selection should be retained.
+Canonical input options override the saved input selection for this invocation.
+Captured input supports run and executing test/nextest/bench; direct workers
+retain the 16 MiB regular-file limit. Inherited input is available only for
+direct local execution with nonterminal stdin. Services and remote workers
+require closed or captured input. Values after the program/test -- separator
+remain literal arguments, including names that resemble launcher options.
 
 Recovery defaults to the saved direct delivery or the same daemon job's wait.
 Select --status, --cancel, --resume-to NEW, --delivery EXISTING, or
@@ -75,7 +83,10 @@ enum Invocation<'a> {
         require_daemon: bool,
     },
     Remote(&'a [OsString]),
-    Canonical(Vec<OsString>),
+    Canonical {
+        arguments: Vec<OsString>,
+        cargo_start: usize,
+    },
     Recover(&'a [OsString]),
 }
 
@@ -93,16 +104,56 @@ fn parse(arguments: &[OsString]) -> Result<Invocation<'_>, &'static str> {
             .get(1)
             .filter(|value| !value.is_empty() && !value.as_encoded_bytes().starts_with(b"-"))
             .ok_or("canonical mode requires a profile path")?;
-        let cargo = arguments[2..]
+        let mut translated = vec![mode.0.into(), profile.clone()];
+        let mut at = 2;
+        let mut input_selected = false;
+        while let Some(argument) = arguments.get(at) {
+            let (name, inline) = argument
+                .to_str()
+                .and_then(|value| value.split_once('='))
+                .map_or((argument.as_os_str(), None), |(name, value)| {
+                    (std::ffi::OsStr::new(name), Some(value))
+                });
+            let native = match name.to_str() {
+                Some("--rabs-stdin") => "--stdin",
+                Some("--rabs-stdin-file") => "--stdin-file",
+                _ => break,
+            };
+            if input_selected {
+                return Err("select canonical stdin or stdin-file only once");
+            }
+            input_selected = true;
+            if let Some(value) = inline {
+                if value.is_empty() {
+                    return Err("canonical input option requires a nonempty value");
+                }
+                translated.push(format!("{native}={value}").into());
+            } else {
+                at += 1;
+                let value = arguments
+                    .get(at)
+                    .filter(|value| {
+                        !value.is_empty() && !value.as_encoded_bytes().starts_with(b"-")
+                    })
+                    .ok_or("canonical input option requires a value")?;
+                translated.extend([native.into(), value.clone()]);
+            }
+            at += 1;
+        }
+        let cargo = arguments[at..]
             .strip_prefix(&[OsString::from("--")])
-            .unwrap_or(&arguments[2..]);
-        let mut translated = vec![mode.0.into(), profile.clone(), "--".into()];
+            .unwrap_or(&arguments[at..]);
+        translated.push("--".into());
+        let cargo_start = translated.len();
         if cargo.is_empty() {
             translated.push(mode.1.into());
         } else {
             translated.extend_from_slice(cargo);
         }
-        return Ok(Invocation::Canonical(translated));
+        return Ok(Invocation::Canonical {
+            arguments: translated,
+            cargo_start,
+        });
     }
     if arguments
         .first()
@@ -208,11 +259,14 @@ fn run(arguments: &[OsString]) -> Result<(), String> {
                 Err("RCH remote dispatch requires Linux or macOS".into())
             }
         }
-        Invocation::Canonical(arguments) => {
+        Invocation::Canonical {
+            arguments,
+            cargo_start,
+        } => {
             // Canonical selectors have their own literal program delimiter;
             // no second frontend mode may reach their Cargo selector parser.
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            cargo_rch::reject_frontend_controls(&arguments[3..])
+            cargo_rch::reject_frontend_controls(&arguments[cargo_start..])
                 .map_err(|error| error.to_string())?;
             #[cfg(target_os = "linux")]
             {
@@ -229,7 +283,7 @@ fn run(arguments: &[OsString]) -> Result<(), String> {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = arguments;
+                let _ = (arguments, cargo_start);
                 Err("canonical Cargo operations require Linux".into())
             }
         }
@@ -293,9 +347,87 @@ mod tests {
                 input.extend(arguments(&trailing));
                 assert_eq!(
                     parse(&input).unwrap(),
-                    Invocation::Canonical(arguments(&[native, "profile.json", "--", command,]))
+                    Invocation::Canonical {
+                        arguments: arguments(&[native, "profile.json", "--", command]),
+                        cargo_start: 3,
+                    }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn canonical_input_options_reach_native_validation_without_consuming_cargo_data() {
+        for (alias, native, default) in [
+            ("--rabs-canonical-local", "--local", "check"),
+            ("--rabs-canonical-remote", "--remote", "check"),
+            ("--rabs-canonical", "--worker", "build"),
+        ] {
+            for (public, value, translated, inline) in [
+                ("--rabs-stdin", "closed", "--stdin", false),
+                (
+                    "--rabs-stdin-file",
+                    "inputs/request α.bin",
+                    "--stdin-file",
+                    false,
+                ),
+                ("--rabs-stdin-file", "-request.bin", "--stdin-file", true),
+                ("--rabs-stdin-file", "--", "--stdin-file", true),
+            ] {
+                let mut input = arguments(&[alias, "profile.json"]);
+                let mut expected = arguments(&[native, "profile.json"]);
+                if inline {
+                    input.push(format!("{public}={value}").into());
+                    expected.push(format!("{translated}={value}").into());
+                } else {
+                    input.extend(arguments(&[public, value]));
+                    expected.extend(arguments(&[translated, value]));
+                }
+                let cargo = arguments(&["+nightly", "run", "--", "--rabs-stdin", "", "α β"]);
+                input.push("--".into());
+                input.extend_from_slice(&cargo);
+                expected.push("--".into());
+                let cargo_start = expected.len();
+                expected.extend(cargo);
+                assert_eq!(
+                    parse(&input).unwrap(),
+                    Invocation::Canonical {
+                        arguments: expected.clone(),
+                        cargo_start,
+                    }
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    let cargo_cli::Invocation::Run(options) = cargo_cli::parse(&expected).unwrap()
+                    else {
+                        panic!("expected native operation");
+                    };
+                    let (_, selection) = options.selected.unwrap();
+                    assert_eq!(selection.run_args, ["--rabs-stdin", "", "α β"]);
+                    assert_eq!(options.toolchain.as_deref(), Some("nightly"));
+                    match options.input.unwrap() {
+                        cargo_cli::Input::Policy(policy) => {
+                            assert_eq!(policy, rabs_sandbox::cargo_check::CompilationStdin::Closed)
+                        }
+                        cargo_cli::Input::File(path) => assert_eq!(path, value),
+                    }
+                }
+            }
+            let input = arguments(&[alias, "profile.json", "--rabs-stdin", "closed", "--"]);
+            assert_eq!(
+                parse(&input).unwrap(),
+                Invocation::Canonical {
+                    arguments: arguments(&[
+                        native,
+                        "profile.json",
+                        "--stdin",
+                        "closed",
+                        "--",
+                        default
+                    ]),
+                    cargo_start: 5,
+                }
+            );
         }
     }
 
@@ -309,6 +441,33 @@ mod tests {
             vec!["--rabs-canonical"],
             vec!["--rabs-canonical-remote", "--"],
             vec!["--rabs-unknown"],
+            vec!["--rabs-stdin", "closed", "run"],
+            vec!["--rabs-remote", "--rabs-stdin-file", "input", "run"],
+            vec!["--rabs-canonical", "p.json", "--rabs-stdin"],
+            vec!["--rabs-canonical", "p.json", "--rabs-stdin=", "run"],
+            vec![
+                "--rabs-canonical",
+                "p.json",
+                "--rabs-stdin-file",
+                "--",
+                "run",
+            ],
+            vec![
+                "--rabs-canonical",
+                "p.json",
+                "--rabs-stdin",
+                "closed",
+                "--rabs-stdin-file",
+                "input",
+                "run",
+            ],
+            vec![
+                "--rabs-canonical",
+                "p.json",
+                "--rabs-stdin-file=input",
+                "--rabs-stdin=closed",
+                "run",
+            ],
         ] {
             assert!(parse(&arguments(&input)).is_err(), "{input:?}");
         }

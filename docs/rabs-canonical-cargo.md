@@ -95,6 +95,28 @@ options cannot combine with remote or canonical modes.
 
 The canonical aliases retain their established no-command defaults: `check` for
 local/shared-coordinator profiles and `build` for a direct worker profile.
+
+Canonical input controls follow the profile path and precede the Cargo command
+or its launcher `--`. Use `--rabs-stdin closed`, `--rabs-stdin inherit`, or
+`--rabs-stdin-file RELATIVE`; each also accepts `=VALUE`. They select the same
+native input policy as `rabs-cargo --stdin` and `--stdin-file`, overriding the
+saved input selection only for the retained invocation. The original profile
+is unchanged. For example:
+
+```sh
+cargo rabs --rabs-canonical WORKER.json --rabs-stdin-file inputs/request.bin -- run --bin application
+cargo rabs --rabs-canonical-remote REMOTE.json --rabs-stdin closed -- test --workspace
+cargo rabs --rabs-canonical-local LOCAL.json --rabs-stdin inherit -- run --bin application < request.bin
+```
+
+Captured input supports `run` and executing `test`, `nextest run`, or `bench`.
+The file path is relative to the profile's source root; direct workers retain
+their regular-file and 16 MiB limit. Inherited input requires direct local
+execution and a pipe, file or `/dev/null`, not a terminal. Services, shared
+coordinators and workers require closed or captured input. Select only one
+input option before the Cargo command. Arguments after Cargo's program/test
+`--` remain literal, including `--rabs-stdin` and `--rabs-stdin-file`.
+
 `--rabs-recover` performs the existing result-only recovery/wait using the saved
 operation identity. It never submits another build. The standalone
 `rabs-recover` command continues to default to inspection.
