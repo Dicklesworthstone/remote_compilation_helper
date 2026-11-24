@@ -1060,10 +1060,20 @@ fn validate_named_example(artifact: &CompilerArtifact) -> Result<()> {
                 _ => anyhow::bail!("unsupported crate type for library example: {kind}"),
             };
             anyhow::ensure!(
-                artifact.filenames.iter().any(|name| Path::new(name)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| extensions.contains(&ext))),
+                artifact.filenames.iter().any(|name| {
+                    // Windows emits an import archive alongside a DLL. Both
+                    // MSVC and GNU use an archive extension for that sidecar.
+                    let path = Path::new(name);
+                    let import_archive = path
+                        .file_stem()
+                        .and_then(|stem| Path::new(stem).extension())
+                        .and_then(|inner| inner.to_str())
+                        .is_some_and(|inner| inner.eq_ignore_ascii_case("dll"));
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| extensions.contains(&ext))
+                        && !(kind == "staticlib" && import_archive)
+                }),
                 "Cargo library example is missing its {kind} output"
             );
         }
@@ -3168,6 +3178,20 @@ mod tests {
             let mut bad = library.clone();
             bad["target"]["crate_types"] = types;
             assert!(validate(&[bad]).is_err());
+        }
+        for (import, archive) in [
+            ("sample.dll.lib", "sample.lib"),
+            ("libsample.dll.a", "libsample.a"),
+        ] {
+            let mut mixed = library.clone();
+            mixed["target"]["crate_types"] = json!(["cdylib", "staticlib"]);
+            let dll = "/target/debug/examples/sample.dll";
+            let import = format!("/target/debug/examples/{import}");
+            let archive = format!("/target/debug/examples/{archive}");
+            mixed["filenames"] = json!([dll, import]);
+            assert!(validate(std::slice::from_ref(&mixed)).is_err());
+            mixed["filenames"] = json!([dll, import, archive]);
+            assert!(validate(&[mixed]).is_ok());
         }
         let empty = BTreeMap::new();
         let binding = json!({});

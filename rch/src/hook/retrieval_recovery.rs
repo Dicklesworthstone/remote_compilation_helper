@@ -13894,7 +13894,11 @@ func TestValue(t *testing.T) {{
         } else {
             (local.clone(), remote.clone(), Path::new("target/lean"))
         };
-        let command = "cargo build --bin app --bin helper --profile lean --message-format=json";
+        let command = if bundle {
+            "cargo build --bin app --bin helper --example plugin --profile lean --message-format=json"
+        } else {
+            "cargo build --bin app --bin helper --profile lean --message-format=json"
+        };
         session.recipe.project_root = local;
         session.recipe.transfer.retrieval_staging_dir = Some(directory.join("retrieval"));
         session.recipe.kind = Some(CompilationKind::CargoBuild);
@@ -13960,6 +13964,17 @@ func TestValue(t *testing.T) {{
             stdout.extend(serde_json::to_vec(&record).unwrap());
             stdout.push(b'\n');
         }
+        let library = output_relative.join("examples/libplugin.a");
+        if bundle {
+            let record = serde_json::json!({
+                "reason": "compiler-artifact",
+                "target": {"name": "plugin", "kind": ["example"], "crate_types": ["staticlib"]},
+                "profile": {"test": false}, "manifest_path": remote.join("Cargo.toml"),
+                "filenames": [output_remote.join(&library)], "executable": null, "fresh": true
+            });
+            stdout.extend(serde_json::to_vec(&record).unwrap());
+            stdout.push(b'\n');
+        }
         stdout.extend_from_slice(b"{\"reason\":\"build-finished\",\"success\":true}\n");
         session
             .install_complete_cargo_evidence(&crate::transfer::CargoArtifactEvidence {
@@ -13994,6 +14009,8 @@ func TestValue(t *testing.T) {{
             std::fs::write(stage.join(output_relative).join(name), name.as_bytes()).unwrap();
         }
         if bundle {
+            std::fs::create_dir_all(stage.join(output_relative).join("examples")).unwrap();
+            std::fs::write(stage.join(library), b"static library bytes").unwrap();
             let root = stage.join(output_relative).join("app.dSYM");
             std::fs::create_dir_all(root.join("Contents/Resources/DWARF")).unwrap();
             std::fs::write(root.join("Contents/Info.plist"), b"bundle metadata").unwrap();
@@ -14025,7 +14042,9 @@ func TestValue(t *testing.T) {{
             session.returned(0).unwrap();
             let stdout = session.caller_cargo_json().await.unwrap();
             let delivery = session.recipe.caller_delivery.clone().unwrap();
-            assert_eq!(delivery.files.len(), 4);
+            assert_eq!(delivery.files.len(), 5);
+            let library = bundle.parent().unwrap().join("examples/libplugin.a");
+            assert!(delivery.files.contains_key(&library));
             assert!(!delivery.files.contains_key(&bundle));
             for line in std::str::from_utf8(&stdout).unwrap().lines() {
                 let record: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -14035,6 +14054,16 @@ func TestValue(t *testing.T) {{
                         filenames.contains(&serde_json::json!(delivery.output_root.join(&bundle)))
                     );
                     assert!(delivery.output_root.join(&bundle).is_dir());
+                } else if record["target"]["name"] == "plugin" {
+                    assert!(record["executable"].is_null());
+                    assert_eq!(
+                        record["filenames"],
+                        serde_json::json!([delivery.output_root.join(&library)])
+                    );
+                    assert_eq!(
+                        record["rch"]["file_blake3"][library.to_str().unwrap()],
+                        blake3::hash(b"static library bytes").to_hex().to_string()
+                    );
                 }
             }
             session.persist_tree_retirement(Some(true)).unwrap();
@@ -14052,6 +14081,10 @@ func TestValue(t *testing.T) {{
                 recover_job_cargo_json(&recovered.writer).await.unwrap();
             assert_eq!(exit, 0);
             assert_eq!(recovered_stdout.as_deref(), Some(stdout.as_slice()));
+            assert_eq!(
+                std::fs::read(delivery.output_root.join(&library)).unwrap(),
+                b"static library bytes"
+            );
             assert_eq!(
                 std::fs::read(
                     delivery
