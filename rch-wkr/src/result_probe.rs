@@ -62,6 +62,25 @@ fn run(arguments: &[String]) -> Result<String> {
     if arguments == ["probe"] {
         return Ok(PROBE_REPLY.to_owned());
     }
+    if let [operation, path, token] = arguments
+        && operation == "path-status"
+    {
+        ensure!(
+            Path::new(path).is_absolute() && !path.chars().any(char::is_control),
+            "artifact root must be an absolute Unix path"
+        );
+        validate_token(token)?;
+        // A trailing slash would make lstat follow a final symlink. A dangling
+        // link still occupies the artifact path and cannot authorize retirement.
+        let path = path.trim_end_matches('/');
+        let path = if path.is_empty() { "/" } else { path };
+        let state = match std::fs::symlink_metadata(path) {
+            Ok(_) => "present",
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent",
+            Err(error) => return Err(error.into()),
+        };
+        return Ok(format!("{token}:{state}"));
+    }
     ensure!(
         arguments.len() == 3,
         "expected source root, result path and token"
@@ -89,6 +108,11 @@ fn validate(root: &str, relative: &str, token: &str) -> Result<()> {
                 .all(|part| !matches!(part, "" | "." | "..")),
         "invalid admitted result path"
     );
+    validate_token(token)
+}
+
+#[cfg(unix)]
+fn validate_token(token: &str) -> Result<()> {
     ensure!(
         !token.is_empty() && token.len() <= 256 && !token.chars().any(char::is_control),
         "invalid result receipt token"

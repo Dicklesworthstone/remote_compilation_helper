@@ -1398,13 +1398,33 @@ pub(crate) fn remote_timeout_kill_script(pgid_file: &str, build_id: u64) -> Stri
     )
 }
 
-/// Prints `RCH_PATH_ABSENT` only when `path` does not exist, not even as a
-/// dangling symlink.
-fn remote_path_probe_script(path: &str) -> String {
-    let quoted = escape(Cow::from(path));
+/// Keep the portable affirmative check for old workers. A negative shell test
+/// conflates ENOENT with permissions and I/O failures, so only the native
+/// worker's errno-aware lookup may prove that the artifact tree is gone.
+fn remote_path_probe_script(path: &str, token: &str) -> String {
     format!(
-        "if [ -e {quoted} ] || [ -L {quoted} ]; then echo RCH_PATH_PRESENT; else echo RCH_PATH_ABSENT; fi"
+        r#"if [ -e {path} ] || [ -L {path} ]; then printf '%s:present\n' {token}; exit 0; fi
+{locate}
+rch_wkr_locate || exit 73
+exec "$RCH_WKR" result-directory path-status {path} {token}"#,
+        path = escape(Cow::from(path)),
+        token = escape(Cow::from(token)),
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
     )
+}
+
+fn parse_remote_path_probe(output: &std::process::Output, token: &str) -> Result<bool> {
+    anyhow::ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "cannot confirm remote artifact path status; check worker access and rch-wkr version"
+    );
+    if output.stdout == format!("{token}:absent\n").as_bytes() {
+        Ok(true)
+    } else if output.stdout == format!("{token}:present\n").as_bytes() {
+        Ok(false)
+    } else {
+        anyhow::bail!("unexpected remote artifact path receipt")
+    }
 }
 
 /// A worker whose canonical source roots hold editors' checkouts (a host that
@@ -9875,7 +9895,8 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
             // No POSIX probe there; never claim absence.
             return Ok(false);
         }
-        let script = remote_path_probe_script(path);
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let script = remote_path_probe_script(path, &token);
         let mut command = self.worker_ssh_command_with_activity(
             worker,
             &["sh", "-c", &escape(Cow::from(script.as_str()))],
@@ -9883,12 +9904,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         );
         command.kill_on_drop(true);
         let output = tokio::time::timeout(Duration::from_secs(20), command.output()).await??;
-        anyhow::ensure!(output.status.success(), "remote path probe failed");
-        match String::from_utf8_lossy(&output.stdout).trim() {
-            "RCH_PATH_ABSENT" => Ok(true),
-            "RCH_PATH_PRESENT" => Ok(false),
-            other => anyhow::bail!("unexpected remote path probe output: {other:?}"),
-        }
+        parse_remote_path_probe(&output, &token)
     }
 
     fn remote_tree_retirement_command(root: &str) -> String {
@@ -13315,28 +13331,62 @@ esac
 
     #[test]
     fn remote_path_probe_reports_absence_only_for_missing_paths() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
         let dir = tempfile::tempdir().unwrap();
-        let present = dir.path().join("pool with space");
-        std::fs::create_dir(&present).unwrap();
-        let dangling = dir.path().join("dangling");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
-        let probe = |path: &std::path::Path| {
-            let output = std::process::Command::new("sh") // ubs:ignore — fixed probe over this test's temporary paths
+        let existing = dir.path().join("pool with 'quotes");
+        std::fs::create_dir(&existing).unwrap();
+        let worker = native_control_worker_for_test();
+        let unavailable = dir.path().join("worker-not-installed");
+        let observe = |path: &Path, binary: &Path| {
+            let output = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(remote_path_probe_script(path.to_str().unwrap()))
+                .arg(remote_path_probe_script(
+                    path.to_str().unwrap(),
+                    "probe-token",
+                ))
+                .env("RCH_WKR_BIN", binary)
                 .output()
                 .unwrap();
-            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            parse_remote_path_probe(&output, "probe-token")
         };
-        assert_eq!(probe(&present), "RCH_PATH_PRESENT");
-        assert_eq!(probe(&dir.path().join("gone")), "RCH_PATH_ABSENT");
-        #[cfg(unix)]
-        assert_eq!(
-            probe(&dangling),
-            "RCH_PATH_PRESENT",
-            "a dangling link is not absence"
-        );
+        assert!(!observe(&existing, &unavailable).unwrap());
+        // A successful SSH exit alone cannot bind an observation to this probe.
+        let mut wrong = std::process::Command::new("true").output().unwrap();
+        wrong.stdout = b"another-token:absent\n".to_vec();
+        assert!(parse_remote_path_probe(&wrong, "probe-token").is_err());
+        wrong.stdout = b"probe-token:absent\n".to_vec();
+        wrong.stderr = b"lookup failed".to_vec();
+        assert!(parse_remote_path_probe(&wrong, "probe-token").is_err());
+        let missing = dir.path().join("missing-parent/output");
+        assert!(observe(&missing, &worker).unwrap());
+        assert!(observe(&missing, &unavailable).is_err());
+        let dangling = dir.path().join("dangling");
+        symlink("missing", &dangling).unwrap();
+        assert!(!observe(&dangling, &unavailable).unwrap());
+
+        let looped = dir.path().join("loop");
+        symlink("loop", &looped).unwrap();
+        assert!(observe(&looped.join("output"), &worker).is_err());
+        let regular = dir.path().join("file");
+        std::fs::write(&regular, "not a parent").unwrap();
+        assert!(observe(&regular.join("output"), &worker).is_err());
+
+        let output = existing.join("retained-output");
+        std::fs::write(&output, "still here").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Privileged test runners can search a mode-000 directory.
+        let can_read = std::fs::symlink_metadata(&output).is_ok();
+        let receipt = observe(&output, &worker);
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if can_read {
+            assert!(!receipt.unwrap());
+        } else {
+            assert!(
+                receipt.is_err(),
+                "an inaccessible output must retain ownership"
+            );
+        }
     }
 
     #[test]
