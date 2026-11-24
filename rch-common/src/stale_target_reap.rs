@@ -706,8 +706,10 @@ __gc_source_begin() {
 ///
 /// `on_guard_exit` is the `sh` fragment run before `exit 0` on every guard
 /// bail-out (e.g. printing an empty metrics line so callers always parse a
-/// result). The `find … > file` + `while read … < file` shape (instead of a
-/// pipe) keeps the caller's loop in the parent shell so counters survive.
+/// result). An incomplete discovery instead exits nonzero before any pass or
+/// successful metrics. Complete argv paths are validated before entering the
+/// line-oriented candidate list. The `find … > file` + `while read … < file`
+/// shape keeps the caller's loop in the parent shell so counters survive.
 /// Depth to scan under the worker's tmp base for dot-prefixed reap-class dirs.
 ///
 /// rch stages pooled/per-job targets at
@@ -925,6 +927,17 @@ fn find_name_alternatives(names: &[&str]) -> String {
         .join(" -o ")
 }
 
+/// Validate complete `find -exec` argv paths before writing line records.
+/// Checking after `find -print` cannot distinguish an embedded newline from
+/// another candidate, including an absolute path outside every scan root.
+/// `$0` is the caller's diagnostic marker, never a discovered path.
+const DISCOVERY_PATH_RECORDS: &str = r#"__discover='__cr=$(printf "\r")
+for candidate do
+    case "$candidate" in *"
+"*|*"$__cr"*) printf "%s\n" "$0" >&2; exit 1;; esac
+    printf "%s\n" "$candidate" || exit 1
+done'; "#;
+
 /// `names` is every directory basename ANY pass of this script will look at.
 /// The tree is walked once for all of them (bd-2bsz0): a depth-8 walk of a
 /// worker's mirror root took 350-440 s with a cold dentry cache, and the
@@ -942,18 +955,33 @@ fn candidate_discovery_preamble(bases: &[&str], on_guard_exit: &str, names: &[&s
         .join(" ");
     format!(
         "set -u; \
+         __lf='\n'; __cr=$(printf '\\r'); \
          {tmp_base_prelude}; \
          __tmpbase=\"${{{tmp_base_var}}}\"; \
+         case \"$__tmpbase\" in *\"$__lf\"*|*\"$__cr\"*) printf 'RCH_GC_DISCOVERY_INCOMPLETE invalid-temp-root\\n' >&2; exit 1;; esac; \
          __tmpscan=\"\"; \
-         case \"$__tmpbase\" in /*/*) __tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P) || __tmpscan=\"\";; esac; \
+         case \"$__tmpbase\" in /*/*) \
+           if __tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P && printf '.'); then \
+             __tmpscan=${{__tmpscan%.}}; __tmpscan=${{__tmpscan%\"$__lf\"}}; \
+           else __tmpscan=\"\"; fi;; esac; \
+         case \"$__tmpscan\" in *\"$__lf\"*|*\"$__cr\"*) printf 'RCH_GC_DISCOVERY_INCOMPLETE invalid-temp-root\\n' >&2; exit 1;; esac; \
          case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac; \
+         if [ -n \"$__tmpscan\" ] && [ ! \"$__tmpbase\" -ef \"$__tmpscan\" ]; then \
+           printf 'RCH_GC_DISCOVERY_INCOMPLETE changed-temp-root\\n' >&2; exit 1; fi; \
          {gates}\
          __all=$(rch_gc_mktemp) || {{ {cleanup}{on_guard_exit}exit 0; }}; \
+         __gc_discovery_failed() {{ \
+           printf 'RCH_GC_DISCOVERY_INCOMPLETE\\n' >&2; \
+           rm -f \"$__all\"; {cleanup}exit 1; \
+         }}; \
+         {DISCOVERY_PATH_RECORDS}\
          __gc_resolved_roots=\"\"; __gc_select_root=\"\"; \
          for base in {bases}; do \
            printf 'RCH_GC_ROOT base %s\\n' \"$base\"; \
            if [ ! -d \"$base\" ]; then printf 'RCH_GC_ROOT_SKIPPED %s missing\\n' \"$base\"; continue; fi; \
-           __rt=$(cd \"$base\" 2>/dev/null && pwd -P) || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; continue; }}; \
+           __rt=$(cd \"$base\" 2>/dev/null && pwd -P && printf '.') || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; continue; }}; \
+           __rt=${{__rt%.}}; __rt=${{__rt%\"$__lf\"}}; \
+           case \"$__rt\" in *\"$__lf\"*|*\"$__cr\"*) __gc_discovery_failed;; esac; \
            [ -n \"$__rt\" ] || {{ printf 'RCH_GC_ROOT_SKIPPED %s unresolvable\\n' \"$base\"; continue; }}; \
            case \"$__rt\" in */*/*) ;; *) printf 'RCH_GC_ROOT_SKIPPED %s too-shallow\\n' \"$base\"; continue;; esac; \
            case \"$__rt\" in *[!A-Za-z0-9/._-]*|*..*) printf 'RCH_GC_ROOT_SKIPPED %s unsafe-resolved\\n' \"$base\"; continue;; esac; \
@@ -961,11 +989,19 @@ fn candidate_discovery_preamble(bases: &[&str], on_guard_exit: &str, names: &[&s
            printf 'RCH_GC_ROOT resolved %s\\n' \"$__rt\"; \
            case \" $__gc_resolved_roots \" in *\" $__rt \"*) continue;; esac; \
            __gc_resolved_roots=\"$__gc_resolved_roots $__rt\"; \
-           find \"$__rt\" -maxdepth 8 -type d \\( {name_alternatives} \\) -prune 2>/dev/null >> \"$__all\"; \
+           if ! find \"$__rt\" -maxdepth 8 -type d \\( {name_alternatives} \\) -prune \
+             -exec sh -c \"$__discover\" RCH_GC_DISCOVERY_INVALID_PATH {{}} + >> \"$__all\"; \
+           then __gc_discovery_failed; fi; \
          done; \
          printf 'RCH_GC_ROOT tmp %s\\n' \"$__tmpscan\"; \
-         if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune 2>/dev/null >> \"$__all\"; \
-           find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( {name_alternatives} \\) -prune 2>/dev/null >> \"$__all\"; fi; \
+         if [ -n \"$__tmpscan\" ]; then \
+           if ! find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune \
+             -exec sh -c \"$__discover\" RCH_GC_DISCOVERY_INVALID_PATH {{}} + >> \"$__all\"; \
+           then __gc_discovery_failed; fi; \
+           if ! find \"$__tmpscan\" -maxdepth {TMPBASE_MAXDEPTH} -type d \\( {name_alternatives} \\) -prune \
+             -exec sh -c \"$__discover\" RCH_GC_DISCOVERY_INVALID_PATH {{}} + >> \"$__all\"; \
+           then __gc_discovery_failed; fi; \
+         fi; \
          {dedup}\
          {SELECT_CANDIDATES}\
          __tmpf=$(rch_gc_mktemp) || {{ rm -f \"$__all\"; {cleanup}{on_guard_exit}exit 0; }}; \
@@ -1013,8 +1049,9 @@ pub const MIN_POOLED_IDLE_MINUTES: u64 = 24 * 60;
 /// Build the worker-wide sweep script shared by the daemon's periodic reaper
 /// (`rchd::stale_target_reap`) and the on-demand `rch gc` — one builder so the
 /// two can never drift (bead 6dj11). Applies [`reap_loop_body`] to every
-/// candidate from [`candidate_discovery_preamble`] and always prints a final
-/// `RCH_WORKER_REAP_METRICS removed=<n> freed_kb=<kb>` line.
+/// candidate from [`candidate_discovery_preamble`] and prints a final
+/// `RCH_WORKER_REAP_METRICS removed=<n> freed_kb=<kb>` line after a complete
+/// discovery. Incomplete discovery aborts before any reclamation or metrics.
 ///
 /// `pooled_idle_minutes` adds a SECOND pass over the pooled
 /// `.rch-target-*-pool-*` dirs with its own (much longer) idle window —
@@ -1643,22 +1680,15 @@ __all=$(mktemp) || exit 1
 __unique=$(mktemp) || {{ rm -f "$__all"; exit 1; }}
 trap 'rm -f "$__all" "$__unique"' EXIT
 trap 'exit 1' HUP INT TERM
-# Check complete argv paths before entering the line-oriented report protocol.
-# A newline in a directory name must never forge a second inventory entry.
-__discover='__cr=$(printf "\r")
-for candidate do
-    case "$candidate" in *"
-"*|*"$__cr"*) printf "RCH_WINDOWS_INVENTORY_INVALID_PATH\n" >&2; exit 1;; esac
-    printf "%s\n" "$candidate" || exit 1
-done'
+{discovery}
 if [ -n "$__rt" ]; then
-    if ! find "$__rt" -maxdepth 8 -type d \( {names} \) -prune -exec sh -c "$__discover" sh {{}} + > "$__all"; then
+    if ! find "$__rt" -maxdepth 8 -type d \( {names} \) -prune -exec sh -c "$__discover" RCH_WINDOWS_INVENTORY_INVALID_PATH {{}} + > "$__all"; then
         printf 'RCH_WINDOWS_INVENTORY_INCOMPLETE %s\n' "$__rt" >&2
         exit 1
     fi
 fi
 if [ "$__tmpscan" != "$__rt" ]; then
-    if ! find "$__tmpscan" -maxdepth {TMPBASE_MAXDEPTH} -type d \( {names} \) -prune -exec sh -c "$__discover" sh {{}} + >> "$__all"; then
+    if ! find "$__tmpscan" -maxdepth {TMPBASE_MAXDEPTH} -type d \( {names} \) -prune -exec sh -c "$__discover" RCH_WINDOWS_INVENTORY_INVALID_PATH {{}} + >> "$__all"; then
         printf 'RCH_WINDOWS_INVENTORY_INCOMPLETE %s\n' "$__tmpscan" >&2
         exit 1
     fi
@@ -1681,6 +1711,7 @@ done < "$__unique"
 "#,
         temp_base = crate::gc_roots::remote_cargo_home_base_prelude(),
         temp_var = crate::gc_roots::RCH_CARGO_HOME_BASE_VAR,
+        discovery = DISCOVERY_PATH_RECORDS,
         metadata = ENUMERATE_METADATA_FRAGMENT,
     ))
 }
@@ -3016,6 +3047,227 @@ exec /usr/bin/find "$@"
         }
     }
 
+    #[cfg(unix)]
+    fn posix_inventory_fixture() -> tempfile::TempDir {
+        // Keep forged absolute paths within the production depth bounds even
+        // when the host TMPDIR is a deep staging tree or macOS /var/folders.
+        tempfile::Builder::new()
+            .prefix("rch-gc-framing-")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn posix_inventory_fixture_output(
+        directory: &std::path::Path,
+        base: &std::path::Path,
+        temp: &std::path::Path,
+        find_wrapper: Option<&str>,
+    ) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = directory.join("inventory-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let script = directory.join("inventory.sh");
+        std::fs::write(
+            &script,
+            enumerate_targets_command_for_roots(&[base.to_str().unwrap().to_owned()]).unwrap(),
+        )
+        .unwrap();
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg(&script)
+            .current_dir(directory)
+            .env("TMPDIR", temp)
+            .env("RCH_GC_SCRATCH", scratch)
+            .env("RCH_WKR_BIN", "/absent/rch-wkr")
+            .env("LC_ALL", "C");
+        if let Some(wrapper) = find_wrapper {
+            let tools = directory.join("tools");
+            std::fs::create_dir_all(&tools).unwrap();
+            let find = tools.join("find");
+            std::fs::write(&find, wrapper).unwrap();
+            std::fs::set_permissions(&find, std::fs::Permissions::from_mode(0o755)).unwrap();
+            command.env("PATH", format!("{}:/usr/bin:/bin", tools.display()));
+        }
+        command.output().expect("run POSIX inventory script")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_inventory_preserves_ordinary_candidates_and_root_aliases() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let fixture = posix_inventory_fixture();
+        let root = fixture.path();
+        let base = root.join("projects");
+        let temp = root.join("worker-temp");
+        let candidates = [
+            base.join("repo/.rch-target-worker-job-1"),
+            temp.join("rch_target_legacy"),
+            temp.join("rch/project/hash/.rch-target-worker-pool-key"),
+        ];
+        for candidate in &candidates {
+            fs::create_dir_all(candidate).unwrap();
+            fs::write(candidate.join("artifact"), b"preserved").unwrap();
+        }
+        let base_alias = root.join("projects-alias");
+        let temp_alias = root.join("temp-alias");
+        symlink(&base, &base_alias).unwrap();
+        symlink(&temp, &temp_alias).unwrap();
+        for (base, temp) in [(&base, &temp), (&base_alias, &temp_alias)] {
+            let output = posix_inventory_fixture_output(root, base, temp, None);
+            assert!(output.status.success(), "{output:?}");
+            let entries = parse_target_entries(&String::from_utf8_lossy(&output.stdout));
+            assert_eq!(entries.len(), candidates.len(), "{entries:?}");
+            for candidate in &candidates {
+                let physical = fs::canonicalize(candidate).unwrap();
+                assert!(
+                    entries
+                        .iter()
+                        .any(|entry| entry.path == physical.to_str().unwrap())
+                );
+                assert_eq!(fs::read(candidate.join("artifact")).unwrap(), b"preserved");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_inventory_refuses_forged_records_in_every_discovery_walk() {
+        use std::fs;
+
+        for separator in ['\n', '\r'] {
+            for placement in ["configured", "temp", "legacy-temp"] {
+                let fixture = posix_inventory_fixture();
+                let root = fixture.path();
+                let base = root.join("projects");
+                let temp = root.join("worker-temp");
+                let ordinary = base.join(".rch-target-worker-job-valid");
+                let outside = root.join("outside/.rch-target-worker-job-outside");
+                fs::create_dir_all(&temp).unwrap();
+                for candidate in [&ordinary, &outside] {
+                    fs::create_dir_all(candidate).unwrap();
+                    fs::write(candidate.join("artifact"), b"preserved").unwrap();
+                }
+                let malformed = if placement == "legacy-temp" {
+                    temp.join(format!("rch_target_legacy{separator}forged"))
+                } else {
+                    let scan_root = if placement == "configured" {
+                        &base
+                    } else {
+                        &temp
+                    };
+                    // With raw find -print, the LF separates an existing
+                    // absolute candidate outside both authorized scan roots.
+                    scan_root
+                        .join(format!("ancestor{separator}"))
+                        .join(outside.strip_prefix("/").unwrap())
+                };
+                fs::create_dir_all(&malformed).unwrap();
+                fs::write(malformed.join("artifact"), b"preserved").unwrap();
+
+                let output = posix_inventory_fixture_output(root, &base, &temp, None);
+                assert!(
+                    !output.status.success(),
+                    "{placement} {separator:?}: {output:?}"
+                );
+                assert!(parse_target_entries(&String::from_utf8_lossy(&output.stdout)).is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("RCH_GC_DISCOVERY_INCOMPLETE")
+                );
+                for candidate in [&ordinary, &outside, &malformed] {
+                    assert_eq!(fs::read(candidate.join("artifact")).unwrap(), b"preserved");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_inventory_discards_partial_discovery_from_every_walk() {
+        use std::fs;
+
+        for depth in [8, 1, TMPBASE_MAXDEPTH] {
+            let fixture = posix_inventory_fixture();
+            let root = fixture.path();
+            let base = root.join("projects");
+            let temp = root.join("worker-temp");
+            let candidates = [
+                base.join(".rch-target-worker-job-valid"),
+                temp.join("rch_target_legacy"),
+                temp.join("rch/project/.rch-target-worker-pool-key"),
+            ];
+            for candidate in &candidates {
+                fs::create_dir_all(candidate).unwrap();
+                fs::write(candidate.join("artifact"), b"preserved").unwrap();
+            }
+            let wrapper = format!(
+                "#!/bin/sh\n/usr/bin/find \"$@\" || exit $?\n\
+                 if [ \"${{2:-}}\" = -maxdepth ] && [ \"${{3:-}}\" = {depth} ]; then exit 9; fi\n"
+            );
+            let output = posix_inventory_fixture_output(root, &base, &temp, Some(&wrapper));
+            assert!(!output.status.success(), "depth {depth}: {output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(parse_target_entries(&stdout).is_empty(), "{stdout}");
+            assert!(!stdout.contains("RCH_WORKER_REAP_METRICS"));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("RCH_GC_DISCOVERY_INCOMPLETE")
+            );
+            for candidate in &candidates {
+                assert_eq!(fs::read(candidate.join("artifact")).unwrap(), b"preserved");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_inventory_refuses_unframed_roots_without_trimming_them() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        for separator in ['\n', '\r'] {
+            for placement in ["configured-alias", "temp-alias", "temp-literal"] {
+                let fixture = posix_inventory_fixture();
+                let root = fixture.path();
+                let mut base = root.join("projects");
+                let mut temp = root.join("worker-temp");
+                let physical = root.join("physical");
+                let malformed = root.join(format!("physical{separator}"));
+                let outside = physical.join(".rch-target-worker-job-wrong-root");
+                fs::create_dir_all(&base).unwrap();
+                fs::create_dir_all(&temp).unwrap();
+                fs::create_dir_all(&malformed).unwrap();
+                fs::create_dir_all(&outside).unwrap();
+                fs::write(outside.join("artifact"), b"preserved").unwrap();
+                match placement {
+                    "configured-alias" => {
+                        base = root.join("projects-alias");
+                        symlink(&malformed, &base).unwrap();
+                    }
+                    "temp-alias" => {
+                        temp = root.join("temp-alias");
+                        symlink(&malformed, &temp).unwrap();
+                    }
+                    _ => temp = malformed.clone(),
+                }
+                let output = posix_inventory_fixture_output(root, &base, &temp, None);
+                assert!(
+                    !output.status.success(),
+                    "{placement} {separator:?}: {output:?}"
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(parse_target_entries(&stdout).is_empty(), "{stdout}");
+                assert!(!stdout.contains(malformed.to_str().unwrap()));
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("RCH_GC_DISCOVERY_INCOMPLETE")
+                );
+                assert_eq!(fs::read(outside.join("artifact")).unwrap(), b"preserved");
+            }
+        }
+    }
+
     /// The glob gc enumerates with must stay welded to the prefix the creator
     /// uses; a rename on one side is exactly how these dirs went unscanned.
     #[test]
@@ -3945,11 +4197,11 @@ exec /usr/bin/find "$@"
         // The depth guard is applied to the raw tmp base before resolution AND
         // to the resolved path, so neither a shallow `/tmp` nor a `/tmp` that
         // canonicalizes deeper (macOS `/private/tmp`) becomes sweepable.
-        assert!(cmd.contains("case \"$__tmpbase\" in /*/*) __tmpscan="));
+        assert!(cmd.contains("case \"$__tmpbase\" in /*/*) if __tmpscan="));
         assert!(cmd.contains("case \"$__tmpscan\" in /*/*) ;; *) __tmpscan=\"\";; esac"));
         // Both roots are canonicalized, which is what makes string dedup sound.
-        assert!(cmd.contains("__rt=$(cd \"$base\" 2>/dev/null && pwd -P)"));
-        assert!(cmd.contains("__tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P)"));
+        assert!(cmd.contains("__rt=$(cd \"$base\" 2>/dev/null && pwd -P && printf '.')"));
+        assert!(cmd.contains("__tmpscan=$(cd \"$__tmpbase\" 2>/dev/null && pwd -P && printf '.')"));
 
         // Every tmp-base scan must sit behind the resolved, guarded variable —
         // never scan `$__tmpbase` directly, which is only the mktemp location.
@@ -4105,7 +4357,7 @@ exec /usr/bin/find "$@"
         assert!(!cmd.contains("sweep-pool"));
         // 6dj11: the legacy tmp-base pass, depth-guarded so /tmp is never swept.
         assert!(cmd.contains(
-            "if [ -n \"$__tmpscan\" ]; then find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune"
+            "if [ -n \"$__tmpscan\" ]; then if ! find \"$__tmpscan\" -maxdepth 1 -type d -name \"rch_target_*\" -prune"
         ));
         // Metrics survive the loop: no `find | while` pipe subshell.
         assert!(cmd.contains("done < \"$__tmpf\""));
