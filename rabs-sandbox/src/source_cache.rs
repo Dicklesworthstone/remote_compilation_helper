@@ -781,9 +781,6 @@ impl SourceCache {
         let Some(writer) = self.writer()? else {
             return Ok(None);
         };
-        if !enabled {
-            return Ok(None);
-        }
         let mut entries = self.inventory()?;
         let mut total = entries.iter().try_fold(0_u64, |sum, entry| {
             sum.checked_add(entry.bytes)
@@ -795,6 +792,12 @@ impl SourceCache {
                 .ok_or_else(|| invalid("source cache capacity accounting is inconsistent"))?;
             fs::remove_file(&entry.path)?;
             total -= entry.bytes;
+        }
+        // Byte-only owners can also reopen persistent storage with a reduced
+        // allowance. Apply it before returning a usable cache, even if the
+        // next operation consists entirely of hits and writes no checkpoint.
+        if !enabled {
+            return Ok(None);
         }
         match writer {
             // Move the held lock into the projection pool without releasing
@@ -2739,6 +2742,46 @@ mod tests {
                 b"ABCD"
             );
         }
+    }
+
+    #[test]
+    fn byte_only_reopen_applies_a_lower_budget_before_any_upload_or_cache_write() {
+        let parent = private();
+        let input = private();
+        let source = staged(
+            input.path(),
+            &[("a", b"aaaa"), ("b", b"bbbb"), ("c", b"cccc")],
+        );
+        let cache = SourceCache::open_byte_only(parent.path(), 12).unwrap();
+        assert_eq!(cache.remember(&source).unwrap(), 3);
+        assert_eq!(cache.inventory().unwrap().len(), 3);
+        drop(cache);
+
+        let reopened = SourceCache::open_byte_only(parent.path(), 8).unwrap();
+        let inventory = reopened.inventory().unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory.iter().map(|entry| entry.bytes).sum::<u64>(), 8);
+        assert_eq!(
+            source
+                .manifest()
+                .files()
+                .iter()
+                .filter(|file| reopened.load(file).is_some())
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read(source.sealed_root().unwrap().join("a")).unwrap(),
+            b"aaaa"
+        );
+        assert_eq!(
+            fs::read(source.sealed_root().unwrap().join("b")).unwrap(),
+            b"bbbb"
+        );
+        assert_eq!(
+            fs::read(source.sealed_root().unwrap().join("c")).unwrap(),
+            b"cccc"
+        );
     }
 
     #[test]

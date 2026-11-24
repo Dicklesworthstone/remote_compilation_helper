@@ -2,7 +2,8 @@
 
 use super::*;
 use rabs_sandbox::toolchain_dataset::{PreparedToolchain, ToolchainLimits, capture_toolchain};
-use std::os::unix::fs::symlink;
+use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 
 const ALICE: [u8; 32] = [0x11; 32];
@@ -243,6 +244,80 @@ fn cached_objects(cache: &RemoteToolchainFileCache) -> Vec<PathBuf> {
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "sdk"))
         .collect()
+}
+
+fn durable_cache(parent: &Path, max_bytes: u64) -> RemoteToolchainFileCache {
+    RemoteToolchainFileCache::with_storage(
+        Arc::new(InputCacheStorage::persistent(parent).unwrap()),
+        max_bytes,
+    )
+    .unwrap()
+}
+
+#[test]
+fn service_restart_reuses_sdk_files_and_prefixes_but_seals_a_fresh_image() {
+    let bytes = vec![0x37; MAX_TOOLCHAIN_CHUNK * 2 + 29];
+    let (_owner, sdk) = fixture(&[("bin/compiler", &bytes, true)], None);
+    let parent = private();
+    let cache = durable_cache(parent.path(), sdk.identity().bytes * 2);
+    let prefix = MAX_TOOLCHAIN_CHUNK as u64 + 17;
+    interrupt_with_prefix(&cache, &sdk, prefix, false);
+    drop(cache);
+
+    let reopened = durable_cache(parent.path(), sdk.identity().bytes * 2);
+    let (uploaded, plans) = complete(&reopened, ALICE, &sdk);
+    assert_eq!(uploaded, sdk.identity().bytes - prefix);
+    assert_eq!(plans[0].prefixes[0].offset, prefix);
+    drop(reopened);
+
+    let reopened = durable_cache(parent.path(), sdk.identity().bytes * 2);
+    let (uploaded, plans) = complete(&reopened, ALICE, &sdk);
+    assert_eq!(uploaded, 0);
+    assert!(plans.iter().all(|plan| plan.missing_files.is_empty()));
+    let (_linked_owner, linked) = fixture(
+        &[("bin/compiler", &bytes, true)],
+        Some(("compiler", "bin/compiler")),
+    );
+    assert_ne!(linked.identity(), sdk.identity());
+    assert_eq!(complete(&reopened, ALICE, &linked).0, 0);
+    let (foreign, plans) = complete(&reopened, BOB, &sdk);
+    assert_eq!(foreign, sdk.identity().bytes);
+    assert!(plans.iter().all(|plan| plan.prefixes.is_empty()));
+}
+
+#[test]
+fn restarted_sdk_storage_reuses_unchanged_members_across_images_and_rejects_corruption() {
+    let compiler = b"retained compiler bytes";
+    let (_owner, sdk) = fixture(&[("bin/compiler", compiler, true)], None);
+    let parent = private();
+    let cache = durable_cache(parent.path(), 1024);
+    assert_eq!(complete(&cache, ALICE, &sdk).0, compiler.len() as u64);
+    drop(cache);
+
+    let (_changed_owner, changed) = fixture(
+        &[
+            ("bin/compiler", compiler, true),
+            ("lib/new", b"new library", false),
+        ],
+        None,
+    );
+    let reopened = durable_cache(parent.path(), 1024);
+    assert_ne!(sdk.identity(), changed.identity());
+    assert_eq!(complete(&reopened, ALICE, &changed).0, 11);
+    let objects = cached_objects(&reopened);
+    drop(reopened);
+    for object in objects {
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut bytes = fs::read(&object).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&object, bytes).unwrap();
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    let reopened = durable_cache(parent.path(), 1024);
+    assert_eq!(
+        complete(&reopened, ALICE, &changed).0,
+        changed.identity().bytes
+    );
 }
 
 fn corrupt_retained_prefix(cache: &RemoteToolchainFileCache) {

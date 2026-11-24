@@ -6,6 +6,7 @@
 //! path-based Unix service is deliberately not used as a network protocol.
 
 mod client;
+mod input_cache_storage;
 mod operations;
 mod source_inputs;
 mod toolchain_inputs;
@@ -28,6 +29,7 @@ use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::net::TcpListener;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::signal::ShutdownController;
+use input_cache_storage::InputCacheStorage;
 use operations::{Attachment, Claim, DiagnosticFrontier, Reaper, Registry};
 use rabs_asupersync::daemon_runtime::block_on_top_level;
 use rabs_asupersync::worker_transport::{TlsFiles, accept_edge_peer, runtime_transport_now};
@@ -111,6 +113,10 @@ struct ServiceProfile {
     /// Retain verified source bytes under one authenticated-peer-aware budget.
     #[serde(default)]
     source_cache_bytes: u64,
+    /// Optional server-owned directory for source and SDK byte objects across
+    /// restarts. Complete executable images remain separately owned and sealed.
+    #[serde(default)]
+    input_cache_root: Option<PathBuf>,
     /// Retain only verified SDKs, independently of each operation's source.
     #[serde(default)]
     toolchain_cache_bytes: u64,
@@ -170,13 +176,20 @@ impl ServiceProfile {
         if let Some(cache) = &self.target_cache {
             cache.validate()?;
         }
-        let roots = [&self.state_root, &self.input_root, &self.operation_root];
+        let mut roots = vec![&self.state_root, &self.input_root, &self.operation_root];
+        if let Some(root) = &self.input_cache_root {
+            require(
+                self.source_cache_bytes != 0 || self.toolchain_file_cache_bytes != 0,
+                "persistent input storage requires a nonzero source or toolchain file cache budget",
+            )?;
+            roots.push(root);
+        }
         for (index, root) in roots.iter().enumerate() {
             private_directory(root)?;
             for other in &roots[index + 1..] {
                 require(
                     !overlap(root, other),
-                    "remote service state, input and operation roots must be disjoint",
+                    "remote service state, input, operation and input cache roots must be disjoint",
                 )?;
             }
         }
@@ -247,6 +260,11 @@ struct InputCaches {
 
 impl InputCaches {
     fn new(config: &ServiceProfile) -> io::Result<Self> {
+        let persistent = config
+            .input_cache_root
+            .as_ref()
+            .map(|root| InputCacheStorage::persistent(root).map(Arc::new))
+            .transpose()?;
         let toolchains = RemoteToolchainCache::new(
             config.toolchain_cache_bytes,
             config.toolchain_cache_entries,
@@ -254,18 +272,26 @@ impl InputCaches {
         let sources = if config.source_cache_bytes == 0 {
             None
         } else {
-            Some(RemoteSourceCache::new(
-                &config.input_root,
-                config.source_cache_bytes,
-            )?)
+            Some(match &persistent {
+                Some(owner) => {
+                    RemoteSourceCache::with_storage(Arc::clone(owner), config.source_cache_bytes)?
+                }
+                None => RemoteSourceCache::new(&config.input_root, config.source_cache_bytes)?,
+            })
         };
         let toolchain_files = if config.toolchain_file_cache_bytes == 0 {
             None
         } else {
-            Some(RemoteToolchainFileCache::new(
-                &config.input_root,
-                config.toolchain_file_cache_bytes,
-            )?)
+            Some(match &persistent {
+                Some(owner) => RemoteToolchainFileCache::with_storage(
+                    Arc::clone(owner),
+                    config.toolchain_file_cache_bytes,
+                )?,
+                None => RemoteToolchainFileCache::new(
+                    &config.input_root,
+                    config.toolchain_file_cache_bytes,
+                )?,
+            })
         };
         Ok(Self {
             toolchains,
@@ -424,6 +450,7 @@ pub fn run_service_profile(
         "max_queued_roots_per_peer":config.max_queued_per_peer(),
         "queue_timeout_seconds":config.queue_timeout_seconds,
         "source_cache_bytes":config.source_cache_bytes,
+        "persistent_input_cache":config.input_cache_root.is_some(),
         "toolchain_cache_bytes":config.toolchain_cache_bytes,
         "toolchain_file_cache_bytes":config.toolchain_file_cache_bytes,
         "toolchain_cache_entries":config.toolchain_cache_entries,
@@ -1917,6 +1944,7 @@ mod tests {
         assert_eq!(profile.max_queued_per_peer(), 0);
         assert_eq!(profile.queue_timeout_seconds, 300);
         assert_eq!(profile.source_cache_bytes, 0);
+        assert!(profile.input_cache_root.is_none());
         assert_eq!(profile.toolchain_cache_bytes, 0);
         assert_eq!(profile.toolchain_cache_entries, 4);
         assert_eq!(profile.toolchain_file_cache_bytes, 0);
@@ -1963,6 +1991,57 @@ mod tests {
             profile.toolchain_file_cache_bytes = bytes;
             assert!(profile.validate().is_err(), "SDK file cache bytes {bytes}");
         }
+    }
+
+    #[test]
+    fn persistent_input_storage_is_explicit_private_disjoint_and_exclusively_owned() {
+        let (owner, mut profile) = service_profile();
+        let path = owner.path().join("input-cache");
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        profile.input_cache_root = Some(path.clone());
+        assert!(
+            profile.validate().is_err(),
+            "a path alone enables no retention"
+        );
+        profile.source_cache_bytes = 1024;
+        profile.toolchain_file_cache_bytes = 2048;
+        profile.validate().unwrap();
+        let caches = InputCaches::new(&profile).unwrap();
+        assert!(path.join("source-files-v1").is_dir());
+        assert!(path.join("toolchain-files-v1").is_dir());
+        assert!(InputCaches::new(&profile).is_err());
+        drop(caches);
+        let reopened = InputCaches::new(&profile).unwrap();
+        drop(reopened);
+        assert!(path.join("source-files-v1").is_dir());
+        assert!(path.join("toolchain-files-v1").is_dir());
+
+        for alias in [
+            profile.state_root.clone(),
+            profile.input_root.clone(),
+            profile.operation_root.clone(),
+            owner.path().to_path_buf(),
+            PathBuf::from("relative-cache"),
+        ] {
+            profile.input_cache_root = Some(alias.clone());
+            assert!(profile.validate().is_err(), "{}", alias.display());
+        }
+        let nested = profile.input_root.join("cache");
+        fs::DirBuilder::new().mode(0o700).create(&nested).unwrap();
+        profile.input_cache_root = Some(nested);
+        assert!(profile.validate().is_err());
+
+        let alias = owner.path().join("cache-alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        profile.input_cache_root = Some(alias);
+        assert!(profile.validate().is_err());
+
+        profile.input_cache_root = Some(path.clone());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(profile.validate().is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        profile.source_cache_bytes = 0;
+        profile.validate().unwrap();
     }
 
     #[test]

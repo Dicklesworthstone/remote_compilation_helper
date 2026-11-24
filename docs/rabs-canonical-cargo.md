@@ -3215,13 +3215,14 @@ configured through `RABS_COORD_TLS_CA`, `RABS_COORD_TLS_CERT` and
 
 #### Start the coordinator
 
-Create three pairwise disjoint, owned private directories. Existing directories
+Create the pairwise disjoint, owned private directories below. Existing directories
 must already have mode 0700; the service does not repair their permissions.
 Keep the operation root short enough for its operation-scoped Unix sockets:
 
 ```sh
 mkdir -m 700 /home/builder/rabs-remote-state \
-  /home/builder/rabs-remote-inputs /tmp/rabs-remote-ops
+  /home/builder/rabs-remote-inputs /tmp/rabs-remote-ops \
+  /home/builder/rabs-remote-input-cache
 ```
 
 Save the complete service profile as `remote-service.json`:
@@ -3232,6 +3233,7 @@ Save the complete service profile as `remote-service.json`:
   "listen": "192.0.2.10:45300",
   "state_root": "/home/builder/rabs-remote-state",
   "input_root": "/home/builder/rabs-remote-inputs",
+  "input_cache_root": "/home/builder/rabs-remote-input-cache",
   "operation_root": "/tmp/rabs-remote-ops",
   "wrapper": "/usr/local/bin/rabs-wrap",
   "tls": {
@@ -3258,13 +3260,20 @@ Save the complete service profile as `remote-service.json`:
 }
 ```
 
-`listen` is an IP address and port bound on the coordinator. The three storage
+`listen` is an IP address and port bound on the coordinator. The storage
 roots must have ordinary absolute paths and no symlink ancestry. The wrapper
 must be an ordinary executable outside those mutable roots. `allowed_edge_pins`
 accepts 1–256 distinct nonzero client-key pins. `max_roots` accepts 1–32 and
 `jobs_per_root` accepts 1–4096, with at most 4096 aggregate jobs. Each admitted
 operation holds its root slot across input transfer, execution and final
 delivery, bounding simultaneous work even while inputs are uploading.
+
+`input_cache_root` is optional. The example uses it to preserve source and SDK
+byte objects across service restarts. Omit it to retain the existing temporary
+cache lifetime. Its directory must already exist, be owned by the service user
+with mode 0700, and be disjoint from the state, input and operation roots. It
+requires a nonzero `source_cache_bytes` or `toolchain_file_cache_bytes` budget.
+The path is server policy; clients cannot select or override it.
 
 `max_queued_roots` accepts 0–128 and defaults to 0. Set it above zero to let
 authenticated clients wait when the active roots are occupied. Requests keep
@@ -3354,8 +3363,10 @@ SDK retains only its dedicated compiler directory. Changes to the retained SDK
 or its ownership invalidate that generation and refuse the affected operation.
 A cache failure never causes a second execution, reconnection or local fallback.
 
-This cache lasts for the service process. A service restart requires a new SDK
-upload; no directory is adopted from a pathname or an old on-disk marker. The
+This complete-image cache lasts for the service process. A service restart
+requires a newly reconstructed and sealed SDK; persistent file-byte reuse below
+can supply its unchanged members. No executable directory is adopted from a
+pathname or an old on-disk marker. The
 client still captures and validates its local SDK on each invocation. Reuse
 removes repeated SDK network transfer and reconstruction; it does not eliminate
 local capture or verification, and no end-to-end speedup is claimed here.
@@ -3366,8 +3377,10 @@ retains up to 8 GiB of SDK byte objects in addition to its complete-image cache.
 All authenticated clients share that one byte budget, object-count limit and
 nonblocking writer lock. Content names are partitioned by the TLS client key;
 one client cannot discover or reuse another client's retained file or prefix.
-These byte objects carry no SDK identity or execution authority. Like the
-complete-image cache, this optional storage lasts for the service process.
+These byte objects carry no SDK identity or execution authority. Without
+`input_cache_root`, this optional storage lasts for the service process. With
+that setting, completed files and partial-file checkpoints remain available for
+verified reconstruction after a restart.
 
 Complete-image reuse takes precedence. On a cold SDK upload with file caching
 enabled, Ready selects `upload-files`. After the source window is acknowledged,
@@ -3404,9 +3417,33 @@ later requests. It defaults to 0 (disabled), accepts at most 8 GiB, and uses one
 aggregate budget of at most 4096 objects across all enrolled clients. The example
 enables 512 MiB. Objects are scoped by the client key authenticated by TLS and
 their content digest; another client key cannot reuse those bytes. The service
-owns a private pool for its process lifetime. A restart starts a fresh pool and
-does not adopt old cache directories. This budget is separate from SDK retention,
+owns a private pool for its process lifetime by default. With `input_cache_root`,
+it reopens the existing byte pool and verifies each selected object before reuse.
+This budget is separate from SDK retention,
 Cargo target state and active operations' private input trees.
+
+Persistent storage retains the same peer-scoped content names and aggregate
+source and SDK file budgets. Reopening with a smaller budget evicts old byte
+objects under the existing cache writer lock before the pool becomes usable.
+One additional ownership lock spans both pools and remains held through the last
+upload or snapshot lease; a second service cannot reopen the directory while the
+first owner is still active. A normal shutdown preserves its byte objects, and a
+process crash releases the lock for the next service. Missing or torn objects
+remain ordinary cache misses after verification. No execution, action-result,
+whole-SDK-image or accepted-operation ownership survives in this storage.
+Setting either byte budget to 0 disables that pool's reads and writes without
+erasing its earlier persistent objects. Reenabling the pool with a smaller
+positive budget applies the new limit on reopen.
+
+The first request after restart still declares its complete source manifest and
+SDK file inventory. A complete verified hit avoids resending that file. An
+interrupted prefix is offered with its offset and digest, independently checked
+by the client against the captured input, and followed by the missing tail. A
+changed file or a different authenticated client key requires its own upload.
+Every request reconstructs fresh private source and SDK receivers and must pass
+their complete seals before execution; persistent bytes never become a writable
+shared compilation tree. The service-ready event reports
+`persistent_input_cache` so operators can distinguish the two storage modes.
 
 Every request still sends its complete `SourceManifest`. Ready includes a
 `SourcePlan` binding that manifest's digest to a strictly increasing list of

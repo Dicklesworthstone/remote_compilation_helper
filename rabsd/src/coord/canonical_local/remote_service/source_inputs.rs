@@ -5,7 +5,7 @@
 //! seals the complete manifest before execution. A hit never grants source-tree
 //! or publication authority, and no shared file is mounted writable.
 
-use super::private_directory;
+use super::input_cache_storage::InputCacheStorage;
 use super::wire::{SourcePlan, SourcePrefixOffer, digest, invalid, require};
 use rabs_protocol::raw_bytes::encode_hex;
 use rabs_sandbox::source_cache::{
@@ -16,9 +16,7 @@ use rabs_sandbox::source_transfer::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -28,18 +26,20 @@ use std::time::Instant;
 /// writer/inventory state; enrolled peers do not receive independent quotas.
 pub(super) struct RemoteSourceCache {
     cache: SourceCache,
-    owner: Arc<tempfile::TempDir>,
+    owner: Arc<InputCacheStorage>,
 }
 
 impl RemoteSourceCache {
     pub(super) fn new(parent: &Path, max_bytes: u64) -> io::Result<Self> {
-        private_directory(parent)?;
-        let owner = Arc::new(
-            tempfile::Builder::new()
-                .prefix("canonical-remote-source-cache-")
-                .permissions(fs::Permissions::from_mode(0o700))
-                .tempdir_in(parent)?,
-        );
+        let owner = Arc::new(InputCacheStorage::ephemeral(
+            parent,
+            "canonical-remote-source-cache-",
+        )?);
+        Self::with_storage(owner, max_bytes)
+    }
+
+    pub(super) fn with_storage(owner: Arc<InputCacheStorage>, max_bytes: u64) -> io::Result<Self> {
+        owner.verify()?;
         let cache = SourceCache::open_byte_only(owner.path(), max_bytes)?;
         Ok(Self { cache, owner })
     }
@@ -52,6 +52,7 @@ impl RemoteSourceCache {
         stopped: Arc<AtomicBool>,
         deadline: Instant,
     ) -> io::Result<SourceCacheLease> {
+        self.owner.verify()?;
         Ok(SourceCacheLease {
             cache: self
                 .cache
@@ -68,7 +69,7 @@ impl RemoteSourceCache {
 /// writer, even if the service's original pool handle has already been dropped.
 pub(super) struct SourceCacheLease {
     cache: SourceCache,
-    _owner: Arc<tempfile::TempDir>,
+    _owner: Arc<InputCacheStorage>,
 }
 
 fn checkpoint(cancelled: &impl Fn() -> bool) -> io::Result<()> {
@@ -420,7 +421,8 @@ mod tests {
     use super::*;
     use rabs_sandbox::source_transfer::{SourceFile, SourceManifest};
     use sha2::{Digest, Sha256};
-    use std::os::unix::fs::MetadataExt;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -457,12 +459,20 @@ mod tests {
         pool: &RemoteSourceCache,
         manifest: &SourceManifest,
     ) -> (tempfile::TempDir, SourceInput) {
+        prepared_for_peer(pool, manifest, EDGE)
+    }
+
+    fn prepared_for_peer(
+        pool: &RemoteSourceCache,
+        manifest: &SourceManifest,
+        peer: [u8; 32],
+    ) -> (tempfile::TempDir, SourceInput) {
         let owner = private();
         let receiver =
             SourceReceiver::create(&owner.path().join("source"), manifest.clone()).unwrap();
         let deadline = deadline();
         let cache = pool
-            .for_peer(EDGE, Arc::new(AtomicBool::new(false)), deadline)
+            .for_peer(peer, Arc::new(AtomicBool::new(false)), deadline)
             .unwrap();
         let input =
             SourceInput::prepare(receiver, Some(cache), || Instant::now() >= deadline).unwrap();
@@ -496,6 +506,95 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|extension| extension == "src"))
             .collect()
+    }
+
+    fn durable_pool(parent: &Path, max_bytes: u64) -> RemoteSourceCache {
+        RemoteSourceCache::with_storage(
+            Arc::new(InputCacheStorage::persistent(parent).unwrap()),
+            max_bytes,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn service_restart_reuses_complete_source_files_and_verified_prefixes_for_the_same_peer() {
+        let parent = private();
+        let pool = durable_pool(parent.path(), 1024);
+        let first = b"unchanged complete member";
+        let second = b"an interrupted source upload";
+        let declared = manifest(&[("a.rs", first), ("b.rs", second)]);
+        let (old_owner, mut input) = prepared(&pool, &declared);
+        input.begin_transfer(deadline()).unwrap();
+        send(&mut input, "a.rs", first);
+        send(&mut input, "b.rs", &second[..7]);
+        assert!(input.receiver.sealed_root().is_none());
+        drop(pool);
+        assert!(InputCacheStorage::persistent(parent.path()).is_err());
+        drop(input);
+        drop(old_owner);
+
+        let reopened = durable_pool(parent.path(), 1024);
+        let (_foreign_owner, foreign) = prepared_for_peer(&reopened, &declared, [18; 32]);
+        assert_eq!(foreign.plan().missing_files, vec![0, 1]);
+        assert!(foreign.plan().prefixes.is_empty());
+        drop(foreign);
+
+        let (new_owner, mut input) = prepared(&reopened, &declared);
+        assert_eq!(input.plan().missing_files, vec![1]);
+        let prefix = input.plan().prefix_for(1).unwrap();
+        assert_eq!(prefix.offset, 7);
+        assert_eq!(prefix.sha256, encode_hex(&Sha256::digest(&second[..7])));
+        let retained = objects(&reopened);
+        let restored = new_owner.path().join("source/a.rs");
+        assert!(retained.iter().all(|path| {
+            fs::metadata(path).unwrap().ino() != fs::metadata(&restored).unwrap().ino()
+        }));
+        input.begin_transfer(deadline()).unwrap();
+        input
+            .write_chunk(
+                "b.rs",
+                7,
+                &second[7..],
+                Sha256::digest(&second[7..]).into(),
+                || false,
+            )
+            .unwrap();
+        let received = input.finish(|| false).unwrap();
+        let root = received.sealed_root().unwrap();
+        assert_eq!(fs::read(root.join("a.rs")).unwrap(), first);
+        assert_eq!(fs::read(root.join("b.rs")).unwrap(), second);
+        drop(reopened);
+
+        let reopened = durable_pool(parent.path(), 1024);
+        let changed = manifest(&[("a.rs", first), ("b.rs", b"changed input")]);
+        let (_changed_owner, changed) = prepared(&reopened, &changed);
+        assert_eq!(changed.plan().missing_files, vec![1]);
+        assert!(changed.plan().prefixes.is_empty());
+    }
+
+    #[test]
+    fn restarted_source_storage_rechecks_bytes_before_readiness_and_repairs_with_full_upload() {
+        let parent = private();
+        let pool = durable_pool(parent.path(), 1024);
+        let bytes = b"verified source";
+        let manifest = seed(&pool, &[("input.rs", bytes)]);
+        let object = objects(&pool).pop().unwrap();
+        drop(pool);
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&object, b"corrupt! source").unwrap();
+
+        let reopened = durable_pool(parent.path(), 1024);
+        let (_owner, mut input) = prepared(&reopened, &manifest);
+        assert_eq!(input.plan().missing_files, vec![0]);
+        assert!(input.plan().prefixes.is_empty());
+        input.begin_transfer(deadline()).unwrap();
+        send(&mut input, "input.rs", bytes);
+        let received = input.finish(|| false).unwrap();
+        assert_eq!(
+            fs::read(received.sealed_root().unwrap().join("input.rs")).unwrap(),
+            bytes
+        );
+        assert_eq!(fs::read(object).unwrap(), bytes);
     }
 
     #[test]

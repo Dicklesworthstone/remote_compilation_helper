@@ -5,7 +5,7 @@
 //! transfer; the sender selects only a verified range or zero. The complete
 //! SDK seal remains the only transition into executable toolchain custody.
 
-use super::private_directory;
+use super::input_cache_storage::InputCacheStorage;
 use super::wire::{
     ToolchainFilePage, ToolchainFilePlan, ToolchainPrefixOffer, ToolchainResume, digest, invalid,
     require,
@@ -21,9 +21,8 @@ use rabs_sandbox::toolchain_transfer::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read, Seek};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -56,18 +55,20 @@ fn cache_warning(stage: &str, error: &io::Error) {
 /// object names, never the quota, and cannot discover another peer's bytes.
 pub(super) struct RemoteToolchainFileCache {
     cache: ToolchainFileCache,
-    owner: Arc<tempfile::TempDir>,
+    owner: Arc<InputCacheStorage>,
 }
 
 impl RemoteToolchainFileCache {
     pub(super) fn new(parent: &Path, max_bytes: u64) -> io::Result<Self> {
-        private_directory(parent)?;
-        let owner = Arc::new(
-            tempfile::Builder::new()
-                .prefix("canonical-remote-sdk-files-")
-                .permissions(fs::Permissions::from_mode(0o700))
-                .tempdir_in(parent)?,
-        );
+        let owner = Arc::new(InputCacheStorage::ephemeral(
+            parent,
+            "canonical-remote-sdk-files-",
+        )?);
+        Self::with_storage(owner, max_bytes)
+    }
+
+    pub(super) fn with_storage(owner: Arc<InputCacheStorage>, max_bytes: u64) -> io::Result<Self> {
+        owner.verify()?;
         let cache = ToolchainFileCache::open(owner.path(), max_bytes)?;
         Ok(Self { cache, owner })
     }
@@ -79,6 +80,7 @@ impl RemoteToolchainFileCache {
         stopped: &impl Fn() -> bool,
     ) -> io::Result<ToolchainFileInput> {
         checkpoint(stopped)?;
+        self.owner.verify()?;
         let cache = self.cache.for_peer(peer)?;
         let snapshots = match Snapshots::new(cache.clone(), identity.bytes) {
             Ok(snapshots) => Some(snapshots),
@@ -129,7 +131,7 @@ pub(super) struct ToolchainFileInput {
     sealed: bool,
     failed: bool,
     // Snapshots and writer close before the private cache storage owner.
-    _owner: Arc<tempfile::TempDir>,
+    _owner: Arc<InputCacheStorage>,
 }
 
 impl ToolchainFileInput {
