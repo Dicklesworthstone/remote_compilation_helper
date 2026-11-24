@@ -241,7 +241,8 @@ impl SelectedCommand {
                 "--package" | "-p" | "--exclude" | "--features" | "-F" | "--bin" | "--test"
                 | "--example" | "--bench" | "--target" | "--profile" | "--manifest-path"
                 | "--target-dir" | "--message-format" | "--color" | "--jobs"
-                | "--cargo-profile" | "--test-threads" | "--filterset" | "-E" | "--build-jobs" => {
+                | "--cargo-profile" | "--test-threads" | "--filterset" | "-E" | "--build-jobs"
+                | "--partition" => {
                     let value = match inline {
                         Some(value) => value,
                         None => {
@@ -321,6 +322,14 @@ impl SelectedCommand {
                                 "nextest test threads must be one integer between 1 and 4096",
                             )?;
                             selection.test_threads = count;
+                        }
+                        "--partition" => {
+                            require(
+                                command == CompilationCommand::Nextest
+                                    && selection.partition.is_none(),
+                                "partition requires nextest run and may be selected only once",
+                            )?;
+                            selection.partition = Some(value.to_owned());
                         }
                         "--filterset" | "-E" => {
                             require(

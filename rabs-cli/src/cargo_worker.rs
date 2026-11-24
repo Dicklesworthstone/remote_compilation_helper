@@ -989,6 +989,8 @@ mod tests {
             "ci",
             "--test-threads",
             "1",
+            "--partition",
+            "hash:2/3",
             "-E",
             "test(roundtrip)",
             "--",
@@ -1008,7 +1010,12 @@ mod tests {
         let contract: NextestTree =
             serde_json::from_value(spec["artifacts"]["cargo"].clone()).unwrap();
         assert_eq!(contract.selection, options.selected.as_ref().unwrap().1);
+        assert_eq!(contract.selection.partition.as_deref(), Some("hash:2/3"));
         let args = spec["args"].as_array().unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == [json!("--partition"), json!("hash:2/3")])
+        );
         assert_eq!(&args[..2], &[json!("nextest"), json!("run")]);
         assert!(
             args.windows(2)

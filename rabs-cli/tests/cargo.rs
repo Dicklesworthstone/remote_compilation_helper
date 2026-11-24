@@ -907,6 +907,35 @@ fn nextest_unknown_runtime_concurrency_refuses_before_native_handoff() {
 }
 
 #[test]
+fn nextest_invalid_partitions_refuse_before_native_handoff() {
+    for remote in [false, true] {
+        for partition in ["hash:0/3", "slice:4/3", "count:1/0", "unknown:1/3"] {
+            let fixture = Fixture::new();
+            new_file(
+                &fixture.toolchain.join("bin/cargo-nextest"),
+                b"unused captured runner fixture",
+                0o700,
+            );
+            let stderr = fixture.refused(
+                fixture
+                    .command(remote)
+                    .args([
+                        "nextest",
+                        "run",
+                        "--test-threads",
+                        "1",
+                        "--partition",
+                        partition,
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+            assert!(stderr.contains("partition"), "{stderr}");
+        }
+    }
+}
+
+#[test]
 fn nextest_validates_captured_runner_and_retains_local_and_remote_intent() {
     for remote in [false, true] {
         let fixture = Fixture::new();
@@ -935,6 +964,8 @@ fn nextest_validates_captured_runner_and_retains_local_and_remote_intent() {
                     "ci",
                     "--test-threads",
                     "1",
+                    "--partition",
+                    "slice:2/3",
                     "-E",
                     "package(core)",
                     "--",
@@ -952,6 +983,7 @@ fn nextest_validates_captured_runner_and_retains_local_and_remote_intent() {
         assert_eq!(settings["selection"]["profile"], "release");
         assert_eq!(settings["selection"]["runner_profile"], "ci");
         assert_eq!(settings["selection"]["test_threads"], 1);
+        assert_eq!(settings["selection"]["partition"], "slice:2/3");
         assert_eq!(
             settings["selection"]["filtersets"],
             json!(["package(core)"])

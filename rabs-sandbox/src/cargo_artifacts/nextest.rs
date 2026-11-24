@@ -244,6 +244,64 @@ mod tests {
     }
 
     #[test]
+    fn partition_is_bound_to_retained_argv_without_discounting_runtime_capacity() {
+        for partition in ["hash:2/5", "slice:3/5", "count:4/5"] {
+            let selection = CompilationSelection {
+                partition: Some(partition.into()),
+                test_threads: Some(7),
+                ..Default::default()
+            };
+            let original = request(selection);
+            assert_eq!(
+                requested(&original).unwrap(),
+                CargoArtifactMode::NextestExecution
+            );
+            assert_eq!(fresh_execution_slots(&original).unwrap(), Some(7));
+            assert_eq!(
+                original["artifacts"]["cargo"]["selection"]["partition"],
+                partition
+            );
+            let args = original["args"].as_array().unwrap();
+            let at = args.iter().position(|arg| arg == "--partition").unwrap();
+            assert_eq!(args[at + 1], partition);
+
+            let mut changed = original.clone();
+            changed["artifacts"]["cargo"]["selection"]["partition"] = json!("hash:1/5");
+            assert!(requested(&changed).is_err());
+            let mut changed = original.clone();
+            changed["args"][at + 1] = json!("hash:1/5");
+            assert!(requested(&changed).is_err());
+            let mut changed = original.clone();
+            changed["artifacts"]["cargo"]["selection"]
+                .as_object_mut()
+                .unwrap()
+                .remove("partition");
+            assert!(requested(&changed).is_err());
+
+            let compile_only = request(CompilationSelection {
+                partition: Some(partition.into()),
+                no_run: true,
+                ..Default::default()
+            });
+            assert_eq!(
+                requested(&compile_only).unwrap(),
+                CargoArtifactMode::NextestCompilation
+            );
+            assert_eq!(fresh_execution_slots(&compile_only).unwrap(), Some(3));
+        }
+        let historical = request(CompilationSelection::default());
+        assert!(
+            historical["artifacts"]["cargo"]["selection"]
+                .get("partition")
+                .is_none()
+        );
+        assert_eq!(
+            requested(&historical).unwrap(),
+            CargoArtifactMode::NextestExecution
+        );
+    }
+
+    #[test]
     fn unknown_or_mismatched_intent_cannot_change_execution_or_output_contract() {
         let original = request(CompilationSelection::default());
         let mut cases = Vec::new();

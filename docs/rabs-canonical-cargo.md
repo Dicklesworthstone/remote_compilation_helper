@@ -182,9 +182,34 @@ Compilation and runner options remain distinct:
 | Cargo compilation profile | `--cargo-profile NAME` or `--release` | `profile` or `release` |
 | Nextest configuration profile | `--profile NAME` | `runner_profile` |
 | Explicit test concurrency | `--test-threads N`, `--jobs N`, or `-jN` | `test_threads` |
+| One test partition | `--partition hash:M/N`, `slice:M/N`, or `count:M/N` | `partition` |
 | Nextest filter expressions | Repeated `--filterset EXPR` or `-E EXPR` | `filtersets` |
 | One optional test-name filter | Positional filter | `test_filter` |
 | Emulated test-harness arguments | Arguments after `--` | `test_args` |
+
+For a CI matrix, submit each partition as its own operation. Two jobs can use:
+
+```sh
+rabs-cargo --worker WORKER_A.json -- nextest run --workspace \
+  --test-threads 2 --partition hash:1/2
+rabs-cargo --worker WORKER_B.json -- nextest run --workspace \
+  --test-threads 2 --partition hash:2/2
+```
+
+The shared selector validates [nextest's partition syntax](https://nexte.st/docs/ci-features/partitioning/):
+`hash:M/N`, `slice:M/N`, or `count:M/N`, with positive 64-bit integers and
+`1 <= M <= N`. Both `--partition VALUE` and `--partition=VALUE` work.
+The captured nextest executable performs test assignment; it must support the
+selected mode. The frontend preserves the literal partition in local and remote
+profiles, direct-worker requests and retained nextest contracts. Duplicate or
+malformed partitions refuse before native handoff or source-graph preparation.
+
+Partitioning selects the tests executed by that operation. Every shard retains
+the complete Cargo compilation selection and input graph; the nonexecuting
+Cargo graph query omits runner partitions and filters. A shard reserves the
+same build and explicit test concurrency as an unpartitioned run, and executes
+its tests fresh. Choose the set of partitions in the CI matrix; the frontend
+submits the single requested shard.
 
 Local and remote profiles supply nextest's `--build-jobs` from `jobs`. Worker
 profiles use `jobserver_grant`, defaulting to one, and retain that exact compiler

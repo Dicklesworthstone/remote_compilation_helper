@@ -137,6 +137,11 @@ pub struct CompilationSelection {
     /// parallelism remains the driver's independent `--build-jobs` control.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_threads: Option<u32>,
+    /// One literal nextest partition, such as `hash:1/4` or `slice:2/4`.
+    /// The captured runner owns test assignment. Partitioning never narrows the
+    /// Cargo graph, reduces admitted concurrency, or authorizes a cached pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
     /// Literal nextest filterset expressions. They select test execution only
     /// and must never narrow the Cargo graph used for compiler input capture.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -182,6 +187,30 @@ fn ordinary_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Match nextest's bounded, one-based partition grammar without assigning tests.
+/// Its captured version remains the authority for the partitioning algorithm.
+fn valid_nextest_partition(value: &str) -> bool {
+    let Some((kind, numbers)) = value.split_once(':') else {
+        return false;
+    };
+    let Some((shard, total)) = numbers.split_once('/') else {
+        return false;
+    };
+    if value.len() > MAX_VALUE_BYTES
+        || !matches!(kind, "hash" | "slice" | "count")
+        || shard.is_empty()
+        || total.is_empty()
+        || !shard.bytes().all(|byte| byte.is_ascii_digit())
+        || !total.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    matches!(
+        (shard.parse::<u64>(), total.parse::<u64>()),
+        (Ok(shard), Ok(total)) if shard > 0 && shard <= total
+    )
 }
 
 fn validate_lint_arguments(args: &[String]) -> io::Result<()> {
@@ -267,6 +296,7 @@ impl CompilationSelection {
         if command != CompilationCommand::Nextest
             && (self.runner_profile.is_some()
                 || self.test_threads.is_some()
+                || self.partition.is_some()
                 || !self.filtersets.is_empty())
         {
             return Err(invalid("runner selection requires the nextest command"));
@@ -283,6 +313,15 @@ impl CompilationSelection {
             .is_some_and(|threads| !(1..=4096).contains(&threads))
         {
             return Err(invalid("nextest test threads must be between 1 and 4096"));
+        }
+        if self
+            .partition
+            .as_ref()
+            .is_some_and(|partition| !valid_nextest_partition(partition))
+        {
+            return Err(invalid(
+                "nextest partition must be hash:M/N, slice:M/N or count:M/N with 1 <= M <= N",
+            ));
         }
         if self.filtersets.iter().any(|filter| {
             filter.trim().is_empty()
@@ -389,6 +428,7 @@ impl CompilationSelection {
             + usize::from(self.profile.is_some())
             + usize::from(self.runner_profile.is_some())
             + usize::from(self.test_threads.is_some())
+            + usize::from(self.partition.is_some())
             + self.filtersets.len()
             + usize::from(self.test_filter.is_some())
             + self.test_args.len()
@@ -452,6 +492,9 @@ impl CompilationSelection {
         if let Some(threads) = self.test_threads {
             args.extend(["--test-threads".into(), threads.to_string()]);
         }
+        if let Some(partition) = &self.partition {
+            args.extend(["--partition".into(), partition.clone()]);
+        }
         for filter in &self.filtersets {
             args.extend(["--filterset".into(), filter.clone()]);
         }
@@ -491,8 +534,8 @@ impl CompilationSelection {
 
     /// Derive the exact Cargo compilation selection used by `nextest run`.
     ///
-    /// Nextest builds with `cargo test --no-run`; its runner profiles, filters,
-    /// concurrency and emulated harness arguments never select Cargo units.
+    /// Nextest builds with `cargo test --no-run`; its runner profiles, partitions,
+    /// filters, concurrency and emulated harness arguments never select Cargo units.
     /// The caller runs this selection with the captured Cargo executable and
     /// `CompilationCommand::Test`, then validates the graph as `Nextest` so
     /// project execution still requires the closed worker authority boundary.
@@ -505,6 +548,7 @@ impl CompilationSelection {
         compilation.test_args.clear();
         compilation.runner_profile = None;
         compilation.test_threads = None;
+        compilation.partition = None;
         compilation.filtersets.clear();
         Ok(compilation)
     }
@@ -1075,7 +1119,7 @@ mod tests {
             ["test", "--no-run"]
         );
         let encoded = serde_json::to_value(&selection).unwrap();
-        for field in ["runner_profile", "test_threads", "filtersets"] {
+        for field in ["runner_profile", "test_threads", "partition", "filtersets"] {
             assert!(encoded.get(field).is_none(), "old commands gained {field}");
         }
         let selected: CompilationSelection = serde_json::from_value(json!({
@@ -1102,6 +1146,115 @@ mod tests {
     }
 
     #[test]
+    fn nextest_partitions_are_retained_without_narrowing_compiler_inputs() {
+        for partition in [
+            "hash:1/4",
+            "hash:4/4",
+            "slice:2/3",
+            "count:1/1",
+            "hash:18446744073709551615/18446744073709551615",
+        ] {
+            let selection = CompilationSelection {
+                workspace: true,
+                profile: Some("release".into()),
+                runner_profile: Some("ci".into()),
+                test_threads: Some(2),
+                partition: Some(partition.into()),
+                filtersets: vec!["test(roundtrip)".into()],
+                test_filter: Some("packet".into()),
+                test_args: vec!["--exact".into()],
+                ..Default::default()
+            };
+            let original = selection.clone();
+            let args = selection
+                .cargo_arguments(CompilationCommand::Nextest)
+                .unwrap();
+            assert!(args.windows(2).any(|pair| pair == ["--partition", partition]));
+            assert_eq!(
+                selection
+                    .runtime_arguments(CompilationCommand::Nextest)
+                    .unwrap(),
+                ["--", "--exact"]
+            );
+            let planned = selection.nextest_build_selection().unwrap();
+            assert!(planned.partition.is_none());
+            assert_eq!(
+                planned.cargo_arguments(CompilationCommand::Test).unwrap(),
+                ["test", "--workspace", "--no-run", "--profile", "release"]
+            );
+            assert_eq!(selection, original);
+            let encoded = serde_json::to_value(&selection).unwrap();
+            assert_eq!(encoded["partition"], partition);
+            assert_eq!(
+                serde_json::from_value::<CompilationSelection>(encoded).unwrap(),
+                selection
+            );
+            let mut compile_only = selection;
+            compile_only.no_run = true;
+            assert!(
+                compile_only
+                    .cargo_arguments(CompilationCommand::Nextest)
+                    .unwrap()
+                    .windows(2)
+                    .any(|pair| pair == ["--partition", partition])
+            );
+        }
+    }
+
+    #[test]
+    fn nextest_partition_refuses_bad_bounds_grammar_and_argument_budget() {
+        for partition in [
+            "",
+            "hash",
+            "hash:1",
+            "hash:0/1",
+            "hash:1/0",
+            "hash:3/2",
+            "slice:0/2",
+            "count:2/1",
+            "other:1/2",
+            "HASH:1/2",
+            "hash:+1/2",
+            "hash:1/-2",
+            "hash:1/2/3",
+            "hash:1/2:3",
+            "hash:1/2 ",
+            "hash: 1/2",
+            "hash:1/2\n",
+            "hash:١/2",
+            "hash:18446744073709551616/18446744073709551616",
+            "--config=outside",
+            &format!("hash:{}/1", "0".repeat(MAX_VALUE_BYTES)),
+        ] {
+            let selection = CompilationSelection {
+                partition: Some(partition.into()),
+                ..Default::default()
+            };
+            assert!(
+                selection
+                    .cargo_arguments(CompilationCommand::Nextest)
+                    .is_err(),
+                "{partition:?}"
+            );
+            assert!(selection.nextest_build_selection().is_err());
+        }
+        let mut selection = CompilationSelection {
+            filtersets: vec!["all()".into(); MAX_VALUES - 1],
+            partition: Some("hash:1/2".into()),
+            ..Default::default()
+        };
+        selection
+            .cargo_arguments(CompilationCommand::Nextest)
+            .unwrap();
+        selection.test_threads = Some(1);
+        assert!(
+            selection
+                .cargo_arguments(CompilationCommand::Nextest)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn nextest_runner_controls_cannot_select_other_commands_or_doctests() {
         for selection in [
             CompilationSelection {
@@ -1114,6 +1267,10 @@ mod tests {
             },
             CompilationSelection {
                 filtersets: vec!["all()".into()],
+                ..Default::default()
+            },
+            CompilationSelection {
+                partition: Some("hash:1/2".into()),
                 ..Default::default()
             },
         ] {

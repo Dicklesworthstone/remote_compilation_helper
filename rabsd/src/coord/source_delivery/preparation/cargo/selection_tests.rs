@@ -161,12 +161,14 @@ fn selected_native_nextest_plans_only_its_cargo_build_selection() {
         json!({
             "workspace":true, "features":["feature-a"], "profile":"release",
             "runner_profile":"ci", "filtersets":["package(core)"],
-            "test_threads":1, "test_filter":"roundtrip", "test_args":["--exact"],
+            "test_threads":1, "partition":"hash:2/5",
+            "test_filter":"roundtrip", "test_args":["--exact"],
         }),
     ));
     let selected =
         SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::CanonicalLocal).unwrap();
     assert_eq!(selected.command, CompilationCommand::Nextest);
+    assert_eq!(selected.selection.partition.as_deref(), Some("hash:2/5"));
     assert_eq!(
         selected.graph_arguments(&Value::Null, None).unwrap(),
         [
@@ -182,6 +184,7 @@ fn selected_native_nextest_plans_only_its_cargo_build_selection() {
         ]
     );
     assert!(selected.graph_tail_arguments().unwrap().is_empty());
+    assert_eq!(selected.selection.partition.as_deref(), Some("hash:2/5"));
     assert!(
         SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
     );
@@ -233,6 +236,7 @@ fn selected_worker_nextest_reuses_shared_build_selection_and_requires_exact_cont
             profile: Some("release".into()),
             runner_profile: Some("ci".into()),
             test_threads: Some(1),
+            partition: Some("slice:3/5".into()),
             filtersets: vec!["package(core)".into()],
             test_filter: Some("roundtrip".into()),
             test_args: vec!["--exact".into()],
@@ -250,6 +254,7 @@ fn selected_worker_nextest_reuses_shared_build_selection_and_requires_exact_cont
     let selected =
         SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest).unwrap();
     assert_eq!(selected.command, CompilationCommand::Nextest);
+    assert_eq!(selected.selection.partition.as_deref(), Some("slice:3/5"));
     assert_eq!(
         selected.graph_arguments(&Value::Null, None).unwrap(),
         [
@@ -277,10 +282,63 @@ fn selected_worker_nextest_reuses_shared_build_selection_and_requires_exact_cont
                 .is_err()
         );
     }
-    let mut changed = input;
-    changed["artifacts"]["cargo"]["selection"]["test_threads"] = json!(2);
+    for (field, value) in [
+        ("test_threads", json!(2)),
+        ("partition", json!("slice:4/5")),
+        ("partition", Value::Null),
+    ] {
+        let mut changed = input.clone();
+        changed["artifacts"]["cargo"]["selection"][field] = value;
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::RemoteRequest)
+                .is_err(),
+            "{field}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_nextest_partition_is_validated_before_graph_preparation() {
+    let input = native_specification(native_profile(
+        "nextest",
+        json!({"test_threads":1, "partition":"hash:1/2"}),
+    ));
+    for extra in [
+        vec!["--partition", "hash:2/2"],
+        vec!["--partition=slice:1/2"],
+    ] {
+        let mut changed = input.clone();
+        changed["args"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.into_iter().map(|argument| json!(argument)));
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .is_err()
+        );
+    }
+    for partition in ["hash:0/2", "hash:3/2", "slice:1/0", "count:1/2/3"] {
+        let mut changed = input.clone();
+        let args = changed["args"].as_array_mut().unwrap();
+        let at = args
+            .iter()
+            .position(|argument| argument == "--partition")
+            .unwrap();
+        args[at + 1] = json!(partition);
+        assert!(
+            SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::CanonicalLocal)
+                .is_err(),
+            "{partition}"
+        );
+    }
+    let mut ordinary = request("test", &[]);
+    ordinary["args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("--partition"), json!("hash:1/2")]);
     assert!(
-        SelectedCommand::parse(&changed, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
+        SelectedCommand::parse(&ordinary, "Cargo.toml", PreparationContext::RemoteRequest).is_err()
     );
 }
 

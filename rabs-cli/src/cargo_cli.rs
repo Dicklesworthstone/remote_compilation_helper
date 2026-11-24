@@ -289,6 +289,7 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
                     | "-j"
                     | "--filterset"
                     | "-E"
+                    | "--partition"
             ) {
                 return Err(invalid(
                     "unsupported Cargo selector; configure manifest, jobs and roots in the profile",
@@ -338,6 +339,11 @@ fn selection(arguments: &[OsString]) -> io::Result<(CompilationCommand, Compilat
                         })?;
                     if selected.test_threads.replace(count).is_some() {
                         return Err(invalid("nextest test threads may be selected only once"));
+                    }
+                }
+                "--partition" if command == CompilationCommand::Nextest => {
+                    if selected.partition.replace(value).is_some() {
+                        return Err(invalid("nextest --partition may be selected only once"));
                     }
                 }
                 "--filterset" | "-E" if command == CompilationCommand::Nextest => {
@@ -432,6 +438,60 @@ mod tests {
             selected.runtime_arguments(command).unwrap(),
             ["--", "--exact"]
         );
+    }
+
+    #[test]
+    fn nextest_partitions_reach_every_canonical_mode_as_literal_runner_selection() {
+        for mode in ["--local", "--remote", "--worker"] {
+            for partition in ["hash:1/4", "slice:2/4", "count:4/4"] {
+                for inline in [false, true] {
+                    let option = format!("--partition={partition}");
+                    let mut arguments = vec![mode, "p.json", "nextest", "run"];
+                    if inline {
+                        arguments.push(&option);
+                    } else {
+                        arguments.extend(["--partition", partition]);
+                    }
+                    arguments.extend(["--test-threads", "2", "-Eall()", "--", "--exact"]);
+                    let Invocation::Run(options) = parse_strings(&arguments).unwrap() else {
+                        panic!("expected nextest invocation");
+                    };
+                    let (command, selected) = options.selected.unwrap();
+                    assert_eq!(command, CompilationCommand::Nextest);
+                    assert_eq!(selected.partition.as_deref(), Some(partition));
+                    assert_eq!(selected.test_threads, Some(2));
+                    assert_eq!(selected.filtersets, ["all()"]);
+                    assert_eq!(selected.test_args, ["--exact"]);
+                    assert_eq!(
+                        selected
+                            .nextest_build_selection()
+                            .unwrap()
+                            .cargo_arguments(CompilationCommand::Test)
+                            .unwrap(),
+                        ["test", "--no-run"]
+                    );
+                }
+            }
+        }
+        for options in [
+            vec!["--partition"],
+            vec!["--partition="],
+            vec!["--partition", "hash:0/4"],
+            vec!["--partition", "slice:5/4"],
+            vec!["--partition", "count:1/0"],
+            vec!["--partition", "hash:1/4", "--partition=slice:2/4"],
+        ] {
+            let mut arguments = vec!["--local", "p.json", "nextest", "run"];
+            arguments.extend(options);
+            assert!(parse_strings(&arguments).is_err(), "{arguments:?}");
+        }
+        for command in ["build", "check", "test", "run", "bench", "doc", "clippy"] {
+            assert!(
+                parse_strings(&["--remote", "p.json", command, "--partition=hash:1/4"])
+                    .is_err(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
