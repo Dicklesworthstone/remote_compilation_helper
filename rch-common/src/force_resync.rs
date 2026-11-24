@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 /// A stale root to force-resync: its local project root and the worker-side
@@ -66,6 +67,134 @@ pub fn is_safe_invalidation_target(target: &Path, managed_base: &Path) -> bool {
         return false;
     }
     target.starts_with(managed_base) && target != managed_base
+}
+
+/// Build explicit force-resync through worker collection's ownership,
+/// retention, liveness, and emergency-storage machinery. The selected scope
+/// remains one immediate child of the existing managed base.
+///
+/// # Errors
+///
+/// Refuses unsafe bases, nested or escaping candidates, and ambiguous names.
+pub fn remote_invalidation_command(path: &Path, managed_base: &Path) -> anyhow::Result<String> {
+    let registry = crate::stale_target_reap::SOURCE_CLAIM_REGISTRY;
+    let command = remote_invalidation_script(path, managed_base, registry)?;
+    Ok(crate::stale_target_reap::with_gc_recovery_reserve(
+        registry, &command,
+    ))
+}
+
+/// The same guarded transaction for an explicit source registry. Production
+/// wraps it in the emergency reserve; isolated native fixtures use their own
+/// registry without touching deployed worker ownership.
+///
+/// # Errors
+///
+/// Refuses a candidate outside the exact normalized managed-base scope.
+pub fn remote_invalidation_script(
+    path: &Path,
+    managed_base: &Path,
+    registry: &str,
+) -> anyhow::Result<String> {
+    let base = managed_base.to_str().context("managed base is not UTF-8")?;
+    let normalized =
+        crate::types::validate_worker_remote_base(base, None).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        normalized == base
+            && is_safe_invalidation_target(path, managed_base)
+            && path.parent() == Some(managed_base),
+        "force-resync requires an immediate child of its normalized managed base"
+    );
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("cache directory name is not UTF-8")?;
+    anyhow::ensure!(
+        !leaf.chars().any(char::is_control),
+        "cache directory name contains control characters"
+    );
+    let guard = crate::stale_target_reap::source_claim_gc_guard_fragment_with_registry(registry);
+    let (liveness, cleanup) = crate::stale_target_reap::gc_liveness_guard_fragments();
+    Ok(format!(
+        r#"{guard}
+{locate}
+set -u
+__sync_base={base}
+__sync_leaf={leaf}
+__held=''; __proc=''
+rch_sync_end() {{
+    {cleanup}
+    __held=''; __proc=''
+    if ! __gc_source_end; then
+        printf 'RCH_SYNC_INVALIDATION_REFUSED retirement-failed\n' >&2
+        return 1
+    fi
+}}
+rch_sync_refuse_held() {{
+    printf 'RCH_SYNC_INVALIDATION_REFUSED %s\n' "$1" >&2
+    rch_sync_end || exit 73
+    exit 73
+}}
+# An absent cache needs no removal. Existing links are never treated as absent.
+if [ ! -e "$__sync_base" ] && [ ! -L "$__sync_base" ]; then
+    printf 'RCH_SYNC_INVALIDATED absent\n'; exit 0
+fi
+if [ -L "$__sync_base" ] || ! cd -P -- "$__sync_base"; then
+    printf 'RCH_SYNC_INVALIDATION_REFUSED managed-base\n' >&2; exit 73
+fi
+__sync_root=$(pwd -P) || exit 73
+case "$__sync_root" in /*/*) ;; *)
+    printf 'RCH_SYNC_INVALIDATION_REFUSED shallow-managed-base\n' >&2; exit 73;;
+esac
+__sync_target="$__sync_root/$__sync_leaf"
+if [ ! -e "./$__sync_leaf" ] && [ ! -L "./$__sync_leaf" ]; then
+    printf 'RCH_SYNC_INVALIDATED absent\n'; exit 0
+fi
+if [ -L "./$__sync_leaf" ] || [ ! -d "./$__sync_leaf" ]; then
+    printf 'RCH_SYNC_INVALIDATION_REFUSED cache-directory\n' >&2; exit 73
+fi
+if ! rch_wkr_locate || [ "$("$RCH_WKR" force-resync probe)" != 'rch-wkr force-resync v1' ]; then
+    printf 'RCH_SYNC_INVALIDATION_REFUSED deploy-rch-wkr-with-force-resync\n' >&2; exit 73
+fi
+__sync_worker=$RCH_WKR
+__sync_identity=$("$__sync_worker" force-resync inspect "$__sync_target") || exit 73
+if __gc_source_begin "$__sync_target"; then :; else
+    __sync_admission=$?
+    if [ "$__sync_admission" -eq 4 ]; then
+        printf 'RCH_SYNC_INVALIDATED absent\n'; exit 0
+    fi
+    printf 'RCH_SYNC_INVALIDATION_REFUSED source-or-retention-%s\n' "$__sync_admission" >&2
+    exit 73
+fi
+{liveness}
+__sync_handles=$(__gc_handles "$__sync_target")
+__sync_processes=$(__gc_procs "$__sync_target")
+if [ "$__sync_handles" != free ] || [ "$__sync_processes" != free ]; then
+    rch_sync_refuse_held "activity-handles-$__sync_handles-processes-$__sync_processes"
+fi
+# The source transaction serializes RCH admission. Recheck the initially
+# observed directory after that wait and the process census. The native helper
+# repeats these identities through each descriptor-relative unlink and keeps
+# the canonical candidate in its argv for abandoned-claim reconciliation.
+if [ "$__gc_candidate" != "$__sync_target" ] \
+    || [ "$(pwd -P)" != "$__sync_root" ] \
+    || [ ! "$__sync_base" -ef . ] \
+    || [ -L "$__sync_base" ] \
+    || [ -L "./$__sync_leaf" ] \
+    || [ ! "$__sync_target" -ef "./$__sync_leaf" ]; then
+    rch_sync_refuse_held changed-directory
+fi
+__sync_status=0
+__sync_removed=$("$__sync_worker" force-resync apply "$__sync_target" "$__sync_identity" "$__gc_source_registry" "$__gc_reservation") || __sync_status=$?
+rch_sync_end || exit 73
+[ "$__sync_status" -eq 0 ] || exit "$__sync_status"
+[ "$__sync_removed" = removed ] || exit 73
+printf 'RCH_SYNC_INVALIDATED removed\n'
+"#,
+        base = shell_escape::escape(base.into()),
+        leaf = shell_escape::escape(leaf.into()),
+        locate = crate::wkr_locate::WKR_LOCATE_SHELL,
+    ))
 }
 
 /// Plan the force-resync: each stale root whose worker cache path is safely

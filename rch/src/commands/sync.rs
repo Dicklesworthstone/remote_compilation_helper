@@ -18,15 +18,16 @@
 //!    an escaping `..` path. Canonical source mirrors (e.g. `/data/projects/x`)
 //!    are therefore *refused*, never wiped — only RCH-managed cache is touched.
 //! 4. Only when `--force` is given without `--dry-run` and the worker is
-//!    reachable, apply a safety-**re-checked** recursive remove over SSH
-//!    ([`apply_force_resync`] decides; `is_safe_invalidation_target` re-gates
-//!    each path at the SSH boundary), then trigger a daemon-driven convergence
-//!    repair so the closure re-syncs. Default (no `--force`, or `--dry-run`) is
-//!    a safe preview that takes no destructive action.
+//!    reachable, invalidate under the worker's durable source transaction and
+//!    retention/liveness gates. The managed directory is pinned as the shell's
+//!    CWD, and only its verified immediate child can be removed. Confirm the
+//!    removal and retirement receipt before requesting convergence repair.
+//!    Default (no force, or dry-run) previews the lexical plan only.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use rch_common::force_resync::remote_invalidation_command;
 use rch_common::{
     ApiResponse, ForceResyncPlan, StaleRoot, WorkerConfig, apply_force_resync,
     build_dependency_closure_plan, is_safe_invalidation_target, plan_force_resync,
@@ -39,7 +40,6 @@ use crate::ui::context::OutputContext;
 
 use super::load_workers_from_config;
 use super::send_daemon_command;
-use super::workers_setup::run_setup_ssh_command;
 
 /// A refused invalidation surfaced to the agent (cache path escaped the base).
 #[derive(Debug, Clone, Serialize)]
@@ -54,9 +54,10 @@ struct RefusedEntry {
 struct SyncForceWorkerResult {
     worker_id: String,
     reachable: bool,
-    /// `applied`, `deferred_worker_unavailable`, or `preview`.
+    /// Applied, partially applied, refused, deferred, or preview.
     outcome: String,
     removed_ok: usize,
+    already_absent: usize,
     remove_failures: Vec<String>,
     repair_triggered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,7 +71,7 @@ struct SyncForceResult {
     managed_base: String,
     force: bool,
     dry_run: bool,
-    /// True only when `force && !dry_run` — i.e. destructive action was taken.
+    /// True only when at least one worker confirmed a completed removal.
     applied: bool,
     closure_roots: Vec<String>,
     /// RCH-managed cache paths that were (or, in preview, would be) invalidated.
@@ -146,7 +147,7 @@ pub async fn sync_force(
         managed_base: managed_base.display().to_string(),
         force,
         dry_run,
-        applied: is_apply,
+        applied: worker_results.iter().any(|worker| worker.removed_ok > 0),
         closure_roots: closure_roots
             .iter()
             .map(|r| r.display().to_string())
@@ -168,13 +169,30 @@ pub async fn sync_force(
         workers: worker_results,
     };
 
-    let _ = ctx.json(&ApiResponse::ok("sync", &result));
-    if ctx.is_json() {
-        return Ok(());
+    if !ctx.is_json() {
+        render_human(&result, ctx);
     }
-
-    render_human(&result, ctx);
+    if apply_failed(&result) {
+        return Err(crate::GcFailure {
+            command: "sync",
+            data: serde_json::to_value(&result)?,
+            api_error: rch_common::ApiError::from_code(rch_common::ErrorCode::WorkerReclaimFailed)
+                .with_details(
+                    "force-resync incomplete; inspect per-worker refusals and confirmed removals",
+                ),
+            format: ctx.format(),
+        }
+        .into());
+    }
+    ctx.json(&ApiResponse::ok("sync", &result))?;
     Ok(())
+}
+
+fn apply_failed(result: &SyncForceResult) -> bool {
+    result.force
+        && !result.dry_run
+        && (!result.refused.is_empty()
+            || result.workers.iter().any(|worker| worker.outcome != "applied"))
 }
 
 /// Resolve the path-dependency closure roots for `project_root`. Fail-open: an
@@ -205,25 +223,26 @@ fn stale_roots_for(roots: &[PathBuf], managed_base: &Path) -> Vec<StaleRoot> {
         .collect()
 }
 
-/// Single-quote a string for safe interpolation into a remote shell command.
-fn shell_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
+#[derive(Debug, PartialEq, Eq)]
+enum InvalidationReceipt {
+    Removed,
+    Absent,
 }
 
-/// The remote command that removes a safety-checked cache path. `--` guards
-/// against any leading-dash interpretation; the path is single-quoted.
-fn remote_rm_command(path: &Path) -> String {
-    format!("rm -rf -- {}", shell_single_quote(&path.to_string_lossy()))
+fn invalidation_receipt(stdout: &str) -> Result<InvalidationReceipt> {
+    let receipts: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("RCH_SYNC_INVALIDATED "))
+        .collect();
+    anyhow::ensure!(
+        receipts.len() == 1 && stdout.ends_with(&format!("{}\n", receipts[0])),
+        "worker did not confirm one completed invalidation and retirement"
+    );
+    match receipts[0] {
+        "RCH_SYNC_INVALIDATED removed" => Ok(InvalidationReceipt::Removed),
+        "RCH_SYNC_INVALIDATED absent" => Ok(InvalidationReceipt::Absent),
+        _ => anyhow::bail!("worker returned an unrecognized invalidation receipt"),
+    }
 }
 
 /// Probe + (optionally) apply the invalidation on one worker.
@@ -233,24 +252,38 @@ async fn apply_on_worker(
     managed_base: &Path,
     is_apply: bool,
 ) -> SyncForceWorkerResult {
-    // Reachability probe (also gates apply_force_resync's deferral decision).
-    let reachable = match run_setup_ssh_command(worker, "true").await {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
-    };
-
-    // The pure module decides what (if anything) is safe to invalidate.
+    if is_apply && crate::transfer::WorkerPlatform::from_worker(worker).is_windows() {
+        return SyncForceWorkerResult {
+            worker_id: worker.id.0.clone(),
+            reachable: false,
+            outcome: "refused".into(),
+            removed_ok: 0,
+            already_absent: 0,
+            remove_failures: vec![
+                "force-resync requires the POSIX source-ownership protocol; Windows invalidation is unsupported".into(),
+            ],
+            repair_triggered: false,
+            repair_status: None,
+        };
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut output_budget = crate::GC_OUTPUT_LIMIT;
+    // One worker budget covers reachability and every invalidation. Streaming
+    // SSH retains local child custody and a bounded stdout/stderr aggregate.
+    let reachable =
+        match crate::run_gc_surface_command(worker, "true", deadline, &mut output_budget).await {
+            Ok(out) => out.success(),
+            Err(_) => false,
+        };
     let report = apply_force_resync(plan, reachable);
-
     let mut removed_ok = 0usize;
+    let mut already_absent = 0usize;
     let mut remove_failures = Vec::new();
     let mut repair_triggered = false;
     let mut repair_status = None;
 
     if is_apply && reachable {
         for path in &report.invalidated {
-            // Defense-in-depth: never rm a path that is not strictly under the
-            // managed base, even though plan_force_resync already gated it.
             if !is_safe_invalidation_target(path, managed_base) {
                 remove_failures.push(format!(
                     "{} (refused at SSH boundary: not strictly under managed base)",
@@ -258,35 +291,52 @@ async fn apply_on_worker(
                 ));
                 continue;
             }
-            let cmd = remote_rm_command(path);
-            match run_setup_ssh_command(worker, &cmd).await {
-                Ok(out) if out.status.success() => removed_ok += 1,
+            let command = match remote_invalidation_command(path, managed_base) {
+                Ok(command) => command,
+                Err(error) => {
+                    remove_failures.push(format!("{} ({error})", path.display()));
+                    continue;
+                }
+            };
+            match crate::run_gc_surface_command(worker, &command, deadline, &mut output_budget).await {
+                Ok(out) if out.success() => match invalidation_receipt(&out.stdout) {
+                    Ok(InvalidationReceipt::Removed) => removed_ok += 1,
+                    Ok(InvalidationReceipt::Absent) => already_absent += 1,
+                    Err(error) => {
+                        remove_failures.push(format!("{} ({error})", path.display()));
+                    }
+                },
                 Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
                     remove_failures.push(format!(
                         "{} (exit {}: {})",
                         path.display(),
-                        out.status.code().unwrap_or(-1),
-                        stderr.trim()
+                        out.exit_code,
+                        out.stderr.trim()
                     ));
                 }
-                Err(e) => {
-                    remove_failures.push(format!("{} (ssh error: {e})", path.display()));
+                Err(error) => {
+                    remove_failures.push(format!("{} (ssh error: {error})", path.display()));
                 }
             }
         }
 
-        // Trigger a daemon-driven convergence repair so the closure re-syncs.
-        // Best-effort: the next build re-syncs naturally even if this fails.
-        let (triggered, status) = trigger_repair(worker).await;
-        repair_triggered = triggered;
-        repair_status = status;
+        // The next build also resyncs naturally. Never claim this repair step
+        // after any selected cache failed its guarded invalidation.
+        if remove_failures.is_empty() && !plan.has_refusals() {
+            let (triggered, status) = trigger_repair(worker).await;
+            repair_triggered = triggered;
+            repair_status = status;
+        }
     }
 
     let outcome = if !is_apply {
         "preview"
-    } else if reachable {
+    } else if reachable && remove_failures.is_empty() && !plan.has_refusals() {
         "applied"
+    } else if removed_ok > 0 {
+        "partially_applied"
+    } else if reachable {
+        "refused"
     } else {
         "deferred_worker_unavailable"
     };
@@ -296,6 +346,7 @@ async fn apply_on_worker(
         reachable,
         outcome: outcome.to_string(),
         removed_ok,
+        already_absent,
         remove_failures,
         repair_triggered,
         repair_status,
@@ -335,7 +386,7 @@ fn render_human(result: &SyncForceResult, ctx: &OutputContext) {
         style.key("managed base:"),
         style.value(&result.managed_base)
     );
-    let mode = if result.applied {
+    let mode = if result.force && !result.dry_run {
         style.warning("APPLY (destructive)")
     } else {
         style.info("preview (no destructive action)")
@@ -372,10 +423,15 @@ fn render_human(result: &SyncForceResult, ctx: &OutputContext) {
     for w in &result.workers {
         let status = match w.outcome.as_str() {
             "applied" => style.success(&format!(
-                "applied ({} removed, {} failed)",
+                "applied ({} removed, {} already absent)",
+                w.removed_ok, w.already_absent
+            )),
+            "partially_applied" => style.warning(&format!(
+                "partially applied ({} removed, {} failed)",
                 w.removed_ok,
                 w.remove_failures.len()
             )),
+            "refused" => style.error("refused (no confirmed removal)"),
             "deferred_worker_unavailable" => style.warning("deferred (worker unreachable)"),
             _ => style.info("preview"),
         };
@@ -435,22 +491,44 @@ mod tests {
     }
 
     #[test]
-    fn shell_single_quote_escapes_embedded_quote() {
-        assert_eq!(shell_single_quote("abc"), "'abc'");
-        assert_eq!(shell_single_quote("a b"), "'a b'");
-        // The classic single-quote escape: ' -> '\''
-        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    fn invalidation_rejects_scope_changes_before_worker_dispatch() {
+        for (base, target) in [
+            ("/", "/project"),
+            ("relative/base", "relative/base/project"),
+            ("/tmp/rch", "/tmp/rch"),
+            ("/tmp/rch", "/tmp/rch/project/nested"),
+            ("/tmp/rch", "/tmp/rch/../outside"),
+            ("/tmp/rch", "/tmp/other/project"),
+        ] {
+            assert!(
+                remote_invalidation_command(Path::new(target), Path::new(base)).is_err(),
+                "{base:?} {target:?}"
+            );
+        }
     }
 
     #[test]
-    fn remote_rm_command_is_quoted_and_guarded() {
-        let cmd = remote_rm_command(Path::new("/tmp/rch/myproj"));
-        assert_eq!(cmd, "rm -rf -- '/tmp/rch/myproj'");
-        // A path with a space stays a single shell token.
-        let cmd = remote_rm_command(Path::new("/tmp/rch/my proj"));
-        assert_eq!(cmd, "rm -rf -- '/tmp/rch/my proj'");
-        // Always has the -- option terminator before the path.
-        assert!(cmd.contains(" -- '"));
+    fn invalidation_requires_one_final_retirement_receipt() {
+        assert_eq!(
+            invalidation_receipt(
+                "RCH_GC_GATES handles=1 procs=1\nRCH_SYNC_INVALIDATED removed\n"
+            )
+            .unwrap(),
+            InvalidationReceipt::Removed
+        );
+        assert_eq!(
+            invalidation_receipt("RCH_SYNC_INVALIDATED absent\n").unwrap(),
+            InvalidationReceipt::Absent
+        );
+        for output in [
+            "",
+            "RCH_SYNC_INVALIDATED removed",
+            "RCH_SYNC_INVALIDATED removed\npartial\n",
+            "RCH_SYNC_INVALIDATED removed\nRCH_SYNC_INVALIDATED removed\n",
+            "RCH_SYNC_INVALIDATED unknown\n",
+        ] {
+            assert!(invalidation_receipt(output).is_err(), "{output:?}");
+        }
     }
 
     #[test]
@@ -492,6 +570,7 @@ mod tests {
                 reachable: true,
                 outcome: "applied".to_string(),
                 removed_ok: 1,
+                already_absent: 0,
                 remove_failures: vec![],
                 repair_triggered: true,
                 repair_status: Some("ok".to_string()),
@@ -503,5 +582,24 @@ mod tests {
         assert_eq!(json["workers"][0]["outcome"], "applied");
         assert_eq!(json["workers"][0]["removed_ok"], 1);
         assert_eq!(json["workers"][0]["repair_status"], "ok");
+        assert_eq!(json["workers"][0]["already_absent"], 0);
+        assert!(!apply_failed(&result));
+
+        // The live output boundary uses this same decision before emitting a
+        // JSON success envelope, retaining all partial per-worker evidence.
+        let mut result = result;
+        for outcome in ["refused", "partially_applied", "deferred_worker_unavailable"] {
+            result.workers[0].outcome = outcome.into();
+            assert!(apply_failed(&result), "{outcome}");
+        }
+        result.workers[0].outcome = "applied".into();
+        result.refused.push(RefusedEntry {
+            local_root: "/data/projects/y".into(),
+            worker_cache_path: "/outside".into(),
+            reason: "outside managed base".into(),
+        });
+        assert!(apply_failed(&result));
+        result.dry_run = true;
+        assert!(!apply_failed(&result));
     }
 }

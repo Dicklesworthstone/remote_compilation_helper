@@ -4,7 +4,10 @@
 //! liveness. This helper does not grant that authority: it binds the claimed
 //! physical candidate to the enumerated directory identities, repeats the exact
 //! metadata/age check, and removes entries only through retained descriptors.
-//! Source-content containers are never candidates. No file contents are read.
+//! Source-content containers are never staging-GC candidates. The separate
+//! force-resync entry point consumes the explicit operator cache-invalidation
+//! scope, while sharing descriptor-bound filesystem operations. Neither entry
+//! point grants source-claim, retention, or process-liveness authority.
 
 use std::ffi::OsString;
 use std::io::{self, Write as _};
@@ -30,15 +33,40 @@ pub(crate) fn main(arguments: &[OsString]) -> i32 {
     status
 }
 
+/// The force-resync process owns the entire removal and retains the canonical
+/// candidate in its argv until completion. A lost SSH/shell supervisor therefore
+/// cannot leave an unlabelled removal child invisible to abandoned-claim
+/// reconciliation.
+pub(crate) fn force_resync_main(arguments: &[OsString]) -> i32 {
+    #[cfg(unix)]
+    let result = native::force_resync(arguments);
+    #[cfg(not(unix))]
+    let result: Result<String, ()> = {
+        let _ = arguments;
+        Err(())
+    };
+    match result {
+        Ok(reply) if writeln!(io::stdout().lock(), "{reply}").is_ok() => 0,
+        _ => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "RCH_SYNC_INVALIDATION_REFUSED native-directory"
+            );
+            REFUSED
+        }
+    }
+}
+
 #[cfg(unix)]
 mod native {
     use super::*;
     use rustix::fd::OwnedFd;
     use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
     use rustix::io::Errno;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use sha2::{Digest as _, Sha256};
     use std::ffi::{CStr, CString};
+    use std::io::Read as _;
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::{Component, Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,7 +81,7 @@ mod native {
     const MAX_DEPTH: usize = 256;
     const MAX_ENTRIES: usize = 1_000_000;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct Identity {
         device: u64,
@@ -80,6 +108,14 @@ mod native {
         parent: Identity,
         tree: Identity,
         metadata_digest: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct ForceResyncWitness {
+        canonical_base: PathBuf,
+        base: Identity,
+        tree: Identity,
     }
 
     enum Error {
@@ -224,7 +260,8 @@ mod native {
 
     struct Tree<'a> {
         base_path: &'a Path,
-        witness: &'a Witness,
+        canonical_base: &'a Path,
+        base_identity: Identity,
         base: OwnedFd,
         chain: Vec<Anchor>,
     }
@@ -247,9 +284,9 @@ mod native {
         }
 
         fn unchanged(&self) -> Result<()> {
-            require(self.base_path.canonicalize()? == self.witness.canonical_base)?;
+            require(self.base_path.canonicalize()?.as_path() == self.canonical_base)?;
             let base = rustix::fs::stat(self.base_path)?;
-            require(directory(&base) && Identity::of(&base) == self.witness.base)?;
+            require(directory(&base) && Identity::of(&base) == self.base_identity)?;
             let mut parent = &self.base;
             for anchor in &self.chain {
                 let current = named(parent, &anchor.name)?;
@@ -311,7 +348,8 @@ mod native {
         require(Identity::of(&rustix::fs::fstat(&base_descriptor)?) == witness.base)?;
         let mut tree = Tree {
             base_path: base,
-            witness,
+            canonical_base: &witness.canonical_base,
+            base_identity: witness.base,
             base: base_descriptor,
             chain: Vec::new(),
         };
@@ -359,6 +397,172 @@ mod native {
         rustix::fs::unlinkat(tree.descriptor(), &*removed.name, AtFlags::REMOVEDIR)?;
         rustix::fs::fsync(tree.descriptor())?;
         Ok("removed")
+    }
+
+    fn force_resync_base(path: &Path) -> Result<(&Path, CString)> {
+        require(absolute_clean(path))?;
+        let base = path.parent().ok_or(Error::Changed)?;
+        let text = base.to_str().ok_or(Error::Changed)?;
+        let normalized =
+            rch_common::types::validate_worker_remote_base(text, None).map_err(|_| Error::Changed)?;
+        require(normalized == text && base.canonicalize()?.as_path() == base)?;
+        require(std::env::current_dir()?.as_path() == base)?;
+        let name = path.file_name().ok_or(Error::Changed)?;
+        require(!name.as_bytes().iter().any(u8::is_ascii_control))?;
+        let name = CString::new(name.as_bytes()).map_err(|_| Error::Changed)?;
+        Ok((base, name))
+    }
+
+    fn inspect_force_resync(path: &Path) -> Result<ForceResyncWitness> {
+        let (base, name) = force_resync_base(path)?;
+        let descriptor = rustix::fs::open(".", DIRECTORY_FLAGS, Mode::empty())?;
+        let base_identity = Identity::of(&rustix::fs::fstat(&descriptor)?);
+        require(Identity::of(&rustix::fs::stat(base)?) == base_identity)?;
+        let target = named(&descriptor, &name)?;
+        require(directory(&target))?;
+        let target_identity = Identity::of(&target);
+        let opened = open_directory(&descriptor, &name, target_identity)?;
+        require(rustix::fs::fstat(&opened)?.st_uid == rustix::process::geteuid().as_raw())?;
+        Ok(ForceResyncWitness {
+            canonical_base: base.to_path_buf(),
+            base: base_identity,
+            tree: target_identity,
+        })
+    }
+
+    /// Bind the trusted shell's inherited transaction to its exact active GC
+    /// claim. This is not a second liveness scan or a fresh flock acquisition:
+    /// source, retention and liveness admission belong to the supervising shell.
+    /// Reopening FD8 inspects identity only and never unlocks the inherited
+    /// descriptor; an inspect witness alone cannot authorize deletion.
+    fn force_resync_custody(path: &Path, registry: &Path, claim: &Path) -> Result<()> {
+        require(absolute_clean(registry) && claim.parent() == Some(registry))?;
+        let name = claim
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(Error::Changed)?;
+        let parts: Vec<_> = name.split('.').collect();
+        let [token, digest, extension] = parts.as_slice() else {
+            return Err(Error::Changed);
+        };
+        require(
+            token.starts_with("fc-")
+                && token.len() == 39
+                && token[3..].bytes().all(|byte| {
+                    (byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) || byte == b'-'
+                })
+                && digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && *extension == "claim",
+        )?;
+        let directory = rustix::fs::open(registry, DIRECTORY_FLAGS, Mode::empty())?;
+        let registry_info = rustix::fs::fstat(&directory)?;
+        let uid = rustix::process::geteuid().as_raw();
+        require(registry_info.st_uid == uid && registry_info.st_mode & 0o022 == 0)?;
+        let lock = named(&directory, c"metadata.lock")?;
+        require(
+            FileType::from_raw_mode(lock.st_mode) == FileType::RegularFile && lock.st_uid == uid,
+        )?;
+        // The producer opens FD8 write-only, including on Darwin. Do not
+        // replace a missing inherited descriptor by opening the named lock.
+        let inherited = rustix::fs::open(
+            "/dev/fd/8",
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?;
+        require(Identity::of(&rustix::fs::fstat(&inherited)?) == Identity::of(&lock))?;
+        let name = CString::new(name).map_err(|_| Error::Changed)?;
+        let descriptor = rustix::fs::openat(
+            &directory,
+            &*name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?;
+        let before = rustix::fs::fstat(&descriptor)?;
+        require(
+            FileType::from_raw_mode(before.st_mode) == FileType::RegularFile
+                && before.st_uid == uid
+                && before.st_nlink == 1
+                && before.st_mode & 0o022 == 0,
+        )?;
+        let mut file = std::fs::File::from(descriptor);
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(u64::try_from(MAX_WITNESS_BYTES + 1).map_err(|_| Error::Unavailable)?)
+            .read_to_end(&mut bytes)?;
+        let expected = format!("{}\n", path.to_str().ok_or(Error::Changed)?);
+        require(bytes == expected.as_bytes())?;
+        require(format!("{:x}", Sha256::digest(&bytes)) == *digest)?;
+        require(fields(&rustix::fs::fstat(&file)?) == fields(&before))?;
+        require(fields(&named(&directory, &name)?) == fields(&before))?;
+        require(Identity::of(&named(&directory, c"metadata.lock")?) == Identity::of(&lock))?;
+        Ok(())
+    }
+
+    fn apply_force_resync(
+        path: &Path,
+        witness: &ForceResyncWitness,
+        registry: &Path,
+        claim: &Path,
+    ) -> Result<()> {
+        let (base, name) = force_resync_base(path)?;
+        require(base == witness.canonical_base.as_path())?;
+        force_resync_custody(path, registry, claim)?;
+        let descriptor = rustix::fs::open(".", DIRECTORY_FLAGS, Mode::empty())?;
+        require(Identity::of(&rustix::fs::fstat(&descriptor)?) == witness.base)?;
+        let mut tree = Tree {
+            base_path: base,
+            canonical_base: &witness.canonical_base,
+            base_identity: witness.base,
+            base: descriptor,
+            chain: Vec::new(),
+        };
+        tree.push(name, witness.tree)?;
+        require(
+            rustix::fs::fstat(tree.descriptor())?.st_uid == rustix::process::geteuid().as_raw(),
+        )?;
+        tree.unchanged()?;
+        // Inventory limits and metadata stability are checked before mutation.
+        // Explicit force-resync has no age policy.
+        let mut digest = Sha256::new();
+        let mut remaining = MAX_ENTRIES;
+        observe(tree.descriptor(), b"", &mut digest, &mut remaining, 0)?;
+        tree.unchanged()?;
+        let mut remaining = MAX_ENTRIES;
+        tree.remove_contents(&mut remaining, 0)?;
+        tree.unchanged()?;
+        let removed = tree.chain.pop().ok_or(Error::Unavailable)?;
+        rustix::fs::unlinkat(tree.descriptor(), &*removed.name, AtFlags::REMOVEDIR)?;
+        rustix::fs::fsync(tree.descriptor())?;
+        Ok(())
+    }
+
+    pub(super) fn force_resync(arguments: &[OsString]) -> std::result::Result<String, ()> {
+        match arguments {
+            [operation] if operation == "probe" => Ok("rch-wkr force-resync v1".into()),
+            [operation, path] if operation == "inspect" => {
+                let witness = inspect_force_resync(Path::new(path)).map_err(|_| ())?;
+                serde_json::to_string(&witness).map_err(|_| ())
+            }
+            [operation, path, encoded, registry, claim] if operation == "apply" => {
+                let bytes = encoded.as_os_str().as_bytes();
+                if bytes.len() > MAX_WITNESS_BYTES {
+                    return Err(());
+                }
+                let witness: ForceResyncWitness = serde_json::from_slice(bytes).map_err(|_| ())?;
+                apply_force_resync(
+                    Path::new(path),
+                    &witness,
+                    Path::new(registry),
+                    Path::new(claim),
+                )
+                .map_err(|_| ())?;
+                Ok("removed".into())
+            }
+            _ => Err(()),
+        }
     }
 
     pub(super) fn run(arguments: &[OsString]) -> std::result::Result<&'static str, ()> {
