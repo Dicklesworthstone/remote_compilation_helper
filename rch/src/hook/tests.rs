@@ -15522,11 +15522,7 @@ fn test_custom_target_artifact_patterns_for_nextest_are_target_relative() {
 #[test]
 fn test_custom_target_artifact_patterns_for_build_commands_capture_outputs_only() {
     let _guard = test_guard!();
-    for kind in [
-        CompilationKind::CargoBuild,
-        CompilationKind::CargoDoc,
-        CompilationKind::Rustc,
-    ] {
+    for kind in [CompilationKind::CargoBuild, CompilationKind::Rustc] {
         let patterns = get_custom_target_artifact_patterns(Some(kind), None);
 
         // No longer the firehose: must NOT sync the entire per-job target dir.

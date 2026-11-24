@@ -124,9 +124,20 @@ pub(super) fn get_artifact_patterns(
         // Neither command executes tests. Diagnostics already travel on the
         // build channel, so even an empty report scan is unnecessary (#132).
         Some(CompilationKind::CargoCheck) | Some(CompilationKind::CargoClippy) => Vec::new(),
-        Some(CompilationKind::Rustc)
-        | Some(CompilationKind::CargoBuild)
-        | Some(CompilationKind::CargoDoc) => default_rust_artifact_patterns(),
+        Some(CompilationKind::Rustc) | Some(CompilationKind::CargoBuild) => {
+            default_rust_artifact_patterns()
+        }
+        // Rustdoc writes to doc/, independently of the compilation profile.
+        // An explicit or configured target adds one target-name component.
+        // Compiled dependencies are not the result of a documentation command.
+        Some(CompilationKind::CargoDoc) => vec![
+            "target/doc/**".to_owned(),
+            "target/*/doc/**".to_owned(),
+            // Preserve the existing metadata-only completeness check. Dropping
+            // these would turn a proven missing-doc match into no evidence.
+            "target/.rustc_info.json".to_owned(),
+            "target/CACHEDIR.TAG".to_owned(),
+        ],
         // Zig cross-builds write to target/<triple>/<profile>/, so they need the
         // triple-aware globs — the plain rust patterns would miss the binary.
         Some(CompilationKind::CargoZigbuild) => default_zigbuild_artifact_patterns(),
@@ -180,21 +191,15 @@ pub(super) fn get_artifact_patterns(
     patterns
 }
 
-/// Whether this kind's artifact patterns are the cargo `target/`-rooted rust
-/// output globs — i.e. the kinds for which a custom `--profile` changes the
-/// output directory. This covers the explicit build/doc/rustc/zigbuild arms
-/// AND the unclassified (`None`) rust catch-all; test/diagnostic kinds use the
-/// narrow streaming allowlist (no full target/ sync, so no profile globs), and
-/// non-rust kinds never write into a cargo target dir.
+/// Whether a custom Cargo profile changes the selected output directory.
+/// Documentation stays under doc/ for every profile. Build/rustc/zigbuild
+/// and the unclassified Rust catch-all retain profile-specific build outputs;
+/// streaming test/diagnostic and non-Rust kinds do not add profile globs.
 fn rust_kind_targets_cargo_output_tree(kind: Option<CompilationKind>) -> bool {
     matches!(
         kind,
-        Some(
-            CompilationKind::CargoBuild
-                | CompilationKind::CargoDoc
-                | CompilationKind::CargoZigbuild
-                | CompilationKind::Rustc
-        ) | None
+        Some(CompilationKind::CargoBuild | CompilationKind::CargoZigbuild | CompilationKind::Rustc)
+            | None
     )
 }
 /// the forwarded `CARGO_TARGET_DIR` (via [`get_custom_target_artifact_patterns`]).
@@ -360,7 +365,7 @@ pub(super) fn cargo_retrieval_patterns(
 fn cargo_profile_tree_pattern(pattern: &str) -> bool {
     let components: Vec<_> = pattern.split('/').collect();
     matches!(components.as_slice(), [profile, "**"] if *profile != "doc")
-        || matches!(components.as_slice(), ["*", _, "**"])
+        || matches!(components.as_slice(), ["*", profile, "**"] if *profile != "doc")
 }
 
 /// Decide disjointness component by component. An exhausted prefix or `**`
@@ -581,14 +586,15 @@ pub(super) fn get_custom_target_artifact_patterns(
         // no artifacts.
         | Some(CompilationKind::NixBuild)
         | Some(CompilationKind::Job) => Vec::new(),
-        Some(CompilationKind::CargoTest)
+        Some(CompilationKind::CargoDoc)
+        | Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoNextest)
         | Some(CompilationKind::CargoBench) => {
-            // Cargo target forwarding is active even with the default local
-            // target/. Keep its report allowlist, but rebase ONLY target-root
-            // reports. Project-root junit/tarpaulin/cobertura files belong to
-            // the project phase; looking for them here can return stale files
-            // from a reused target tree into the wrong local directory.
+            // Rebase documentation and reports onto the actual target root.
+            // Documentation must not inherit compilation-cache exclusions:
+            // a crate or module named build or incremental is a valid doc path.
+            // Project-root junit/tarpaulin/cobertura files still belong only
+            // to the project phase, not this target-directory phase.
             get_artifact_patterns(kind, command)
                 .into_iter()
                 .filter_map(|pattern| pattern.strip_prefix("target/").map(str::to_owned))
@@ -630,7 +636,7 @@ pub(super) fn get_custom_target_artifact_patterns(
             }));
             patterns
         }
-        // CargoBuild / CargoDoc / Rustc (the `_` arm) previously synced the WHOLE
+        // CargoBuild / Rustc (the `_` arm) previously synced the WHOLE
         // per-job remote target dir via `**`, dragging deps/, incremental/,
         // .fingerprint/, and build/ back on every build. Capture only the build
         // OUTPUTS — final binaries/libs under `<profile>/` and the crate's own
@@ -799,6 +805,33 @@ fn retrieved_path_is_build_output(path: &str, custom_target_sync: bool) -> bool 
     !rel.ends_with(".d")
 }
 
+/// Documentation has its own output namespace. Dependency binaries cannot
+/// establish that docs were returned, and crate/module names such as build
+/// and incremental are valid here even though they name caches in a profile.
+/// Rustdoc's root lock file alone is not a documentation result.
+fn retrieved_path_is_documentation(path: &str, custom_target_sync: bool) -> bool {
+    let relative = if custom_target_sync {
+        path
+    } else {
+        let Some(relative) = path.strip_prefix("target/") else {
+            return false;
+        };
+        relative
+    };
+    let ordinary_component = |part: &str| !matches!(part, "" | "." | "..");
+    let Some(document) = relative.strip_prefix("doc/").or_else(|| {
+        let (target, rest) = relative.split_once('/')?;
+        if ordinary_component(target) {
+            rest.strip_prefix("doc/")
+        } else {
+            None
+        }
+    }) else {
+        return false;
+    };
+    document != ".lock" && document.split('/').all(ordinary_component)
+}
+
 /// Whether a kind has an ENUMERABLE build-output contract: a successful
 /// remote build of this kind provably materializes files at known locations
 /// under the cargo target tree, so a sync-back that matched zero outputs is
@@ -867,8 +900,8 @@ pub(super) fn sync_back_verified_zero_package_archives(
 ///   files than rsync matched (e.g. a worker rsync that does not itemize
 ///   up-to-date files), outputs may exist unlisted and the gate must not
 ///   fire;
-/// - and no manifest path may classify as a build output (see
-///   [`retrieved_path_is_build_output`]).
+/// - and no manifest path may classify as the requested kind's output (see
+///   [`retrieved_path_is_build_output`] and [`retrieved_path_is_documentation`]).
 pub(super) fn sync_back_verified_zero_build_outputs(
     manifest: &[String],
     matched_regular_files: Option<u32>,
@@ -888,9 +921,198 @@ pub(super) fn sync_back_verified_zero_build_outputs(
     if manifest.len() < matched as usize {
         return false;
     }
-    !manifest
-        .iter()
-        .any(|path| retrieved_path_is_build_output(path, custom_target_sync))
+    !manifest.iter().any(|path| {
+        if kind == Some(CompilationKind::CargoDoc) {
+            retrieved_path_is_documentation(path, custom_target_sync)
+        } else {
+            retrieved_path_is_build_output(path, custom_target_sync)
+        }
+    })
+}
+
+#[cfg(test)]
+mod cargo_doc_tests {
+    use super::*;
+
+    #[test]
+    fn cargo_documentation_selects_host_and_target_docs_without_build_products() {
+        let kind = Some(CompilationKind::CargoDoc);
+        for command in [
+            "cargo doc",
+            "cargo doc --no-deps --target aarch64-unknown-linux-gnu",
+            "env -- cargo doc --release",
+            "cargo doc --profile doc-artifacts --target x86_64-unknown-linux-gnu",
+        ] {
+            assert!(
+                get_project_artifact_patterns(kind, Some(command), true).is_empty(),
+                "forwarded docs belong only to the target-directory phase"
+            );
+            for custom in [false, true] {
+                let patterns = if custom {
+                    get_custom_target_artifact_patterns(kind, Some(command))
+                } else {
+                    get_project_artifact_patterns(kind, Some(command), false)
+                };
+                let filters = crate::transfer::ArtifactFilters::from_patterns(&patterns).unwrap();
+                let prefix = if custom { "" } else { "target/" };
+                for output in [
+                    "doc/fixture/index.html",
+                    "doc/static.files/style.css",
+                    "doc/src/fixture/lib.rs.html",
+                    "doc/build/index.html",
+                    "doc/incremental/index.html",
+                    "aarch64-unknown-linux-gnu/doc/fixture/index.html",
+                    "aarch64-unknown-linux-gnu/doc/build/index.html",
+                    "x86_64-unknown-linux-gnu/doc/incremental/index.html",
+                ] {
+                    assert!(
+                        filters.selects(&format!("{prefix}{output}")),
+                        "{command}: documentation output {output} missing from {patterns:?}"
+                    );
+                }
+                for unrelated in [
+                    "debug/app",
+                    "release/deps/libfixture.rlib",
+                    "doc-artifacts/deps/libfixture.rmeta",
+                    "aarch64-unknown-linux-gnu/debug/app",
+                    "aarch64-unknown-linux-gnu/doc-artifacts/build/cache",
+                    "docs/fixture/index.html",
+                ] {
+                    assert!(
+                        !filters.selects(&format!("{prefix}{unrelated}")),
+                        "{command}: unrelated build output {unrelated} selected by {patterns:?}"
+                    );
+                }
+                for metadata in [".rustc_info.json", "CACHEDIR.TAG"] {
+                    assert!(
+                        filters.selects(&format!("{prefix}{metadata}")),
+                        "retain metadata evidence for the existing zero-documentation guard"
+                    );
+                }
+                assert!(!filters.selects("src/lib.rs"));
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_documentation_exclusions_protect_host_and_target_doc_roots() {
+        let baseline = get_custom_target_artifact_patterns(
+            Some(CompilationKind::CargoDoc),
+            Some("cargo doc --target aarch64-unknown-linux-gnu"),
+        );
+        for directory in [
+            "doc",
+            "doc/fixture",
+            "doc/build",
+            "aarch64-unknown-linux-gnu/doc",
+            "aarch64-unknown-linux-gnu/doc/fixture",
+            "x86_64-unknown-linux-gnu/doc/incremental",
+        ] {
+            let transfer = TransferConfig {
+                cargo_retrieval_exclude_dirs: vec![directory.into()],
+                ..TransferConfig::default()
+            };
+            assert!(
+                cargo_retrieval_patterns(&baseline, &transfer, None).is_err(),
+                "{directory}: documentation cannot be suppressed as a profile cache"
+            );
+        }
+        let transfer = TransferConfig {
+            cargo_retrieval_exclude_dirs: vec!["aarch64-unknown-linux-gnu/debug/private".into()],
+            ..TransferConfig::default()
+        };
+        assert!(cargo_retrieval_patterns(&baseline, &transfer, None).is_ok());
+    }
+
+    #[test]
+    fn cargo_documentation_completion_requires_doc_paths_in_a_complete_manifest() {
+        let kind = Some(CompilationKind::CargoDoc);
+        for custom in [false, true] {
+            let prefix = if custom { "" } else { "target/" };
+            let stale_build_outputs: Vec<_> = [
+                ".rustc_info.json",
+                "CACHEDIR.TAG",
+                "debug/stale-app",
+                "aarch64-unknown-linux-gnu/release/deps/libfixture.rlib",
+                "doc/.lock",
+                "aarch64-unknown-linux-gnu/doc/.lock",
+                "debug/build/doc/index.html",
+            ]
+            .into_iter()
+            .map(|path| format!("{prefix}{path}"))
+            .collect();
+            let matched = u32::try_from(stale_build_outputs.len()).unwrap();
+            assert!(sync_back_verified_zero_build_outputs(
+                &stale_build_outputs,
+                Some(matched),
+                kind,
+                custom,
+            ));
+            for document in [
+                "doc/fixture/index.html",
+                "doc/build/index.html",
+                "doc/incremental/index.html",
+                "aarch64-unknown-linux-gnu/doc/fixture/index.html",
+                "aarch64-unknown-linux-gnu/doc/build/index.html",
+                "aarch64-unknown-linux-gnu/doc/incremental/index.html",
+            ] {
+                assert!(!sync_back_verified_zero_build_outputs(
+                    &[format!("{prefix}{document}")],
+                    Some(1),
+                    kind,
+                    custom,
+                ));
+            }
+            // This guard still makes no claim from an incomplete itemization
+            // or a legitimate no-output invocation.
+            assert!(!sync_back_verified_zero_build_outputs(
+                &stale_build_outputs,
+                None,
+                kind,
+                custom,
+            ));
+            assert!(!sync_back_verified_zero_build_outputs(
+                &stale_build_outputs,
+                Some(matched + 1),
+                kind,
+                custom,
+            ));
+            assert!(!sync_back_verified_zero_build_outputs(
+                &[],
+                Some(0),
+                kind,
+                custom,
+            ));
+        }
+    }
+
+    #[test]
+    fn cargo_documentation_manifest_rejects_non_target_and_ambiguous_paths() {
+        for path in [
+            "doc/index.html",
+            "other/doc/index.html",
+            "target/doc",
+            "target/doc/",
+            "target/doc//index.html",
+            "target/doc/../index.html",
+            "target/../doc/index.html",
+            "target/aarch64/doc/./index.html",
+        ] {
+            assert!(!retrieved_path_is_documentation(path, false), "{path}");
+        }
+        for path in [
+            "",
+            "doc",
+            "doc/",
+            "doc//index.html",
+            "doc/../index.html",
+            "../doc/index.html",
+            "aarch64/doc/./index.html",
+            "debug/build/doc/index.html",
+        ] {
+            assert!(!retrieved_path_is_documentation(path, true), "{path}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -991,11 +1213,7 @@ mod profile_artifact_tests {
 
     #[test]
     fn cargo_profile_artifacts_use_wrapped_profile_for_includes_and_cache_excludes() {
-        for kind in [
-            CompilationKind::CargoBuild,
-            CompilationKind::CargoDoc,
-            CompilationKind::CargoZigbuild,
-        ] {
+        for kind in [CompilationKind::CargoBuild, CompilationKind::CargoZigbuild] {
             for command in [
                 "env -- cargo build --profile release-perf",
                 "/usr/bin/time -f cargo -- cargo build --profile release-perf",
