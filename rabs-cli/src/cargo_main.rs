@@ -66,6 +66,12 @@ Nextest execution requires explicit --test-threads/--jobs/-j concurrency;
 compilation independently. Admission reserves the larger build or test count
 without changing either selection. Direct workers must advertise
 nextest-runtime-admission-v1. Test bodies run on every invocation.
+Cargo test/bench also reserve explicit --test-threads N or =N after Cargo's --,
+up to the harness's own -- separator. Repeated controls reserve their maximum.
+These requests require cargo-test-runtime-admission-v1 on direct workers.
+Malformed, zero or above-4096 controls refuse, including custom harnesses using
+that spelling. Arguments and defaults stay unchanged; default test concurrency
+and threads created by test bodies are outside this explicit-control guarantee.
 
 Worker profiles require an explicit command and retain the existing direct-worker
 contract: one pinned TLS endpoint, or an ordered worker pool with daemon_socket.

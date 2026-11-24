@@ -2156,6 +2156,11 @@ where
                                 {
                                     return Err(format!("nextest execution requires {slots} slots but worker capacity is {}", report.slots));
                                 }
+                                if let Some(execution) = rabs_sandbox::cargo_artifacts::test_threads::requested(&value)
+                                    .map_err(|error| error.to_string())?
+                                {
+                                    execution.execution_slots(report.slots).map_err(|error| error.to_string())?;
+                                }
                                 Ok(request)
                             })().and_then(|mut request| {
                                 // A different request or a worker-local execute
@@ -2313,6 +2318,7 @@ fn worker_hello(
         "execution_leases": [REQUEST_EXECUTION_LEASE_VERSION],
         "command_contexts": [rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION],
         "nextest_admission_versions": [rabs_sandbox::cargo_artifacts::nextest::RUNTIME_ADMISSION_VERSION],
+        "cargo_test_admission_versions": [rabs_sandbox::cargo_artifacts::test_threads::RUNTIME_ADMISSION_VERSION],
         "dependency_contexts": [DEPENDENCY_CONTEXT_VERSION, CANONICAL_DEPENDENCY_CONTEXT_VERSION, CANONICAL_WORKSPACE_CONTEXT_VERSION, CANONICAL_WORKSPACE_CLOSED_METADATA_CONTEXT_VERSION],
         "dependency_native_inputs": [CANONICAL_NATIVE_METADATA_CAPABILITY, CANONICAL_NATIVE_ROOTS_CAPABILITY, CANONICAL_NATIVE_MODIFIERS_CAPABILITY],
         "dependency_execution_modes": report.dependency_modes.iter()

@@ -281,6 +281,19 @@ fn execution_capabilities(
             "nextest build or test execution slots exceed worker capacity",
         )?;
     }
+    if let Some(execution) = rabs_sandbox::cargo_artifacts::test_threads::requested(request)? {
+        require(
+            supports(
+                hello,
+                "cargo_test_admission_versions",
+                rabs_sandbox::cargo_artifacts::test_threads::RUNTIME_ADMISSION_VERSION,
+            ),
+            "worker lacks cargo-test-runtime-admission-v1 execution accounting",
+        )?;
+        let slots = u32::try_from(number(hello, "slots")?)
+            .map_err(|_| invalid("worker slot capacity exceeds its supported bound"))?;
+        execution.execution_slots(slots)?;
+    }
     if context.is_some() {
         let host = request
             .get("dependency_execution_host")
@@ -1813,6 +1826,77 @@ mod tests {
         // Admission must not rewrite the smaller compiler grant.
         assert_eq!(request["jobserver_grant"], 2);
         assert_eq!(request["artifacts"]["cargo"]["build_jobs"], 2);
+    }
+
+    #[test]
+    fn explicit_test_capacity_and_capability_are_required_only_for_fresh_execution() {
+        use rabs_sandbox::cargo_artifacts::test_threads::RUNTIME_ADMISSION_VERSION;
+
+        for command in ["test", "bench"] {
+            let request = json!({
+                "kind":"canonical-exec", "request_id":7,
+                "program":"/__rabs/toolchain/bin/cargo",
+                "args":[command, "--message-format=json", "--target-dir=/__rabs/out/cargo",
+                    "--", "--test-threads=8", "--test-threads", "1"],
+                "jobserver_grant":2, "toolchain_backing":"/tc", "workspace_backing":"/ws",
+                "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[],
+                    "cargo":format!("cargo-{command}-json-v1")},
+            });
+            for (slots, version, expected) in [
+                (4, json!([RUNTIME_ADMISSION_VERSION]), "worker capacity"),
+                (8, Value::Null, "cargo-test-runtime-admission-v1"),
+                (
+                    8,
+                    json!(["cargo-test-runtime-admission-v0"]),
+                    "cargo-test-runtime-admission-v1",
+                ),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let destination = root.path().join("unadmitted-test");
+                let mut peer = fixture(&destination);
+                peer.replies[0]["slots"] = json!(slots);
+                peer.replies[0]["cargo_test_admission_versions"] = version;
+                let failure =
+                    receive_execution(&mut peer, &request, "worker", &destination).unwrap_err();
+                assert!(failure.detail.contains(expected), "{}", failure.detail);
+                assert!(!failure.execution_may_have_run);
+                assert!(peer.sent.is_empty());
+                assert!(!destination.exists());
+            }
+            let legacy = fixture(Path::new("/unused-test-admission")).replies[0].clone();
+            let mut supported = legacy.clone();
+            supported["slots"] = json!(8);
+            supported["cargo_test_admission_versions"] = json!([RUNTIME_ADMISSION_VERSION]);
+            validate_worker_execution_capabilities(&supported, &request).unwrap();
+            assert_eq!(request["jobserver_grant"], 2);
+
+            let mut ordinary = request.clone();
+            ordinary["args"] = json!([
+                command,
+                "--message-format=json",
+                "--target-dir=/__rabs/out/cargo",
+                "--",
+                "--nocapture"
+            ]);
+            validate_worker_execution_capabilities(&legacy, &ordinary).unwrap();
+            ordinary["args"] = json!([
+                command,
+                "--message-format=json",
+                "--target-dir=/__rabs/out/cargo",
+                "--",
+                "--",
+                "--test-threads=8"
+            ]);
+            validate_worker_execution_capabilities(&legacy, &ordinary).unwrap();
+            ordinary["args"] = json!([
+                command,
+                "--no-run",
+                "--message-format=json",
+                "--target-dir=/__rabs/out/cargo"
+            ]);
+            ordinary["artifacts"]["cargo"] = json!("cargo-json-v1");
+            validate_worker_execution_capabilities(&legacy, &ordinary).unwrap();
+        }
     }
 
     #[test]

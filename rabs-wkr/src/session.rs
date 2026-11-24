@@ -907,7 +907,7 @@ struct ExecutionGrants {
     execution_slots: u32,
 }
 
-/// Preserve the compiler's fixed grant while reserving the larger nextest phase.
+/// Preserve the compiler grant while reserving explicit test-runner demand.
 /// Only an artifact plan validated from the original request carries runner
 /// intent; an argv tail or a bare nextest program cannot create that authority.
 fn execution_grants(
@@ -918,7 +918,39 @@ fn execution_grants(
     use rabs_sandbox::cargo_artifacts::nextest::{PROGRAM, worker_build_grant};
 
     let nextest = artifact_plan.and_then(ArtifactPlan::nextest);
-    let grants = if request.program == PROGRAM || nextest.is_some() {
+    let actual_tests =
+        rabs_sandbox::cargo_artifacts::test_threads::ExplicitTestExecution::from_command(
+            &request.program,
+            &request.args,
+            request.jobserver_grant,
+        )
+        .map_err(|error| error.to_string())?;
+    let retained_tests = artifact_plan.and_then(ArtifactPlan::explicit_test_execution);
+    let grants = if actual_tests.is_some() || retained_tests.is_some() {
+        let actual = actual_tests
+            .as_ref()
+            .ok_or_else(|| "test execution differs from its validated artifact plan".to_owned())?;
+        let (retained, context) = retained_tests.ok_or_else(|| {
+            "explicit test execution requires its validated artifact plan".to_owned()
+        })?;
+        if actual != retained
+            || &request.command_context != context
+            || request.dependency_context.is_some()
+        {
+            return Err(
+                "test execution differs from its validated argv, grant or command context"
+                    .to_owned(),
+            );
+        }
+        ExecutionGrants {
+            build_grant: actual
+                .build_grant(resources.slots)
+                .map_err(|error| error.to_string())?,
+            execution_slots: actual
+                .execution_slots(resources.slots)
+                .map_err(|error| error.to_string())?,
+        }
+    } else if request.program == PROGRAM || nextest.is_some() {
         let contract = nextest
             .ok_or_else(|| "nextest execution requires its validated tree contract".to_owned())?;
         if request.program != PROGRAM
@@ -2434,6 +2466,166 @@ mod tests {
             assert_eq!(blocked.err().unwrap().kind(), std::io::ErrorKind::Interrupted);
             drop(lease);
             assert!(budget.acquire(8, || false).is_ok());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn explicit_test_fixture(
+        command: &str,
+        grant: Option<u32>,
+        tail: &[&str],
+        no_run: bool,
+    ) -> (CanonicalExecRequest, ArtifactPlan) {
+        use serde_json::json;
+
+        let mut arguments = vec![
+            command.to_owned(),
+            "--message-format=json".into(),
+            "--target-dir=/__rabs/out/cargo".into(),
+        ];
+        if no_run {
+            arguments.push("--no-run".into());
+        } else if !tail.is_empty() {
+            arguments.push("--".into());
+            arguments.extend(tail.iter().map(|value| (*value).to_owned()));
+        }
+        let mut value = json!({
+            "program":"/__rabs/toolchain/bin/cargo", "args":arguments,
+            "command_context":{"version":COMMAND_CONTEXT_VERSION,
+                "cwd":"/__rabs/workspace", "env":{"RUN_LABEL":"exact"}},
+            "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1",
+                "cargo":if no_run { "cargo-json-v1".to_owned() } else { format!("cargo-{command}-json-v1") }},
+        });
+        if let Some(grant) = grant {
+            value["jobserver_grant"] = json!(grant);
+        }
+        let request = CanonicalExecRequest {
+            request_id: 73,
+            program: "/__rabs/toolchain/bin/cargo".into(),
+            args: arguments,
+            command_context: parse_command_context(&value).unwrap(),
+            captured_stdin: None,
+            dependency_context: None,
+            toolchain_backing: "/absent-toolchain".into(),
+            toolchain_identity: None,
+            workspace_backing: "/absent-workspace".into(),
+            jobserver_grant: grant,
+        };
+        (
+            request,
+            crate::artifacts::parse_plan(&value).unwrap().unwrap(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_test_threads_reserve_host_capacity_without_changing_the_compiler_grant() {
+        for command in ["test", "bench"] {
+            let root = tempfile::tempdir().unwrap();
+            let budget =
+                crate::host_budget::HostBudget::open(&root.path().join("budget"), 8).unwrap();
+            let (request, plan) = explicit_test_fixture(
+                command,
+                Some(2),
+                &["--test-threads=8", "--test-threads", "1"],
+                false,
+            );
+            let original = request.clone();
+            let mut resources = ExecutionResources::new(8);
+            resources.host_budget = Some(&budget);
+            let grants = execution_grants(&request, Some(&plan), resources).unwrap();
+            assert_eq!(
+                grants,
+                ExecutionGrants {
+                    build_grant: 2,
+                    execution_slots: 8
+                }
+            );
+            assert_eq!(
+                request, original,
+                "harness argv and context must remain exact"
+            );
+            let bridge =
+                crate::jobserver::JobserverBridge::mint(grants.build_grant, root.path()).unwrap();
+            assert!(bridge.makeflags().starts_with("-j2 "));
+            let lease = budget.acquire(grants.execution_slots, || false).unwrap();
+            let polls = std::cell::Cell::new(0);
+            let competing = budget.acquire(1, || {
+                let before = polls.get();
+                polls.set(before + 1);
+                before > 0
+            });
+            assert_eq!(
+                competing.err().unwrap().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+            drop(lease);
+            assert!(budget.acquire(8, || false).is_ok());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_test_admission_requires_the_exact_retained_plan_and_context() {
+        let (request, plan) = explicit_test_fixture("test", Some(2), &["--test-threads=8"], false);
+        assert!(execution_grants(&request, None, ExecutionResources::new(8)).is_err());
+        assert!(execution_grants(&request, Some(&plan), ExecutionResources::new(4)).is_err());
+        let root = tempfile::tempdir().unwrap();
+        let budget = crate::host_budget::HostBudget::open(&root.path().join("budget"), 4).unwrap();
+        let mut resources = ExecutionResources::new(8);
+        resources.host_budget = Some(&budget);
+        assert!(execution_grants(&request, Some(&plan), resources).is_err());
+
+        let mut changed = request.clone();
+        // The maximum remains 8, but this is a different custom-harness argv.
+        changed.args.push("--test-threads=1".into());
+        assert!(execution_grants(&changed, Some(&plan), ExecutionResources::new(8)).is_err());
+        changed = request.clone();
+        changed.jobserver_grant = Some(1);
+        assert!(execution_grants(&changed, Some(&plan), ExecutionResources::new(8)).is_err());
+        changed = request.clone();
+        changed.command_context = CommandContext::new(
+            "/__rabs/workspace",
+            vec![("RUN_LABEL".into(), "different".into())],
+        )
+        .unwrap();
+        assert!(execution_grants(&changed, Some(&plan), ExecutionResources::new(8)).is_err());
+        changed = request.clone();
+        changed.program = "/__rabs/toolchain/bin/rustc".into();
+        assert!(execution_grants(&changed, Some(&plan), ExecutionResources::new(8)).is_err());
+        changed = request;
+        changed.args.insert(1, "--no-run".into());
+        assert!(execution_grants(&changed, Some(&plan), ExecutionResources::new(8)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standard_test_defaults_and_no_run_retain_the_existing_worker_route() {
+        for command in ["test", "bench"] {
+            for (tail, no_run, expected) in [
+                (vec!["--nocapture"], false, 2),
+                (vec!["--", "--test-threads=8"], false, 2),
+                (vec![], true, 2),
+            ] {
+                let (request, plan) = explicit_test_fixture(command, Some(2), &tail, no_run);
+                assert!(plan.explicit_test_execution().is_none());
+                assert_eq!(
+                    execution_grants(&request, Some(&plan), ExecutionResources::new(8)).unwrap(),
+                    ExecutionGrants {
+                        build_grant: expected,
+                        execution_slots: expected
+                    },
+                );
+            }
+            let (request, plan) =
+                explicit_test_fixture(command, None, &["--test-threads=2"], false);
+            assert_eq!(
+                execution_grants(&request, Some(&plan), ExecutionResources::new(8)).unwrap(),
+                ExecutionGrants {
+                    build_grant: 8,
+                    execution_slots: 8
+                },
+            );
         }
     }
 

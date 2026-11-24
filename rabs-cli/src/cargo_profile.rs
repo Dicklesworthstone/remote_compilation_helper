@@ -332,6 +332,12 @@ fn logical(
             .try_into()
             .map_err(|_| invalid("nextest build-job bound exceeds u32"))?;
         rabs_sandbox::cargo_artifacts::nextest::execution_slots(&selection, build_jobs)?;
+    } else {
+        let build_jobs = u32::try_from(profile.get("jobs").and_then(Value::as_u64).unwrap_or(1))
+            .map_err(|_| invalid("compilation job bound exceeds u32"))?;
+        rabs_sandbox::cargo_artifacts::test_threads::selection_execution_slots(
+            command, &selection, build_jobs,
+        )?;
     }
     let manifest = profile
         .get("manifest")

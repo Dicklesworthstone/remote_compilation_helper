@@ -105,6 +105,7 @@ impl SourcePreparation {
             // admitted by their typed Profile before reaching this preparer.
             // Worker requests must carry their exact nextest execution contract.
             rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(specification)?;
+            rabs_sandbox::cargo_artifacts::test_threads::requested(specification)?;
         }
 
         let mut roots = Vec::new();
@@ -361,6 +362,36 @@ mod tests {
                 let error = result.unwrap_err();
                 assert!(error.to_string().contains("test-threads"), "{error}");
             }
+        }
+    }
+
+    #[test]
+    fn explicit_test_controls_are_admitted_before_source_preparation() {
+        let base = Path::new("/unopened/test-source");
+        for command in ["test", "bench"] {
+            let mut request = json!({
+                "kind":"canonical-exec", "request_id":71,
+                "program":"/__rabs/toolchain/bin/cargo",
+                "args":[command, "--message-format=json", "--target-dir=/__rabs/out/cargo",
+                    "--", "--test-threads=0"],
+                "jobserver_grant":2, "toolchain_backing":"/tc",
+                "source_files":["Cargo.toml"],
+                "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1",
+                    "cargo":format!("cargo-{command}-json-v1")},
+            });
+            let error = SourcePreparation::parse(base, &request, PreparationContext::RemoteRequest)
+                .unwrap_err();
+            assert!(error.to_string().contains("concurrency"), "{error}");
+            request["args"][4] = json!("--test-threads=8");
+            SourcePreparation::parse(base, &request, PreparationContext::RemoteRequest).unwrap();
+            request["args"]
+                .as_array_mut()
+                .unwrap()
+                .insert(1, json!("--no-run"));
+            request["args"][5] = json!("--test-threads=0");
+            request["artifacts"]["cargo"] =
+                json!(rabs_sandbox::cargo_artifacts::CARGO_ARTIFACTS_VERSION);
+            SourcePreparation::parse(base, &request, PreparationContext::RemoteRequest).unwrap();
         }
     }
 

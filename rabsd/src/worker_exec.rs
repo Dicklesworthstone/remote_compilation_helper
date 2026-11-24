@@ -162,6 +162,7 @@ fn capture_source(
         return Ok(None);
     }
     rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(request)?;
+    rabs_sandbox::cargo_artifacts::test_threads::requested(request)?;
     let root = match (manifest, root) {
         (None, None) => return Ok(None),
         (None, Some(_)) => {
@@ -1278,6 +1279,35 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn fresh_test_controls_are_admitted_without_revalidating_retained_results() {
+        for command in ["test", "bench"] {
+            let mut request = json!({
+                "kind":"canonical-exec", "request_id":7,
+                "program":"/__rabs/toolchain/bin/cargo",
+                "args":[command, "--message-format=json", "--target-dir=/__rabs/out/cargo",
+                    "--", "--test-threads=0"],
+                "jobserver_grant":2, "workspace_backing":"/retained/source",
+                "toolchain_backing":"/tc",
+                "artifacts":{"unit":"cargo", "tree":"tree-files-v1", "files":[],
+                    "cargo":format!("cargo-{command}-json-v1")},
+            });
+            let error = capture_source(&request, DeliveryMode::Execute, None).unwrap_err();
+            assert!(error.to_string().contains("concurrency"), "{error}");
+            assert!(
+                capture_source(&request, DeliveryMode::Resume, None)
+                    .unwrap()
+                    .is_none()
+            );
+            request["args"][4] = json!("--test-threads=8");
+            assert!(
+                capture_source(&request, DeliveryMode::Execute, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[cfg(unix)]

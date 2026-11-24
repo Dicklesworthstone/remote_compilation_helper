@@ -809,7 +809,11 @@ impl Profile {
                 self.jobs,
             )
         } else {
-            Ok(self.jobs)
+            rabs_sandbox::cargo_artifacts::test_threads::selection_execution_slots(
+                self.command,
+                &self.selection.clone().unwrap_or_default(),
+                self.jobs,
+            )
         }
     }
 
@@ -3189,6 +3193,52 @@ mod tests {
         profile.command = CompilationCommand::Build;
         profile.selection = None;
         assert_eq!(profile.execution_slots().unwrap(), profile.jobs);
+    }
+
+    #[test]
+    fn explicit_harness_threads_increase_root_admission_without_changing_cargo_arguments() {
+        for command in [CompilationCommand::Test, CompilationCommand::Bench] {
+            let mut profile = application_environment_profile();
+            profile.command = command;
+            profile.jobs = 2;
+            let tail = vec![
+                "--test-threads=8".to_owned(),
+                "--test-threads".into(),
+                "1".into(),
+            ];
+            profile.selection = Some(CompilationSelection {
+                test_args: tail.clone(),
+                ..Default::default()
+            });
+            profile.validate_logical().unwrap();
+            assert_eq!(profile.execution_slots().unwrap(), 8);
+            let arguments = profile.compilation_args().unwrap();
+            let separator = arguments.iter().position(|arg| arg == "--").unwrap();
+            assert_eq!(&arguments[separator + 1..], tail);
+            assert!(arguments.windows(2).any(|pair| pair == ["--jobs", "2"]));
+            assert!(
+                !profile
+                    .graph_args(None)
+                    .unwrap()
+                    .iter()
+                    .any(|arg| arg.starts_with("--test-threads"))
+            );
+
+            profile.selection.as_mut().unwrap().no_run = true;
+            assert_eq!(profile.execution_slots().unwrap(), 2);
+            profile.selection = Some(CompilationSelection {
+                test_args: vec!["--".into(), "--test-threads=8".into()],
+                ..Default::default()
+            });
+            assert_eq!(profile.execution_slots().unwrap(), 2);
+            profile.selection = None;
+            assert_eq!(profile.execution_slots().unwrap(), 2);
+            profile.selection = Some(CompilationSelection {
+                test_args: vec!["--test-threads=0".into()],
+                ..Default::default()
+            });
+            assert!(profile.execution_slots().is_err());
+        }
     }
 
     #[test]

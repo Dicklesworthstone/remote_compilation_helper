@@ -343,6 +343,19 @@ pub(super) fn validate_profile(
             .try_into()
             .map_err(|_| invalid("nextest build-job bound exceeds u32"))?;
         rabs_sandbox::cargo_artifacts::nextest::execution_slots(selection, build_jobs)?;
+    } else {
+        // Validate explicit harness controls before creating an operation. The
+        // request still omits an absent grant, preserving the worker default.
+        let build_jobs = u32::try_from(
+            profile
+                .get("jobserver_grant")
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
+        )
+        .map_err(|_| invalid("compilation job bound exceeds u32"))?;
+        rabs_sandbox::cargo_artifacts::test_threads::selection_execution_slots(
+            command, selection, build_jobs,
+        )?;
     }
     placement(profile)?;
     manifest(profile)?;
@@ -974,6 +987,52 @@ mod tests {
             "--target=x86_64-pc-windows-msvc",
         ]);
         assert!(validate_profile(&profile, &unsupported).is_err());
+    }
+
+    #[test]
+    fn worker_explicit_test_threads_preserve_argv_and_the_host_sized_default_grant() {
+        let (_root, mut profile) = filesystem_profile();
+        for command in ["test", "bench"] {
+            let selected = options(&[command, "--", "--test-threads=8", "--test-threads", "1"]);
+            validate_profile(&profile, &selected).unwrap();
+            let original = profile.clone();
+            let spec = specification(&profile, &selected).unwrap();
+            assert!(spec.get("jobserver_grant").is_none());
+            let contract = rabs_sandbox::cargo_artifacts::test_threads::requested(&spec)
+                .unwrap()
+                .unwrap();
+            assert_eq!(contract.build_grant(16).unwrap(), 16);
+            assert_eq!(contract.execution_slots(16).unwrap(), 16);
+            assert!(contract.execution_slots(4).is_err());
+            assert_eq!(profile, original);
+            let args = spec["args"].as_array().unwrap();
+            assert_eq!(
+                &args[args.len() - 4..],
+                &[
+                    json!("--"),
+                    json!("--test-threads=8"),
+                    json!("--test-threads"),
+                    json!("1")
+                ]
+            );
+            set(&mut profile, "jobserver_grant", json!(2));
+            let fixed = specification(&profile, &selected).unwrap();
+            let contract = rabs_sandbox::cargo_artifacts::test_threads::requested(&fixed)
+                .unwrap()
+                .unwrap();
+            assert_eq!(contract.build_grant(8).unwrap(), 2);
+            assert_eq!(contract.execution_slots(8).unwrap(), 8);
+            profile.remove("jobserver_grant");
+        }
+        set(&mut profile, "source_root", json!("/unopened/test-source"));
+        for control in [
+            "--test-threads=0",
+            "--test-threads=4097",
+            "--test-threads=custom",
+        ] {
+            let error = validate_profile(&profile, &options(&["test", "--", control])).unwrap_err();
+            assert!(error.to_string().contains("concurrency"), "{error}");
+        }
     }
 
     #[test]

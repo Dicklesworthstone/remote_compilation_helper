@@ -13,7 +13,9 @@ use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
 };
 use rabs_sandbox::canonical_mounts::UnitMount;
+use rabs_sandbox::cargo_artifacts::test_threads::ExplicitTestExecution;
 use rabs_sandbox::cargo_artifacts::{self, CargoArtifactMode, CargoArtifactReport};
+use rabs_sandbox::process_context::CommandContext;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
@@ -42,6 +44,7 @@ pub struct ArtifactPlan {
     tree: bool,
     cargo: Option<CargoArtifactMode>,
     nextest: Option<cargo_artifacts::nextest::NextestTree>,
+    explicit_test_execution: Option<(ExplicitTestExecution, CommandContext)>,
     private_incremental: Option<Vec<String>>,
 }
 
@@ -146,6 +149,7 @@ impl ArtifactPlan {
             tree: false,
             cargo: None,
             nextest: None,
+            explicit_test_execution: None,
             private_incremental: None,
         })
     }
@@ -170,6 +174,16 @@ impl ArtifactPlan {
     /// program, argv, environment and fixed compiler grant.
     pub(crate) fn nextest(&self) -> Option<&cargo_artifacts::nextest::NextestTree> {
         self.nextest.as_ref()
+    }
+
+    /// Fresh test admission binds the original actual argv and command context.
+    /// A changed execution request cannot borrow an earlier artifact plan.
+    pub(crate) fn explicit_test_execution(
+        &self,
+    ) -> Option<(&ExplicitTestExecution, &CommandContext)> {
+        self.explicit_test_execution
+            .as_ref()
+            .map(|(execution, context)| (execution, context))
     }
 
     /// A compiler-unit result must declare every file before execution.
@@ -874,6 +888,12 @@ pub fn parse_plan(request: &serde_json::Value) -> Result<Option<ArtifactPlan>, S
         plan.nextest = Some(
             serde_json::from_value(value["cargo"].clone()).map_err(|error| error.to_string())?,
         );
+    }
+    if let Some(execution) =
+        cargo_artifacts::test_threads::requested(request).map_err(|error| error.to_string())?
+    {
+        plan.explicit_test_execution =
+            Some((execution, crate::session::parse_command_context(request)?));
     }
     Ok(Some(plan))
 }

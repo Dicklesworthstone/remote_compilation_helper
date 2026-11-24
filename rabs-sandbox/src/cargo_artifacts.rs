@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, BufReader, Read};
 
 pub mod nextest;
+pub mod test_threads;
 
 /// Explicit opt-in under artifacts.cargo; old endpoints must reject this field.
 pub const CARGO_ARTIFACTS_VERSION: &str = "cargo-json-v1";
