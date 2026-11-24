@@ -8060,6 +8060,16 @@ mod tests {
         let peer = pool.get(&WorkerId::new("free-small")).await.unwrap();
         worker.config.write().await.remote_base = Some("/mnt/storage-a/rch".into());
         peer.config.write().await.remote_base = Some("/mnt/storage-b/rch".into());
+        for candidate in [&worker, &peer] {
+            let root = candidate.config.read().await.remote_base.clone().unwrap();
+            let mut caps = candidate.capabilities().await;
+            caps.staging_disk = Some(rch_common::types::StagingDiskProbe {
+                root,
+                free_gb: Some(100.0),
+                total_gb: Some(200.0),
+            });
+            candidate.set_capabilities(caps).await;
+        }
         let resolved = rch_common::SourceTopology {
             canonical_root: "/mnt/storage-a/rch".into(),
             alias_root: "/mnt/storage-a/rch".into(),
@@ -8152,6 +8162,15 @@ mod tests {
         let mut replacement = original.clone();
         replacement.remote_base = Some("/mnt/repaired/rch".into());
         worker.update_config(replacement).await;
+        assert!(
+            !worker.reserve_slots(1).await,
+            "replacement storage is unmeasured"
+        );
+        let mut refreshed = worker.capabilities().await;
+        let staging = refreshed.staging_disk.as_mut().unwrap();
+        staging.free_gb = Some(100.0);
+        staging.total_gb = Some(200.0);
+        worker.set_capabilities(refreshed).await;
         assert!(selector.select(&pool, &request).await.worker.is_some());
         assert_eq!(history.source_topology_fences().len(), 1);
         assert_eq!(
@@ -8159,11 +8178,57 @@ mod tests {
             resolved
         );
         worker.update_config(original).await;
+        let mut refreshed = worker.capabilities().await;
+        let staging = refreshed.staging_disk.as_mut().unwrap();
+        staging.free_gb = Some(100.0);
+        staging.total_gb = Some(200.0);
+        worker.set_capabilities(refreshed).await;
         assert_eq!(
             selector.select(&pool, &request).await.reason,
             SelectionReason::SourceTopologyIncompatible,
             "restoring a configured root must not erase its existing refusal"
         );
+    }
+
+    #[tokio::test]
+    async fn staging_only_evidence_cannot_admit_an_unrelated_explicit_namespace() {
+        let (pool, selector, mut request) = active_project_capacity_fixture().await;
+        request.estimated_cores = 1;
+        request.command = None;
+        request.preferred_workers = vec![WorkerId::new("active-project")];
+        request.source_topology = Some(rch_common::SourceTopology {
+            canonical_root: "/other/projects".into(),
+            alias_root: "/other/alias".into(),
+        });
+        let worker = pool.get(&WorkerId::new("active-project")).await.unwrap();
+        worker.config.write().await.remote_base = Some("/mnt/staging/rch".into());
+        let mut caps = worker.capabilities().await;
+        caps.build_disk_free_gb = None;
+        caps.build_disk_total_gb = None;
+        caps.projects_root_ok = Some(false);
+        caps.projects_root_topology = Some(rch_common::SourceTopology {
+            canonical_root: "/data/projects".into(),
+            alias_root: "/dp".into(),
+        });
+        caps.staging_disk = Some(rch_common::types::StagingDiskProbe {
+            root: "/mnt/staging/rch".into(),
+            free_gb: Some(1000.0),
+            total_gb: Some(2000.0),
+        });
+        worker.set_capabilities(caps).await;
+
+        for isolated in [false, true] {
+            request.isolated_source = isolated;
+            assert!(selector.select(&pool, &request).await.worker.is_none());
+            assert!(
+                selector
+                    .try_fallback(&pool, &request, &HashSet::new())
+                    .await
+                    .is_none()
+            );
+            assert!(!worker.reserve_slots(1).await);
+        }
+        assert_eq!(worker.used_slots(), 0);
     }
 
     #[tokio::test]

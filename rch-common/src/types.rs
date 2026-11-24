@@ -1373,6 +1373,41 @@ impl NativeToolCapabilities {
     }
 }
 
+/// Disk evidence for the exact worker-local staging root requested by a probe.
+/// The root remains present when measurement fails, so an unavailable staging
+/// volume cannot silently inherit capacity from the canonical projects mount.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StagingDiskProbe {
+    /// Normalized literal path requested by the dispatcher.
+    pub root: String,
+    /// Free GiB on the resolved staging filesystem, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_gb: Option<f64>,
+    /// Total GiB on the resolved staging filesystem, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_gb: Option<f64>,
+}
+
+impl StagingDiskProbe {
+    /// Return only a complete, valid measurement for a normalized root.
+    pub fn measured_gb(&self) -> Option<(f64, f64)> {
+        if validate_worker_remote_base(&self.root, None)
+            .ok()
+            .as_deref()
+            != Some(self.root.as_str())
+        {
+            return None;
+        }
+        valid_build_disk_gb(self.free_gb, self.total_gb)
+    }
+}
+
+fn valid_build_disk_gb(free: Option<f64>, total: Option<f64>) -> Option<(f64, f64)> {
+    let (free, total) = (free?, total?);
+    (free.is_finite() && total.is_finite() && total > 0.0 && free >= 0.0 && free <= total)
+        .then_some((free, total))
+}
+
 /// Runtime capabilities detected on a worker.
 ///
 /// These are probed during health checks and cached for routing decisions.
@@ -1496,6 +1531,11 @@ pub struct WorkerCapabilities {
     /// Total size in GB of the mount reported in `build_disk_free_gb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_disk_total_gb: Option<f64>,
+    /// Exact staging-root evidence when the dispatcher configures a worker
+    /// override. Canonical projects and temporary storage retain their own
+    /// measurements; they may live on different filesystems.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_disk: Option<StagingDiskProbe>,
     /// Free space in GB on `/tmp`, retained independently of the tightest
     /// mount. Its absolute safety floor can be violated even when a build
     /// filesystem has a lower free-space ratio. Older workers omit it.
@@ -1640,13 +1680,40 @@ impl WorkerCapabilities {
     /// are about that filesystem, not about a small tmpfs `/tmp` that happens
     /// to be the tightest mount. Falls back to the tightest-mount sample when
     /// the worker does not report a build-disk sample (older `rch-wkr`), which
-    /// is the conservative pre-GH-#78 behaviour.
+    /// is the conservative pre-GH-#78 behaviour. A configured staging root
+    /// instead requires complete evidence for both build locations and uses
+    /// the lower free-byte measurement; missing staging never falls back.
     pub fn build_disk_gb(&self) -> (Option<f64>, Option<f64>) {
+        if self.staging_disk.is_some() {
+            return self
+                .measured_build_disk_gb()
+                .map_or((None, None), |(free, total)| (Some(free), Some(total)));
+        }
         if self.build_disk_free_gb.is_some() {
             (self.build_disk_free_gb, self.build_disk_total_gb)
         } else {
             (self.disk_free_gb, self.disk_total_gb)
         }
+    }
+
+    /// Complete build-storage capacity, without the legacy `/tmp` fallback.
+    /// Reservations remain worker-wide, so the minimum free bytes across
+    /// usable build roots conservatively funds work on either filesystem.
+    pub fn measured_build_disk_gb(&self) -> Option<(f64, f64)> {
+        let projects = valid_build_disk_gb(self.build_disk_free_gb, self.build_disk_total_gb);
+        let Some(staging) = &self.staging_disk else {
+            return projects;
+        };
+        let staging = staging.measured_gb()?;
+        // A worker also serves shared-mirror requests, including explicitly
+        // scoped namespaces. Staging evidence alone cannot authorize their
+        // different filesystem, even if the default topology is fenced.
+        let projects = projects?;
+        Some(if staging.0 < projects.0 {
+            staging
+        } else {
+            projects
+        })
     }
 
     /// Check if the build disk is below the free-space threshold.
@@ -8365,11 +8432,83 @@ retry_max = 2
     }
 
     #[test]
+    fn staging_capacity_uses_free_bytes_and_requires_both_build_volumes() {
+        let _guard = test_guard!();
+        for (projects, staging) in [
+            ((300.0, 1000.0), (20.0, 100.0)),
+            ((20.0, 100.0), (300.0, 1000.0)),
+            ((80.0, 100.0), (30.0, 1000.0)),
+        ] {
+            let mut caps = WorkerCapabilities {
+                disk_free_gb: Some(500.0),
+                disk_total_gb: Some(1000.0),
+                build_disk_free_gb: Some(projects.0),
+                build_disk_total_gb: Some(projects.1),
+                staging_disk: Some(StagingDiskProbe {
+                    root: "/mnt/staging/rch".into(),
+                    free_gb: Some(staging.0),
+                    total_gb: Some(staging.1),
+                }),
+                ..Default::default()
+            };
+            let expected = if staging.0 < projects.0 {
+                staging
+            } else {
+                projects
+            };
+            assert_eq!(caps.measured_build_disk_gb(), Some(expected));
+            assert_eq!(caps.build_disk_gb(), (Some(expected.0), Some(expected.1)));
+
+            caps.build_disk_free_gb = None;
+            caps.projects_root_ok = Some(false);
+            caps.projects_root_topology = Some(SourceTopology {
+                canonical_root: "/data/projects".into(),
+                alias_root: "/dp".into(),
+            });
+            assert_eq!(caps.measured_build_disk_gb(), None);
+            assert_eq!(caps.build_disk_gb(), (None, None));
+        }
+    }
+
+    #[test]
+    fn staging_capacity_never_falls_back_after_failed_or_invalid_measurement() {
+        let _guard = test_guard!();
+        let mut caps = WorkerCapabilities {
+            build_disk_free_gb: Some(300.0),
+            build_disk_total_gb: Some(1000.0),
+            ..Default::default()
+        };
+        for (free, total) in [
+            (None, Some(100.0)),
+            (Some(20.0), None),
+            (Some(-1.0), Some(100.0)),
+            (Some(101.0), Some(100.0)),
+            (Some(f64::NAN), Some(100.0)),
+            (Some(0.0), Some(0.0)),
+        ] {
+            caps.staging_disk = Some(StagingDiskProbe {
+                root: "/mnt/staging/rch".into(),
+                free_gb: free,
+                total_gb: total,
+            });
+            assert_eq!(caps.measured_build_disk_gb(), None);
+            assert_eq!(caps.build_disk_gb(), (None, None));
+        }
+        caps.staging_disk = Some(StagingDiskProbe {
+            root: "relative/root".into(),
+            free_gb: Some(20.0),
+            total_gb: Some(100.0),
+        });
+        assert_eq!(caps.measured_build_disk_gb(), None);
+    }
+
+    #[test]
     fn build_disk_sample_is_optional_on_the_wire() {
         let _guard = test_guard!();
         let old: WorkerCapabilities =
             serde_json::from_str(r#"{"disk_free_gb":13.9,"disk_total_gb":15.5}"#).unwrap();
         assert_eq!(old.build_disk_free_gb, None);
+        assert!(old.staging_disk.is_none());
         assert_eq!(old.build_disk_gb(), (Some(13.9), Some(15.5)));
 
         let new: WorkerCapabilities = serde_json::from_str(
@@ -8379,6 +8518,16 @@ retry_max = 2
         assert_eq!(new.build_disk_gb(), (Some(1700.0), Some(1900.0)));
         let json = serde_json::to_string(&new).unwrap();
         assert!(json.contains("\"build_disk_free_gb\":1700.0"), "{json}");
+        let mut with_staging = new;
+        with_staging.staging_disk = Some(StagingDiskProbe {
+            root: "/mnt/staging/rch".into(),
+            free_gb: None,
+            total_gb: None,
+        });
+        let roundtrip: WorkerCapabilities =
+            serde_json::from_str(&serde_json::to_string(&with_staging).unwrap()).unwrap();
+        assert_eq!(roundtrip.staging_disk, with_staging.staging_disk);
+        assert_eq!(roundtrip.measured_build_disk_gb(), None);
     }
 
     #[test]

@@ -1183,6 +1183,16 @@ impl WorkerState {
         endpoint_transports: Arc<EndpointTransports>,
     ) -> Self {
         let transport = endpoint_transports.get(&config);
+        let capabilities = Self::unmeasured_capabilities(&config);
+        let pressure = if capabilities.staging_disk.is_some() {
+            refresh_pressure_policy(
+                &capabilities,
+                &PressureAssessment::default(),
+                &DiskPressurePolicyConfig::configured(),
+            )
+        } else {
+            PressureAssessment::default()
+        };
         Self {
             id: config.id.clone(),
             config: RwLock::new(config),
@@ -1205,18 +1215,31 @@ impl WorkerState {
             circuit: RwLock::new(CircuitStats::new()),
             last_error_msg: RwLock::new(None),
             registry_storage_pressure: RwLock::new(None),
-            capabilities: RwLock::new(WorkerCapabilities::new()),
+            capabilities: RwLock::new(capabilities),
             disk_capacity_generation: Arc::new(AtomicU64::new(0)),
             disk_capacity_observation: RwLock::new(None),
             capability_probe: tokio::sync::Mutex::new(()),
             toolchain_preflight: RwLock::new(ToolchainPreflightCache::default()),
-            pressure_assessment: RwLock::new(PressureAssessment::default()),
+            pressure_assessment: RwLock::new(pressure),
             disk_slot_policy,
             unmeasured_capacity_hold_until: std::sync::Mutex::new(None),
             disabled_reason: RwLock::new(None),
             drain_completion: RwLock::new(DrainCompletionAction::default()),
             removal_pending: AtomicBool::new(false),
             disabled_at: AtomicI64::new(0),
+        }
+    }
+
+    fn unmeasured_capabilities(config: &WorkerConfig) -> WorkerCapabilities {
+        WorkerCapabilities {
+            staging_disk: config.remote_base.as_ref().map(|root| {
+                rch_common::types::StagingDiskProbe {
+                    root: rch_common::types::validate_worker_remote_base(root, None)
+                        .unwrap_or_else(|_| root.clone()),
+                    ..Default::default()
+                }
+            }),
+            ..Default::default()
         }
     }
 
@@ -1643,6 +1666,7 @@ impl WorkerState {
         let _transition = self.network_transition.lock().await;
         let endpoint_changed = !same_endpoint(&config, &new_config);
         let tools_changed = config.tools != new_config.tools;
+        let storage_changed = config.remote_base != new_config.remote_base;
         self.disk_capacity_generation.fetch_add(1, Ordering::AcqRel);
         if endpoint_changed {
             self.require_connection_probe();
@@ -1664,9 +1688,19 @@ impl WorkerState {
             self.last_latency_ms.store(0, Ordering::Relaxed);
             self.cached_projects.write().await.clear();
             self.toolchain_preflight.write().await.invalidate();
-            *self.capabilities.write().await = WorkerCapabilities::new();
+            let capabilities = Self::unmeasured_capabilities(&new_config);
+            let pressure = if capabilities.staging_disk.is_some() {
+                refresh_pressure_policy(
+                    &capabilities,
+                    &PressureAssessment::default(),
+                    &DiskPressurePolicyConfig::configured(),
+                )
+            } else {
+                PressureAssessment::default()
+            };
+            *self.capabilities.write().await = capabilities;
             *self.disk_capacity_observation.write().await = None;
-            *self.pressure_assessment.write().await = PressureAssessment::default();
+            *self.pressure_assessment.write().await = pressure;
             self.lifecycle
                 .write()
                 .await
@@ -1697,8 +1731,22 @@ impl WorkerState {
                 }
             }
             drop(capabilities);
+        }
 
-            // A healthy idle worker can refresh the new declarations now.
+        if !endpoint_changed && storage_changed {
+            let mut capabilities = self.capabilities.write().await;
+            capabilities.staging_disk = Self::unmeasured_capabilities(&new_config).staging_disk;
+            let mut pressure = self.pressure_assessment.write().await;
+            *pressure = refresh_pressure_policy(
+                &capabilities,
+                &pressure,
+                &DiskPressurePolicyConfig::configured(),
+            );
+            *self.disk_capacity_observation.write().await = None;
+        }
+
+        if !endpoint_changed && (tools_changed || storage_changed) {
+            // A healthy idle worker can refresh new declarations or storage now.
             // A running health check already owns its next capability refresh;
             // an offline worker must keep its bounded recovery cadence.
             let transport = self.transport();
@@ -1734,7 +1782,7 @@ impl WorkerState {
             self.set_pooled_connections_enabled(self.background_network_allowed().await)
                 .await;
         }
-        endpoint_changed || tools_changed || resume_inventory_drain
+        endpoint_changed || tools_changed || storage_changed || resume_inventory_drain
     }
 
     /// Get the current worker status as the legacy single-axis [`WorkerStatus`].
@@ -2311,7 +2359,7 @@ impl WorkerState {
     pub(crate) async fn publish_capabilities(
         &self,
         context: CapabilityProbeContext,
-        capabilities: WorkerCapabilities,
+        mut capabilities: WorkerCapabilities,
     ) -> bool {
         let deadline = context.deadline;
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
@@ -2338,8 +2386,31 @@ impl WorkerState {
                 || config.host != context.config.host
                 || config.user != context.config.user
                 || config.identity_file != context.config.identity_file
+                || config.remote_base != context.config.remote_base
             {
                 return false;
+            }
+            let expected_root = Self::unmeasured_capabilities(&config)
+                .staging_disk
+                .map(|probe| probe.root);
+            match expected_root.as_deref() {
+                Some(root)
+                    if capabilities
+                        .staging_disk
+                        .as_ref()
+                        .map(|probe| probe.root.as_str())
+                        != Some(root) =>
+                {
+                    capabilities.staging_disk = Some(rch_common::types::StagingDiskProbe {
+                        root: root.to_owned(),
+                        ..Default::default()
+                    });
+                    capabilities.probe_warnings.push(format!(
+                        "staging disk probe did not acknowledge configured root {root}"
+                    ));
+                }
+                None => capabilities.staging_disk = None,
+                _ => {}
             }
             let pressure_config = DiskPressurePolicyConfig::configured();
             let next_pressure = refresh_pressure_policy(&capabilities, &pressure, &pressure_config);
@@ -5016,6 +5087,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staging_capacity_is_root_bound_and_reload_preserves_existing_ownership() {
+        let mut config = recovered_worker_config("staging-capacity", 8);
+        config.remote_base = Some("/mnt/original/rch///".into());
+        let worker = WorkerState::new(config.clone());
+        assert!(!worker.reserve_slots(1).await);
+        let capabilities = |root: Option<&str>| WorkerCapabilities {
+            rustc_version: Some("1.97.0".into()),
+            disk_free_gb: Some(300.0),
+            disk_total_gb: Some(1000.0),
+            build_disk_free_gb: Some(300.0),
+            build_disk_total_gb: Some(1000.0),
+            staging_disk: root.map(|root| rch_common::types::StagingDiskProbe {
+                root: root.to_owned(),
+                free_gb: Some(80.0),
+                total_gb: Some(100.0),
+            }),
+            ..Default::default()
+        };
+        for root in [None, Some("/mnt/unrelated/rch")] {
+            worker.set_capabilities(capabilities(root)).await;
+            assert!(worker.disk_capacity_observation().await.is_none());
+            assert!(!worker.reserve_slots(1).await);
+            assert_eq!(worker.used_slots(), 0);
+            let observed = worker.capabilities().await.staging_disk.unwrap();
+            assert_eq!(observed.root, "/mnt/original/rch");
+            assert_eq!(observed.measured_gb(), None);
+        }
+
+        worker
+            .set_capabilities(capabilities(Some("/mnt/original/rch")))
+            .await;
+        let old_capacity = worker.disk_capacity_observation().await.unwrap();
+        assert_eq!(old_capacity.current_free_gib("staging-capacity"), Some(80));
+        assert!(worker.reserve_slots(1).await);
+        worker
+            .record_toolchain_preflight("stable".into(), true, None)
+            .await;
+        let in_flight = worker.capability_probe_context().await;
+        config.remote_base = Some("/mnt/replacement/rch///".into());
+        assert!(
+            worker.update_config(config).await,
+            "root changes must wake probes"
+        );
+        assert_eq!(worker.used_slots(), 1);
+        assert_eq!(worker.status().await, WorkerStatus::Healthy);
+        assert!(worker.toolchain_preflight_status("stable").await.is_some());
+        assert!(worker.disk_capacity_observation().await.is_none());
+        assert_eq!(old_capacity.current_free_gib("staging-capacity"), None);
+        assert!(!worker.reserve_slots(1).await);
+        assert!(
+            !worker
+                .publish_capabilities(in_flight, capabilities(Some("/mnt/original/rch")))
+                .await
+        );
+        worker
+            .set_capabilities(capabilities(Some("/mnt/replacement/rch")))
+            .await;
+        assert!(worker.reserve_slots(1).await);
+        assert_eq!(worker.used_slots(), 2);
+        worker.release_slots(2).await;
+    }
+
+    #[tokio::test]
     async fn worker_remote_base_reservation_rechecks_placement_and_exact_topology() {
         let mut config = recovered_worker_config("staging-reservation", 8);
         config.remote_base = Some("/mnt/original/rch".into());
@@ -5050,6 +5184,13 @@ mod tests {
             alias_root: "/mnt/replacement/rch".into(),
         };
         let mut caps = WorkerCapabilities {
+            build_disk_free_gb: Some(100.0),
+            build_disk_total_gb: Some(200.0),
+            staging_disk: Some(rch_common::types::StagingDiskProbe {
+                root: "/mnt/replacement/rch".into(),
+                free_gb: Some(100.0),
+                total_gb: Some(200.0),
+            }),
             projects_root_ok: Some(false),
             projects_root_topology: Some(original_topology),
             projects_root_issue: Some("canonical_not_directory".into()),

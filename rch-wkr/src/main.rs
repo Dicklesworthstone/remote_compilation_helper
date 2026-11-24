@@ -300,6 +300,10 @@ enum Commands {
         /// running an older binary is unaffected.
         #[arg(long, value_name = "JSON")]
         tool_probe: Option<String>,
+        /// Worker-local staging root whose disk capacity must also be measured.
+        /// Omitted for legacy workers without a configured root override.
+        #[arg(long, value_name = "PATH", value_parser = parse_staging_probe_root)]
+        staging_root: Option<String>,
     },
 
     /// Clean up old project caches
@@ -837,8 +841,12 @@ async fn run_worker(cli: Cli) -> Result<()> {
             print_system_info();
             Ok(())
         }
-        Commands::Capabilities { tool_probe } => {
-            let capabilities = probe_capabilities(tool_probe.as_deref()).await;
+        Commands::Capabilities {
+            tool_probe,
+            staging_root,
+        } => {
+            let capabilities =
+                probe_capabilities(tool_probe.as_deref(), staging_root.as_deref()).await;
             // Output as JSON for the daemon to parse
             println!("{}", serde_json::to_string(&capabilities)?);
             Ok(())
@@ -1397,7 +1405,10 @@ async fn probe_declared_tools(
 
 /// This function detects installed runtimes (Rust, Bun, Node.js, npm)
 /// and returns a WorkerCapabilities struct suitable for JSON serialization.
-async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
+async fn probe_capabilities(
+    tool_probe: Option<&str>,
+    staging_root: Option<&str>,
+) -> WorkerCapabilities {
     let mut capabilities = WorkerCapabilities::new();
     let mut warnings = Vec::new();
 
@@ -1506,6 +1517,15 @@ async fn probe_capabilities(tool_probe: Option<&str>) -> WorkerCapabilities {
     if let Some((free_gb, total_gb)) = disk.tmp {
         capabilities.tmp_disk_free_gb = Some(free_gb);
         capabilities.tmp_disk_total_gb = Some(total_gb);
+    }
+    if let Some(root) = staging_root {
+        let staging = probe_staging_disk(root);
+        if staging.measured_gb().is_none() {
+            capabilities.probe_warnings.push(format!(
+                "staging disk capacity unavailable for {root}; check the directory, mounts and permissions"
+            ));
+        }
+        capabilities.staging_disk = Some(staging);
     }
 
     let (canonical_root, alias_root) = resolved_topology_roots();
@@ -3484,6 +3504,54 @@ fn probe_disk_space_for(path: &std::path::Path) -> Option<(f64, f64)> {
     None
 }
 
+fn parse_staging_probe_root(root: &str) -> Result<String, String> {
+    rch_common::types::validate_worker_remote_base(root, Some(std::env::consts::OS))
+}
+
+/// New staging directories may not exist yet. Resolve existing directory
+/// links, including Darwin's `/tmp` and `/var`, before measuring descendants.
+/// Only a genuinely missing descendant permits using its nearest existing
+/// directory. Failed links and non-directories never fall back above the link.
+fn staging_probe_directory(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = std::path::PathBuf::new();
+    let mut existing = None;
+    for component in root.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                current = std::fs::canonicalize(&current).ok()?;
+                if !std::fs::metadata(&current).ok()?.is_dir() {
+                    return None;
+                }
+                existing = Some(current.clone());
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                existing = Some(current.clone());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return existing,
+            _ => return None,
+        }
+    }
+    existing
+}
+
+fn probe_staging_disk(root: &str) -> rch_common::types::StagingDiskProbe {
+    let mut probe = rch_common::types::StagingDiskProbe {
+        root: root.to_owned(),
+        ..Default::default()
+    };
+    if parse_staging_probe_root(root).as_deref() != Ok(root) {
+        return probe;
+    }
+    if let Some(directory) = staging_probe_directory(std::path::Path::new(root))
+        && let Some((free, total)) = probe_disk_space_for(&directory)
+    {
+        probe.free_gb = Some(free);
+        probe.total_gb = Some(total);
+    }
+    probe
+}
+
 fn parse_rustc_version_stdout(stdout: &str) -> Option<String> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -3856,6 +3924,69 @@ mod tests {
         let tight_root = (20.0, 225.0);
         let roomy_tmpfs = (11.0, 16.0);
         assert_eq!(fuller_disk_sample(roomy_tmpfs, tight_root), tight_root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staging_probe_keeps_exact_root_and_never_falls_back_above_a_failed_link() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(fixture.path()).unwrap();
+        let requested = base.join("new $HOME's staging").join("rch");
+        assert_eq!(staging_probe_directory(&requested), Some(base.clone()));
+        let probe = probe_staging_disk(requested.to_str().unwrap());
+        assert_eq!(probe.root, requested.to_str().unwrap());
+        assert!(probe.measured_gb().is_some(), "{probe:?}");
+        assert!(
+            !requested.exists(),
+            "capacity probes must not create directories"
+        );
+
+        let file = base.join("regular-file");
+        std::fs::write(&file, b"owned fixture").unwrap();
+        assert!(staging_probe_directory(&file.join("child")).is_none());
+        for (name, target) in [("dangling", base.join("absent")), ("file-link", file)] {
+            let link = base.join(name);
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let probe = probe_staging_disk(link.join("rch").to_str().unwrap());
+            assert!(probe.measured_gb().is_none(), "{probe:?}");
+        }
+        let live = base.join("live-link");
+        std::os::unix::fs::symlink(&base, &live).unwrap();
+        let requested = live.join("future").join("rch");
+        assert_eq!(staging_probe_directory(&requested), Some(base));
+        let probe = probe_staging_disk(requested.to_str().unwrap());
+        assert_eq!(probe.root, requested.to_str().unwrap());
+        assert!(probe.measured_gb().is_some(), "{probe:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capabilities_cli_accepts_only_literal_staging_roots() {
+        let cli = Cli::try_parse_from([
+            "rch-wkr",
+            "capabilities",
+            "--staging-root",
+            "/Volumes/Build Disk/rch///",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Capabilities { staging_root: Some(root), .. }
+                if root == "/Volumes/Build Disk/rch"
+        ));
+        for root in ["/", "/tmp", "~/rch", "relative/rch", "/data/../rch"] {
+            assert!(
+                Cli::try_parse_from(["rch-wkr", "capabilities", "--staging-root", root]).is_err()
+            );
+        }
+        let cli = Cli::try_parse_from(["rch-wkr", "capabilities"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Capabilities {
+                staging_root: None,
+                tool_probe: None
+            }
+        ));
     }
 
     #[test]

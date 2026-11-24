@@ -1341,6 +1341,18 @@ fn capability_tool_argument(tools: &[rch_common::types::WorkerToolProbe]) -> Str
     format!(" --tool-probe '{}'", json.replace('\'', "'\\''"))
 }
 
+fn capability_staging_argument(config: &rch_common::WorkerConfig) -> Result<String, String> {
+    let Some(root) = config.remote_base.as_deref() else {
+        return Ok(String::new());
+    };
+    let os = rch_common::types::declared_os(&config.tags);
+    let root = rch_common::types::validate_worker_remote_base(root, os.as_deref())?;
+    Ok(format!(
+        " --staging-root {}",
+        shell_escape::escape(root.into())
+    ))
+}
+
 /// Probe worker capabilities (Bun, Node, Rust versions).
 ///
 /// Runs `rch-wkr capabilities` on the worker and parses the JSON output.
@@ -1424,6 +1436,13 @@ async fn probe_worker_capabilities_allowed(
     if tokio::time::Instant::now() >= deadline {
         return None;
     }
+    let staging_argument = match capability_staging_argument(worker_config) {
+        Ok(argument) => argument,
+        Err(error) => {
+            warn!(worker = %worker_config.id, "Invalid staging capacity probe root: {error}");
+            return None;
+        }
+    };
 
     if is_mock_transport(worker) {
         debug!(
@@ -1435,6 +1454,14 @@ async fn probe_worker_capabilities_allowed(
         let capabilities = WorkerCapabilities {
             build_disk_free_gb: Some(1024.0),
             build_disk_total_gb: Some(2048.0),
+            staging_disk: worker_config.remote_base.as_ref().map(|root| {
+                rch_common::types::StagingDiskProbe {
+                    root: rch_common::types::validate_worker_remote_base(root, None)
+                        .unwrap_or_else(|_| root.clone()),
+                    free_gb: Some(1024.0),
+                    total_gb: Some(2048.0),
+                }
+            }),
             native_tools: rch_common::types::NativeToolCapabilities {
                 present: vec!["make".into()],
                 ..Default::default()
@@ -1457,16 +1484,13 @@ async fn probe_worker_capabilities_allowed(
     // Try to run rch-wkr capabilities command
     // Handle PATH vs ~/.local/bin lookup.
     //
-    // Operator-declared tool probes are appended ONLY when this worker declares
-    // any. A worker with no declarations therefore receives the byte-identical
-    // command older deployments have always received, so adding this feature
-    // cannot break capability probing on a fleet that has not been redeployed.
-    // A worker that DOES declare tools and still runs an old binary fails the
-    // probe, falls back to its cached snapshot, and stays inadmissible for
-    // `--require-tool` work — the safe direction for a gate.
+    // Optional arguments are sent only for configured tools or a staging
+    // override. Workers with neither receive the legacy command unchanged.
+    // Older binaries reject unsupported flags; they cannot qualify the new
+    // requirement until a successful probe supplies the requested evidence.
     let tool_argument = capability_tool_argument(&worker_config.tools);
     let cmd = format!(
-        "if command -v rch-wkr >/dev/null 2>&1; then rch-wkr capabilities{tool_argument}; else ~/.local/bin/rch-wkr capabilities{tool_argument}; fi"
+        "if command -v rch-wkr >/dev/null 2>&1; then rch-wkr capabilities{tool_argument}{staging_argument}; else ~/.local/bin/rch-wkr capabilities{tool_argument}{staging_argument}; fi"
     );
     let cmd = cmd.as_str();
 
@@ -1630,6 +1654,43 @@ mod tests {
         let argument = capability_tool_argument(&tricky);
         assert!(!argument.contains("it's"), "raw quote survived: {argument}");
         assert!(argument.contains(r"'\''"), "{argument}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capability_staging_argument_preserves_legacy_and_quotes_literal_worker_path() {
+        let mut config = WorkerConfig {
+            id: WorkerId::new("staging-probe"),
+            host: "localhost".into(),
+            user: "worker".into(),
+            identity_file: "/unused/key".into(),
+            total_slots: 4,
+            priority: 1,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            remote_base: None,
+        };
+        assert_eq!(capability_staging_argument(&config).unwrap(), "");
+        let root = "/Volumes/Build Disk/$HOME/$(printf wrong)/'quoted";
+        config.remote_base = Some(format!("{root}///"));
+        let argument = capability_staging_argument(&config).unwrap();
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!("set --{argument}; printf '%s\\n' \"$#\" \"$1\" \"$2\""),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("2\n--staging-root\n{root}\n")
+        );
+        config.tags = vec!["os:windows".into()];
+        assert!(capability_staging_argument(&config).is_err());
+        config.tags.clear();
+        config.remote_base = Some("/".into());
+        assert!(capability_staging_argument(&config).is_err());
     }
 
     #[test]

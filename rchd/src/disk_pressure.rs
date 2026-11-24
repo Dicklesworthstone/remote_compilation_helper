@@ -186,15 +186,7 @@ impl DiskCapacityObservation {
         // Pressure may describe /tmp instead of build storage. Older workers
         // without an explicit complete build-root sample cannot prove this
         // build budget, even if their generic disk report looks healthy.
-        let (Some(free), Some(total)) = (
-            capabilities.build_disk_free_gb,
-            capabilities.build_disk_total_gb,
-        ) else {
-            return None;
-        };
-        if !free.is_finite() || !total.is_finite() || total <= 0.0 || free < 0.0 || free > total {
-            return None;
-        }
+        let (free, _) = capabilities.measured_build_disk_gb()?;
         Some(Self {
             worker_id,
             // Worker df probes divide KiB by 1024²: these legacy *_gb fields
@@ -939,7 +931,7 @@ fn evaluate_pressure_with_metrics(
     };
     // A zero-total or non-finite build sample is a failed probe; drop it so
     // capacity falls back to the tightest mount instead of trusting junk.
-    let (build_disk_free_gb, build_disk_total_gb) = match (
+    let (mut build_disk_free_gb, mut build_disk_total_gb) = match (
         capabilities.build_disk_free_gb,
         capabilities.build_disk_total_gb,
     ) {
@@ -948,7 +940,6 @@ fn evaluate_pressure_with_metrics(
         }
         _ => (None, None),
     };
-
     // Older workers only reported the lowest-ratio mount and the build
     // mount. Different readings identify `/tmp` as the lowest-ratio mount.
     // Keep that inference as a fallback for workers without a valid explicit
@@ -1020,13 +1011,48 @@ fn evaluate_pressure_with_metrics(
             config,
         )
     };
-    let (state, confidence, reason_code, mut policy_rule) = match tmp_sample {
+    let verdict = match tmp_sample {
         Some((tmp_free_gb, tmp_free_ratio)) => worse_verdict(
             verdict,
             classify_tmp_mount(tmp_free_gb, tmp_free_ratio, telemetry_fresh, config),
         ),
         _ => verdict,
     };
+    // Staging can be a third filesystem. Its absolute and ratio thresholds
+    // must both be enforced, without reinterpreting a differing sample as
+    // `/tmp` or letting a low-ratio, roomy canonical volume hide it.
+    let (state, confidence, reason_code, mut policy_rule) =
+        if let Some(staging) = &capabilities.staging_disk {
+            let mut staging_verdict = match staging.measured_gb() {
+                Some(_) if capabilities.measured_build_disk_gb().is_none() => (
+                    PressureState::Critical,
+                    PressureConfidence::Low,
+                    "build_disk_unavailable".to_string(),
+                    "required_build_roots_unmeasured".to_string(),
+                ),
+                Some((free, total)) if telemetry_fresh => classify_with_fresh_telemetry(
+                    free,
+                    total,
+                    free / total,
+                    disk_io_util_pct,
+                    memory_pressure,
+                    config,
+                ),
+                Some((free, total)) => {
+                    classify_without_fresh_telemetry(free, total, free / total, config)
+                }
+                None => (
+                    PressureState::Critical,
+                    PressureConfidence::Low,
+                    "staging_disk_unavailable".to_string(),
+                    "required_staging_root_unmeasured".to_string(),
+                ),
+            };
+            staging_verdict.3 = format!("staging_root={:?}; {}", staging.root, staging_verdict.3);
+            worse_verdict(verdict, staging_verdict)
+        } else {
+            verdict
+        };
 
     // Explain why a low percentage did not zero this worker. The existing
     // status and capabilities surfaces already carry this rule, so operators
@@ -1039,6 +1065,12 @@ fn evaluate_pressure_with_metrics(
         policy_rule.push_str(&format!(
             "; critical ratio capped: disk_free_gb={free} > selection.disk_critical_ratio_cap_gb={cap}"
         ));
+    }
+
+    if capabilities.staging_disk.is_some() {
+        (build_disk_free_gb, build_disk_total_gb) = capabilities
+            .measured_build_disk_gb()
+            .map_or((None, None), |(free, total)| (Some(free), Some(total)));
     }
 
     PressureAssessment {
@@ -1652,6 +1684,78 @@ mod tests {
         caps.build_disk_free_gb = build.map(|(free, _)| free);
         caps.build_disk_total_gb = build.map(|(_, total)| total);
         caps
+    }
+
+    #[test]
+    fn staging_volume_capacity_and_pressure_are_independent_of_project_ratio() {
+        let config = DiskPressurePolicyConfig::default();
+        let slots = DiskSlotPolicy::from(&rch_common::SelectionConfig::default());
+        for (projects, staging, expected_free) in [
+            ((300.0, 1000.0), (20.0, 100.0), 20.0),
+            ((20.0, 100.0), (300.0, 1000.0), 20.0),
+        ] {
+            let mut caps = caps_with_build_disk(projects, Some(projects));
+            caps.tmp_disk_free_gb = Some(8.0);
+            caps.tmp_disk_total_gb = Some(16.0);
+            caps.staging_disk = Some(rch_common::types::StagingDiskProbe {
+                root: "/mnt/staging/rch".into(),
+                free_gb: Some(staging.0),
+                total_gb: Some(staging.1),
+            });
+            let pressure = evaluate_pressure_policy(&caps, None, &config);
+            assert_eq!(pressure.capacity_free_gb(), Some(expected_free));
+            assert_eq!(slots.effective_slots(16, &pressure), 1);
+            let observation = DiskCapacityObservation::from_capabilities(
+                "split-volumes".into(),
+                &caps,
+                1,
+                Arc::new(AtomicU64::new(1)),
+                1,
+                Arc::new(AtomicU64::new(1)),
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(observation.current_free_gib("split-volumes"), Some(20));
+
+            caps.staging_disk.as_mut().unwrap().free_gb = Some(0.5);
+            assert_eq!(
+                evaluate_pressure_policy(&caps, None, &config).state,
+                PressureState::Critical
+            );
+            caps.staging_disk.as_mut().unwrap().free_gb = Some(staging.0);
+            caps.build_disk_free_gb = Some(0.5);
+            caps.disk_free_gb = Some(0.5);
+            assert_eq!(
+                evaluate_pressure_policy(&caps, None, &config).state,
+                PressureState::Critical,
+                "roomy staging cannot conceal a full canonical build mount"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_staging_volume_requires_complete_measurements_before_admission() {
+        let config = DiskPressurePolicyConfig::default();
+        let mut caps = caps_with_build_disk((300.0, 1000.0), Some((300.0, 1000.0)));
+        caps.staging_disk = Some(rch_common::types::StagingDiskProbe {
+            root: "/mnt/staging/rch".into(),
+            ..Default::default()
+        });
+        let pressure = evaluate_pressure_policy(&caps, None, &config);
+        assert_eq!(pressure.state, PressureState::Critical);
+        assert_eq!(pressure.reason_code, "staging_disk_unavailable");
+        assert_eq!(pressure.build_disk_free_gb, None);
+
+        let staging = caps.staging_disk.as_mut().unwrap();
+        staging.free_gb = Some(80.0);
+        staging.total_gb = Some(100.0);
+        caps.build_disk_free_gb = None;
+        caps.build_disk_total_gb = None;
+        caps.projects_root_ok = Some(false);
+        let pressure = evaluate_pressure_policy(&caps, None, &config);
+        assert_eq!(pressure.state, PressureState::Critical);
+        assert_eq!(pressure.reason_code, "build_disk_unavailable");
+        assert_eq!(pressure.build_disk_free_gb, None);
     }
 
     #[test]
