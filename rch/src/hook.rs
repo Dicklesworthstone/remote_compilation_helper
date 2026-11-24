@@ -492,6 +492,9 @@ fn remote_failure_exit_code(error: &anyhow::Error) -> i32 {
     if is_remote_execution_unconfirmed(error) {
         return EXIT_BUILD_ERROR;
     }
+    if error.is::<crate::transfer::RemoteBuildCpuBudgetExceeded>() {
+        return 120;
+    }
     error
         .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
         .map_or(
@@ -575,6 +578,17 @@ fn remote_release_faults<'a>(
                 };
             }
             if let Some(failure) = error
+                .downcast_ref::<crate::transfer::RemoteBuildCpuBudgetExceeded>()
+                .filter(|failure| failure.worker_id == worker_id.as_str())
+            {
+                return daemon_ipc::ReleaseFaults {
+                    // Another dispatcher's live reservation is normal load,
+                    // not a broken worker or evidence of disk pressure.
+                    worker_fault: failure.reason != "capacity_busy",
+                    ..Default::default()
+                };
+            }
+            if let Some(failure) = error
                 .downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
                 .filter(|failure| failure.worker_id == worker_id.as_str())
             {
@@ -642,6 +656,9 @@ fn remote_pipeline_failure_summary(worker_id: &WorkerId, error: &anyhow::Error) 
             "[RCH] remote {worker_id} stopped [{}]: {failure}",
             ErrorCode::BuildDiskBudgetExceeded.code_string()
         );
+    }
+    if let Some(failure) = error.downcast_ref::<crate::transfer::RemoteBuildCpuBudgetExceeded>() {
+        return format!("[RCH] remote {worker_id} did not start: {failure}");
     }
     format!(
         "[RCH] remote {} failed [{}] SSH command timed out (no local fallback)",
@@ -6011,7 +6028,8 @@ pub async fn run_exec(
             durable_lease.record_exit(result.exit_code)?;
         } else if let Err(error) = result.as_ref()
             && !retain_recovery_ownership
-            && error.is::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+            && (error.is::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+                || error.is::<crate::transfer::RemoteBuildCpuBudgetExceeded>())
         {
             durable_lease.record_exit(release_exit_code)?;
         }
@@ -6588,6 +6606,22 @@ pub async fn run_exec(
                         log_reason: "source topology incompatible".to_string(),
                         failed_worker: worker.id.clone(),
                         on_exhaust: RemoteFaultExhaustAction::RefuseSourceTopology { summary },
+                    }
+                } else if let Some(failure) =
+                    e.downcast_ref::<crate::transfer::RemoteBuildCpuBudgetExceeded>()
+                {
+                    // Exact prelaunch refusal was checked against completion
+                    // and source ownership. The shared retry path below also
+                    // requires acknowledged daemon release, excludes this
+                    // worker, and consumes the ordinary bounded retry budget.
+                    RetryableRemoteFault {
+                        log_reason: format!("worker CPU admission refused: {}", failure.reason),
+                        failed_worker: worker.id.clone(),
+                        on_exhaust: RemoteFaultExhaustAction::ExitWithCode {
+                            code: release_exit_code,
+                            summary: remote_pipeline_failure_summary(&worker.id, &e),
+                            error_code: None,
+                        },
                     }
                 } else if let Some(failure) =
                     e.downcast_ref::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
@@ -7812,7 +7846,8 @@ async fn handle_selection_response(
         }
         Err(e) => {
             if !is_remote_execution_unconfirmed(&e)
-                && e.is::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+                && (e.is::<crate::transfer::RemoteBuildDiskBudgetExceeded>()
+                    || e.is::<crate::transfer::RemoteBuildCpuBudgetExceeded>())
             {
                 reporter.summary_critical(&remote_pipeline_failure_summary(&worker.id, &e));
                 return HookOutput::allow_with_modified_command(format!(

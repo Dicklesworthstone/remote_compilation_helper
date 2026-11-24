@@ -9847,6 +9847,54 @@ fn disk_budget_failures_preserve_owner_peak_and_never_replay_started_work() {
 }
 
 #[test]
+fn cpu_admission_busy_is_not_worker_or_disk_failure_and_needs_confirmed_ownership() {
+    let worker = WorkerId::new("shared-cpu-worker");
+    for reason in ["capacity_busy", "monitor_unavailable"] {
+        let failure = crate::transfer::RemoteBuildCpuBudgetExceeded {
+            reason: reason.into(),
+            started: false,
+            requested_slots: 4,
+            capacity_slots: if reason == "capacity_busy" { 8 } else { 0 },
+            reserved_slots: if reason == "capacity_busy" { 6 } else { 0 },
+            detail: "worker admission refused before execution".into(),
+            worker_id: worker.as_str().into(),
+        };
+        let error = anyhow::Error::new(failure.clone());
+        assert_eq!(remote_failure_exit_code(&error), 120);
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::AllowLocalFallback
+        );
+        assert!(remote_pipeline_failure_summary(&worker, &error).contains("did not start"));
+        let result = Err(error);
+        let faults = remote_release_faults(&result, &worker);
+        assert_eq!(faults.worker_fault, reason == "monitor_unavailable");
+        assert!(!faults.worker_disk_full);
+        assert!(faults.worker_disk_roots.is_empty());
+        assert!(faults.disk_peak_output_bytes.is_none());
+        assert!(faults.disk_peak_growth_bytes.is_none());
+        assert!(faults.disk_observation.is_none());
+        assert_eq!(
+            remote_release_faults(&result, &WorkerId::new("other-worker")),
+            daemon_ipc::ReleaseFaults::default()
+        );
+
+        let unconfirmed =
+            anyhow::Error::new(failure).context(crate::transfer::RemoteExecutionUnconfirmed);
+        assert!(requires_recovery_before_release(&unconfirmed));
+        assert_eq!(remote_failure_exit_code(&unconfirmed), EXIT_BUILD_ERROR);
+        assert_eq!(
+            classify_remote_pipeline_failure(&unconfirmed),
+            RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+        );
+        assert_eq!(
+            remote_release_faults(&Err(unconfirmed), &worker),
+            daemon_ipc::ReleaseFaults::default()
+        );
+    }
+}
+
+#[test]
 fn changed_pool_requires_one_owner_confirmed_cold_readmission_before_launch() {
     let gib = rch_common::BuildDiskBudget::GIB;
     let pool = rch_common::BuildDiskPool {

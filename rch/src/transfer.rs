@@ -1153,6 +1153,26 @@ pub(crate) struct RemoteBuildDiskBudgetExceeded {
     pub roots: Vec<String>,
 }
 
+/// Attempt-bound worker admission refusal. The payload has not started, but
+/// source ownership and durable completion still have to be reconciled before
+/// the caller may release its local reservation or select another worker.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[error(
+    "remote worker CPU admission refused: {reason} (requested {requested_slots} slots, reserved {reserved_slots}, capacity {capacity_slots}); {detail}"
+)]
+pub(crate) struct RemoteBuildCpuBudgetExceeded {
+    pub reason: String,
+    pub started: bool,
+    pub requested_slots: u32,
+    pub capacity_slots: u32,
+    pub reserved_slots: u64,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(skip)]
+    pub worker_id: String,
+}
+
 #[derive(serde::Deserialize)]
 struct RemoteBuildDiskUsage {
     max_growth_bytes: u64,
@@ -1924,8 +1944,8 @@ pub(crate) fn parse_remote_timeout_kill_output(stdout: &str) -> Option<RemoteTim
 /// crate's rustc peaks around 3 GiB, so 8 GiB per job leaves headroom for two
 /// to three concurrent rch jobs on the same box before it starts paging.
 const REMOTE_BUILD_JOBS_GIB_PER_JOB: u64 = 8;
-/// Floor for the derived job count: below two, cargo loses pipelining
-/// between codegen units and the build serialises for no memory benefit.
+/// Usual floor for the derived job count. A smaller worker slot grant remains
+/// binding, including a single-slot admission on a capacity-degraded worker.
 const REMOTE_BUILD_JOBS_AUTO_MIN: u64 = 2;
 /// Ceiling for the derived job count. Above eight jobs per rch job the
 /// worker's slot accounting, not per-job parallelism, is the right lever.
@@ -1947,11 +1967,15 @@ const LINUX_MEMINFO_PATH: &str = "/proc/meminfo";
 /// - a `-j N` flag beats the env var by cargo's own precedence.
 ///
 /// `auto` computes `clamp(mem_gib / 8, 2, min(nproc, 8))` from live worker
-/// facts. Every probe is fail-open: if either cores or memory cannot be read
-/// as a number the fragment exports nothing and cargo keeps its `nproc`
-/// default. `meminfo_path` is the Linux `/proc/meminfo` location (overridable
-/// for tests); macOS falls back to `sysctl hw.memsize`.
-fn remote_build_jobs_fragment(policy: RemoteBuildJobs, meminfo_path: &str) -> String {
+/// facts, additionally bounded by the exact admitted slot grant. If a probe
+/// fails, a known grant still supplies a bounded default; without a grant the
+/// disk-only path exports nothing. `meminfo_path` is the Linux `/proc/meminfo`
+/// location (overridable for tests); macOS falls back to `sysctl hw.memsize`.
+fn remote_build_jobs_fragment(
+    policy: RemoteBuildJobs,
+    meminfo_path: &str,
+    reserved_slots: Option<u32>,
+) -> String {
     match policy {
         RemoteBuildJobs::Off => String::new(),
         RemoteBuildJobs::Fixed(n) => format!(
@@ -1959,6 +1983,16 @@ fn remote_build_jobs_fragment(policy: RemoteBuildJobs, meminfo_path: &str) -> St
         ),
         RemoteBuildJobs::Auto => {
             let escaped_meminfo = escape(Cow::from(meminfo_path));
+            let max = reserved_slots
+                .filter(|slots| *slots > 0)
+                .map_or(REMOTE_BUILD_JOBS_AUTO_MAX, |slots| {
+                    u64::from(slots).min(REMOTE_BUILD_JOBS_AUTO_MAX)
+                });
+            let fallback = if reserved_slots.is_some_and(|slots| slots > 0) {
+                format!("else CARGO_BUILD_JOBS={max}; export CARGO_BUILD_JOBS; ")
+            } else {
+                String::new()
+            };
             format!(
                 "if [ -z \"${{CARGO_BUILD_JOBS:-}}\" ]; then \
 __rch_c=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null); \
@@ -1966,16 +2000,15 @@ __rch_m=$(awk '/^MemTotal:/ {{ print int($2 / 1048576) }}' {escaped_meminfo} 2>/
 [ -n \"$__rch_m\" ] || __rch_m=$(sysctl -n hw.memsize 2>/dev/null | awk '{{ print int($1 / 1073741824) }}'); \
 case \"$__rch_c\" in ''|*[!0-9]*) __rch_c=;; esac; \
 case \"$__rch_m\" in ''|*[!0-9]*) __rch_m=;; esac; \
-if [ -n \"$__rch_c\" ] && [ -n \"$__rch_m\" ]; then \
+if [ -n \"$__rch_c\" ] && [ \"$__rch_c\" -gt 0 ] && [ -n \"$__rch_m\" ]; then \
 __rch_j=$((__rch_m / {gib})); \
 if [ \"$__rch_j\" -lt {min} ]; then __rch_j={min}; fi; \
 __rch_x=$__rch_c; if [ \"$__rch_x\" -gt {max} ]; then __rch_x={max}; fi; \
 if [ \"$__rch_j\" -gt \"$__rch_x\" ]; then __rch_j=$__rch_x; fi; \
 CARGO_BUILD_JOBS=$__rch_j; export CARGO_BUILD_JOBS; \
-fi; fi; ",
+{fallback}fi; fi; ",
                 gib = REMOTE_BUILD_JOBS_GIB_PER_JOB,
-                min = REMOTE_BUILD_JOBS_AUTO_MIN,
-                max = REMOTE_BUILD_JOBS_AUTO_MAX,
+                min = REMOTE_BUILD_JOBS_AUTO_MIN.min(max),
             )
         }
     }
@@ -3229,6 +3262,10 @@ pub struct TransferPipeline {
     prepared_dependencies: Option<prepared_dependencies::PreparedDependencyExecution>,
     /// Absolute worker headroom and allocated-output growth reservation.
     disk_budget: Option<rch_common::BuildDiskBudget>,
+    /// Exact daemon grant checked against the worker's shared process ledger
+    /// before a disk-supervised command starts. This is admission, not a
+    /// kernel CPU quota or permission to change user compiler flags.
+    cpu_slots: Option<u32>,
     /// Whole selected source root when execution is rebased to a subdirectory.
     /// Disk supervision must keep accounting for writes above the command cwd.
     disk_source_root: Option<String>,
@@ -3442,6 +3479,7 @@ impl TransferPipeline {
             source_activity_owns_execution: false,
             prepared_dependencies: None,
             disk_budget: None,
+            cpu_slots: None,
             disk_source_root: None,
             cargo_disk_cache: None,
             cargo_disk_cache_base: None,
@@ -4480,6 +4518,11 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
 
     pub fn with_disk_budget(mut self, budget: Option<rch_common::BuildDiskBudget>) -> Self {
         self.disk_budget = budget;
+        self
+    }
+
+    pub(crate) fn with_cpu_slots(mut self, slots: Option<u32>) -> Self {
+        self.cpu_slots = slots;
         self
     }
 
@@ -6298,6 +6341,25 @@ mkdir -p {source}
         )
     }
 
+    fn cpu_prestart_refusal(&self, detail: &str) -> String {
+        let body = serde_json::json!({
+            "reason": "monitor_unavailable", "started": false,
+            "requested_slots": self.cpu_slots.expect("worker CPU admission grant"),
+            "capacity_slots": 0, "reserved_slots": 0, "detail": detail,
+        });
+        let line = escape(Cow::Owned(format!(
+            "{}_CPU_BUDGET:{body}",
+            self.deadline_marker
+        )));
+        let receipt = escape(Cow::Owned(
+            self.remote_disk_receipt_path()
+                .expect("resource receipt path"),
+        ));
+        format!(
+            "(umask 077; printf '%s\\n' {line} > {receipt}) || exit 120; printf '\\n%s\\n' {line} >&2; exit 120"
+        )
+    }
+
     fn wrap_with_disk_budget(
         &self,
         command: &str,
@@ -6341,7 +6403,7 @@ mkdir -p {source}
                 "verified": cache.verified,
             })
         });
-        let plan = serde_json::json!({
+        let mut plan = serde_json::json!({
             "probe": probes, "output": outputs,
             "receipt": self.remote_disk_receipt_path(), "receipt_initialized": true,
             "timeout_seconds": timeout_seconds,
@@ -6352,6 +6414,9 @@ mkdir -p {source}
             "cargo_cache_required": self.cargo_disk_cache.is_some()
                 || (!self.cargo_disk_scope_captured && command.contains("cargo")),
         });
+        if let Some(slots) = self.cpu_slots {
+            plan["cpu_slots"] = serde_json::json!(slots);
+        }
         let target = escape(Cow::Owned(self.remote_cargo_target_dir()));
         let marker = escape(Cow::Owned(format!("{}_DISK_BUDGET:", self.deadline_marker)));
         let plan = escape(Cow::Owned(plan.to_string()));
@@ -6363,6 +6428,19 @@ mkdir -p {source}
         };
         let refusal =
             self.disk_prestart_refusal("deploy rch-wkr with native disk-supervise support", 120);
+        let cpu_probe = if self.cpu_slots.is_some() {
+            let refusal = self.cpu_prestart_refusal(
+                "deploy rch-wkr with shared CPU admission support (disk-supervise cpu-v1)",
+            );
+            format!(
+                r#"if ! rch_cpu_version=$("$RCH_WKR" disk-supervise probe-cpu) \
+    || [ "$rch_cpu_version" != 'rch-wkr disk-supervise cpu-v1' ]; then
+    {refusal}
+fi"#
+            )
+        } else {
+            String::new()
+        };
         let program = format!(
             r#"{timing}
 {locate}
@@ -6370,6 +6448,7 @@ if ! rch_wkr_locate || ! rch_disk_version=$("$RCH_WKR" disk-supervise probe) \
     || [ "$rch_disk_version" != 'rch-wkr disk-supervise v1' ]; then
     {refusal}
 fi
+{cpu_probe}
 "$RCH_WKR" disk-supervise {} {} {marker} {target} {plan} {mode} sh -lc {command}"#,
             budget.max_growth_bytes,
             budget.min_free_bytes,
@@ -6400,6 +6479,10 @@ fi
             "{}_DISK_USAGE:{{",
             self.deadline_marker
         )));
+        let cpu_prefix = escape(Cow::Owned(format!(
+            "{}_CPU_BUDGET:{{",
+            self.deadline_marker
+        )));
         let fallback = escape(Cow::Owned(self.disk_failure_line(
             "disk supervisor did not publish a complete receipt; execution cannot be replayed",
             true,
@@ -6413,10 +6496,44 @@ fi
 if ! (umask 077; set -C; printf '%s\\n' {marker} > {receipt}); then printf '\\n%s\\n' {fallback} >&2; exit 120; fi; \
 if ( {execution} ); then __rch_disk_status=0; else __rch_disk_status=$?; fi; \
 if [ -f {receipt} ] && [ ! -L {receipt} ] && [ \"$(wc -c < {receipt})\" -le 8192 ] && \
-{{ grep -F -q -- {failure_prefix} {receipt} || grep -F -q -- {usage_prefix} {receipt}; }}; then \
+{{ grep -F -q -- {failure_prefix} {receipt} || grep -F -q -- {usage_prefix} {receipt} || grep -F -q -- {cpu_prefix} {receipt}; }}; then \
 cat {receipt} >&2 || exit 120; else printf '\\n%s\\n' {fallback} >&2; exit 120; fi; \
 exit \"$__rch_disk_status\"; }}"
         )
+    }
+
+    pub(crate) fn is_cpu_budget_marker(&self, line: &str) -> bool {
+        self.cpu_slots.is_some()
+            && self.disk_budget.is_some()
+            && line.starts_with(&format!("{}_CPU_BUDGET:", self.deadline_marker))
+    }
+
+    pub(crate) fn parse_cpu_budget_marker(
+        &self,
+        line: &str,
+    ) -> Option<RemoteBuildCpuBudgetExceeded> {
+        let slots = self.cpu_slots?;
+        self.disk_budget?;
+        if slots == 0 || line.len() > 8192 {
+            return None;
+        }
+        let body = line.strip_suffix('\n')?.trim_end_matches('\r');
+        let prefix = format!("{}_CPU_BUDGET:", self.deadline_marker);
+        let failure: RemoteBuildCpuBudgetExceeded =
+            serde_json::from_str(body.strip_prefix(&prefix)?).ok()?;
+        if failure.started || failure.requested_slots != slots {
+            return None;
+        }
+        let valid = match failure.reason.as_str() {
+            "capacity_busy" => {
+                failure.capacity_slots > 0
+                    && u128::from(failure.reserved_slots) + u128::from(slots)
+                        > u128::from(failure.capacity_slots)
+            }
+            "monitor_unavailable" => failure.capacity_slots == 0 && failure.reserved_slots == 0,
+            _ => false,
+        };
+        valid.then_some(failure)
     }
 
     /// Parse before stderr truncation. A partial line cannot establish a
@@ -6539,6 +6656,25 @@ exit \"$__rch_disk_status\"; }}"
             return Ok(());
         }
         for line in result.stderr.split_inclusive('\n').rev() {
+            if self.is_cpu_budget_marker(line) {
+                let failure = self
+                    .parse_cpu_budget_marker(line)
+                    .ok_or(RemoteExecutionUnconfirmed)?;
+                let contradictory = result.stderr.split_inclusive('\n').any(|line| {
+                    self.parse_disk_budget_marker(line).is_some()
+                        || self.parse_complete_disk_usage(line).is_some()
+                        || (self.is_cpu_budget_marker(line)
+                            && self
+                                .parse_cpu_budget_marker(line)
+                                .is_none_or(|other| other != failure))
+                });
+                if result.exit_code == 120 && !contradictory {
+                    return Err(failure.into());
+                }
+                return Err(RemoteExecutionUnconfirmed.into());
+            }
+        }
+        for line in result.stderr.split_inclusive('\n').rev() {
             if let Some(failure) = self.parse_disk_budget_marker(line) {
                 if (!failure.started && matches!(result.exit_code, 120 | 125))
                     || (failure.started && matches!(result.exit_code, 120 | 137))
@@ -6615,6 +6751,7 @@ exit \"$__rch_disk_status\"; }}"
         anyhow::ensure!(
             text.split_inclusive('\n')
                 .any(|line| self.parse_disk_budget_marker(line).is_some()
+                    || self.parse_cpu_budget_marker(line).is_some()
                     || self.parse_disk_usage_marker(line).is_some()
                     || (line.ends_with('\n') && self.is_deadline_marker(line))),
             "disk receipt is incomplete or belongs to another attempt"
@@ -6866,7 +7003,7 @@ mkdir -p {} && rm -f {} && {launch}",
             return String::new();
         }
         debug!("Remote build jobs policy: {policy} (CARGO_BUILD_JOBS exported unless already set)");
-        remote_build_jobs_fragment(policy, LINUX_MEMINFO_PATH)
+        remote_build_jobs_fragment(policy, LINUX_MEMINFO_PATH, self.cpu_slots)
     }
 
     /// Prepare TypeScript and Bun dependencies through the worker's fingerprint
@@ -14904,6 +15041,139 @@ Number of files transferred: 42
     }
 
     #[test]
+    fn cpu_admission_plan_preserves_exact_slot_grant_and_requires_capability() {
+        let pipeline = disk_budget_test_pipeline(Path::new("/tmp/cpu-plan"), Some(7), 20)
+            .with_cpu_slots(Some(3));
+        let argv = disk_supervisor_argv_for_test(&pipeline, "cargo check");
+        let plan: serde_json::Value = serde_json::from_str(&argv[6]).unwrap();
+        assert_eq!(plan["cpu_slots"], 3);
+        assert_eq!(argv[7], "tracked");
+        let wrapped = pipeline.wrap_with_disk_budget("cargo check", &[], 20);
+        assert!(wrapped.contains("disk-supervise probe-cpu"));
+        assert!(wrapped.contains("rch-wkr disk-supervise cpu-v1"));
+        assert!(wrapped.contains("_CPU_BUDGET:"));
+        assert!(wrapped.contains("monitor_unavailable"));
+
+        let disk_only = pipeline.with_cpu_slots(None);
+        let argv = disk_supervisor_argv_for_test(&disk_only, "rsync --server");
+        let plan: serde_json::Value = serde_json::from_str(&argv[6]).unwrap();
+        assert!(plan.get("cpu_slots").is_none());
+        assert!(
+            !disk_only
+                .wrap_with_disk_budget("rsync --server", &[], 20)
+                .contains("probe-cpu"),
+            "disk-only transfer guards do not invent a compiler reservation"
+        );
+    }
+
+    #[test]
+    fn cpu_budget_receipts_require_exact_attempt_grant_and_prestart_shortfall() {
+        let pipeline = disk_budget_test_pipeline(Path::new("/tmp/cpu-receipts"), Some(8), 20)
+            .with_cpu_slots(Some(3));
+        let other = disk_budget_test_pipeline(Path::new("/tmp/cpu-receipts"), Some(8), 20)
+            .with_cpu_slots(Some(3));
+        let valid = serde_json::json!({
+            "reason": "capacity_busy", "started": false,
+            "requested_slots": 3, "capacity_slots": 8, "reserved_slots": 6,
+            "detail": "another dispatcher owns the remaining capacity",
+        });
+        let line = |value: &serde_json::Value| {
+            format!("{}_CPU_BUDGET:{value}\n", pipeline.deadline_marker)
+        };
+        let marker = line(&valid);
+        let parsed = pipeline.parse_cpu_budget_marker(&marker).unwrap();
+        assert_eq!(parsed.requested_slots, 3);
+        assert_eq!(parsed.reserved_slots, 6);
+        assert!(other.parse_cpu_budget_marker(&marker).is_none());
+        assert!(
+            pipeline
+                .parse_cpu_budget_marker(marker.trim_end())
+                .is_none()
+        );
+        assert!(
+            pipeline
+                .clone()
+                .with_cpu_slots(None)
+                .parse_cpu_budget_marker(&marker)
+                .is_none()
+        );
+        for (key, value) in [
+            ("started", serde_json::json!(true)),
+            ("requested_slots", serde_json::json!(2)),
+            ("requested_slots", serde_json::json!(0)),
+            ("capacity_slots", serde_json::json!(0)),
+            ("reserved_slots", serde_json::json!(5)),
+            ("reserved_slots", serde_json::json!(-1)),
+            ("reason", serde_json::json!("growth")),
+            ("reason", serde_json::json!("monitor_unavailable")),
+            ("unrecognized_evidence", serde_json::json!(true)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(
+                pipeline.parse_cpu_budget_marker(&line(&invalid)).is_none(),
+                "{invalid}"
+            );
+        }
+        let mut unavailable = valid.clone();
+        unavailable["reason"] = serde_json::json!("monitor_unavailable");
+        unavailable["capacity_slots"] = serde_json::json!(0);
+        unavailable["reserved_slots"] = serde_json::json!(0);
+        assert!(
+            pipeline
+                .parse_cpu_budget_marker(&line(&unavailable))
+                .is_some()
+        );
+
+        let result = |exit_code, stderr| CommandResult {
+            exit_code,
+            stderr,
+            stdout: String::new(),
+            duration_ms: 0,
+        };
+        let refused = pipeline
+            .ensure_remote_disk_budget(&result(120, marker.clone()))
+            .unwrap_err();
+        assert!(refused.is::<RemoteBuildCpuBudgetExceeded>());
+        assert!(!refused.is::<RemoteBuildDiskBudgetExceeded>());
+        for exit in [0, 1, 125, 137] {
+            assert!(
+                pipeline
+                    .ensure_remote_disk_budget(&result(exit, marker.clone()))
+                    .unwrap_err()
+                    .is::<RemoteExecutionUnconfirmed>()
+            );
+        }
+        let mut conflicting = valid.clone();
+        conflicting["reserved_slots"] = serde_json::json!(7);
+        for contradictory in [
+            format!("{marker}{}", line(&conflicting)),
+            format!("{marker}{}_CPU_BUDGET:{{broken\n", pipeline.deadline_marker),
+            format!("{}_CPU_BUDGET:{{broken\n{marker}", pipeline.deadline_marker),
+            format!(
+                "{marker}{}_CPU_BUDGET:{{\"reason\":\"capacity_busy\",\"started\":true,\"requested_slots\":3,\"capacity_slots\":8,\"reserved_slots\":6}}\n",
+                pipeline.deadline_marker
+            ),
+            format!(
+                "{marker}{}\n",
+                pipeline.disk_failure_line("other refusal", false)
+            ),
+            format!(
+                "{marker}{}_DISK_USAGE:{{\"max_growth_bytes\":8388608,\"min_free_bytes\":1048576,\"peak_output_bytes\":0,\"peak_growth_bytes\":0,\"complete\":true,\"exit_code\":120}}\n",
+                pipeline.deadline_marker
+            ),
+        ] {
+            assert!(
+                pipeline
+                    .ensure_remote_disk_budget(&result(120, contradictory))
+                    .unwrap_err()
+                    .is::<RemoteExecutionUnconfirmed>(),
+                "contradictory evidence cannot authorize retry"
+            );
+        }
+    }
+
+    #[test]
     fn non_cargo_disk_cache_plan_preserves_compiler_flags_and_literal_home() {
         let worker = WorkerId::new("cache/worker");
         for (requested, home) in [
@@ -21819,6 +22089,7 @@ func main() {
         nproc_out: &str,
         mem_total_kb: Option<u64>,
         preset: Option<&str>,
+        reserved_slots: Option<u32>,
     ) -> String {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("tempdir");
@@ -21848,6 +22119,7 @@ func main() {
         let fragment = remote_build_jobs_fragment(
             RemoteBuildJobs::Auto,
             meminfo.to_str().expect("utf8 tempdir"),
+            reserved_slots,
         );
         let script = format!("{fragment}printf '%s' \"${{CARGO_BUILD_JOBS:-unset}}\"");
         let mut cmd = std::process::Command::new("sh");
@@ -21882,7 +22154,7 @@ func main() {
             ("1", 4, "1"),    // floor never exceeds nproc
         ];
         for (nproc, gib, expected) in cases {
-            let got = run_auto_fragment(nproc, Some(gib * GIB_KB), None);
+            let got = run_auto_fragment(nproc, Some(gib * GIB_KB), None, None);
             assert_eq!(got, expected, "nproc={nproc} mem={gib}GiB");
         }
     }
@@ -21893,13 +22165,48 @@ func main() {
         let _guard = test_guard!();
         const GIB_KB: u64 = 1024 * 1024;
         // Worker-side value (e.g. /etc/environment) wins untouched.
-        assert_eq!(run_auto_fragment("16", Some(30 * GIB_KB), Some("5")), "5");
+        assert_eq!(
+            run_auto_fragment("16", Some(30 * GIB_KB), Some("5"), None),
+            "5"
+        );
         // No readable memory fact -> export nothing, cargo keeps its default.
-        assert_eq!(run_auto_fragment("16", None, None), "unset");
+        assert_eq!(run_auto_fragment("16", None, None, None), "unset");
         // Garbage nproc -> export nothing.
         assert_eq!(
-            run_auto_fragment("not-a-number", Some(30 * GIB_KB), None),
+            run_auto_fragment("not-a-number", Some(30 * GIB_KB), None, None),
             "unset"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cpu_slot_grant_bounds_automatic_cargo_jobs_even_when_worker_probes_fail() {
+        const GIB_KB: u64 = 1024 * 1024;
+        for slots in [1, 3, 4, 12] {
+            let expected = slots.min(8).to_string();
+            assert_eq!(
+                run_auto_fragment("64", Some(256 * GIB_KB), None, Some(slots)),
+                expected
+            );
+            assert_eq!(run_auto_fragment("64", None, None, Some(slots)), expected);
+            assert_eq!(
+                run_auto_fragment("unavailable", Some(256 * GIB_KB), None, Some(slots)),
+                expected
+            );
+            assert_eq!(
+                run_auto_fragment("0", Some(256 * GIB_KB), None, Some(slots)),
+                expected
+            );
+        }
+        assert_eq!(
+            run_auto_fragment("64", Some(256 * GIB_KB), Some("7"), Some(3)),
+            "7",
+            "explicit worker settings retain their existing precedence"
+        );
+        assert_eq!(
+            run_auto_fragment("64", Some(16 * GIB_KB), None, Some(4)),
+            "2",
+            "a slot grant must not raise the memory-derived default"
         );
     }
 

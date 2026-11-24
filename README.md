@@ -1312,6 +1312,27 @@ builds retain their reservations when capacity drops; new work waits for space.
 Change the budget with `rch config set selection.disk_gb_per_slot 10` and restart
 the daemon to apply it.
 
+Disk-supervised Unix execution also checks the exact granted CPU slots on the
+worker before starting the command. Independent dispatchers using the same SSH
+user share one locked process ledger across all staging and output filesystems.
+Admission uses the worker's available parallelism and the smallest capacity
+recorded by its active reservations. A live legacy reservation without slot
+metadata consumes the whole capacity for this check. Dead reservations become
+reusable only after a complete process census; live descendants keep their
+slots even after their original leader exits.
+
+A full worker returns an attempt-specific prelaunch CPU refusal. `rch exec`
+tries another eligible worker within its existing retry limit only after exact
+completion, source ownership retirement, and acknowledged daemon release. This
+normal contention does not mark the worker unhealthy or report disk pressure.
+Deploy `rch-wkr` with `disk-supervise probe-cpu` support before using this path;
+an older binary refuses before execution. Automatic Cargo parallelism is capped
+at the admitted slots, including when worker memory/CPU probes are unavailable.
+This checks declared reservations, not kernel CPU quotas: explicit compiler
+parallelism settings still apply.
+Disk-only transfers, unannotated legacy invocations, jobs without a disk guard,
+and different SSH users do not share this CPU admission contract.
+
 Separately, on build filesystems of at least 50 GiB, rchd marks a worker Critical
 when free space falls to 10 GiB, or when **both** the free ratio is at or below
 `selection.disk_critical_free_ratio` (default `0.05`) and free space is at or below

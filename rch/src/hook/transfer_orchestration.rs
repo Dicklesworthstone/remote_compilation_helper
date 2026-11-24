@@ -216,6 +216,18 @@ pub(super) fn capture_disk_budget_diagnostic(
     Some(failure)
 }
 
+fn capture_cpu_budget_diagnostic(
+    pipeline: &TransferPipeline,
+    line: &str,
+    state: &mut CompileUiState,
+    capture: &mut String,
+    emit: impl FnMut(&str),
+) -> Option<crate::transfer::RemoteBuildCpuBudgetExceeded> {
+    let failure = pipeline.parse_cpu_budget_marker(line)?;
+    state.capture_stderr(line, capture, true, emit);
+    Some(failure)
+}
+
 /// Keep completion evidence separate from the measurements eligible for
 /// learning. Both streamed diagnostics and the durable receipt use this path.
 #[derive(Default)]
@@ -1018,7 +1030,7 @@ pub(super) async fn execute_remote_compilation(
         // The pipeline's state machine is large; held inline, debug builds moved
         // it across a 2 MiB thread stack and overflowed (bd-uz82c). Keep it on
         // the heap so every caller's future stays small.
-        let outcome =
+        let mut outcome =
             super::ssh::guard_offload_ssh_operation(Box::pin(execute_remote_compilation_inner(
                 worker,
                 command,
@@ -1046,6 +1058,12 @@ pub(super) async fn execute_remote_compilation(
                 pooled_target_store_base,
             )))
             .await;
+        if let Err(error) = &mut outcome
+            && let Some(failure) =
+                error.downcast_mut::<crate::transfer::RemoteBuildCpuBudgetExceeded>()
+        {
+            failure.worker_id = worker.id.as_str().to_string();
+        }
         // The inner future has dropped every local holder before cleanup tries to
         // reattach it. Cancellation drains remote mutation descriptors first; once
         // execution may have started, its exact completion must resolve ownership.
@@ -1283,6 +1301,17 @@ async fn execute_remote_compilation_inner(
         compilation_config.disk_headroom_gib,
         crate::config::load_config()?.selection.min_free_gb,
     )?;
+    let execution_cpu_slots = execution_disk_budget
+        .map(|_| {
+            worker
+                .reserved_slots
+                .filter(|slots| *slots > 0)
+                .ok_or_else(|| TransferError::TransferSkipped {
+                    reason: "worker CPU admission requires an exact positive daemon slot grant"
+                        .to_owned(),
+                })
+        })
+        .transpose()?;
     let caller_command = command;
     // The build is already registered. Source validation and fingerprinting can
     // outlast the stuck detector's deadline before any remote transfer begins.
@@ -2429,7 +2458,8 @@ async fn execute_remote_compilation_inner(
             root_pipeline = root_pipeline
                 .with_env_allowlist(effective_env_allowlist.clone())
                 .with_cargo_profile_forwarding(forward_cargo_profile_settings)
-                .with_disk_budget(execution_disk_budget);
+                .with_disk_budget(execution_disk_budget)
+                .with_cpu_slots(execution_cpu_slots);
             // The primary root's pipeline runs the command, so the Layer 0
             // pack belongs here. Until bd-hoxgn it rode only on
             // workspace-metadata roots, which never execute anything.
@@ -3351,6 +3381,8 @@ async fn execute_remote_compilation_inner(
     let stderr_capture_cell = Rc::new(RefCell::new(String::new()));
     let deadline_triggered = Rc::new(Cell::new(false));
     let disk_failure = Rc::new(RefCell::new(None));
+    let cpu_failure = Rc::new(RefCell::new(None));
+    let cpu_failure_conflict = Rc::new(Cell::new(false));
     let disk_usage = Rc::new(RefCell::new(DiskUsageCapture::default()));
 
     let use_compile_progress = progress_enabled
@@ -3407,6 +3439,8 @@ async fn execute_remote_compilation_inner(
     let stderr_capture_stderr = Rc::clone(&stderr_capture_cell);
     let deadline_triggered_stderr = Rc::clone(&deadline_triggered);
     let disk_failure_stderr = Rc::clone(&disk_failure);
+    let cpu_failure_stderr = Rc::clone(&cpu_failure);
+    let cpu_failure_conflict_stderr = Rc::clone(&cpu_failure_conflict);
     let disk_usage_stderr = Rc::clone(&disk_usage);
     let deadline_pipeline = pipeline.clone();
     let process_setup_marker = pipeline.remote_process_setup_marker();
@@ -3475,6 +3509,35 @@ async fn execute_remote_compilation_inner(
         move |line| {
             // Capture the attempt-bound control receipts before any bounded
             // output/UI buffer can discard a late disk failure.
+            if deadline_pipeline.is_cpu_budget_marker(line)
+                && deadline_pipeline.parse_cpu_budget_marker(line).is_none()
+            {
+                cpu_failure_conflict_stderr.set(true);
+                ui_state_stderr.borrow_mut().capture_stderr(
+                    line,
+                    &mut stderr_capture_stderr.borrow_mut(),
+                    true,
+                    |line| eprint!("{line}"),
+                );
+                return;
+            }
+            if let Some(failure) = capture_cpu_budget_diagnostic(
+                &deadline_pipeline,
+                line,
+                &mut ui_state_stderr.borrow_mut(),
+                &mut stderr_capture_stderr.borrow_mut(),
+                |line| eprint!("{line}"),
+            ) {
+                let mut captured = cpu_failure_stderr.borrow_mut();
+                if captured
+                    .as_ref()
+                    .is_some_and(|previous| previous != &failure)
+                {
+                    cpu_failure_conflict_stderr.set(true);
+                }
+                *captured = Some(failure);
+                return;
+            }
             if let Some(failure) = capture_disk_budget_diagnostic(
                 &deadline_pipeline,
                 line,
@@ -3545,10 +3608,15 @@ async fn execute_remote_compilation_inner(
     }
 
     let mut captured_disk_failure = disk_failure.borrow_mut().take();
+    let mut captured_cpu_failure = cpu_failure.borrow_mut().take();
     // Mock transport never runs the remote disk supervisor, so it has neither
     // a receipt to read nor usage to certify (as in `execute_remote`).
     let disk_supervised = !crate::transfer::use_mock_transport(&worker_config);
-    if disk_supervised && captured_disk_failure.is_none() && disk_usage.borrow().is_missing() {
+    if disk_supervised
+        && captured_disk_failure.is_none()
+        && captured_cpu_failure.is_none()
+        && disk_usage.borrow().is_missing()
+    {
         // A full stderr pipe may drop control output. The immutable receipt
         // remains available after confirmed completion and is attempt-bound.
         if let Some(receipt) = pipeline
@@ -3563,14 +3631,50 @@ async fn execute_remote_compilation_inner(
                 if let Some(failure) = pipeline.parse_disk_budget_marker(line) {
                     captured_disk_failure = Some(failure);
                 }
+                if let Some(failure) = pipeline.parse_cpu_budget_marker(line) {
+                    if captured_cpu_failure
+                        .as_ref()
+                        .is_some_and(|previous| previous != &failure)
+                    {
+                        cpu_failure_conflict.set(true);
+                    }
+                    captured_cpu_failure = Some(failure);
+                } else if pipeline.is_cpu_budget_marker(line) {
+                    cpu_failure_conflict.set(true);
+                }
                 disk_usage.borrow_mut().capture(&pipeline, line);
             }
         }
     }
     anyhow::ensure!(
-        disk_usage.borrow().matches_exit(result.exit_code),
+        !cpu_failure_conflict.get() && disk_usage.borrow().matches_exit(result.exit_code),
         crate::transfer::RemoteExecutionUnconfirmed
     );
+    if let Some(mut failure) = captured_cpu_failure {
+        // Capacity is checked before the payload starts. A contradictory
+        // completion or lost source owner cannot turn that claim into replay
+        // authority, even when another dispatcher has filled the worker.
+        confirm_source_pair_execution(source_pair_lock.as_mut(), result.exit_code)?;
+        anyhow::ensure!(
+            result.exit_code == 120
+                && captured_disk_failure.is_none()
+                && disk_usage.borrow().is_missing(),
+            crate::transfer::RemoteExecutionUnconfirmed
+        );
+        failure.worker_id = worker.id.as_str().to_string();
+        if let Some(session) = recovery_session.as_mut() {
+            session
+                .returned(result.exit_code)
+                .context(crate::transfer::RemoteExecutionUnconfirmed)?;
+            drop(source_authority_lock.take());
+            drop(source_pair_lock.take());
+            session
+                .retire_returned()
+                .await
+                .context(crate::transfer::RemoteExecutionUnconfirmed)?;
+        }
+        return Err(failure.into());
+    }
     if let Some(mut failure) = captured_disk_failure {
         // The holder may have disappeared while its durable receipts were
         // read. Recheck before turning pre-start evidence into a retry grant.

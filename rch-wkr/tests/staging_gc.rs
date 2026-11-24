@@ -155,7 +155,10 @@ fn force_resync_custody(fixture: &Fixture) -> (PathBuf, PathBuf) {
     fs::create_dir_all(&registry).unwrap();
     fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
     let bytes = format!("{}\n", fixture.tree.parent().unwrap().display());
-    let digest = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+    let digest: String = Sha256::digest(bytes.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let claim = registry.join(format!(
         "fc-12345678-1234-1234-1234-123456789abc.{digest}.claim"
     ));
@@ -445,7 +448,10 @@ fn invalidation_preserves_active_pending_and_retained_recovery_trees() {
             _ => candidate.clone(),
         };
         let bytes = format!("{}\n", path.display());
-        let digest = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+        let digest: String = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let record = registry.join(format!("aa.{digest}.{extension}"));
         fs::write(&record, &bytes).unwrap();
         let result = run_invalidation_fixture(&base, &candidate, &registry);
