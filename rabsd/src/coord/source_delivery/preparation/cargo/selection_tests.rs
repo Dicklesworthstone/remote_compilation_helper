@@ -1604,6 +1604,13 @@ fn selected_execution_refuses_conflicting_modes_and_transport_controls_hidden_in
         ("run", vec!["--all-targets"]),
         ("run", vec!["-p", "first", "-p", "second"]),
         ("run", vec!["--bin", "first", "--bin", "second"]),
+        (
+            "run",
+            vec![
+                "--target=x86_64-unknown-linux-gnu",
+                "--target=aarch64-unknown-linux-gnu",
+            ],
+        ),
         ("run", vec!["--", "NUL\0value"]),
     ] {
         assert!(
@@ -1624,6 +1631,45 @@ fn selected_execution_refuses_conflicting_modes_and_transport_controls_hidden_in
 }
 
 #[test]
+fn selected_commands_plan_every_explicit_linux_target_in_request_order() {
+    for (command, extra) in [
+        ("build", vec![]),
+        ("check", vec![]),
+        ("clippy", vec![]),
+        ("doc", vec!["--no-deps"]),
+        ("test", vec!["--no-run"]),
+        ("test", vec![]),
+        ("bench", vec!["--no-run"]),
+        ("bench", vec![]),
+    ] {
+        let mut extra = extra;
+        extra.extend([
+            "--target=aarch64-unknown-linux-gnu",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--target=aarch64-unknown-linux-gnu",
+        ]);
+        let input = request(command, &extra);
+        let selected =
+            SelectedCommand::parse(&input, "Cargo.toml", PreparationContext::RemoteRequest)
+                .unwrap();
+        let expected = [
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+        ];
+        assert_eq!(selected.selection.target, expected, "{command}");
+        let graph = selected.graph_arguments(&Value::Null, None).unwrap();
+        let planned = graph
+            .windows(2)
+            .filter(|pair| pair[0] == "--target")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(planned, expected, "{command}");
+    }
+}
+
+#[test]
 fn selected_command_refuses_independent_resolution_and_execution_controls() {
     for extra in [
         vec!["--config", "build.target='outside'"],
@@ -1631,12 +1677,6 @@ fn selected_command_refuses_independent_resolution_and_execution_controls() {
         vec!["--jobs", "2"],
         vec!["--target", "/outside/target.json"],
         vec!["--target", "x86_64-pc-windows-msvc"],
-        vec![
-            "--target",
-            "x86_64-unknown-linux-gnu",
-            "--target",
-            "aarch64-unknown-linux-gnu",
-        ],
         vec!["--manifest-path", "/__rabs/workspace/other/Cargo.toml"],
         vec!["--target-dir", "/__rabs/out/other"],
         vec!["--message-format=human"],
@@ -2383,6 +2423,151 @@ fn cargo_output(
         std::time::Duration::from_secs(30),
         OUTPUT_LIMIT,
     )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cargo_multiple_targets_prepare_and_replay_host_and_target_dependencies() {
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("workspace");
+    let seed = fixture.path().join("seed");
+    let tools = fixture.path().join("tools");
+    let approved = seed.join("cargo-home");
+    for directory in [
+        workspace.join("src"),
+        workspace.join("host-helper/src"),
+        workspace.join("x86-helper/src"),
+        workspace.join("arm-helper/src"),
+        seed.join("home"),
+        approved.clone(),
+        tools.clone(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let cargo = super::super::local_tool("cargo", &tools).unwrap();
+    let toolchain = cargo.parent().unwrap().parent().unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname='selected-cross'\nversion='0.1.0'\nedition='2021'\n\
+         [build-dependencies]\nhost-helper={path='host-helper'}\n\
+         [target.'cfg(target_arch = \"x86_64\")'.dependencies]\nx86-helper={path='x86-helper'}\n\
+         [target.'cfg(target_arch = \"aarch64\")'.dependencies]\narm-helper={path='arm-helper'}\n",
+    )
+    .unwrap();
+    // Empty no_core libraries exercise actual cross-target Cargo/rustc output
+    // without requiring downloaded target standard libraries or cross linkers.
+    // The build script and its helper still compile and execute for the host.
+    let no_core = "#![feature(no_core)]\n#![no_core]\n";
+    fs::write(
+        workspace.join("src/lib.rs"),
+        format!(
+            "{no_core}\n#[cfg(target_arch=\"x86_64\")] extern crate x86_helper;\n\
+             #[cfg(target_arch=\"aarch64\")] extern crate arm_helper;\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("build.rs"),
+        "fn main() { assert_eq!(host_helper::answer(), 42); }\n",
+    )
+    .unwrap();
+    for name in ["host-helper", "x86-helper", "arm-helper"] {
+        fs::write(
+            workspace.join(name).join("Cargo.toml"),
+            format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(name).join("src/lib.rs"),
+            if name == "host-helper" {
+                "pub fn answer() -> u32 { 42 }\n"
+            } else {
+                no_core
+            },
+        )
+        .unwrap();
+    }
+    cargo_output(
+        &cargo,
+        toolchain,
+        &workspace,
+        &seed,
+        &["generate-lockfile", "--offline"],
+    )
+    .unwrap();
+    let extra = [
+        "--target=x86_64-unknown-linux-gnu",
+        "--target=aarch64-unknown-linux-gnu",
+    ];
+    let selected = CargoSource::parse_request(
+        &source(&approved, true),
+        &request("build", &extra),
+        PreparationContext::RemoteRequest,
+    )
+    .unwrap();
+    let (retained, _) = selected
+        .prepare(capture(&workspace), Some(toolchain))
+        .unwrap();
+    let mut graph_args = vec![
+        "build",
+        "--locked",
+        "--offline",
+        "--unit-graph",
+        "-Zunstable-options",
+    ];
+    graph_args.extend(extra);
+    let graph: Value = serde_json::from_slice(
+        &cargo_output(&cargo, toolchain, &workspace, &seed, &graph_args).unwrap(),
+    )
+    .unwrap();
+    let units = selected_units(
+        &graph,
+        CompilationCommand::Build,
+        &PreparationControl::uncontrolled(),
+    )
+    .unwrap();
+    for (package, target) in [
+        ("x86-helper", "x86_64-unknown-linux-gnu"),
+        ("arm-helper", "aarch64-unknown-linux-gnu"),
+    ] {
+        assert!(units.iter().any(|unit| {
+            unit["pkg_id"].as_str().unwrap().contains(package) && unit["platform"] == target
+        }));
+    }
+    assert!(units.iter().any(|unit| {
+        unit["pkg_id"].as_str().unwrap().contains("host-helper")
+            && unit["platform"].is_null()
+    }));
+    let delivered = fixture.path().join("delivered");
+    retained.materialize_into(&delivered).unwrap();
+    let replay = fixture.path().join("replay");
+    for name in ["home", "cargo-home"] {
+        fs::create_dir_all(replay.join(name)).unwrap();
+    }
+    let replay_workspace = delivered.join("workspace");
+    let mut build_args = vec!["build", "--locked", "--offline", "--message-format=json"];
+    build_args.extend(extra);
+    let output = cargo_output(&cargo, toolchain, &replay_workspace, &replay, &build_args).unwrap();
+    let artifacts = output
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .filter(|record| record["reason"] == "compiler-artifact")
+        .collect::<Vec<_>>();
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let archive = replay
+            .join("target")
+            .join(target)
+            .join("debug/libselected_cross.rlib");
+        assert!(archive.is_file(), "{}", archive.display());
+        assert!(artifacts.iter().any(|record| {
+            record["target"]["name"] == "selected_cross"
+                && record["filenames"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|name| name.as_str() == archive.to_str())
+        }));
+    }
 }
 
 #[cfg(target_os = "linux")]

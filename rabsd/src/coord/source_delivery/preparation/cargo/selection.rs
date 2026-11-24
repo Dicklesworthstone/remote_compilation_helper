@@ -266,15 +266,14 @@ impl SelectedCommand {
                         "--bench" => selection.bench.push(value.to_owned()),
                         "--target" => {
                             require(
-                                selection.target.is_empty()
-                                    && matches!(
-                                        value,
-                                        "x86_64-unknown-linux-gnu"
-                                            | "aarch64-unknown-linux-gnu"
-                                            | "x86_64-unknown-linux-musl"
-                                            | "aarch64-unknown-linux-musl"
-                                    ),
-                                "selected Cargo requires one supported Linux target",
+                                matches!(
+                                    value,
+                                    "x86_64-unknown-linux-gnu"
+                                        | "aarch64-unknown-linux-gnu"
+                                        | "x86_64-unknown-linux-musl"
+                                        | "aarch64-unknown-linux-musl"
+                                ),
+                                "selected Cargo requires supported explicit Linux targets",
                             )?;
                             selection.target.push(value.to_owned());
                         }

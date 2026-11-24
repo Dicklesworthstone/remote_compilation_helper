@@ -354,7 +354,7 @@ pub fn is_private_incremental_file(roots: &[String], name: &str) -> bool {
 
 fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
     let mut profile = None;
-    let mut target = None;
+    let mut targets = Vec::new();
     let mut release = false;
     let mut test_filter = false;
     let mut at = 1;
@@ -394,20 +394,18 @@ fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
                     // Cargo's special `host-tuple` spelling expands to another
                     // directory name. Admit the same explicit Linux triples as
                     // the canonical frontend, never aliases or JSON targets.
-                    if target.is_some()
-                        || !matches!(
-                            value,
-                            "x86_64-unknown-linux-gnu"
-                                | "aarch64-unknown-linux-gnu"
-                                | "x86_64-unknown-linux-musl"
-                                | "aarch64-unknown-linux-musl"
-                        )
-                    {
+                    if !matches!(
+                        value,
+                        "x86_64-unknown-linux-gnu"
+                            | "aarch64-unknown-linux-gnu"
+                            | "x86_64-unknown-linux-musl"
+                            | "aarch64-unknown-linux-musl"
+                    ) {
                         return Err(invalid(
-                            "private incremental Cargo requires one named target",
+                            "private incremental Cargo requires supported explicit Linux targets",
                         ));
                     }
-                    target = Some(value);
+                    targets.push(value);
                 }
             }
             "--release" | "-r" if inline.is_none() && args[0] != "bench" => {
@@ -471,11 +469,20 @@ fn derive_private_incremental_roots(args: &[&str]) -> io::Result<Vec<String>> {
             "private incremental Cargo doc profile overlaps documentation outputs",
         ));
     }
-    let mut roots = vec![format!("{profile}/incremental")];
-    if let Some(target) = target {
-        roots.push(format!("{target}/{profile}/incremental"));
+    if args[0] == "run" && targets.len() > 1 {
+        return Err(invalid("Cargo run selects at most one compilation target"));
     }
+    // Cargo shares host build-script/proc-macro state across all requested
+    // triples, while each target has its own compiler-state directory. Repeated
+    // selectors name the same directory and must not duplicate exclusions.
+    let mut roots = vec![format!("{profile}/incremental")];
+    roots.extend(
+        targets
+            .into_iter()
+            .map(|target| format!("{target}/{profile}/incremental")),
+    );
     roots.sort();
+    roots.dedup();
     Ok(roots)
 }
 
@@ -910,6 +917,73 @@ mod tests {
     }
 
     #[test]
+    fn private_incremental_multiple_targets_keep_host_and_each_target_state_private() {
+        let targets = [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+        ];
+        for (command, extra, profile) in [
+            ("build", vec![], "debug"),
+            ("check", vec!["--profile=ci"], "ci"),
+            ("clippy", vec!["--release"], "release"),
+            ("doc", vec!["--no-deps"], "debug"),
+            ("test", vec!["--no-run"], "debug"),
+            ("test", vec![], "debug"),
+            ("bench", vec!["--no-run"], "release"),
+            ("bench", vec![], "release"),
+        ] {
+            let mut arguments = extra;
+            for target in targets {
+                arguments.extend(["--target", target]);
+            }
+            arguments.push("--target=x86_64-unknown-linux-gnu");
+            let mut request = private_request(command, &arguments);
+            if command == "doc" {
+                request["command_context"]["env"]["RUSTDOC"] =
+                    json!("/__rabs/toolchain/bin/rustdoc");
+            }
+            let roots = private_incremental_roots(&request).unwrap().unwrap();
+            let mut expected = vec![format!("{profile}/incremental")];
+            expected.extend(
+                targets
+                    .iter()
+                    .map(|target| format!("{target}/{profile}/incremental")),
+            );
+            expected.sort();
+            assert_eq!(roots, expected, "{command}");
+            for root in &roots {
+                let private_file = format!("{root}/crate/session/query-cache.bin");
+                assert!(is_private_incremental_file(&roots, &private_file));
+                let mut required_private = request.clone();
+                required_private["artifacts"]["files"] = json!([private_file]);
+                assert!(requested(&required_private).is_err());
+            }
+            for target in targets {
+                for public in [
+                    format!("{target}/{profile}/deps/libapp.rlib"),
+                    format!("{target}/{profile}/build/app/out/incremental/data"),
+                    format!("{target}/{profile}/incremental-data/file"),
+                    format!("{target}/doc/app/index.html"),
+                ] {
+                    assert!(!is_private_incremental_file(&roots, &public), "{public}");
+                }
+            }
+        }
+        assert!(
+            private_incremental_roots(&private_request(
+                "run",
+                &[
+                    "--target=x86_64-unknown-linux-gnu",
+                    "--target=aarch64-unknown-linux-gnu",
+                ],
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn private_run_and_bench_projection_follows_the_compilation_profile_only() {
         for (command, extra, mode, profile) in [
             (
@@ -980,10 +1054,6 @@ mod tests {
             vec!["--profile=ci", "--release"],
             vec!["--release", "--profile=ci"],
             vec!["--release", "-r"],
-            vec![
-                "--target=x86_64-unknown-linux-gnu",
-                "--target=aarch64-unknown-linux-gnu",
-            ],
             vec!["--target=host-tuple"],
             vec!["--target=custom.json"],
             vec!["--target=../target"],

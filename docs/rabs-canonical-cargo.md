@@ -180,6 +180,30 @@ profile's command and selection remain in effect. Arguments after Cargo's own
 `--` remain program or test arguments and are validated by the shared canonical
 command contract.
 
+### Build for multiple Linux targets
+
+Canonical local, shared-coordinator and direct-worker builds accept repeated
+`--target` selectors for the supported explicit Linux triples:
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+`x86_64-unknown-linux-musl`, and `aarch64-unknown-linux-musl`. For example:
+
+```sh
+cargo rabs --rabs-canonical WORKER.json -- build --workspace --release \
+  --target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu
+```
+
+Cargo plans the target-specific dependencies and shared host build dependencies
+together. The captured toolchain and worker SDK must contain the standard
+libraries and linkers each selected target needs. Output delivery includes every
+selected target directory. With worker-private incremental state enabled, only
+the exact host and selected-target incremental directories are omitted; libraries,
+executables, build-script outputs and documentation remain deliverable.
+
+Multiple targets also work with `check`, `clippy`, `doc`, `test` and `bench`;
+executing tests or benchmarks still requires a worker able to run their target
+executables. `run` and `nextest run` retain their single-target restriction.
+Custom JSON target specifications and the `host-tuple` alias remain unsupported.
+
 ### Run nextest with captured inputs
 
 `rabs-cargo --local`, `--remote`, and `--worker` accept `nextest run`. The captured

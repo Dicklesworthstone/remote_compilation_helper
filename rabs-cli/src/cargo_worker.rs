@@ -295,17 +295,16 @@ pub(super) fn validate_profile(
         }
     }
     require(
-        selection.target.len() <= 1
-            && selection.target.iter().all(|target| {
-                matches!(
-                    target.as_str(),
-                    "x86_64-unknown-linux-gnu"
-                        | "aarch64-unknown-linux-gnu"
-                        | "x86_64-unknown-linux-musl"
-                        | "aarch64-unknown-linux-musl"
-                )
-            }),
-        "worker target must be one supported explicit Linux triple",
+        selection.target.iter().all(|target| {
+            matches!(
+                target.as_str(),
+                "x86_64-unknown-linux-gnu"
+                    | "aarch64-unknown-linux-gnu"
+                    | "x86_64-unknown-linux-musl"
+                    | "aarch64-unknown-linux-musl"
+            )
+        }),
+        "worker targets must be supported explicit Linux triples",
     )?;
     require(
         command == CompilationCommand::Nextest
@@ -934,6 +933,47 @@ mod tests {
                 assert!(actual.ends_with(&tail));
             }
         }
+    }
+
+    #[test]
+    fn worker_multiple_target_builds_bind_all_targets_and_private_state_roots() {
+        let (_root, mut profile) = filesystem_profile();
+        let selected_options = options(&[
+            "build",
+            "--target=aarch64-unknown-linux-gnu",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--release",
+        ]);
+        for incremental in [false, true] {
+            set(&mut profile, "incremental", json!(incremental));
+            validate_profile(&profile, &selected_options).unwrap();
+            let spec = specification(&profile, &selected_options).unwrap();
+            let arguments = spec["args"].as_array().unwrap();
+            let targets = arguments
+                .windows(2)
+                .filter(|pair| pair[0] == "--target")
+                .map(|pair| pair[1].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                targets,
+                ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+            );
+            assert_eq!(
+                rabs_sandbox::cargo_artifacts::private_incremental_roots(&spec).unwrap(),
+                incremental.then(|| vec![
+                    "aarch64-unknown-linux-gnu/release/incremental".into(),
+                    "release/incremental".into(),
+                    "x86_64-unknown-linux-gnu/release/incremental".into(),
+                ])
+            );
+        }
+        let unsupported = options(&[
+            "build",
+            "--target=x86_64-unknown-linux-gnu",
+            "--target=x86_64-pc-windows-msvc",
+        ]);
+        assert!(validate_profile(&profile, &unsupported).is_err());
     }
 
     #[test]
