@@ -939,7 +939,11 @@ mod tests {
     #[test]
     fn worker_nextest_requires_explicit_runtime_admission_before_opening_roots() {
         let mut profile = profile();
-        set(&mut profile, "source_root", json!("/unopened/nextest-source"));
+        set(
+            &mut profile,
+            "source_root",
+            json!("/unopened/nextest-source"),
+        );
         let error = validate_profile(&profile, &options(&["nextest", "run"])).unwrap_err();
         assert!(error.to_string().contains("test-threads"), "{error}");
 
@@ -954,8 +958,7 @@ mod tests {
             validate_profile(&profile, &options).unwrap();
             let request = specification(&profile, &options).unwrap();
             assert_eq!(
-                rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&request)
-                    .unwrap(),
+                rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&request).unwrap(),
                 Some(expected)
             );
             assert_eq!(request["jobserver_grant"], 2);
@@ -963,7 +966,10 @@ mod tests {
         }
         for alias in ["--test-threads=8", "--jobs=8", "-j8", "--build-jobs=8"] {
             let arguments = ["nextest", "run", "--test-threads", "1", "--", alias];
-            assert!(validate_profile(&profile, &options(&arguments)).is_err(), "{alias}");
+            assert!(
+                validate_profile(&profile, &options(&arguments)).is_err(),
+                "{alias}"
+            );
         }
         assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 0);
     }
@@ -1182,7 +1188,11 @@ mod tests {
             let (root, mut profile) = filesystem_profile();
             let options = options(&arguments);
             set(&mut profile, "vendor", json!("vendor"));
-            set(&mut profile, "source_selection", json!("cargo-unit-graph-v1"));
+            set(
+                &mut profile,
+                "source_selection",
+                json!("cargo-unit-graph-v1"),
+            );
             validate_profile(&profile, &options).unwrap();
             let request = specification(&profile, &options).unwrap();
             assert_eq!(

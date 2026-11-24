@@ -9460,13 +9460,13 @@ fn workspace_leaf_denied_input(command: &str) {
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/cache execution"]
 fn canonical_cargo_offloads_generated_metadata_replays_and_invalidates_changed_out_dir() {
-    remote_dependency_replay("check", GeneratedDependency::Consumer);
+    generated_immutable_dependency_replay("check", GeneratedDependency::Consumer);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated-input Cargo/TLS worker/archive execution"]
 fn canonical_cargo_build_offloads_generated_archives_and_delivers_changed_output() {
-    remote_dependency_replay("build", GeneratedDependency::Consumer);
+    generated_immutable_dependency_replay("build", GeneratedDependency::Consumer);
 }
 
 #[test]
@@ -9484,13 +9484,13 @@ fn canonical_cargo_build_offloads_generated_archives_and_delivers_current_genera
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated native archive execution, remote cache replay and linked binary validation"]
 fn canonical_cargo_build_bundles_generated_native_archives_replays_and_invalidates_them() {
-    remote_dependency_replay("build", GeneratedDependency::NativeConsumer);
+    generated_immutable_dependency_replay("build", GeneratedDependency::NativeConsumer);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual native-input Cargo checks, worker sampling, cache replay and archive-only invalidation"]
 fn canonical_cargo_check_offloads_native_dependency_metadata_replays_and_invalidates_archives() {
-    remote_dependency_replay("check", GeneratedDependency::NativeConsumer);
+    generated_immutable_dependency_replay("check", GeneratedDependency::NativeConsumer);
 }
 
 #[test]
@@ -11997,6 +11997,508 @@ fn assert_metadata_delivery(
             .collect::<BTreeSet<_>>(),
         "metadata delivery did not cover the actual selected results: {output}"
     );
+}
+
+/// Observe current Cargo outputs from a generated immutable dependency chain.
+/// The binary and library share a name; the binary is checked by delivered_build
+/// before comparing the selected libraries and their real metadata/dep-info.
+fn generated_immutable_dependency_outputs(
+    root: &Path,
+    number: u32,
+    command: &str,
+    events: &[Value],
+    output: &str,
+    targets: &mut BTreeSet<PathBuf>,
+) -> (BTreeMap<String, Vec<u8>>, Vec<String>) {
+    let names = ["canonical_leaf", "canonical_dep", "canonical_app"];
+    if command == "build" {
+        let (owner, _) = delivered_build(
+            root,
+            1600 + number,
+            events,
+            output,
+            if number >= 6 { 43 } else { 42 },
+        );
+        assert!(
+            targets.insert(owner.clone()),
+            "a build reused mutable output"
+        );
+        let target = owner.join("target");
+        let libraries = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| {
+                event["reason"] == "compiler-artifact" && event["target"]["kind"] == json!(["lib"])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(libraries.len(), names.len(), "{output}");
+        assert!(
+            libraries.iter().all(|event| event["fresh"] == false),
+            "{output}"
+        );
+        let mut files = BTreeMap::new();
+        let mut pending = vec![target.clone()];
+        let mut visited = 0;
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                visited += 1;
+                assert!(
+                    visited <= 16_384,
+                    "unexpectedly large generated dependency target"
+                );
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                let path = entry.path();
+                let filename = entry.file_name().into_string().unwrap();
+                let extension = path.extension().and_then(|value| value.to_str());
+                if !matches!(extension, Some("rlib" | "rmeta" | "d"))
+                    || !names.iter().any(|name| {
+                        filename.starts_with(&format!("{name}-"))
+                            || filename.starts_with(&format!("lib{name}-"))
+                            || filename == format!("{name}.d")
+                            || filename == format!("lib{name}.rlib")
+                            || filename == format!("lib{name}.rmeta")
+                    })
+                {
+                    continue;
+                }
+                assert!(kind.is_file());
+                let bytes = read_bounded(&path);
+                assert!(!bytes.is_empty(), "empty library output {path:?}");
+                let relative = path.strip_prefix(&target).unwrap().to_str().unwrap();
+                assert!(files.insert(relative.to_owned(), bytes).is_none());
+            }
+        }
+        for name in names {
+            let archives = delivered_cargo_outputs(&target, output, name, "rlib");
+            assert_eq!(archives.len(), 1, "{name}: {output}");
+            let bytes = read_bounded(&archives[0]);
+            assert!(bytes.starts_with(b"!<arch>\n"));
+            for extension in [".rlib", ".d"] {
+                assert!(
+                    files.keys().any(|path| {
+                        let filename = Path::new(path).file_name().unwrap().to_str().unwrap();
+                        (filename.starts_with(&format!("{name}-"))
+                            || filename.starts_with(&format!("lib{name}-")))
+                            && filename.ends_with(extension)
+                    }),
+                    "missing generated dependency {name} {extension}"
+                );
+            }
+        }
+        return (files, workspace_dag_diagnostics(output, &names));
+    }
+    let started = events
+        .iter()
+        .filter(|event| event["kind"] == "canonical-compilation-started")
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 1, "{output}");
+    assert_eq!(started[0]["command"], "check", "{output}");
+    assert_eq!(started[0]["private_target_state"], "cold", "{output}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed"),
+        "a metadata check delivered an executable: {output}"
+    );
+    let artifacts = output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["reason"] == "compiler-artifact")
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), names.len() + 1, "{output}");
+    assert!(
+        artifacts
+            .iter()
+            .all(|event| event["fresh"] == false && event["executable"].is_null()),
+        "Cargo freshness bypassed the current generator or compiler: {output}"
+    );
+    assert_eq!(
+        artifacts
+            .iter()
+            .filter(|event| event["target"]["kind"] == json!(["custom-build"]))
+            .count(),
+        1,
+        "{output}"
+    );
+    let new_targets = fs::read_dir(root.join("state/canonical-compile-v1/private-target-v2"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("seed/target"))
+        .filter(|target| !targets.contains(target))
+        .collect::<Vec<_>>();
+    assert_eq!(new_targets.len(), 1, "check did not retain one cold target");
+    let files = workspace_dag_metadata_files_with_consumer(&new_targets[0], output, &names, false);
+    assert!(targets.insert(new_targets[0].clone()));
+    (files, workspace_dag_diagnostics(output, &names))
+}
+
+/// A generated immutable provider has Rust ancestry as well as its own
+/// completed OUT_DIR. Its earned producer authority must reach the workspace,
+/// while every invocation still runs the current build script. No test inserts
+/// an action, publication, sample, producer receipt or ancestor record.
+fn generated_immutable_dependency_replay(command: &str, generated: GeneratedDependency) {
+    use rabs_cas::metadata_store::RabsMetadataStore;
+    use rabs_protocol::result_identity::OutputRole;
+
+    assert!(generated.generated_consumer());
+    let native = generated == GeneratedDependency::NativeConsumer;
+    let (owner, mut profile) = native_fixture();
+    let root = owner.path();
+    let first = root.join("source-a");
+    let relocated = root.join("source-b");
+    for source in [&first, &relocated] {
+        if native {
+            generated_native_dependency(source, false);
+        } else {
+            generated_dependency(source);
+        }
+        workspace_execution_feature(source);
+        // Keep this source identical across generated-input changes. A new
+        // consumer key must follow its producer, not an edited assertion.
+        let mut library = "#[cfg(not(feature=\"remote_workspace\"))]\ncompile_error!(\"selected workspace feature was lost\");\nconst _: &str = env!(\"CARGO_PRIMARY_PACKAGE\");\nconst _: &str = include_str!(\"../workspace-readme.txt\");\npub fn answer()->u32 { canonical_dep::answer() }\nfn retained_dag_warning() {}\n".to_owned();
+        if !native {
+            // A fresh metadata consumer must evaluate the current exported
+            // const function, including after generated-value.txt changes.
+            library.push_str("const _: () = assert!(canonical_dep::answer() == 40 + (include_bytes!(\"../generated-value.txt\")[0] - b'0') as u32);\n");
+        }
+        write(source, "src/lib.rs", library);
+    }
+    let provider_checksums =
+        read_bounded(&relocated.join("vendor/canonical_dep/.cargo-checksum.json"));
+    let workspace_source = read_bounded(&relocated.join("src/lib.rs"));
+    let names = ["canonical_leaf", "canonical_dep", "canonical_app"];
+    profile["command"] = json!(command);
+    profile["selection"] = json!({"features":["remote_workspace"]});
+    if command == "check" {
+        profile["selection"]["lib"] = json!(true);
+    }
+    profile["jobs"] = json!(2);
+    assert!(profile.get("target_cache").is_none());
+    let mut targets = BTreeSet::new();
+    let mut stock_profile = profile.clone();
+    if command == "check" {
+        stock_profile["target_cache"] = json!({
+            "runtime_epoch":"generated-immutable-stock-v1",
+            "max_bytes":268435456,
+        });
+    }
+    let (code, events, output) = run(root, 1600, &stock_profile);
+    assert_eq!(code, 0, "stock generated dependency failed: {output}");
+    assert!(decisions(&events, "remote-offer").is_empty(), "{output}");
+    assert!(decisions(&events, "hit").is_empty(), "{output}");
+    let stock =
+        generated_immutable_dependency_outputs(root, 0, command, &events, &output, &mut targets);
+
+    let (mut worker, environment) = NativeWorker::start(root);
+    let mut previous_keys: Option<BTreeMap<String, String>> = None;
+    let mut changed_outputs = None;
+    let mut receipt = None;
+    let mut executions = 0;
+    for number in 1..=if native { 10 } else { 9 } {
+        if number == 5 {
+            profile["source_root"] = json!(relocated);
+        }
+        if number == 6 {
+            // Provider package, build script, Cargo directives and consumer
+            // Rust source stay unchanged. Completed generated/native inputs
+            // and new committed producer identities must reach the consumer.
+            write(&relocated, "generated-value.txt", "3\n");
+        }
+        if number == 10 {
+            // The native archive remains identical. Even an unread empty
+            // generated directory belongs to the retained input closure.
+            write(&relocated, "generated-empty-name.txt", "after\n");
+        }
+        assert_eq!(
+            read_bounded(&relocated.join("vendor/canonical_dep/.cargo-checksum.json")),
+            provider_checksums,
+        );
+        assert_eq!(
+            read_bounded(&relocated.join("src/lib.rs")),
+            workspace_source,
+        );
+        if command == "check" {
+            profile["target_cache"] = json!({
+                "runtime_epoch":format!("generated-immutable-{number}-v1"),
+                "max_bytes":268435456,
+            });
+        }
+        let full_hit = matches!(number, 4 | 5 | 9);
+        let before_journal = full_hit.then(|| read_bounded(&worker.state.join("requests.json")));
+        let (code, events, output) =
+            run_with_environment(root, 1600 + number, &profile, &environment);
+        assert_eq!(code, 0, "{output}\nworker: {:?}", worker.events());
+        assert!(decisions(&events, "execute").is_empty(), "{output}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event["kind"].as_str(),
+                Some("rabsd-remote-dependency-failed" | "rabsd-remote-dependency-install-failed")
+            )),
+            "generated immutable qualification fell back locally: {output}"
+        );
+        let scripts = output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["reason"] == "build-script-executed")
+            .collect::<Vec<_>>();
+        assert_eq!(scripts.len(), 1, "{output}");
+        assert!(
+            scripts[0]["out_dir"]
+                .as_str()
+                .unwrap()
+                .starts_with("/__rabs/out/cargo/"),
+            "{output}"
+        );
+        let offered = decisions(&events, "remote-offer");
+        let hits = decisions(&events, "hit");
+        let expected_offered: BTreeSet<&str> = if full_hit {
+            BTreeSet::new()
+        } else if number <= 3 {
+            BTreeSet::from(names)
+        } else {
+            BTreeSet::from(["canonical_dep", "canonical_app"])
+        };
+        let expected_hits: BTreeSet<&str> = if full_hit {
+            BTreeSet::from(names)
+        } else if number <= 3 {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from(["canonical_leaf"])
+        };
+        assert_eq!(
+            offered.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            expected_offered,
+            "every unqualified or invalidated unit must execute remotely: {output}"
+        );
+        assert_eq!(
+            hits.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            expected_hits,
+            "only independently qualified current inputs may replay: {output}"
+        );
+        let mut actual = offered.clone();
+        actual.extend(hits.clone());
+        if let Some(previous) = &previous_keys {
+            for name in names {
+                if matches!(number, 6 | 10) && name != "canonical_leaf" {
+                    assert_ne!(
+                        actual[name], previous[name],
+                        "changed generated inputs retained the {name} key"
+                    );
+                } else {
+                    assert_eq!(
+                        actual[name], previous[name],
+                        "sampling or relocation split the {name} key"
+                    );
+                }
+            }
+        }
+        for (index, name) in names.iter().enumerate() {
+            let samples = if index == 0 || number <= 5 {
+                number.min(3) as usize
+            } else if number == 10 {
+                1
+            } else {
+                (number - 5).min(3) as usize
+            };
+            let class = match (index, command, native) {
+                (0, _, _) => "rustc-dependency-compile",
+                (1, "build", _) => "rustc-immutable-generated-dag-rlib-v1",
+                (1, _, _) => "rustc-immutable-generated-dag-metadata-v1",
+                (_, "build", true) => "rustc-workspace-propagated-native-dag-rlib-v1",
+                (_, _, true) => "rustc-workspace-propagated-native-dag-metadata-v1",
+                (_, "build", false) => "rustc-workspace-committed-dag-rlib-v2",
+                _ => "rustc-workspace-committed-dag-metadata-v2",
+            };
+            assert_closed_workspace_leaf_evidence(root, &actual[*name], samples, class);
+        }
+        assert_qualified_immutable_leaf(root, &actual["canonical_leaf"], command);
+        assert_no_immutable_leaf_qualification(root, &actual["canonical_dep"]);
+        {
+            let cas = rabsd::janitor::store::mount_and_reconcile(
+                &root.join("state/canonical-compile-v1/cas"),
+            )
+            .unwrap();
+            let mut store = cas.store().lock().unwrap();
+            let manifest_key = store
+                .published_manifest_key_str(&actual["canonical_dep"])
+                .unwrap()
+                .unwrap();
+            let manifest = rabsd::coord::live::load_manifest(&mut *store, &manifest_key).unwrap();
+            assert_eq!(manifest.key_epoch, if command == "build" { 40 } else { 41 });
+            assert_eq!(
+                manifest
+                    .logical_outputs
+                    .iter()
+                    .filter(|output| output.role == OutputRole::Materializable)
+                    .count(),
+                usize::from(command == "build"),
+                "metadata-only producers must not acquire archive authority"
+            );
+            assert!(manifest.logical_outputs.iter().all(|output| matches!(
+                output.role,
+                OutputRole::Materializable | OutputRole::ProvisionalMetadata | OutputRole::DepInfo
+            )));
+        }
+        let observed = generated_immutable_dependency_outputs(
+            root,
+            number,
+            command,
+            &events,
+            &output,
+            &mut targets,
+        );
+        assert_workspace_dag_ancestry(root, &actual, &observed.0, &names);
+        if number <= 5 {
+            assert_eq!(
+                observed, stock,
+                "stock, executed and replayed outputs differ"
+            );
+        } else if number == 6 {
+            let select = |files: &BTreeMap<String, Vec<u8>>, name: &str, suffix: &str| {
+                files
+                    .iter()
+                    .filter(|(path, _)| {
+                        let filename = Path::new(path).file_name().unwrap().to_str().unwrap();
+                        filename.starts_with(&format!("lib{name}")) && filename.ends_with(suffix)
+                    })
+                    .map(|(path, bytes)| (path.clone(), bytes.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            assert_eq!(
+                select(
+                    &observed.0,
+                    "canonical_leaf",
+                    if command == "build" {
+                        ".rlib"
+                    } else {
+                        ".rmeta"
+                    }
+                ),
+                select(
+                    &stock.0,
+                    "canonical_leaf",
+                    if command == "build" {
+                        ".rlib"
+                    } else {
+                        ".rmeta"
+                    }
+                ),
+                "generator changes invalidated the independent immutable leaf bytes"
+            );
+            if command == "build" {
+                assert_ne!(
+                    select(&observed.0, "canonical_dep", ".rlib"),
+                    select(&stock.0, "canonical_dep", ".rlib"),
+                    "changed generated/native inputs reused stale provider archive bytes"
+                );
+            } else if native {
+                assert_eq!(
+                    select(&observed.0, "canonical_dep", ".rmeta"),
+                    select(&stock.0, "canonical_dep", ".rmeta"),
+                    "archive-only changes must not fabricate different Rust metadata"
+                );
+            } else {
+                assert_ne!(
+                    select(&observed.0, "canonical_dep", ".rmeta"),
+                    select(&stock.0, "canonical_dep", ".rmeta"),
+                    "changed generated code reused stale provider metadata"
+                );
+            }
+            changed_outputs = Some(observed);
+        } else {
+            assert_eq!(
+                Some(&observed),
+                changed_outputs.as_ref(),
+                "changed-input qualification, replay or empty-directory mutation changed outputs"
+            );
+        }
+        let completed = events
+            .iter()
+            .filter(|event| event["kind"] == "rabsd-remote-dependency-executed")
+            .filter_map(|event| event["key"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            completed,
+            offered
+                .values()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            "offered compiler work did not complete: {output}"
+        );
+        let served = events
+            .iter()
+            .filter(|event| event["decision"] == "served")
+            .filter_map(|event| event["key"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            served,
+            hits.values().map(String::as_str).collect::<BTreeSet<_>>(),
+            "a replayed result was not installed: {output}"
+        );
+        if command == "build" {
+            assert_metadata_delivery(&events, &offered, true, &output);
+            assert_metadata_delivery(&events, &hits, false, &output);
+        }
+        let next = worker.completed_receipt();
+        if full_hit {
+            assert_eq!(
+                Some(&next),
+                receipt.as_ref(),
+                "replay advanced worker admission"
+            );
+            assert_eq!(
+                read_bounded(&worker.state.join("requests.json")),
+                before_journal.unwrap(),
+                "qualified generated immutable replay reached the worker request journal"
+            );
+        }
+        receipt = Some(next);
+        executions += offered.len();
+        assert_eq!(
+            worker
+                .events()
+                .iter()
+                .filter(|event| event["kind"] == "worker-toolchain-acquired")
+                .count(),
+            executions,
+            "only independent qualifying or invalidated compiler work may execute"
+        );
+        previous_keys = Some(actual);
+    }
+    profile["selection"] = json!({"lib":true,"features":["remote_workspace","optional_build"]});
+    let (code, events, output) = run_with_environment(root, 1699, &profile, &environment);
+    assert_ne!(
+        code, 0,
+        "the selected failing build script was skipped: {output}"
+    );
+    assert!(
+        output.contains("inactive build script must never execute"),
+        "{output}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "canonical-build-completed"),
+        "{output}"
+    );
+    assert!(decisions(&events, "execute").is_empty(), "{output}");
+    let retained = fs::read_dir(root.join("ops"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<BTreeSet<_>>();
+    if command == "build" {
+        assert_eq!(
+            retained, targets,
+            "only successful builds may retain outputs"
+        );
+    } else {
+        assert!(retained.is_empty(), "metadata checks retained an operation");
+    }
+    worker.finish();
 }
 
 /// Exercise the production native CLI, wrapper, remote executor, CAS sampling,

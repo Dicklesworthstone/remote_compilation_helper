@@ -52,8 +52,14 @@ impl ProducerPolicy {
             CommittedDependencyPolicy::MixedWorkspaceMetadata => {
                 (true, ProducerDomain::MixedWorkspace)
             }
-            CommittedDependencyPolicy::ImmutableDagRlib => (false, ProducerDomain::ImmutableDag),
-            CommittedDependencyPolicy::ImmutableDagMetadata => (true, ProducerDomain::ImmutableDag),
+            CommittedDependencyPolicy::ImmutableDagRlib
+            | CommittedDependencyPolicy::GeneratedImmutableDagRlib => {
+                (false, ProducerDomain::ImmutableDag)
+            }
+            CommittedDependencyPolicy::ImmutableDagMetadata
+            | CommittedDependencyPolicy::GeneratedImmutableDagMetadata => {
+                (true, ProducerDomain::ImmutableDag)
+            }
             CommittedDependencyPolicy::WorkspaceDagRlib
             | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
             | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
@@ -94,6 +100,12 @@ impl ProducerPolicy {
             ActionClassRisk::ImmutableDagRlib => CommittedDependencyPolicy::ImmutableDagRlib,
             ActionClassRisk::ImmutableDagMetadata => {
                 CommittedDependencyPolicy::ImmutableDagMetadata
+            }
+            ActionClassRisk::GeneratedImmutableDagRlib => {
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib
+            }
+            ActionClassRisk::GeneratedImmutableDagMetadata => {
+                CommittedDependencyPolicy::GeneratedImmutableDagMetadata
             }
             ActionClassRisk::WorkspaceDagRlib => CommittedDependencyPolicy::WorkspaceDagRlib,
             ActionClassRisk::WorkspaceDagMetadata => {
@@ -156,8 +168,13 @@ impl ProducerPolicy {
             | ActionClassRisk::CommittedWorkspaceMetadata => workspace && self.metadata_allowed,
             ActionClassRisk::MixedWorkspaceRlib => mixed,
             ActionClassRisk::MixedWorkspaceMetadata => mixed && self.metadata_allowed,
-            ActionClassRisk::ImmutableDagRlib => immutable_dag,
-            ActionClassRisk::ImmutableDagMetadata => immutable_dag && self.metadata_allowed,
+            ActionClassRisk::ImmutableDagRlib | ActionClassRisk::GeneratedImmutableDagRlib => {
+                immutable_dag
+            }
+            ActionClassRisk::ImmutableDagMetadata
+            | ActionClassRisk::GeneratedImmutableDagMetadata => {
+                immutable_dag && self.metadata_allowed
+            }
             ActionClassRisk::WorkspaceDagRlib
             | ActionClassRisk::GeneratedWorkspaceDagRlib
             | ActionClassRisk::NativeGeneratedWorkspaceDagRlib
@@ -812,6 +829,7 @@ fn verify_graph(
                 | ActionClassRisk::CommittedWorkspaceMetadata
                 | ActionClassRisk::MixedWorkspaceMetadata
                 | ActionClassRisk::ImmutableDagMetadata
+                | ActionClassRisk::GeneratedImmutableDagMetadata
                 | ActionClassRisk::WorkspaceDagMetadata
                 | ActionClassRisk::GeneratedWorkspaceDagMetadata
                 | ActionClassRisk::NativeGeneratedWorkspaceDagMetadata
@@ -829,10 +847,11 @@ fn verify_graph(
             ));
         }
         match risk {
-            ActionClassRisk::ImmutableDagRlib => {
+            ActionClassRisk::ImmutableDagRlib | ActionClassRisk::GeneratedImmutableDagRlib => {
                 validate_immutable_library_manifest(&manifest, RemoteDependencyOutputClass::Rlib)?;
             }
-            ActionClassRisk::ImmutableDagMetadata => {
+            ActionClassRisk::ImmutableDagMetadata
+            | ActionClassRisk::GeneratedImmutableDagMetadata => {
                 validate_immutable_library_manifest(
                     &manifest,
                     RemoteDependencyOutputClass::Metadata,
@@ -897,6 +916,8 @@ fn verify_graph(
                     | ActionClassRisk::MixedWorkspaceMetadata
                     | ActionClassRisk::ImmutableDagRlib
                     | ActionClassRisk::ImmutableDagMetadata
+                    | ActionClassRisk::GeneratedImmutableDagRlib
+                    | ActionClassRisk::GeneratedImmutableDagMetadata
                     | ActionClassRisk::WorkspaceDagRlib
                     | ActionClassRisk::WorkspaceDagMetadata
                     | ActionClassRisk::GeneratedWorkspaceDagRlib
@@ -1153,6 +1174,12 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::ImmutableDagMetadata => {
                     LIVE_IMMUTABLE_DAG_METADATA_CLASS
                 }
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib => {
+                    LIVE_GENERATED_IMMUTABLE_DAG_RLIB_CLASS
+                }
+                CommittedDependencyPolicy::GeneratedImmutableDagMetadata => {
+                    LIVE_GENERATED_IMMUTABLE_DAG_METADATA_CLASS
+                }
                 CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
                 CommittedDependencyPolicy::WorkspaceDagMetadata => {
                     LIVE_WORKSPACE_DAG_METADATA_CLASS
@@ -1277,6 +1304,8 @@ pub(crate) mod tests {
                 LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS => 35,
                 LIVE_NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 38,
                 LIVE_NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 39,
+                LIVE_GENERATED_IMMUTABLE_DAG_RLIB_CLASS => 40,
+                LIVE_GENERATED_IMMUTABLE_DAG_METADATA_CLASS => 41,
                 _ => manifest.key_epoch,
             });
             manifest.logical_outputs = logical_outputs;
@@ -2868,6 +2897,25 @@ pub(crate) mod tests {
         fixture: &WorkspaceLineageFixture,
         metadata: bool,
     ) -> [OfferPreparedActionResult; 4] {
+        immutable_dag_chain_with_policy(
+            fixture,
+            if metadata {
+                CommittedDependencyPolicy::ImmutableDagMetadata
+            } else {
+                CommittedDependencyPolicy::ImmutableDagRlib
+            },
+        )
+    }
+
+    fn immutable_dag_chain_with_policy(
+        fixture: &WorkspaceLineageFixture,
+        immutable_policy: CommittedDependencyPolicy,
+    ) -> [OfferPreparedActionResult; 4] {
+        let metadata = matches!(
+            immutable_policy,
+            CommittedDependencyPolicy::ImmutableDagMetadata
+                | CommittedDependencyPolicy::GeneratedImmutableDagMetadata
+        );
         let outputs =
             |metadata_name: &'static str, archive_name: &'static str, bytes: &'static [u8]| {
                 let mut result = vec![(metadata_name, OutputRole::ProvisionalMetadata, bytes)];
@@ -2876,11 +2924,6 @@ pub(crate) mod tests {
                 }
                 result
             };
-        let immutable_policy = if metadata {
-            CommittedDependencyPolicy::ImmutableDagMetadata
-        } else {
-            CommittedDependencyPolicy::ImmutableDagRlib
-        };
         let workspace_policy = if metadata {
             CommittedDependencyPolicy::WorkspaceDagMetadata
         } else {
@@ -2967,14 +3010,19 @@ pub(crate) mod tests {
 
     #[test]
     fn immutable_dag_replay_requires_own_samples_and_current_transitive_producers() {
-        for metadata in [false, true] {
+        for immutable_policy in [
+            CommittedDependencyPolicy::ImmutableDagRlib,
+            CommittedDependencyPolicy::ImmutableDagMetadata,
+            CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+            CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+        ] {
             let fixture = WorkspaceLineageFixture::new();
-            let [a, b, c, d] = immutable_dag_chain(&fixture, metadata);
-            let immutable_policy = if metadata {
+            let [a, b, c, d] = immutable_dag_chain_with_policy(&fixture, immutable_policy);
+            let metadata = matches!(
+                immutable_policy,
                 CommittedDependencyPolicy::ImmutableDagMetadata
-            } else {
-                CommittedDependencyPolicy::ImmutableDagRlib
-            };
+                    | CommittedDependencyPolicy::GeneratedImmutableDagMetadata
+            );
             let workspace_policy = if metadata {
                 CommittedDependencyPolicy::WorkspaceDagMetadata
             } else {
@@ -3041,6 +3089,25 @@ pub(crate) mod tests {
             for producer in [&a, &b, &c] {
                 fixture.assert_unsampled(producer);
             }
+            // Sampling a downstream action never qualifies its generated
+            // immutable producer. The new class retains an independent gate.
+            let middle_unsampled = fixture.root.path().join("immutable-middle-unsampled");
+            assert!(matches!(
+                fixture.replay(&b, &middle_unsampled, None).unwrap(),
+                ServeOutcome::ExecutePrivately(ReplayRefusal::Sampling(
+                    PrivateExecutionReason::InsufficientVerificationSamples {
+                        observed: 0,
+                        required: 2
+                    }
+                ))
+            ));
+            assert!(!middle_unsampled.exists());
+            fixture.compare_twice(&b);
+            let middle_served = fixture.root.path().join("immutable-middle-served");
+            assert!(matches!(
+                fixture.replay(&b, &middle_served, None).unwrap(),
+                ServeOutcome::Served { files } if files.len() == if metadata { 1 } else { 2 }
+            ));
 
             fixture.quarantine(&a.manifest.action_key);
             let refused = fixture.root.path().join("dag-revoked");
@@ -3311,6 +3378,193 @@ pub(crate) mod tests {
         assert!(!refused.exists());
         fixture.assert_unsampled(&b);
         fixture.assert_unsampled(&c);
+    }
+
+    #[test]
+    fn generated_immutable_metadata_cannot_authorize_archives_or_drop_ancestry() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [_a, b, _c, d] = immutable_dag_chain_with_policy(
+            &fixture,
+            CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+        );
+        for policy in [
+            CommittedDependencyPolicy::ImmutableDagRlib,
+            CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+            CommittedDependencyPolicy::WorkspaceDagRlib,
+            CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
+            CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib,
+        ] {
+            // Selecting the metadata member does not turn a metadata-only
+            // producer into an archive producer.
+            let selected = witness(&b);
+            assert_eq!(selected.role, OutputRole::ProvisionalMetadata);
+            assert!(
+                fixture
+                    .coord
+                    .verify_committed_dependencies(&[selected], policy)
+                    .is_err(),
+                "{policy:?}"
+            );
+        }
+        fixture
+            .coord
+            .verify_committed_dependencies(
+                &[witness(&b)],
+                CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+            )
+            .unwrap();
+        fixture.compare_twice(&d);
+        let held = fixture.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(
+            engine
+                .execute(
+                    "UPDATE provisional_ancestry SET consumer_action_key = ?1 \
+                     WHERE consumer_action_key = ?2",
+                    &[
+                        SqlValue::Text("explicit-generated-test-orphan".into()),
+                        SqlValue::Text(digest_key(&b.manifest.action_key)),
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        drop(engine);
+        drop(held);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(
+                &[witness(&b)],
+                CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+            )
+            .unwrap_err();
+        assert!(reason.contains("inconsistent class ancestry"), "{reason}");
+        let refused = fixture
+            .root
+            .path()
+            .join("generated-immutable-without-ancestry");
+        assert!(matches!(
+            fixture.replay(&d, &refused, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("inconsistent class ancestry")
+        ));
+        assert!(!refused.exists());
+    }
+
+    #[test]
+    fn generated_immutable_ancestors_keep_their_immutable_scope_during_workspace_replay() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [a, _b, _c, d] = immutable_dag_chain_with_policy(
+            &fixture,
+            CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+        );
+        fixture.compare_twice(&d);
+        let workspace = fixture.commit_metadata_leaf(
+            106,
+            &[(
+                "liba.rmeta",
+                OutputRole::ProvisionalMetadata,
+                b"immutable root A",
+            )],
+        );
+        // The same object is visited under the broad workspace consumer first.
+        // Generated immutable B must still enforce its own narrower ancestry.
+        let held = fixture.cas.store().lock().unwrap();
+        let mut engine = RusqliteEngine::open(&fixture.cas.cas_root().join("meta.sqlite")).unwrap();
+        assert_eq!(
+            engine
+                .execute(
+                    "UPDATE provisional_ancestry SET producer_action_key = ?1 \
+                     WHERE producer_action_key = ?2",
+                    &[
+                        SqlValue::Text(digest_key(&workspace.manifest.action_key)),
+                        SqlValue::Text(digest_key(&a.manifest.action_key)),
+                    ],
+                )
+                .unwrap(),
+            3
+        );
+        drop(engine);
+        drop(held);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(
+                &[witness(&d)],
+                CommittedDependencyPolicy::WorkspaceDagMetadata,
+            )
+            .unwrap_err();
+        assert!(reason.contains("allowed by its consumer"), "{reason}");
+        assert!(
+            reason.contains(&digest_key(&workspace.manifest.action_key)),
+            "{reason}"
+        );
+        let refused = fixture
+            .root
+            .path()
+            .join("generated-immutable-parent-is-workspace");
+        assert!(matches!(
+            fixture.replay(&d, &refused, None).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("allowed by its consumer")
+        ));
+        assert!(!refused.exists());
+    }
+
+    #[test]
+    fn generated_immutable_archive_closure_is_rechecked_through_metadata_edges() {
+        let fixture = WorkspaceLineageFixture::new();
+        let [_a, b, _c, d] = immutable_dag_chain_with_policy(
+            &fixture,
+            CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+        );
+        let selected = witness(&b);
+        assert_eq!(selected.role, OutputRole::ProvisionalMetadata);
+        fixture
+            .coord
+            .verify_committed_dependencies(
+                std::slice::from_ref(&selected),
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+            )
+            .unwrap();
+        fixture.compare_twice(&d);
+        let healthy = fixture
+            .root
+            .path()
+            .join("generated-current-archive-closure");
+        assert!(matches!(
+            fixture.replay(&d, &healthy, None).unwrap(),
+            ServeOutcome::Served { .. }
+        ));
+        fixture.expire_archive_closure(&b);
+        let reason = fixture
+            .coord
+            .verify_committed_dependencies(
+                &[selected],
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+            )
+            .unwrap_err();
+        assert!(reason.contains("native archive"), "{reason}");
+        assert!(
+            reason.contains(&digest_key(&b.manifest.action_key)),
+            "{reason}"
+        );
+        let refused = fixture
+            .root
+            .path()
+            .join("generated-expired-archive-closure");
+        let mut calls = 0;
+        let mut ready = |_: &[PathBuf]| {
+            calls += 1;
+            Ok(())
+        };
+        assert!(matches!(
+            fixture.replay(&d, &refused, Some(&mut ready)).unwrap(),
+            ServeOutcome::ExecutePrivately(ReplayRefusal::CommittedDependency(reason))
+                if reason.contains("native archive")
+                    && reason.contains(&digest_key(&b.manifest.action_key))
+        ));
+        assert_eq!(calls, 0);
+        assert!(!refused.exists());
     }
 
     #[test]

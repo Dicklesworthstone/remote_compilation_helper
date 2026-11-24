@@ -1147,7 +1147,9 @@ impl CanonicalPaths {
                 match remote.verify_committed_producer(request)? {
                     Some(
                         CommittedDependencyPolicy::ImmutableDagRlib
-                        | CommittedDependencyPolicy::ImmutableDagMetadata,
+                        | CommittedDependencyPolicy::ImmutableDagMetadata
+                        | CommittedDependencyPolicy::GeneratedImmutableDagRlib
+                        | CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
                     ) => None,
                     Some(_) => {
                         return Err(
@@ -2608,6 +2610,8 @@ mod tests {
         for policy in [
             CommittedDependencyPolicy::ImmutableDagMetadata,
             CommittedDependencyPolicy::ImmutableDagRlib,
+            CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+            CommittedDependencyPolicy::GeneratedImmutableDagRlib,
             CommittedDependencyPolicy::WorkspaceDagMetadata,
             CommittedDependencyPolicy::WorkspaceDagRlib,
             CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
@@ -2621,6 +2625,7 @@ mod tests {
             let archive = matches!(
                 policy,
                 CommittedDependencyPolicy::ImmutableDagRlib
+                    | CommittedDependencyPolicy::GeneratedImmutableDagRlib
                     | CommittedDependencyPolicy::WorkspaceDagRlib
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
@@ -2653,7 +2658,9 @@ mod tests {
                 81,
                 vec![parent_dependency(&parent)],
                 &outputs,
-                if archive {
+                if !workspace {
+                    policy
+                } else if archive {
                     CommittedDependencyPolicy::ImmutableDagRlib
                 } else {
                     CommittedDependencyPolicy::ImmutableDagMetadata
@@ -2721,17 +2728,20 @@ mod tests {
             inputs.verify_for_policy(policy).unwrap();
             if matches!(
                 policy,
-                CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib
+                    | CommittedDependencyPolicy::GeneratedImmutableDagMetadata
+                    | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                     | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
                     | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
                     | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
             ) {
-                let ordinary = if archive {
-                    CommittedDependencyPolicy::WorkspaceDagRlib
-                } else {
-                    CommittedDependencyPolicy::WorkspaceDagMetadata
+                let ordinary = match (workspace, archive) {
+                    (false, true) => CommittedDependencyPolicy::ImmutableDagRlib,
+                    (false, false) => CommittedDependencyPolicy::ImmutableDagMetadata,
+                    (true, true) => CommittedDependencyPolicy::WorkspaceDagRlib,
+                    (true, false) => CommittedDependencyPolicy::WorkspaceDagMetadata,
                 };
                 restored
                     .capture_committed_inputs(&restarted, Arc::clone(&candidates), ordinary)
@@ -3437,6 +3447,7 @@ mod tests {
     fn dag_archive_installation_keeps_tail_owner_and_exact_file_generation() {
         for producer_policy in [
             CommittedDependencyPolicy::ImmutableDagRlib,
+            CommittedDependencyPolicy::GeneratedImmutableDagRlib,
             CommittedDependencyPolicy::WorkspaceDagRlib,
             CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
             CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
@@ -3501,10 +3512,16 @@ mod tests {
                     "existing policy {policy:?} must not silently admit a new DAG producer"
                 );
             }
-            if producer_policy != CommittedDependencyPolicy::ImmutableDagRlib {
+            if !matches!(
+                producer_policy,
+                CommittedDependencyPolicy::ImmutableDagRlib
+                    | CommittedDependencyPolicy::GeneratedImmutableDagRlib
+            ) {
                 for policy in [
                     CommittedDependencyPolicy::ImmutableDagRlib,
                     CommittedDependencyPolicy::ImmutableDagMetadata,
+                    CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+                    CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
                 ] {
                     assert!(
                         original

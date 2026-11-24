@@ -9,7 +9,9 @@
 //! generation and the current durable producer lineage at each live boundary.
 //! Workspace V2 contracts qualify each isolated compiler action independently
 //! of other project executors in its Cargo operation. Their local completion
-//! claims remain untrusted; immutable dependency DAG contracts are unchanged.
+//! claims remain untrusted; pure immutable DAG contracts are unchanged.
+//! Separate generated immutable DAG contracts retain complete own OUT_DIR inputs,
+//! optional own-tree static native inputs and exact immutable producer ancestry.
 //! Separately versioned generated workspace DAG classes additionally retain
 //! the complete own OUT_DIR and exact completed Cargo build-script record.
 //! Propagated-native metadata and archives have separate classes retaining
@@ -273,6 +275,12 @@ pub enum CommittedDependencyPolicy {
     ImmutableDagRlib,
     /// Immutable metadata with a complete committed producer inventory, epoch 11.
     ImmutableDagMetadata,
+    /// Immutable archive with complete own generated inputs, optional own-tree
+    /// static native inputs and committed immutable archive ancestry, epoch 40.
+    GeneratedImmutableDagRlib,
+    /// Immutable metadata with the same complete own generated/native inputs
+    /// and exact committed immutable producer ancestry, epoch 41.
+    GeneratedImmutableDagMetadata,
     /// Workspace archive admitting committed immutable dependency DAGs, epoch 22.
     WorkspaceDagRlib,
     /// Workspace metadata admitting committed immutable dependency DAGs, epoch 23.
@@ -374,6 +382,7 @@ impl CommittedDependencyPolicy {
             Self::WorkspaceRlib
             | Self::MixedWorkspaceRlib
             | Self::ImmutableDagRlib
+            | Self::GeneratedImmutableDagRlib
             | Self::WorkspaceDagRlib
             | Self::GeneratedWorkspaceDagRlib
             | Self::NativeGeneratedWorkspaceDagRlib
@@ -381,6 +390,7 @@ impl CommittedDependencyPolicy {
             Self::WorkspaceMetadata
             | Self::MixedWorkspaceMetadata
             | Self::ImmutableDagMetadata
+            | Self::GeneratedImmutableDagMetadata
             | Self::WorkspaceDagMetadata
             | Self::WorkspaceTerminalLeafMetadata
             | Self::WorkspaceTerminalMetadata
@@ -430,8 +440,15 @@ impl CommittedDependencyPolicy {
                 }
                 Ok(())
             }
-            Self::ImmutableDagRlib | Self::ImmutableDagMetadata => {
+            Self::ImmutableDagRlib
+            | Self::ImmutableDagMetadata
+            | Self::GeneratedImmutableDagRlib
+            | Self::GeneratedImmutableDagMetadata => {
                 super::canonical_cargo::canonical_layout(plan)?;
+                let generated = matches!(
+                    self,
+                    Self::GeneratedImmutableDagRlib | Self::GeneratedImmutableDagMetadata
+                );
                 let source_is_immutable = match plan.source_kind {
                     DependencySourceKind::RegistryPackage | DependencySourceKind::GitCheckout => {
                         plan.directory_source_manifest.is_none()
@@ -443,13 +460,19 @@ impl CommittedDependencyPolicy {
                 };
                 if !source_is_immutable
                     || !matches!(plan.invocation.crate_types.as_slice(), [kind] if matches!(kind.as_str(), "lib" | "rlib"))
-                    || plan.generated_root.is_some()
+                    || plan.generated_root.is_some() != generated
                     || !plan.native_roots.is_empty()
-                    || !plan.invocation.native_libs.is_empty()
+                    || (!generated && !plan.invocation.native_libs.is_empty())
                     || remote::remote_dependency_output_class(&plan.invocation)
                         != Ok(self.output_class())
                 {
-                    return Err(LiveRefusal::Facts("committed immutable DAG requires a pure canonical immutable library without generated or native inputs".into()));
+                    return Err(LiveRefusal::Facts(
+                        "committed immutable DAG requires its exact immutable library output and generated-input policy; foreign native roots are not admitted"
+                            .into(),
+                    ));
+                }
+                if generated {
+                    remote::validate_plan_native_roots(plan)?;
                 }
                 let outputs = crate::output_derivation::derive_dependency_output_declarations(
                     &plan.invocation,
@@ -493,6 +516,22 @@ const IMMUTABLE_DAG_METADATA: DagContract = DagContract {
     semantics_domain: "rabs.canonical-immutable-committed-dag-metadata.semantics.v1",
     dependencies_domain: "rabs.canonical-immutable-committed-dag-metadata.dependencies.v1",
     profile: "canonical-immutable-committed-dag-metadata-v1: complete immutable canonical registry, Git or checksum-witnessed directory package; existing canonical-dependency-exec-v4 Metadata namespace and established dep-info read-closure contract; exact canonical argv and semantic environment, complete retained toolchain and matched ELF runtime; exact ordered read-only Rust candidate inventory and whole explicit archives; every loadable candidate bound to an operation-owned installed generation and exact committed immutable producer action, descriptor, manifest, role and object; exact empty search metadata remains keyed and materialized without producer authority; explicit empty externs refuse; qualified immutable leaves or committed immutable DAGs; metadata producers authorize only ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole Materializable rlib; H028 carries every loadable candidate and current transitive serving, class and quarantine gates apply at commit and delivery; no unregistered, unresolved, adopted, local fallback or request-owned authority; no generated/native inputs, proc macros, incremental state or codegen output; authenticated drained capture, exact diagnostics and tracked-control veto, independent class samples and existing release and installation gates",
+};
+const GENERATED_IMMUTABLE_DAG_RLIB: DagContract = DagContract {
+    epoch: 40,
+    class: ActionClass::RustcDependencyCompile,
+    isolation_domain: "rabs.canonical-immutable-generated-dag-rlib.isolation.v1",
+    semantics_domain: "rabs.canonical-immutable-generated-dag-rlib.semantics.v1",
+    dependencies_domain: "rabs.canonical-immutable-generated-dag-rlib.dependencies.v1",
+    profile: "canonical-immutable-generated-dag-rlib-v1: complete immutable canonical registry, Git or checksum-witnessed directory package; existing canonical-dependency-exec-v4 Rlib namespace without procfs or entropy devices; complete disjoint own Cargo OUT_DIR files and directory membership including empty directories, exact completed Cargo stdout and matching semantic presented environment; build scripts execute normally without run-cache or local-completion authority; optional supported bundled static native inputs and ordered searches confined to that own generated tree, every selected archive retained and validated; no foreign native roots, host or dynamic/framework searches, external linker, proc macros, incremental state or final executable; exact argv, output placement, complete retained toolchain and matched ELF runtime; every ordered loadable Rust candidate bound to its operation-owned installed generation and exact committed immutable archive producer action, descriptor, manifest, role and whole object identity; qualified pure immutable archive leaves or independently qualified immutable archive DAGs, never metadata-only or workspace producers; whole explicit archives and existing metadata-shadow projection, exact empty search metadata keyed without producer authority, explicit empty externs refuse; complete nonempty H028 ancestry with each intermediate's own producer policy and current transitive publication, serving, class, quarantine and native archive safety checked at commit and delivery; original package, generated inputs, Cargo record and dependency generations revalidated; complete output rlib native closure including source link attributes, thin archives and linker scripts; authenticated drained receipt, exact diagnostics, dep-info and tracked-control-read veto; separate generated immutable archive samples, class quarantine and existing release and private installation gates",
+};
+const GENERATED_IMMUTABLE_DAG_METADATA: DagContract = DagContract {
+    epoch: 41,
+    class: ActionClass::RustcDependencyCompile,
+    isolation_domain: "rabs.canonical-immutable-generated-dag-metadata.isolation.v1",
+    semantics_domain: "rabs.canonical-immutable-generated-dag-metadata.semantics.v1",
+    dependencies_domain: "rabs.canonical-immutable-generated-dag-metadata.dependencies.v1",
+    profile: "canonical-immutable-generated-dag-metadata-v1: complete immutable canonical registry, Git or checksum-witnessed directory package; existing canonical-dependency-exec-v4 Metadata namespace and established dep-info read-closure contract; complete disjoint own Cargo OUT_DIR files and directory membership including empty directories, exact completed Cargo stdout and matching semantic presented environment; build scripts execute normally without run-cache or local-completion authority; optional supported static native inputs and ordered searches confined to that own generated tree, every selected archive retained and validated even when rustc does not open it; no foreign native roots, host or dynamic/framework searches, external linker, proc macros, incremental state or codegen outputs; exact canonical argv, complete retained toolchain and matched ELF runtime; every ordered loadable Rust candidate bound to its operation-owned installed generation and exact committed immutable producer action, descriptor, manifest, role and whole object identity; qualified pure immutable leaves or independently qualified immutable DAGs, never workspace producers; metadata producers authorize only ProvisionalMetadata rmeta, archive producers may authorize rmeta or whole Materializable rlib; whole explicit archives and existing metadata-shadow projection, exact empty search metadata keyed without producer authority, explicit empty externs refuse; complete nonempty H028 ancestry with each intermediate's own producer policy and current transitive publication, serving, class, quarantine and native archive safety checked at commit and delivery; original package, generated inputs, Cargo record and dependency generations revalidated; authenticated drained receipt, exact diagnostics, dep-info and tracked-control-read veto; separate generated immutable metadata samples, class quarantine and existing release and private installation gates",
 };
 const WORKSPACE_DAG_RLIB: DagContract = DagContract {
     epoch: 22,
@@ -564,6 +603,10 @@ fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContrac
     match policy {
         CommittedDependencyPolicy::ImmutableDagRlib => Some(&IMMUTABLE_DAG_RLIB),
         CommittedDependencyPolicy::ImmutableDagMetadata => Some(&IMMUTABLE_DAG_METADATA),
+        CommittedDependencyPolicy::GeneratedImmutableDagRlib => Some(&GENERATED_IMMUTABLE_DAG_RLIB),
+        CommittedDependencyPolicy::GeneratedImmutableDagMetadata => {
+            Some(&GENERATED_IMMUTABLE_DAG_METADATA)
+        }
         CommittedDependencyPolicy::WorkspaceDagRlib => Some(&WORKSPACE_DAG_RLIB),
         CommittedDependencyPolicy::WorkspaceDagMetadata => Some(&WORKSPACE_DAG_METADATA),
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata => {
@@ -1076,7 +1119,9 @@ pub fn remote_committed_dependency_shape(
             remote_mixed_workspace_library_shape(plan, directories, dependencies, toolchain_root)
         }
         CommittedDependencyPolicy::ImmutableDagRlib
-        | CommittedDependencyPolicy::ImmutableDagMetadata => {
+        | CommittedDependencyPolicy::ImmutableDagMetadata
+        | CommittedDependencyPolicy::GeneratedImmutableDagRlib
+        | CommittedDependencyPolicy::GeneratedImmutableDagMetadata => {
             remote::remote_dependency_shape(plan, directories, toolchain_root)?;
             validate_committed_workspace_dependencies(directories, dependencies)?;
             let externs = remote::remote_extern_facts(plan, directories)?;
@@ -1279,6 +1324,8 @@ pub fn committed_dependency_descriptor_policy(
     for policy in [
         CommittedDependencyPolicy::ImmutableDagRlib,
         CommittedDependencyPolicy::ImmutableDagMetadata,
+        CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+        CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
         CommittedDependencyPolicy::WorkspaceDagRlib,
         CommittedDependencyPolicy::WorkspaceDagMetadata,
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
@@ -1321,7 +1368,10 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
     (10..=15).contains(&descriptor.key_epoch)
         || (18..=25).contains(&descriptor.key_epoch)
         || (28..=29).contains(&descriptor.key_epoch)
-        || matches!(descriptor.key_epoch, 31 | 33 | 34 | 35 | 36 | 37 | 38 | 39)
+        || matches!(
+            descriptor.key_epoch,
+            31 | 33 | 34 | 35 | 36 | 37 | 38 | 39 | 40 | 41
+        )
         || [
             descriptor.sandbox_semantic_policy.domain,
             descriptor.execution_semantics.domain,
@@ -1330,6 +1380,8 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
         .into_iter()
         .any(|domain| {
             [
+                "rabs.canonical-immutable-generated-dag-rlib.",
+                "rabs.canonical-immutable-generated-dag-metadata.",
                 "rabs.canonical-workspace-committed-rlib.",
                 "rabs.canonical-workspace-committed-metadata.",
                 "rabs.canonical-workspace-committed-mixed-rlib.",
@@ -1355,6 +1407,8 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
         || [
             &IMMUTABLE_DAG_RLIB,
             &IMMUTABLE_DAG_METADATA,
+            &GENERATED_IMMUTABLE_DAG_RLIB,
+            &GENERATED_IMMUTABLE_DAG_METADATA,
             &WORKSPACE_DAG_RLIB,
             &WORKSPACE_DAG_METADATA,
             &WORKSPACE_TERMINAL_LEAF_METADATA,
@@ -1594,24 +1648,36 @@ pub fn remote_committed_dependency_key(
         }
         _ => {}
     }
-    if build_script_output.is_some() {
+    let generated_immutable = matches!(
+        policy,
+        CommittedDependencyPolicy::GeneratedImmutableDagRlib
+            | CommittedDependencyPolicy::GeneratedImmutableDagMetadata
+    );
+    if generated_immutable && build_script_output.is_none() {
+        return Err(LiveRefusal::Facts(
+            "generated immutable DAG requires its completed Cargo build-script record".into(),
+        )
+        .into());
+    }
+    if !generated_immutable && build_script_output.is_some() {
         return Err(LiveRefusal::Facts(
             "committed dependency DAG cannot consume a build-script run record".into(),
         )
         .into());
     }
-    let immutable = matches!(
-        policy,
-        CommittedDependencyPolicy::ImmutableDagRlib
-            | CommittedDependencyPolicy::ImmutableDagMetadata
-    );
+    let immutable = generated_immutable
+        || matches!(
+            policy,
+            CommittedDependencyPolicy::ImmutableDagRlib
+                | CommittedDependencyPolicy::ImmutableDagMetadata
+        );
     let mut key = if immutable {
         remote::remote_dependency_key(
             plan,
             toolchain,
             directories,
             inputs,
-            None,
+            build_script_output,
             toolchain_root,
             retained_toolchain_sha256,
             runtime,
@@ -3144,7 +3210,15 @@ mod tests {
     }
 
     fn immutable_plan(package: &str, metadata: bool) -> DependencyActionPlan {
-        let argv = [
+        immutable_plan_with_generated(package, metadata, None)
+    }
+
+    fn immutable_plan_with_generated(
+        package: &str,
+        metadata: bool,
+        generated_native: Option<bool>,
+    ) -> DependencyActionPlan {
+        let mut argv = vec![
             "/__rabs/toolchain/bin/rustc".into(),
             "--crate-name=consumer".into(),
             "--crate-type=lib".into(),
@@ -3164,13 +3238,23 @@ mod tests {
             format!("dependency={OUTPUT}"),
             format!("--extern=upstream={OUTPUT}/libupstream.rmeta"),
         ];
-        let env = [
+        let mut env = vec![
             ("HOME".into(), "/__rabs/home".into()),
             ("CARGO_HOME".into(), "/__rabs/cargo-home".into()),
             ("CARGO_MANIFEST_DIR".into(), package.into()),
             ("CARGO_PKG_NAME".into(), "consumer".into()),
             ("CARGO_INCREMENTAL".into(), "0".into()),
         ];
+        if let Some(native) = generated_native {
+            env.push(("OUT_DIR".into(), IMMUTABLE_GENERATED_ROOT.into()));
+            env.push(("BUILD_VALUE".into(), "generated".into()));
+            if native {
+                argv.extend([
+                    format!("-Lnative={IMMUTABLE_GENERATED_ROOT}/native"),
+                    "-lstatic=generated".into(),
+                ]);
+            }
+        }
         let checksum = package
             .starts_with("/__rabs/workspace/vendor/")
             .then(|| digest(b"checked directory package manifest"));
@@ -3215,6 +3299,71 @@ mod tests {
                 .collect(),
             ..ActionInputManifest::default()
         }
+    }
+
+    const IMMUTABLE_GENERATED_ROOT: &str = "/__rabs/out/cargo/debug/build/consumer-generated/out";
+
+    fn generated_immutable_record(native: bool) -> Vec<u8> {
+        let mut record =
+            "cargo::rerun-if-changed=build.rs\ncargo::rustc-env=BUILD_VALUE=generated\n".to_owned();
+        if native {
+            record.push_str(&format!(
+                "cargo::rustc-link-search=native={IMMUTABLE_GENERATED_ROOT}/native\ncargo::rustc-link-lib=static=generated\n"
+            ));
+        }
+        record.into_bytes()
+    }
+
+    fn generated_immutable_inputs(plan: &DependencyActionPlan) -> ActionInputManifest {
+        let mut captured = immutable_inputs(plan);
+        for path in ["value.rs", "native/libgenerated.a"] {
+            captured.inputs.push(PositiveInput {
+                virtual_path: RawBytes::new(plan.generated_input_virtual_path(path).into_bytes()),
+                object: ObjectId(digest(path.as_bytes())),
+                file_type: InputFileType::Regular,
+                executable: false,
+                symlink_resolution: Vec::new(),
+            });
+        }
+        for (path, entries) in [
+            ("", vec!["empty", "native", "value.rs"]),
+            ("empty", Vec::new()),
+            ("native", vec!["libgenerated.a"]),
+        ] {
+            captured.directory_enumerations.push(DirectoryEnumeration {
+                virtual_path: RawBytes::new(
+                    if path.is_empty() {
+                        plan.generated_virtual_root()
+                    } else {
+                        plan.generated_input_virtual_path(path)
+                    }
+                    .into_bytes(),
+                ),
+                entries: entries.into_iter().map(RawBytes::from).collect(),
+            });
+        }
+        captured
+    }
+
+    fn generated_immutable_key(
+        plan: &DependencyActionPlan,
+        policy: CommittedDependencyPolicy,
+        dependencies: &[CommittedWorkspaceDependency],
+        captured: &ActionInputManifest,
+        record: Option<&[u8]>,
+    ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
+        remote_committed_dependency_key(
+            plan,
+            policy,
+            &toolchain(),
+            &directories(dependencies),
+            dependencies,
+            captured,
+            record,
+            TOOLCHAIN,
+            &[39; 32],
+            &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+        )
     }
 
     #[test]
@@ -3352,6 +3501,327 @@ mod tests {
                         .unwrap()
                         .action_key
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_immutable_dags_bind_own_inputs_and_keep_pure_authority_separate() {
+        for (package, kind) in [
+            (
+                "/__rabs/cargo-home/registry/src/index/consumer-1.0.0",
+                DependencySourceKind::RegistryPackage,
+            ),
+            (
+                "/__rabs/cargo-home/git/checkouts/fixture-cafe1234/0123456789ab/crates/member",
+                DependencySourceKind::GitCheckout,
+            ),
+            (
+                "/__rabs/workspace/vendor/consumer-1.0.0",
+                DependencySourceKind::DirectoryPackage,
+            ),
+        ] {
+            for metadata in [false, true] {
+                for native in [false, true] {
+                    let plan = immutable_plan_with_generated(package, metadata, Some(native));
+                    let captured = generated_immutable_inputs(&plan);
+                    let record = generated_immutable_record(native);
+                    let dependencies = vec![candidate("libupstream.rmeta")];
+                    let policy = if metadata {
+                        CommittedDependencyPolicy::GeneratedImmutableDagMetadata
+                    } else {
+                        CommittedDependencyPolicy::GeneratedImmutableDagRlib
+                    };
+                    let keyed = generated_immutable_key(
+                        &plan,
+                        policy,
+                        &dependencies,
+                        &captured,
+                        Some(&record),
+                    )
+                    .unwrap();
+                    assert_eq!(plan.source_kind, kind);
+                    assert!(plan.native_roots.is_empty());
+                    assert_eq!(keyed.descriptor.key_epoch, if metadata { 41 } else { 40 });
+                    assert_eq!(
+                        keyed.descriptor.action_class,
+                        ActionClass::RustcDependencyCompile
+                    );
+                    assert_eq!(
+                        committed_dependency_descriptor_policy(&keyed.descriptor),
+                        Some(policy)
+                    );
+                    assert!(uses_committed_dependency_namespace(&keyed.descriptor));
+                    let ordinary = remote::remote_dependency_key(
+                        &plan,
+                        &toolchain(),
+                        &directories(&dependencies),
+                        &captured,
+                        Some(&record),
+                        TOOLCHAIN,
+                        &[39; 32],
+                        &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
+                    )
+                    .unwrap();
+                    assert_ne!(keyed.action_key, ordinary.action_key);
+                    assert_eq!(
+                        committed_dependency_descriptor_policy(&ordinary.descriptor),
+                        None
+                    );
+                    assert!(!uses_committed_dependency_namespace(&ordinary.descriptor));
+                    for other in [
+                        CommittedDependencyPolicy::ImmutableDagRlib,
+                        CommittedDependencyPolicy::ImmutableDagMetadata,
+                        CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+                        CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+                        CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
+                        CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
+                    ] {
+                        if other != policy {
+                            assert!(
+                                generated_immutable_key(
+                                    &plan,
+                                    other,
+                                    &dependencies,
+                                    &captured,
+                                    Some(&record),
+                                )
+                                .is_err()
+                            );
+                        }
+                    }
+                    let pure = immutable_plan(package, metadata);
+                    assert!(policy.validate_plan(&pure).is_err());
+                    assert!(
+                        generated_immutable_key(&plan, policy, &dependencies, &captured, None)
+                            .is_err()
+                    );
+                    assert!(
+                        generated_immutable_key(&plan, policy, &[], &captured, Some(&record))
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_immutable_dag_keys_bind_native_trees_records_and_every_producer() {
+        let dependencies = vec![
+            candidate("libupstream.rmeta"),
+            candidate("libzztransitive.rlib"),
+        ];
+        for metadata in [false, true] {
+            let plan = immutable_plan_with_generated(
+                "/__rabs/cargo-home/registry/src/index/consumer-1.0.0",
+                metadata,
+                Some(true),
+            );
+            let policy = if metadata {
+                CommittedDependencyPolicy::GeneratedImmutableDagMetadata
+            } else {
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib
+            };
+            let captured = generated_immutable_inputs(&plan);
+            let record = generated_immutable_record(true);
+            let keyed = |plan: &DependencyActionPlan,
+                         inputs: &ActionInputManifest,
+                         producers: &[CommittedWorkspaceDependency],
+                         record: &[u8]| {
+                generated_immutable_key(plan, policy, producers, inputs, Some(record))
+            };
+            let original = keyed(&plan, &captured, &dependencies, &record).unwrap();
+            for position in 0..captured.inputs.len() {
+                let mut changed = captured.clone();
+                changed.inputs[position].object.0.bytes[0] ^= 1;
+                assert_ne!(
+                    original.action_key,
+                    keyed(&plan, &changed, &dependencies, &record)
+                        .unwrap()
+                        .action_key,
+                    "unkeyed input {:?}",
+                    captured.inputs[position].virtual_path
+                );
+            }
+            let mut changed = captured.clone();
+            changed.directory_enumerations.push(DirectoryEnumeration {
+                virtual_path: RawBytes::new(
+                    plan.generated_input_virtual_path("empty/nested")
+                        .into_bytes(),
+                ),
+                entries: Vec::new(),
+            });
+            changed
+                .directory_enumerations
+                .iter_mut()
+                .find(|entry| {
+                    entry.virtual_path.as_bytes()
+                        == plan.generated_input_virtual_path("empty").as_bytes()
+                })
+                .unwrap()
+                .entries
+                .push(RawBytes::from("nested"));
+            assert_ne!(
+                original.action_key,
+                keyed(&plan, &changed, &dependencies, &record)
+                    .unwrap()
+                    .action_key
+            );
+            let mut changed_record = record.clone();
+            changed_record.extend_from_slice(b"cargo::warning=changed native configuration\n");
+            assert_ne!(
+                original.action_key,
+                keyed(&plan, &captured, &dependencies, &changed_record)
+                    .unwrap()
+                    .action_key
+            );
+            let mut reordered = plan.clone();
+            reordered.invocation.lib_search.reverse();
+            assert_ne!(
+                original.action_key,
+                keyed(&reordered, &captured, &dependencies, &record)
+                    .unwrap()
+                    .action_key
+            );
+            let mut missing = captured.clone();
+            missing.inputs.retain(|input| {
+                input.virtual_path.as_bytes()
+                    != plan
+                        .generated_input_virtual_path("native/libgenerated.a")
+                        .as_bytes()
+            });
+            assert!(keyed(&plan, &missing, &dependencies, &record).is_err());
+            let mut missing_directory = captured.clone();
+            missing_directory.directory_enumerations.pop();
+            assert!(keyed(&plan, &missing_directory, &dependencies, &record).is_err());
+            for field in 0..4 {
+                let mut changed = dependencies.clone();
+                let dependency = &mut changed[1];
+                match field {
+                    0 => dependency.producer_action = digest(b"different action"),
+                    1 => dependency.producer_descriptor = digest(b"different descriptor"),
+                    2 => dependency.producer_manifest = digest(b"different manifest"),
+                    _ => dependency.object = ObjectId(digest(b"different whole archive")),
+                }
+                assert_ne!(
+                    original.action_key,
+                    keyed(&plan, &captured, &changed, &record)
+                        .unwrap()
+                        .action_key
+                );
+            }
+            for evidence in [
+                Vec::new(),
+                dependencies[..1].to_vec(),
+                dependencies.iter().rev().cloned().collect(),
+            ] {
+                assert!(
+                    remote_committed_dependency_shape(
+                        &plan,
+                        policy,
+                        &directories(&dependencies),
+                        &evidence,
+                        TOOLCHAIN,
+                    )
+                    .is_err()
+                );
+            }
+            let mut invalid = dependencies.clone();
+            invalid[1].role = OutputRole::ProvisionalMetadata;
+            assert!(keyed(&plan, &captured, &invalid, &record).is_err());
+            invalid = dependencies.clone();
+            invalid.push(candidate("libhidden_proc_macro.so"));
+            assert!(keyed(&plan, &captured, &invalid, &record).is_err());
+            assert!(
+                keyed(
+                    &plan,
+                    &captured,
+                    &dependencies,
+                    b"cargo::rustc-env=BUILD_VALUE=not-presented\n",
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn generated_immutable_dags_refuse_foreign_roots_and_mislabeled_contracts() {
+        for metadata in [false, true] {
+            let plan = immutable_plan_with_generated(
+                "/__rabs/cargo-home/registry/src/index/consumer-1.0.0",
+                metadata,
+                Some(true),
+            );
+            let policy = if metadata {
+                CommittedDependencyPolicy::GeneratedImmutableDagMetadata
+            } else {
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib
+            };
+            let dependencies = vec![candidate("libupstream.rmeta")];
+            let captured = generated_immutable_inputs(&plan);
+            let record = generated_immutable_record(true);
+            let original =
+                generated_immutable_key(&plan, policy, &dependencies, &captured, Some(&record))
+                    .unwrap();
+            for mutation in 0..13 {
+                let mut changed = plan.clone();
+                match mutation {
+                    0 => changed.generated_root = None,
+                    1 => changed.execution_env.retain(|(name, _)| name != "OUT_DIR"),
+                    2 => changed
+                        .native_roots
+                        .push("/__rabs/out/cargo/debug/build/foreign/out".into()),
+                    3 => changed
+                        .invocation
+                        .lib_search
+                        .push("native=/__rabs/out/cargo/debug/build/foreign/out".into()),
+                    4 => changed.invocation.lib_search.push("native=/usr/lib".into()),
+                    5 => changed.invocation.native_libs = vec!["dylib=generated".into()],
+                    6 => changed.invocation.native_libs = vec!["static:-bundle=generated".into()],
+                    7 => {
+                        changed.invocation.native_libs =
+                            vec!["static:+verbatim=../outside.a".into()]
+                    }
+                    8 => changed.invocation.passthrough.push("--test".into()),
+                    9 => changed.invocation.crate_types = vec!["proc-macro".into()],
+                    10 => changed.source_kind = DependencySourceKind::WorkspaceExecutionOnly,
+                    11 => changed.canonical_cargo = false,
+                    _ => changed
+                        .invocation
+                        .codegen
+                        .push(("target-cpu".into(), Some("native".into()))),
+                }
+                assert!(
+                    generated_immutable_key(
+                        &changed,
+                        policy,
+                        &dependencies,
+                        &captured,
+                        Some(&record),
+                    )
+                    .is_err(),
+                    "mutation={mutation}, metadata={metadata}"
+                );
+            }
+            for mutation in 0..5 {
+                let mut forged = original.descriptor.clone();
+                match mutation {
+                    0 => forged.key_epoch = if metadata { 11 } else { 10 },
+                    1 => forged.key_epoch = super::super::LIVE_DEPENDENCY_KEY_EPOCH,
+                    2 => forged.action_class = ActionClass::RustcWorkspaceCompile,
+                    3 => forged.dependency_inputs = digest(b"unqualified inventory"),
+                    _ => {
+                        let pure = if metadata {
+                            &IMMUTABLE_DAG_METADATA
+                        } else {
+                            &IMMUTABLE_DAG_RLIB
+                        };
+                        forged.sandbox_semantic_policy =
+                            compute(pure.isolation_domain, pure.profile.as_bytes());
+                    }
+                }
+                assert!(committed_dependency_descriptor_policy(&forged).is_none());
+                assert!(uses_committed_dependency_namespace(&forged));
             }
         }
     }

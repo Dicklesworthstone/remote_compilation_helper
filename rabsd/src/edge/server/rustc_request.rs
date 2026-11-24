@@ -785,6 +785,8 @@ pub(super) fn decide(live: &LiveEdge, request: &Value) -> Decided {
         for policy in [
             CommittedDependencyPolicy::ImmutableDagRlib,
             CommittedDependencyPolicy::ImmutableDagMetadata,
+            CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+            CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
         ] {
             if paths
                 .require_committed_dependency_library(&plan, policy)

@@ -5179,24 +5179,65 @@ mod execution_resource_tests {
     fn immutable_dag_requires_retained_policy_and_keeps_existing_worker_modes() {
         use rabs_key::live_dependency::ExternFact;
         use rabs_key::live_dependency::workspace_dependency_cache::CommittedWorkspaceDependency;
+        use rabs_protocol::input_evidence::{DirectoryEnumeration, InputFileType, PositiveInput};
         use rabs_protocol::raw_bytes::RawBytes;
         use rabs_protocol::result_identity::ObjectId;
 
-        for (emit, mode, policy) in [
+        let generated_root = "/__rabs/out/cargo/debug/build/parallel-generated/out";
+        for (emit, mode, policy, generated, native) in [
             (
                 "dep-info,metadata",
                 DependencyExecutionMode::Metadata,
                 CommittedDependencyPolicy::ImmutableDagMetadata,
+                false,
+                false,
             ),
             (
                 "dep-info,metadata,link",
                 DependencyExecutionMode::Rlib,
                 CommittedDependencyPolicy::ImmutableDagRlib,
+                false,
+                false,
+            ),
+            (
+                "dep-info,metadata",
+                DependencyExecutionMode::Metadata,
+                CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+                true,
+                false,
+            ),
+            (
+                "dep-info,metadata,link",
+                DependencyExecutionMode::Rlib,
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+                true,
+                false,
+            ),
+            (
+                "dep-info,metadata",
+                DependencyExecutionMode::Metadata,
+                CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
+                true,
+                true,
+            ),
+            (
+                "dep-info,metadata,link",
+                DependencyExecutionMode::Rlib,
+                CommittedDependencyPolicy::GeneratedImmutableDagRlib,
+                true,
+                true,
             ),
         ] {
-            let mut fixture = Fixture::canonical_with_outputs(emit);
+            let mut fixture =
+                Fixture::canonical_with_generated(emit, generated.then_some(generated_root));
             let candidate = format!("{}/libupstream.rmeta", fixture.plan.out_dir);
             fixture.argv.push(format!("--extern=upstream={candidate}"));
+            if native {
+                fixture
+                    .argv
+                    .push(format!("-Lnative={generated_root}/native"));
+                fixture.argv.push("-lstatic=generated".into());
+            }
             fixture.plan = rabs_key::live_dependency::plan_canonical_remote_dependency_action(
                 LiveRustcRequest {
                     argv: &fixture.argv,
@@ -5219,11 +5260,18 @@ mod execution_resource_tests {
                     path: fixture.plan.out_dir.clone(),
                     prefix: "dependencies/0000".into(),
                 }],
-                None,
+                fixture.plan.generated_root.clone(),
                 fixture.plan.execution_env.clone(),
                 [0x11; 32],
             )
+            .unwrap()
+            .with_generated_directories(if generated {
+                vec!["empty".into(), "native".into()]
+            } else {
+                Vec::new()
+            })
             .unwrap();
+            assert!(fixture.plan.native_roots.is_empty());
             let wire = fixture.request().unwrap();
             assert_eq!(wire["args"], json!(fixture.argv[1..]));
             assert_eq!(
@@ -5232,6 +5280,18 @@ mod execution_resource_tests {
                     "metadata"
                 } else {
                     "rlib"
+                }
+            );
+            assert_eq!(
+                wire["dependency_context"]["generated_root"],
+                json!(fixture.plan.generated_root)
+            );
+            assert_eq!(
+                wire["dependency_context"]["generated_directories"],
+                if generated {
+                    json!(["empty", "native"])
+                } else {
+                    json!([])
                 }
             );
             let digest =
@@ -5256,6 +5316,56 @@ mod execution_resource_tests {
             inputs.inputs[0].virtual_path =
                 RawBytes::new(fixture.plan.input_virtual_path("src/lib.rs").into_bytes());
             inputs.directory_enumerations.clear();
+            if generated {
+                for (path, bytes) in [
+                    ("config.rs", b"generated Rust configuration".as_slice()),
+                    (
+                        "native/libgenerated.a",
+                        b"captured native archive".as_slice(),
+                    ),
+                ] {
+                    inputs.inputs.push(PositiveInput {
+                        virtual_path: RawBytes::new(
+                            fixture.plan.generated_input_virtual_path(path).into_bytes(),
+                        ),
+                        object: ObjectId(digest(bytes)),
+                        file_type: InputFileType::Regular,
+                        executable: false,
+                        symlink_resolution: Vec::new(),
+                    });
+                }
+                inputs.directory_enumerations = vec![
+                    DirectoryEnumeration {
+                        virtual_path: RawBytes::new(
+                            fixture.plan.generated_virtual_root().into_bytes(),
+                        ),
+                        entries: vec![
+                            RawBytes::from("config.rs"),
+                            RawBytes::from("empty"),
+                            RawBytes::from("native"),
+                        ],
+                    },
+                    DirectoryEnumeration {
+                        virtual_path: RawBytes::new(
+                            fixture
+                                .plan
+                                .generated_input_virtual_path("empty")
+                                .into_bytes(),
+                        ),
+                        entries: Vec::new(),
+                    },
+                    DirectoryEnumeration {
+                        virtual_path: RawBytes::new(
+                            fixture
+                                .plan
+                                .generated_input_virtual_path("native")
+                                .into_bytes(),
+                        ),
+                        entries: vec![RawBytes::from("libgenerated.a")],
+                    },
+                ];
+            }
+            let build_script_output = generated.then_some(b"".as_slice());
             let runtime = rabs_key::typed_digest::compute(
                 rabs_key::live_dependency::remote::RUNTIME_COHORT_DOMAIN,
                 b"runtime",
@@ -5267,7 +5377,7 @@ mod execution_resource_tests {
                 &directories,
                 &dependencies,
                 &inputs,
-                None,
+                build_script_output,
                 "/__rabs/toolchain",
                 &fixture.toolchain.sha256,
                 &runtime,
@@ -5299,7 +5409,7 @@ mod execution_resource_tests {
                 &toolchain,
                 &directories,
                 &inputs,
-                None,
+                build_script_output,
                 "/__rabs/toolchain",
                 &fixture.toolchain.sha256,
                 &runtime,

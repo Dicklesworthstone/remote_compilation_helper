@@ -2579,8 +2579,9 @@ The new policies earn independent comparison evidence and class safety holds:
 
 | Consumer | Archive policy / key epoch | Metadata policy / key epoch |
 |---|---|---|
-| Immutable dependency DAG | `canonical-immutable-committed-dag-rlib-v1` / 10 | `canonical-immutable-committed-dag-metadata-v1` / 11 |
-| Workspace consuming immutable DAGs | `canonical-workspace-committed-dag-rlib-v1` / 12 | `canonical-workspace-committed-dag-metadata-v1` / 13 |
+| Pure immutable dependency DAG | `canonical-immutable-committed-dag-rlib-v1` / 10 | `canonical-immutable-committed-dag-metadata-v1` / 11 |
+| Immutable DAG with own generated/native inputs | `canonical-immutable-generated-dag-rlib-v1` / 40 | `canonical-immutable-generated-dag-metadata-v1` / 41 |
+| Workspace consuming immutable DAGs | `canonical-workspace-committed-dag-rlib-v2` / 22 | `canonical-workspace-committed-dag-metadata-v2` / 23 |
 
 An immutable DAG producer can consume qualified immutable leaves and other
 immutable DAG producers. Workspace DAG consumers can additionally consume the
@@ -2596,11 +2597,54 @@ transitive graph against current publication, class, object and quarantine
 state. A local-fallback middle crate cannot qualify its descendants. Revocation
 after metadata delivery remains terminal even for metadata-only results.
 
-This support remains limited to ordinary pure libraries without generated,
-native, proc-macro or incremental inputs, and workspace consumers retain the
-executor-free Cargo graph requirement. Complete package/workspace contents and
+The pure immutable policies keep their existing input restrictions. Each
+workspace consumer requires its own qualified compiler policy, including any
+generated or propagated native inputs. Complete package/workspace contents and
 directory inventories remain keyed. Minimal observed read closures, general
 build-script replay and arbitrary external-input graphs remain separate work.
+
+#### Generated and native immutable producers
+
+An immutable registry, Git or checksummed directory-source library can also
+become a committed producer when it has both a complete own `OUT_DIR` and a
+nonempty set of qualified immutable Rust ancestors. This connects a generated
+or native external dependency to downstream workspace cache policies. Builds
+use epoch 40; metadata checks use epoch 41. Their durable sampling classes are
+`rustc-immutable-generated-dag-rlib-v1` and
+`rustc-immutable-generated-dag-metadata-v1`, respectively.
+
+The coordinator retains the complete generated tree, empty directory listings,
+Cargo's exact completed build-script output, the presented environment,
+toolchain and measured runtime. Supported static native libraries and their
+ordered search paths must stay inside that own generated tree. Missing native
+archives, unbound search paths or a missing Cargo record refuse qualification.
+Every loadable Rust candidate also needs its exact committed producer action,
+descriptor, manifest, logical output and whole object identity. A generated
+input change or a changed producer witness therefore requires a new key.
+
+These producer policies require their own independent comparison samples.
+Pure immutable samples and generic remote dependency publications cannot enroll
+them. Archive consumers require archive-capable producer ancestry, and every
+returned archive still passes the existing native-member closure check.
+Publication, replay, restored-target use and final installation revalidate
+the original input and installed-file generations and the current transitive
+producer standing. Each intermediate retains its own immutable-only policy,
+even when a workspace consumer permits a broader producer set.
+
+Build scripts execute for each current Cargo operation. These policies qualify
+the resulting compiler inputs and outputs; they grant no build-script or
+test-result cache authority. Generated/native immutable leaves with no Rust
+ancestry remain outside epochs 40/41, and immutable consumers with foreign
+native roots remain outside this increment. Eligible workspace consumers use
+their separately qualified propagated-native policies when needed.
+
+The existing real-worker generated/native dependency fixtures now exercise
+three independent samples, same-source and relocated cold-target replay,
+current build-script execution, changed generated/native inputs, exact durable
+ancestry and delivered executable behavior. They require the matching wrapper
+and worker, full Linux namespace isolation and, for native inputs, `cc` and
+`ar`. These fixtures still require native execution before this path is
+qualified for deployment.
 
 ### Local Clippy with reusable dependency compilation
 

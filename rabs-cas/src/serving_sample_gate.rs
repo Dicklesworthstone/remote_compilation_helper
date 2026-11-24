@@ -102,6 +102,12 @@ pub enum ActionClassRisk {
     /// Immutable dependency checks with exact committed immutable ancestry.
     /// Metadata and archive producer contracts remain independently sampled.
     ImmutableDagMetadata,
+    /// Immutable archives with complete own generated/static native inputs and
+    /// exact immutable archive ancestry, independently sampled from pure DAGs.
+    GeneratedImmutableDagRlib,
+    /// Immutable metadata with complete own generated/static native inputs and
+    /// exact immutable ancestry; archive and pure-DAG evidence cannot enroll it.
+    GeneratedImmutableDagMetadata,
     /// Workspace archives that admit committed immutable dependency DAGs as
     /// well as the narrower existing workspace and immutable-leaf classes.
     WorkspaceDagRlib,

@@ -487,8 +487,7 @@ mod tests {
         }
         for command in ["build", "check", "test", "run", "bench", "doc", "clippy"] {
             assert!(
-                parse_strings(&["--remote", "p.json", command, "--partition=hash:1/4"])
-                    .is_err(),
+                parse_strings(&["--remote", "p.json", command, "--partition=hash:1/4"]).is_err(),
                 "{command}"
             );
         }

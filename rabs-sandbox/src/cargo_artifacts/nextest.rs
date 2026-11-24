@@ -19,10 +19,7 @@ pub const RUNTIME_ADMISSION_VERSION: &str = "nextest-runtime-admission-v1";
 
 /// The host reservation covers whichever phase has the larger concurrency.
 /// This policy applies only to new execution, not retained v1 validation.
-pub fn execution_slots(
-    selection: &CompilationSelection,
-    build_jobs: u32,
-) -> io::Result<u32> {
+pub fn execution_slots(selection: &CompilationSelection, build_jobs: u32) -> io::Result<u32> {
     if !(1..=4096).contains(&build_jobs) {
         return Err(invalid("nextest build jobs must be between 1 and 4096"));
     }
@@ -395,9 +392,11 @@ mod tests {
             let original = contract.arguments().unwrap();
             assert_eq!(contract.execution_slots().unwrap(), expected);
             assert_eq!(contract.arguments().unwrap(), original);
-            assert!(original.windows(2).any(|pair| {
-                pair[0] == "--build-jobs" && pair[1] == build_jobs.to_string()
-            }));
+            assert!(
+                original
+                    .windows(2)
+                    .any(|pair| { pair[0] == "--build-jobs" && pair[1] == build_jobs.to_string() })
+            );
             assert!(original.windows(2).any(|pair| {
                 pair[0] == "--test-threads" && pair[1] == test_threads.to_string()
             }));
@@ -422,17 +421,26 @@ mod tests {
             ..Default::default()
         });
         let retained = serde_json::to_vec(&legacy).unwrap();
-        assert_eq!(requested(&legacy).unwrap(), CargoArtifactMode::NextestExecution);
+        assert_eq!(
+            requested(&legacy).unwrap(),
+            CargoArtifactMode::NextestExecution
+        );
         assert!(fresh_execution_slots(&legacy).is_err());
         assert_eq!(serde_json::to_vec(&legacy).unwrap(), retained);
-        assert_eq!(requested(&legacy).unwrap(), CargoArtifactMode::NextestExecution);
+        assert_eq!(
+            requested(&legacy).unwrap(),
+            CargoArtifactMode::NextestExecution
+        );
 
         let compile_only = request(CompilationSelection {
             no_run: true,
             ..Default::default()
         });
         assert_eq!(fresh_execution_slots(&compile_only).unwrap(), Some(3));
-        assert_eq!(fresh_execution_slots(&json!({"program":"other"})).unwrap(), None);
+        assert_eq!(
+            fresh_execution_slots(&json!({"program":"other"})).unwrap(),
+            None
+        );
         let mut missing = legacy.clone();
         missing.as_object_mut().unwrap().remove("artifacts");
         assert!(fresh_execution_slots(&missing).is_err());
@@ -459,7 +467,10 @@ mod tests {
                 test_args: args.into_iter().map(str::to_owned).collect(),
                 ..Default::default()
             });
-            assert!(requested(&retained).is_ok(), "historical validation remains exact");
+            assert!(
+                requested(&retained).is_ok(),
+                "historical validation remains exact"
+            );
             assert!(fresh_execution_slots(&retained).is_err());
         }
         let serial = request(CompilationSelection {

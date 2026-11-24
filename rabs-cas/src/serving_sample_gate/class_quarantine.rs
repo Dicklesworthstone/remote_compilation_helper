@@ -32,6 +32,8 @@ const WORKSPACE_MIXED_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-rlib-v
 const WORKSPACE_MIXED_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v2";
 const IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
 const IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
+const GENERATED_IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-generated-dag-rlib-v1";
+const GENERATED_IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-generated-dag-metadata-v1";
 const WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v2";
 const WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v2";
 const GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-generated-dag-rlib-v1";
@@ -150,6 +152,12 @@ pub(super) fn refusal(
             }
             [SqlValue::Text(class)] if class == IMMUTABLE_DAG_METADATA_CLASS => {
                 IMMUTABLE_DAG_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == GENERATED_IMMUTABLE_DAG_RLIB_CLASS => {
+                GENERATED_IMMUTABLE_DAG_RLIB_CLASS
+            }
+            [SqlValue::Text(class)] if class == GENERATED_IMMUTABLE_DAG_METADATA_CLASS => {
+                GENERATED_IMMUTABLE_DAG_METADATA_CLASS
             }
             [SqlValue::Text(class)] if class == WORKSPACE_DAG_RLIB_CLASS => {
                 WORKSPACE_DAG_RLIB_CLASS
@@ -729,6 +737,14 @@ mod tests {
                 IMMUTABLE_DAG_METADATA_CLASS,
                 ActionClassRisk::ImmutableDagMetadata,
             ),
+            (
+                GENERATED_IMMUTABLE_DAG_RLIB_CLASS,
+                ActionClassRisk::GeneratedImmutableDagRlib,
+            ),
+            (
+                GENERATED_IMMUTABLE_DAG_METADATA_CLASS,
+                ActionClassRisk::GeneratedImmutableDagMetadata,
+            ),
             (WORKSPACE_DAG_RLIB_CLASS, ActionClassRisk::WorkspaceDagRlib),
             (
                 WORKSPACE_DAG_METADATA_CLASS,
@@ -803,6 +819,8 @@ mod tests {
                 WORKSPACE_MIXED_METADATA_CLASS,
                 IMMUTABLE_DAG_RLIB_CLASS,
                 IMMUTABLE_DAG_METADATA_CLASS,
+                GENERATED_IMMUTABLE_DAG_RLIB_CLASS,
+                GENERATED_IMMUTABLE_DAG_METADATA_CLASS,
                 WORKSPACE_DAG_RLIB_CLASS,
                 WORKSPACE_DAG_METADATA_CLASS,
                 GENERATED_WORKSPACE_DAG_RLIB_CLASS,

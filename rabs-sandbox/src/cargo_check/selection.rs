@@ -1169,7 +1169,10 @@ mod tests {
             let args = selection
                 .cargo_arguments(CompilationCommand::Nextest)
                 .unwrap();
-            assert!(args.windows(2).any(|pair| pair == ["--partition", partition]));
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--partition", partition])
+            );
             assert_eq!(
                 selection
                     .runtime_arguments(CompilationCommand::Nextest)

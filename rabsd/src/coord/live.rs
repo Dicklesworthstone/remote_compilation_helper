@@ -490,6 +490,9 @@ const LIVE_MIXED_WORKSPACE_RLIB_CLASS: &str = "rustc-workspace-committed-mixed-r
 const LIVE_MIXED_WORKSPACE_METADATA_CLASS: &str = "rustc-workspace-committed-mixed-metadata-v2";
 const LIVE_IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-committed-dag-rlib-v1";
 const LIVE_IMMUTABLE_DAG_METADATA_CLASS: &str = "rustc-immutable-committed-dag-metadata-v1";
+const LIVE_GENERATED_IMMUTABLE_DAG_RLIB_CLASS: &str = "rustc-immutable-generated-dag-rlib-v1";
+const LIVE_GENERATED_IMMUTABLE_DAG_METADATA_CLASS: &str =
+    "rustc-immutable-generated-dag-metadata-v1";
 const LIVE_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-committed-dag-rlib-v2";
 const LIVE_WORKSPACE_DAG_METADATA_CLASS: &str = "rustc-workspace-committed-dag-metadata-v2";
 const LIVE_GENERATED_WORKSPACE_DAG_RLIB_CLASS: &str = "rustc-workspace-generated-dag-rlib-v1";
@@ -556,6 +559,12 @@ fn record_descriptor_class(
             }
             CommittedDependencyPolicy::ImmutableDagRlib => LIVE_IMMUTABLE_DAG_RLIB_CLASS,
             CommittedDependencyPolicy::ImmutableDagMetadata => LIVE_IMMUTABLE_DAG_METADATA_CLASS,
+            CommittedDependencyPolicy::GeneratedImmutableDagRlib => {
+                LIVE_GENERATED_IMMUTABLE_DAG_RLIB_CLASS
+            }
+            CommittedDependencyPolicy::GeneratedImmutableDagMetadata => {
+                LIVE_GENERATED_IMMUTABLE_DAG_METADATA_CLASS
+            }
             CommittedDependencyPolicy::WorkspaceDagRlib => LIVE_WORKSPACE_DAG_RLIB_CLASS,
             CommittedDependencyPolicy::WorkspaceDagMetadata => LIVE_WORKSPACE_DAG_METADATA_CLASS,
             CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => {
@@ -681,6 +690,12 @@ fn recorded_action_risk(
             }
             [SqlValue::Text(class)] if class == LIVE_IMMUTABLE_DAG_METADATA_CLASS => {
                 Ok(ActionClassRisk::ImmutableDagMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_IMMUTABLE_DAG_RLIB_CLASS => {
+                Ok(ActionClassRisk::GeneratedImmutableDagRlib)
+            }
+            [SqlValue::Text(class)] if class == LIVE_GENERATED_IMMUTABLE_DAG_METADATA_CLASS => {
+                Ok(ActionClassRisk::GeneratedImmutableDagMetadata)
             }
             [SqlValue::Text(class)] if class == LIVE_WORKSPACE_DAG_RLIB_CLASS => {
                 Ok(ActionClassRisk::WorkspaceDagRlib)
@@ -5733,7 +5748,9 @@ mod tests {
                     || matches!(
                         policy,
                         Some(
-                            CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
+                            CommittedDependencyPolicy::GeneratedImmutableDagRlib
+                                | CommittedDependencyPolicy::GeneratedImmutableDagMetadata
+                                | CommittedDependencyPolicy::GeneratedWorkspaceDagRlib
                                 | CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib
                                 | CommittedDependencyPolicy::NativeGeneratedWorkspaceDagMetadata
@@ -5763,6 +5780,8 @@ mod tests {
                 Some(
                     CommittedDependencyPolicy::ImmutableDagRlib
                         | CommittedDependencyPolicy::ImmutableDagMetadata
+                        | CommittedDependencyPolicy::GeneratedImmutableDagRlib
+                        | CommittedDependencyPolicy::GeneratedImmutableDagMetadata
                 )
             );
             let source_root = if immutable {
@@ -5876,7 +5895,9 @@ mod tests {
                 ) => plan_mixed_workspace_library(&execution),
                 Some(
                     CommittedDependencyPolicy::ImmutableDagRlib
-                    | CommittedDependencyPolicy::ImmutableDagMetadata,
+                    | CommittedDependencyPolicy::ImmutableDagMetadata
+                    | CommittedDependencyPolicy::GeneratedImmutableDagRlib
+                    | CommittedDependencyPolicy::GeneratedImmutableDagMetadata,
                 ) => Ok(execution),
             }
             .unwrap();
@@ -6115,6 +6136,42 @@ mod tests {
                 ActionClassRisk::ImmutableDagMetadata,
             ),
             (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::GeneratedImmutableDagRlib),
+                    true,
+                    false,
+                ),
+                ActionClassRisk::GeneratedImmutableDagRlib,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::GeneratedImmutableDagMetadata),
+                    true,
+                    false,
+                ),
+                ActionClassRisk::GeneratedImmutableDagMetadata,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata,link",
+                    Some(CommittedDependencyPolicy::GeneratedImmutableDagRlib),
+                    true,
+                    true,
+                ),
+                ActionClassRisk::GeneratedImmutableDagRlib,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::GeneratedImmutableDagMetadata),
+                    true,
+                    true,
+                ),
+                ActionClassRisk::GeneratedImmutableDagMetadata,
+            ),
+            (
                 descriptor(
                     "--emit=dep-info,metadata,link",
                     Some(CommittedDependencyPolicy::WorkspaceDagRlib),
@@ -6260,8 +6317,8 @@ mod tests {
             ),
         ];
         let expected_epochs = [
-            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 30, 32, 31, 33, 36, 37, 37, 36,
-            24, 25, 34, 35, 38, 39,
+            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 40, 41, 40, 41, 22, 23, 28, 29, 30, 32, 31, 33,
+            36, 37, 37, 36, 24, 25, 34, 35, 38, 39,
         ];
         assert_eq!(descriptors.len(), expected_epochs.len());
         for ((descriptor, _), expected_epoch) in descriptors.iter().zip(expected_epochs) {
