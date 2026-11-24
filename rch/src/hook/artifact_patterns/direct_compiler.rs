@@ -958,9 +958,10 @@ fn c_debug_level(option: &str, clang: bool) -> Option<NativeDebugLevel> {
 /// Native driver outputs and their dependency sidecars. Without -MF,
 /// -MD/-MMD derives the depfile from -o for one ordinary C/C++ source, or
 /// from each source basename for an implicit object/assembly output.
-/// Multi-input explicit sidecars, language-overridden inference,
-/// preprocessing-only modes, raw subtool options and response files retain
-/// the previous policy.
+/// Single-source preprocessing with -E/-o and dependency-only -M/-MM with
+/// exactly one of -MF/-o have their own named-file contracts. Mixed modes,
+/// multi-input explicit sidecars, language overrides, raw subtool
+/// options and response files retain the previous policy.
 /// Split DWARF is supported for native Linux object compilation, including its
 /// required .dwo sidecar; linking/split-assembly and target overrides decline.
 fn c_family_patterns(command: &str, compilers: &[&str], clang: bool) -> Option<Vec<String>> {
@@ -985,6 +986,10 @@ fn c_family_outputs(
     let mut depfile: Option<String> = None;
     let mut database: Option<String> = None;
     let mut dependencies = false;
+    let mut preprocess_only = false;
+    let mut dependency_only = false;
+    let mut strip_line_markers = false;
+    let mut missing_headers = false;
     let mut sources = Vec::new();
     let mut language_override = false;
     let mut target_override = false;
@@ -1034,6 +1039,14 @@ fn c_family_outputs(
             if database.replace(arg[3..].to_owned()).is_some() {
                 return None;
             }
+        } else if arg == "-E" {
+            preprocess_only = true;
+        } else if matches!(arg.as_str(), "-M" | "-MM") {
+            dependency_only = true;
+        } else if arg == "-P" {
+            strip_line_markers = true;
+        } else if arg == "-MG" {
+            missing_headers = true;
         } else if matches!(arg.as_str(), "-MD" | "-MMD") {
             dependencies = true;
         } else if arg == "-c" {
@@ -1097,6 +1110,51 @@ fn c_family_outputs(
                 )
             })
     };
+    if preprocess_only || dependency_only {
+        // These modes promise one named text file. Combining -E with
+        // -MD/-MMD can produce additional files, so keep that grammar
+        // outside this single-output contract.
+        let [source] = sources.as_slice() else {
+            return None;
+        };
+        if !ordinary_source(source)
+            || compile_only
+            || assembly_only
+            || dependencies
+            || database.is_some()
+            || language_override
+            || target_override
+            || llvm_emission
+            || split_dwarf
+            || debug_level != NativeDebugLevel::Off
+        {
+            return None;
+        }
+        let path = if dependency_only {
+            // -M/-MM implies -E. Either flag can name its output, but using
+            // both has driver-specific extra-file effects (GCC creates an
+            // empty -o file beside the -MF depfile; Clang does not).
+            if output.is_some() && depfile.is_some() {
+                return None;
+            }
+            depfile.or(output)?
+        } else {
+            if depfile.is_some() || missing_headers {
+                return None;
+            }
+            output?
+        };
+        // '-' is stdout in these modes; './-' is a literal filename. Do not
+        // turn a stdout-only invocation into an empty required-file contract.
+        if path == "-" {
+            return None;
+        }
+        return NativeOutputContract::from_paths([path]);
+    }
+    // New preprocessor options must not broaden ordinary compilation/linking.
+    if strip_line_markers || missing_headers {
+        return None;
+    }
     if split_dwarf
         && (platform != NativeOutputPlatform::Linux
             || !compile_only
@@ -1955,6 +2013,192 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_preprocessing_contracts_bind_only_named_text_outputs() {
+        use rch_common::CompilationKind;
+
+        for (kind, driver) in [
+            (CompilationKind::Gcc, "gcc"),
+            (CompilationKind::Gpp, "g++"),
+            (CompilationKind::Clang, "clang"),
+            (CompilationKind::Clangpp, "clang++"),
+        ] {
+            for (arguments, path, pattern) in [
+                (
+                    "-E src/main.cpp -o generated/main.i",
+                    "generated/main.i",
+                    "generated/main.i",
+                ),
+                ("main.c -o app -E", "app", "app"),
+                (
+                    "-E -P src/main.cpp -o 'target/preprocessed [dev]*?.i'",
+                    "target/preprocessed [dev]*?.i",
+                    "target/preprocessed [[]dev[]][*][?].i",
+                ),
+                ("-E src/main.cpp -o ./-", "-", "[-]"),
+                (
+                    "-M src/main.cpp -MF deps/headers.d",
+                    "deps/headers.d",
+                    "deps/headers.d",
+                ),
+                (
+                    "-MM src/main.cpp -MFdeps/headers.d -MP -MG -MT object.o -MQ quoted",
+                    "deps/headers.d",
+                    "deps/headers.d",
+                ),
+                ("-E -MM src/main.cpp -MF ./-", "-", "[-]"),
+                (
+                    "-MM src/main.cpp -o reports/dependencies.txt",
+                    "reports/dependencies.txt",
+                    "reports/dependencies.txt",
+                ),
+                ("main.c -o app -M", "app", "app"),
+                ("-M src/main.cpp -o ./-", "-", "[-]"),
+                (
+                    "-MM src/main.cpp -MT '-E' -MF 'reports/headers [1].d'",
+                    "reports/headers [1].d",
+                    "reports/headers [[]1[]].d",
+                ),
+            ] {
+                let command = format!("{driver} {arguments}");
+                assert_eq!(rch_common::classify_command(&command).kind, Some(kind));
+                for platform in [
+                    NativeOutputPlatform::Unspecified,
+                    NativeOutputPlatform::Posix,
+                    NativeOutputPlatform::Linux,
+                ] {
+                    let contract = native_output_contract(Some(kind), &command, platform)
+                        .unwrap_or_else(|| panic!("missing contract for {command}"));
+                    assert_eq!(
+                        contract.required_files,
+                        BTreeSet::from([PathBuf::from(path)]),
+                        "{command}"
+                    );
+                    assert_eq!(contract.patterns().unwrap(), vec![pattern], "{command}");
+                }
+                assert_eq!(
+                    super::super::get_project_artifact_patterns(Some(kind), Some(&command), true),
+                    vec![pattern],
+                    "Cargo target forwarding must not displace {command}"
+                );
+                assert!(
+                    super::super::get_custom_target_artifact_patterns(Some(kind), Some(&command))
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_preprocessing_contracts_refuse_stdout_and_ambiguous_modes() {
+        use rch_common::CompilationKind;
+
+        for (kind, driver) in [
+            (CompilationKind::Gcc, "gcc"),
+            (CompilationKind::Gpp, "g++"),
+            (CompilationKind::Clang, "clang"),
+            (CompilationKind::Clangpp, "clang++"),
+        ] {
+            for arguments in [
+                "-E main.c",
+                "-E main.c -o -",
+                "-M main.c",
+                "-MM main.c -MF -",
+                "-M main.c -o -",
+                "-MM main.c -MF headers.d -o also.i",
+                "-E -MD main.c -o result.i",
+                "-E -MMD main.c -o result.i -MF headers.d",
+                "-M -MMD main.c -MF headers.d",
+                "-E main.c -o result.i -MF headers.d",
+                "-E -c main.c -o result.i",
+                "-MM -S main.c -MF headers.d",
+                "-c -P main.c -o main.o",
+                "-c -MG -MMD main.c -o main.o",
+                "-P main.c -D '-E' -o app",
+                "-MG main.c -MT '-M' -o app",
+                "-E -MG main.c -o result.i",
+                "-E main.c -o result.i -MJ compile.json",
+                "-MM main.c -MF headers.d -MJ compile.json",
+                "-E -gsplit-dwarf main.c -o result.i",
+                "-E -g main.c -o result.i",
+                "-E -x c main.c -o result.i",
+                "-MM --target=x86_64-pc-windows-gnu main.c -MF headers.d",
+                "-E -m32 main.c -o result.i",
+                "-E -emit-llvm main.c -o result.i",
+                "-E -Wp,-MD,extra.d main.c -o result.i",
+                "-E first.c second.c -o result.i",
+                "-MM first.c second.c -MF headers.d",
+                "-E -o result.i",
+                "-E already.i -o result.i",
+                "-MM already.ii -MF headers.d",
+                "-E assembly.s -o result.i",
+                "-E existing.o -o result.i",
+                "-M archive.a -MF headers.d",
+                "-E @response -o result.i",
+                "-E main.c -o first.i -o second.i",
+                "-MM main.c -MF first.d -MF second.d",
+                "-E main.c -o ../result.i",
+                "-MM main.c -MF /tmp/headers.d",
+            ] {
+                let command = format!("{driver} {arguments}");
+                for platform in [
+                    NativeOutputPlatform::Unspecified,
+                    NativeOutputPlatform::Posix,
+                    NativeOutputPlatform::Linux,
+                ] {
+                    assert!(
+                        native_output_contract(Some(kind), &command, platform).is_none(),
+                        "ambiguous or output-free command was narrowed: {command}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_preprocessing_restored_contract_accepts_empty_files_but_not_missing_outputs() {
+        for (command, expected) in [
+            (
+                "gcc -E -P empty.c -o generated/empty.i",
+                "generated/empty.i",
+            ),
+            ("gcc -MM main.c -MF deps/headers.d", "deps/headers.d"),
+            ("gcc -M main.c -o dependencies.txt", "dependencies.txt"),
+        ] {
+            let contract = native_output_contract(
+                Some(rch_common::CompilationKind::Gcc),
+                command,
+                NativeOutputPlatform::Posix,
+            )
+            .unwrap();
+            let restored: NativeOutputContract =
+                serde_json::from_slice(&serde_json::to_vec(&contract).unwrap()).unwrap();
+            assert_eq!(restored, contract);
+            assert_eq!(
+                restored.required_files,
+                BTreeSet::from([PathBuf::from(expected)])
+            );
+            let root = tempfile::tempdir().unwrap().keep();
+            let caller = root.join("caller");
+            let stage = root.join("stage");
+            std::fs::create_dir_all(caller.join(expected).parent().unwrap()).unwrap();
+            std::fs::create_dir_all(stage.join(expected).parent().unwrap()).unwrap();
+            std::fs::write(caller.join(expected), b"stale caller output").unwrap();
+            std::fs::write(stage.join("foreign.o"), b"unrelated object").unwrap();
+            assert!(
+                restored.verify_staged(&stage).is_err(),
+                "the stale caller and an unrelated object cannot satisfy {command}"
+            );
+            std::fs::write(stage.join(expected), b"").unwrap();
+            restored.verify_staged(&stage).unwrap();
+            assert_eq!(std::fs::metadata(stage.join(expected)).unwrap().len(), 0);
+            assert_eq!(
+                std::fs::read(caller.join(expected)).unwrap(),
+                b"stale caller output"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn native_required_output_symlinks_and_directories_cannot_satisfy_delivery() {
@@ -2566,8 +2810,6 @@ mod tests {
             "gcc main.c -o app -Wa,--MD,other.d",
             "gcc main.c -o app -Wp,-MMD,other.d",
             "gcc main.c -o app -Xlinker -oother",
-            "gcc main.c -o app -E",
-            "gcc main.c -o app -M",
             "gcc main.c -o app -fsyntax-only",
             "gcc main.c -o -",
             "gcc @args -o app",
@@ -2615,6 +2857,201 @@ mod tests {
                 vec!["target/native/app", "target/native/app.d"]
             );
             assert!(get_custom_target_artifact_patterns(Some(kind), Some(&command)).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_native_preprocessing_outputs_refresh_named_files_through_production_filters() {
+        use rch_common::CompilationKind;
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        async fn run(command: &mut Command) -> std::process::Output {
+            let output = rch_common::ssh::capture_control_output(
+                command,
+                None,
+                64 * 1024,
+                64 * 1024,
+                tokio::time::Instant::now() + Duration::from_secs(20),
+            )
+            .await
+            .expect("gcc, clang and rsync must complete the named preprocessing regression");
+            assert!(output.status.success(), "{command:?}: {output:?}");
+            output
+        }
+
+        fn emitted_files(root: &Path, directory: &Path, found: &mut BTreeSet<PathBuf>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path == root.join("src") {
+                    continue;
+                }
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    emitted_files(root, &path, found);
+                } else {
+                    assert!(kind.is_file(), "unexpected output: {}", path.display());
+                    found.insert(path.strip_prefix(root).unwrap().to_owned());
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap().keep();
+        for (driver, kind) in [
+            ("gcc", CompilationKind::Gcc),
+            ("clang", CompilationKind::Clang),
+        ] {
+            for (case, (arguments, expected)) in [
+                (
+                    vec![
+                        "-E",
+                        "-P",
+                        "src/main.c",
+                        "-o",
+                        "generated/preprocessed [dev]*?.i",
+                    ],
+                    "generated/preprocessed [dev]*?.i",
+                ),
+                (
+                    vec!["-E", "-P", "src/empty.c", "-o", "generated/empty.i"],
+                    "generated/empty.i",
+                ),
+                (
+                    vec![
+                        "-M",
+                        "src/main.c",
+                        "-MF",
+                        "dependencies/all.d",
+                        "-MP",
+                        "-MT",
+                        "unit.o",
+                    ],
+                    "dependencies/all.d",
+                ),
+                (
+                    vec![
+                        "-MM",
+                        "src/main.c",
+                        "-o",
+                        "dependencies/user.dep",
+                        "-MQ",
+                        "unit.o",
+                    ],
+                    "dependencies/user.dep",
+                ),
+                (
+                    vec![
+                        "-MM",
+                        "-MG",
+                        "src/missing.c",
+                        "-MF",
+                        "dependencies/generated.d",
+                    ],
+                    "dependencies/generated.d",
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let base = root.join(format!("{driver}-{case}"));
+                let source = base.join("worker");
+                let caller = base.join("caller");
+                for directory in ["src", "generated", "dependencies"] {
+                    std::fs::create_dir_all(source.join(directory)).unwrap();
+                    std::fs::create_dir_all(caller.join(directory)).unwrap();
+                }
+                std::fs::write(source.join("src/header.h"), b"#define VALUE 37\n").unwrap();
+                std::fs::write(
+                    source.join("src/main.c"),
+                    b"#include \"header.h\"\nint value(void) { return VALUE; }\n",
+                )
+                .unwrap();
+                std::fs::write(source.join("src/empty.c"), b"").unwrap();
+                std::fs::write(source.join("src/missing.c"), b"#include \"generated.h\"\n")
+                    .unwrap();
+                std::fs::write(caller.join("src/main.c"), b"caller source sentinel\n").unwrap();
+                std::fs::write(caller.join(expected), b"stale caller output\n").unwrap();
+                let command =
+                    shell_words::join(std::iter::once(driver).chain(arguments.iter().copied()));
+                let contract =
+                    native_output_contract(Some(kind), &command, NativeOutputPlatform::Posix)
+                        .unwrap();
+                assert_eq!(
+                    contract.required_files,
+                    BTreeSet::from([PathBuf::from(expected)])
+                );
+                assert!(contract.verify_staged(&source).is_err());
+                let mut compiler = Command::new(driver);
+                compiler
+                    .args(&arguments)
+                    .current_dir(&source)
+                    .env_remove("DEPENDENCIES_OUTPUT")
+                    .env_remove("SUNPRO_DEPENDENCIES")
+                    .env_remove("CCC_OVERRIDE_OPTIONS");
+                run(&mut compiler).await;
+                let mut emitted = BTreeSet::new();
+                emitted_files(&source, &source, &mut emitted);
+                assert_eq!(contract.required_files, emitted, "{command}");
+                contract.verify_staged(&source).unwrap();
+                let bytes = std::fs::read(source.join(expected)).unwrap();
+                if case == 1 {
+                    // GNU GCC emits zero bytes; Clang may retain a newline.
+                    assert!(bytes.iter().all(u8::is_ascii_whitespace));
+                } else if case == 0 {
+                    assert!(String::from_utf8_lossy(&bytes).contains("return 37;"));
+                } else {
+                    let header = if case == 4 {
+                        "generated.h"
+                    } else {
+                        "src/header.h"
+                    };
+                    assert!(String::from_utf8_lossy(&bytes).contains(header));
+                }
+                std::fs::write(source.join("foreign.o"), b"unrelated object\n").unwrap();
+                std::fs::write(
+                    source.join("generated/preprocessed dOTHER1.i"),
+                    b"glob decoy\n",
+                )
+                .unwrap();
+                let restored: NativeOutputContract =
+                    serde_json::from_slice(&serde_json::to_vec(&contract).unwrap()).unwrap();
+                let patterns = restored.patterns().unwrap();
+                let pipeline = crate::transfer::TransferPipeline::new(
+                    caller.clone(),
+                    "named-preprocessing".to_owned(),
+                    "test-source".to_owned(),
+                    rch_common::TransferConfig::default(),
+                );
+                assert!(
+                    pipeline
+                        .validate_staged_artifact_paths(
+                            &[PathBuf::from(expected)],
+                            &crate::transfer::default_c_cpp_artifact_patterns(),
+                        )
+                        .is_err(),
+                    "the legacy policy cannot refresh this caller-owned destination"
+                );
+                let mut rsync = pipeline.local_artifact_retrieval_for_test(
+                    &rch_common::WorkerConfig::default(),
+                    &source,
+                    &patterns,
+                );
+                run(&mut rsync).await;
+                restored.verify_staged(&caller).unwrap();
+                assert_eq!(
+                    std::fs::read(caller.join(expected)).unwrap(),
+                    bytes,
+                    "{command}"
+                );
+                assert_eq!(
+                    std::fs::read(caller.join("src/main.c")).unwrap(),
+                    b"caller source sentinel\n"
+                );
+                assert!(!caller.join("foreign.o").exists());
+                assert!(!caller.join("generated/preprocessed dOTHER1.i").exists());
+            }
         }
     }
 

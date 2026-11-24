@@ -11525,6 +11525,26 @@ func TestValue(t *testing.T) {{
         let ordinary = [
             (vec!["main.c", "lib/helper.c"], vec!["a.out"], 0),
             (
+                vec!["-E", "-P", "main.c", "-o", "products/preprocessed.i"],
+                vec!["products/preprocessed.i"],
+                0,
+            ),
+            (
+                vec!["-E", "-P", "empty.c", "-o", "products/empty.i"],
+                vec!["products/empty.i"],
+                0,
+            ),
+            (
+                vec!["-MM", "main.c", "-MF", "products/headers.d"],
+                vec!["products/headers.d"],
+                0,
+            ),
+            (
+                vec!["-M", "main.c", "-o", "products/dependencies.txt"],
+                vec!["products/dependencies.txt"],
+                0,
+            ),
+            (
                 vec!["-c", "main.c", "lib/helper.c"],
                 vec!["helper.o", "main.o"],
                 1,
@@ -11612,6 +11632,7 @@ func TestValue(t *testing.T) {{
             std::fs::create_dir(remote.join("lib")).unwrap();
             std::fs::write(remote.join("main.c"),
                 b"#include <stdio.h>\nint helper(void); int main(void) { printf(\"native-%d\\n\", helper()); return 0; }\n").unwrap();
+            std::fs::write(remote.join("empty.c"), b"").unwrap();
             std::fs::write(
                 remote.join("lib/helper.c"),
                 b"int helper(void) { return 37; }\n",
@@ -11702,6 +11723,17 @@ func TestValue(t *testing.T) {{
                 .env_remove("DEPENDENCIES_OUTPUT")
                 .env_remove("SUNPRO_DEPENDENCIES");
             run(&mut compiler).await;
+            if argv.contains(&"empty.c") {
+                // The gcc executable may be Apple Clang, which preserves a
+                // newline where GNU GCC emits zero bytes. Both are valid;
+                // publication below must retain the exact emitted bytes.
+                assert!(
+                    std::fs::read(remote.join("products/empty.i"))
+                        .unwrap()
+                        .iter()
+                        .all(u8::is_ascii_whitespace)
+                );
+            }
             session.completed(0).unwrap();
             let mut session = reload_publication(&session);
             assert_eq!(
@@ -11770,7 +11802,10 @@ func TestValue(t *testing.T) {{
                             std::fs::read(remote.join(relative)).unwrap()
                         );
                     }
-                    if argv[0] != "-c" && argv[0] != "-S" {
+                    if !argv
+                        .iter()
+                        .any(|argument| matches!(*argument, "-c" | "-S" | "-E" | "-M" | "-MM"))
+                    {
                         let mut executable = Command::new(local.join(expected.last().unwrap()));
                         assert_eq!(run(&mut executable).await.stdout, b"native-37\n");
                     }
