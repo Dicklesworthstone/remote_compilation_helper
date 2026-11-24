@@ -2353,6 +2353,48 @@ These tests require the matching native wrapper and worker, OpenSSL and full
 Linux bubblewrap isolation described in the validation section. Pure key and
 coordinator unit tests do not replace those compiler/worker integration gates.
 
+#### Terminal checks with static native inputs
+
+Selected binary, example and standard/custom harness checks can also qualify
+when Cargo supplies static native search roots, including roots propagated from
+a dependency into a package without its own build script. The independent
+`rustc-workspace-native-terminal-leaf-metadata-v1` class uses key epoch 38 and
+requires an empty Rust candidate inventory. The
+`rustc-workspace-native-terminal-metadata-v1` class uses epoch 39 and requires
+exact committed ancestry for every loadable Rust candidate.
+
+Both classes retain the complete workspace, every own and propagated native
+`OUT_DIR` tree, empty directories, completed Cargo records, ordered search paths,
+exact compiler environment and selected terminal invocation. A changed native
+archive, directory membership, Cargo record or producer witness invalidates
+reuse. Native searches must resolve inside those retained trees; unbound host,
+dynamic and framework inputs remain ineligible. The worker still uses its
+existing explicitly negotiated `ClosedMetadata` namespace. Native-library,
+pure-terminal and generated-terminal samples cannot qualify these classes.
+
+The result contains metadata, dep-info and diagnostics. Even nonempty terminal
+metadata cannot become a dependency producer or trigger early metadata delivery.
+Restoring a private Cargo target rechecks terminal publication, class quarantine
+and transitive producer standing. Build scripts run under Cargo; these classes
+do not cache their execution, executable links or test results.
+
+The real compiler/worker fixtures cover each binary, example and standard/custom
+test and benchmark shape, independent cold samples, relocated cold-target hits,
+native-byte and environment invalidation, and current type errors:
+
+```sh
+cargo test -p rabsd --test canonical_check_local \
+    canonical_native_terminal_metadata_leaves_earn_hits_without_running_targets \
+    -- --ignored --exact --test-threads=1
+cargo test -p rabsd --test canonical_check_local \
+    canonical_native_terminal_metadata_consumers_earn_hits_from_committed_ancestry \
+    -- --ignored --exact --test-threads=1
+```
+
+These additionally require `cc` and `ar`, alongside the complete namespace and
+matching worker/wrapper prerequisites above. Authoring or compiling the fixtures
+does not establish completed native qualification or a measured speedup.
+
 ### Cache workspace libraries using qualified immutable dependency leaves
 
 The canonical driver can also cache an ordinary workspace library whose retained

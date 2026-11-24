@@ -10894,6 +10894,7 @@ fn generated_terminal_metadata_source(
     kind: &str,
     harness: Option<bool>,
     committed: bool,
+    native: bool,
 ) {
     let harness = harness
         .map(|value| format!("harness={value}\n"))
@@ -10923,11 +10924,31 @@ fn generated_terminal_metadata_source(
     write(
         root,
         "app/build.rs",
-        r#"fn main() {
+        format!(
+            "{}{}{}",
+            r#"fn main() {
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     std::fs::write(out.join("value.rs"), std::fs::read("generated.rs.in").unwrap()).unwrap();
     std::fs::write(out.join("source.txt"), std::fs::read("value.txt").unwrap()).unwrap();
     std::fs::create_dir_all(out.join("empty/nested")).unwrap();
+"#,
+            if native {
+                r#"
+    std::fs::write(out.join("native.c"), std::fs::read("native.c").unwrap()).unwrap();
+    assert!(std::process::Command::new("/usr/bin/cc")
+        .args(["-c", "-fPIC", "-o"]).arg(out.join("native.o"))
+        .arg(out.join("native.c")).status().unwrap().success());
+    assert!(std::process::Command::new("/usr/bin/ar")
+        .arg("crsD").arg(out.join("libterminal_native.a"))
+        .arg(out.join("native.o")).status().unwrap().success());
+    println!("cargo::rustc-link-search=native={}", out.display());
+    println!("cargo::rustc-link-lib=static=terminal_native");
+    println!("cargo::rerun-if-changed=native.c");
+"#
+            } else {
+                ""
+            },
+            r#"
     let label = std::env::var("TERMINAL_METADATA_INPUT").unwrap();
     println!("cargo::rustc-env=GENERATED_TERMINAL_LABEL={label}");
     println!("cargo::rerun-if-changed=generated.rs.in");
@@ -10935,8 +10956,16 @@ fn generated_terminal_metadata_source(
     println!("cargo::rerun-if-env-changed=TERMINAL_METADATA_INPUT");
     println!("cargo::warning=RABS_GENERATED_TERMINAL_SCRIPT_RAN");
 }
-"#,
+"#
+        ),
     );
+    if native {
+        write(
+            root,
+            "app/native.c",
+            "unsigned int terminal_native(void) { return 41; }\n",
+        );
+    }
     write(
         root,
         "app/generated.rs.in",
@@ -11052,7 +11081,7 @@ fn generated_terminal_metadata_observations(
 /// The full worker fixture is intentionally separate from pure descriptor and
 /// seed tests. It must earn each class's ordinary samples through actual rustc;
 /// no store rows, positive evidence or generated outputs are injected.
-fn generated_terminal_metadata_replay(committed: bool) {
+fn generated_terminal_metadata_replay(committed: bool, native: bool) {
     for (kind, harness) in [
         ("bin", None),
         ("example", None),
@@ -11065,8 +11094,8 @@ fn generated_terminal_metadata_replay(committed: bool) {
         let root = owner.path();
         let first = root.join("generated-terminal-a");
         let second = root.join("generated-terminal-b");
-        generated_terminal_metadata_source(&first, kind, harness, committed);
-        generated_terminal_metadata_source(&second, kind, harness, committed);
+        generated_terminal_metadata_source(&first, kind, harness, committed, native);
+        generated_terminal_metadata_source(&second, kind, harness, committed, native);
         let libraries: &[&str] = if committed {
             &["canonical_terminal"]
         } else {
@@ -11113,6 +11142,11 @@ fn generated_terminal_metadata_replay(committed: bool) {
             match number {
                 1..=4 => {}
                 5 => profile["source_root"] = json!(second),
+                6 if native => write(
+                    &second,
+                    "app/native.c",
+                    "unsigned int terminal_native(void) { return 42; }\n",
+                ),
                 6 => write(
                     &second,
                     "app/generated.rs.in",
@@ -11204,7 +11238,13 @@ fn generated_terminal_metadata_replay(committed: bool) {
                     } else {
                         1
                     },
-                    if *name != WORKSPACE_METADATA_DAG_CONSUMER {
+                    if native && *name != WORKSPACE_METADATA_DAG_CONSUMER {
+                        "rustc-workspace-native-generated-metadata-v1"
+                    } else if native && committed {
+                        "rustc-workspace-native-terminal-metadata-v1"
+                    } else if native {
+                        "rustc-workspace-native-terminal-leaf-metadata-v1"
+                    } else if *name != WORKSPACE_METADATA_DAG_CONSUMER {
                         "rustc-workspace-generated-metadata-v1"
                     } else if committed {
                         "rustc-workspace-generated-terminal-metadata-v1"
@@ -11290,13 +11330,25 @@ fn generated_terminal_metadata_replay(committed: bool) {
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual generated terminal leaf samples, empty metadata, diagnostics, generated bytes and environment invalidation"]
 fn canonical_generated_terminal_metadata_leaves_earn_hits_without_running_targets() {
-    generated_terminal_metadata_replay(false);
+    generated_terminal_metadata_replay(false, false);
 }
 
 #[test]
 #[ignore = "requires full Linux bubblewrap isolation, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; generated terminal consumers require exact committed ancestry, independent samples, stock bytes and current build scripts"]
 fn canonical_generated_terminal_metadata_consumers_earn_hits_from_committed_ancestry() {
-    generated_terminal_metadata_replay(true);
+    generated_terminal_metadata_replay(true, false);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual own-native terminal leaf samples, relocated replay and native-byte invalidation"]
+fn canonical_native_terminal_metadata_leaves_earn_hits_without_running_targets() {
+    generated_terminal_metadata_replay(false, true);
+}
+
+#[test]
+#[ignore = "requires full Linux bubblewrap isolation, cc, ar, OpenSSL, matching RABS_CANONICAL_TEST_WRAPPER and RABS_TEST_WORKER_BIN; actual native terminal consumers require independent samples, committed ancestry and current native inputs"]
+fn canonical_native_terminal_metadata_consumers_earn_hits_from_committed_ancestry() {
+    generated_terminal_metadata_replay(true, true);
 }
 
 #[test]

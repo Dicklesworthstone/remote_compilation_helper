@@ -202,6 +202,8 @@ enum TerminalCompletionPolicy {
     Committed,
     GeneratedLeaf,
     GeneratedCommitted,
+    NativeLeaf,
+    NativeCommitted,
 }
 
 impl TerminalCompletionPolicy {
@@ -215,6 +217,8 @@ impl TerminalCompletionPolicy {
             CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
                 Ok(Self::GeneratedCommitted)
             }
+            CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata => Ok(Self::NativeLeaf),
+            CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata => Ok(Self::NativeCommitted),
             _ => Err("terminal completion has a nonterminal policy".into()),
         }
     }
@@ -229,6 +233,8 @@ impl TerminalCompletionPolicy {
             Self::GeneratedCommitted => {
                 CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
             }
+            Self::NativeLeaf => CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata,
+            Self::NativeCommitted => CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata,
         }
     }
 }
@@ -1629,6 +1635,8 @@ mod tests {
             TerminalCompletionPolicy::Committed,
             TerminalCompletionPolicy::GeneratedLeaf,
             TerminalCompletionPolicy::GeneratedCommitted,
+            TerminalCompletionPolicy::NativeLeaf,
+            TerminalCompletionPolicy::NativeCommitted,
         ] {
             for bytes in [b"".as_slice(), b"nonempty terminal metadata".as_slice()] {
                 let fixture = WorkspaceLineageFixture::new();
@@ -1716,6 +1724,8 @@ mod tests {
             TerminalCompletionPolicy::Committed,
             TerminalCompletionPolicy::GeneratedLeaf,
             TerminalCompletionPolicy::GeneratedCommitted,
+            TerminalCompletionPolicy::NativeLeaf,
+            TerminalCompletionPolicy::NativeCommitted,
         ] {
             for scope in [
                 "action", "class", "metadata", "dep-info", "manifest", "ancestor",

@@ -396,9 +396,8 @@ impl OperationAdmissions {
         // ticket. Enqueue and try_start have separate locks: an idle allowance
         // in the queue limit could otherwise be spent by several callers.
         // Existing queued work must still win its ordinary fair turn.
-        let immediate = state.peers.is_some()
-            && state.waiting.is_empty()
-            && state.active < self.maximum;
+        let immediate =
+            state.peers.is_some() && state.waiting.is_empty() && state.active < self.maximum;
         if !immediate
             && let (Some(peers), Some(peer)) = (&state.peers, &peer)
             && !peers.can_enqueue(peer)
@@ -2140,7 +2139,10 @@ mod tests {
         let tail = admissions.enqueue_for_peer([1; 32]).unwrap();
         let (ticket, turns) = {
             let state = admissions.state.lock().unwrap();
-            (state.next_ticket, state.peers.as_ref().unwrap().turns.clone())
+            (
+                state.next_ticket,
+                state.peers.as_ref().unwrap().turns.clone(),
+            )
         };
         for _ in 0..64 {
             assert!(matches!(

@@ -1081,7 +1081,12 @@ fn execution_mode(plan: &DependencyActionPlan) -> Result<DependencyExecutionMode
         });
     }
     if plan.source_kind == DependencySourceKind::WorkspaceTerminalMetadata {
-        if plan.generated_root.is_some() {
+        if !plan.native_roots.is_empty()
+            || !plan.invocation.native_libs.is_empty()
+            || plan.invocation.lib_search.iter().any(|path| path.starts_with("native="))
+        {
+            rabs_key::live_dependency::workspace_dependency_cache::validate_native_terminal_workspace_metadata_plan(plan)
+        } else if plan.generated_root.is_some() {
             validate_generated_terminal_workspace_metadata_plan(plan)
         } else {
             validate_terminal_workspace_metadata_plan(plan)

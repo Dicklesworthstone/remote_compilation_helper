@@ -510,6 +510,10 @@ const LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
     "rustc-workspace-generated-terminal-leaf-metadata-v1";
 const LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS: &str =
     "rustc-workspace-generated-terminal-metadata-v1";
+const LIVE_NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
+    "rustc-workspace-native-terminal-leaf-metadata-v1";
+const LIVE_NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str =
+    "rustc-workspace-native-terminal-metadata-v1";
 const LIVE_PRIVATE_CLASS: &str = "private-only";
 
 // This is an additional floor, not a replacement for the stored serving policy.
@@ -583,6 +587,12 @@ fn record_descriptor_class(
             }
             CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
                 LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS
+            }
+            CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata => {
+                LIVE_NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+            }
+            CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata => {
+                LIVE_NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS
             }
         }
     } else if let Some(class) = closed_workspace_library_descriptor_class(descriptor) {
@@ -715,6 +725,14 @@ fn recorded_action_risk(
                 if class == LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS =>
             {
                 Ok(ActionClassRisk::GeneratedWorkspaceTerminalMetadata)
+            }
+            [SqlValue::Text(class)]
+                if class == LIVE_NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS =>
+            {
+                Ok(ActionClassRisk::NativeWorkspaceTerminalLeafMetadata)
+            }
+            [SqlValue::Text(class)] if class == LIVE_NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS => {
+                Ok(ActionClassRisk::NativeWorkspaceTerminalMetadata)
             }
             [SqlValue::Text(_)] => Ok(ActionClassRisk::Elevated),
             _ => Err(StoreError::Backend(
@@ -5682,10 +5700,11 @@ mod tests {
             CommittedDependencyPolicy, CommittedWorkspaceDependency,
             plan_committed_workspace_metadata, plan_committed_workspace_rlib,
             plan_generated_terminal_workspace_metadata, plan_generated_workspace_dag_library,
-            plan_mixed_workspace_library, plan_propagated_native_workspace_dag_metadata,
+            plan_mixed_workspace_library, plan_native_terminal_workspace_metadata,
+            plan_propagated_native_workspace_dag_metadata,
             plan_propagated_native_workspace_dag_rlib, plan_terminal_workspace_metadata,
-            remote_committed_dependency_key,
-            remote_committed_workspace_metadata_key, remote_committed_workspace_rlib_key,
+            remote_committed_dependency_key, remote_committed_workspace_metadata_key,
+            remote_committed_workspace_rlib_key,
         };
         use rabs_key::live_dependency::{
             DependencyDirectoryFact, DependencySourceKind, ExternFact, LiveRustcRequest,
@@ -5702,8 +5721,10 @@ mod tests {
                                          native: bool| {
             let propagated = matches!(
                 policy,
-                Some(CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
-                    | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib)
+                Some(
+                    CommittedDependencyPolicy::PropagatedNativeWorkspaceDagMetadata
+                        | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
+                )
             );
             assert!(!native || generated || propagated);
             assert!(
@@ -5720,6 +5741,8 @@ mod tests {
                                 | CommittedDependencyPolicy::PropagatedNativeWorkspaceDagRlib
                                 | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
                                 | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+                                | CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata
+                                | CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata
                         )
                     )
             );
@@ -5730,6 +5753,8 @@ mod tests {
                         | CommittedDependencyPolicy::WorkspaceTerminalMetadata
                         | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
                         | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+                        | CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata
+                        | CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata
                 )
             );
             let has_dependencies = policy.is_some_and(|policy| !policy.is_terminal_leaf());
@@ -5839,6 +5864,10 @@ mod tests {
                     CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
                     | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
                 ) => plan_generated_terminal_workspace_metadata(&execution),
+                Some(
+                    CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata
+                    | CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata,
+                ) => plan_native_terminal_workspace_metadata(&execution),
                 Some(
                     CommittedDependencyPolicy::MixedWorkspaceRlib
                     | CommittedDependencyPolicy::MixedWorkspaceMetadata
@@ -6211,10 +6240,28 @@ mod tests {
                 ),
                 ActionClassRisk::GeneratedWorkspaceTerminalMetadata,
             ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata),
+                    true,
+                    true,
+                ),
+                ActionClassRisk::NativeWorkspaceTerminalLeafMetadata,
+            ),
+            (
+                descriptor_with_generated(
+                    "--emit=dep-info,metadata",
+                    Some(CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata),
+                    true,
+                    true,
+                ),
+                ActionClassRisk::NativeWorkspaceTerminalMetadata,
+            ),
         ];
         let expected_epochs = [
-            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 30, 32, 31, 33, 36, 36, 24, 25,
-            34, 35,
+            16, 17, 26, 27, 18, 19, 20, 21, 10, 11, 22, 23, 28, 29, 30, 32, 31, 33, 36, 37, 37, 36,
+            24, 25, 34, 35, 38, 39,
         ];
         assert_eq!(descriptors.len(), expected_epochs.len());
         for ((descriptor, _), expected_epoch) in descriptors.iter().zip(expected_epochs) {

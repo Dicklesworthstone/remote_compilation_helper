@@ -21,8 +21,7 @@ mod generated;
 pub(super) use generated::{
     GENERATED_DAG_METADATA_ISOLATION_PROFILE, GENERATED_DAG_RLIB_ISOLATION_PROFILE,
     NATIVE_GENERATED_DAG_METADATA_ISOLATION_PROFILE, NATIVE_GENERATED_DAG_RLIB_ISOLATION_PROFILE,
-    PROPAGATED_NATIVE_DAG_METADATA_ISOLATION_PROFILE,
-    PROPAGATED_NATIVE_DAG_RLIB_ISOLATION_PROFILE,
+    PROPAGATED_NATIVE_DAG_METADATA_ISOLATION_PROFILE, PROPAGATED_NATIVE_DAG_RLIB_ISOLATION_PROFILE,
 };
 pub use generated::{
     plan_generated_workspace_dag_library, plan_propagated_native_workspace_dag_metadata,
@@ -218,6 +217,24 @@ const GENERATED_TERMINAL_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace
     no early metadata notification or dependency producer authority regardless \
     of metadata size; terminal completion standing retained across target seeds";
 
+const NATIVE_TERMINAL_METADATA_ISOLATION_PROFILE: &str = "canonical-workspace-native-terminal-metadata-v1: \
+    driver-retained exact Cargo-selected binary, example, standard or custom \
+    harness metadata check; independently isolated compiler in explicitly \
+    negotiated ClosedMetadata mode without procfs or entropy devices; complete \
+    immutable workspace, every retained own or propagated Cargo OUT_DIR tree \
+    including empty directories, exact completed Cargo records and fully keyed \
+    environment; supported static native searches resolve only inside those \
+    retained roots; exact terminal argv, cwd, output contract, toolchain and \
+    measured runtime; leaf policy requires empty Rust candidate inventories; \
+    committed policy requires every loadable candidate's exact operation-owned \
+    installation and current committed transitive producer ancestry; input \
+    generations, publication, class and quarantine rechecked through delivery; \
+    separate native terminal samples; exact metadata including empty files, \
+    dep-info and diagnostics installed before replay; no early metadata or \
+    dependency producer authority regardless of output size; completion standing \
+    retained across private target reuse; no dynamic or host native inputs, \
+    proc macros, incremental state, final linking, test or build-script cache";
+
 /// Stable logical identity of one retained candidate and its committed producer.
 /// Physical path/generation capabilities stay outside this pure type and key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +307,12 @@ pub enum CommittedDependencyPolicy {
     /// Selected terminal check with complete own generated inputs and exact
     /// committed Rust producer ancestry; never a dependency producer, epoch 35.
     GeneratedWorkspaceTerminalMetadata,
+    /// Selected terminal metadata with complete own/propagated static native
+    /// inputs and an empty Rust candidate inventory, epoch 38.
+    NativeWorkspaceTerminalLeafMetadata,
+    /// Selected terminal metadata with complete static native inputs and exact
+    /// committed Rust ancestry; never a dependency producer, epoch 39.
+    NativeWorkspaceTerminalMetadata,
 }
 
 impl CommittedDependencyPolicy {
@@ -299,7 +322,9 @@ impl CommittedDependencyPolicy {
     pub const fn is_terminal_leaf(self) -> bool {
         matches!(
             self,
-            Self::WorkspaceTerminalLeafMetadata | Self::GeneratedWorkspaceTerminalLeafMetadata
+            Self::WorkspaceTerminalLeafMetadata
+                | Self::GeneratedWorkspaceTerminalLeafMetadata
+                | Self::NativeWorkspaceTerminalLeafMetadata
         )
     }
 
@@ -363,7 +388,9 @@ impl CommittedDependencyPolicy {
             | Self::NativeGeneratedWorkspaceDagMetadata
             | Self::PropagatedNativeWorkspaceDagMetadata
             | Self::GeneratedWorkspaceTerminalLeafMetadata
-            | Self::GeneratedWorkspaceTerminalMetadata => RemoteDependencyOutputClass::Metadata,
+            | Self::GeneratedWorkspaceTerminalMetadata
+            | Self::NativeWorkspaceTerminalLeafMetadata
+            | Self::NativeWorkspaceTerminalMetadata => RemoteDependencyOutputClass::Metadata,
         }
     }
 
@@ -388,6 +415,9 @@ impl CommittedDependencyPolicy {
             Self::GeneratedWorkspaceTerminalLeafMetadata
             | Self::GeneratedWorkspaceTerminalMetadata => {
                 validate_generated_terminal_workspace_metadata_plan(plan)
+            }
+            Self::NativeWorkspaceTerminalLeafMetadata | Self::NativeWorkspaceTerminalMetadata => {
+                validate_native_terminal_workspace_metadata_plan(plan)
             }
             Self::MixedWorkspaceRlib
             | Self::MixedWorkspaceMetadata
@@ -513,6 +543,22 @@ const GENERATED_WORKSPACE_TERMINAL_METADATA: DagContract = DagContract {
     dependencies_domain: "rabs.canonical-workspace-generated-terminal-metadata.dependencies.v1",
     profile: GENERATED_TERMINAL_METADATA_ISOLATION_PROFILE,
 };
+const NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA: DagContract = DagContract {
+    epoch: 38,
+    class: ActionClass::RustcWorkspaceCompile,
+    isolation_domain: "rabs.canonical-workspace-native-terminal-leaf-metadata.isolation.v1",
+    semantics_domain: "rabs.canonical-workspace-native-terminal-leaf-metadata.semantics.v1",
+    dependencies_domain: "rabs.canonical-workspace-native-terminal-leaf-metadata.dependencies.v1",
+    profile: NATIVE_TERMINAL_METADATA_ISOLATION_PROFILE,
+};
+const NATIVE_WORKSPACE_TERMINAL_METADATA: DagContract = DagContract {
+    epoch: 39,
+    class: ActionClass::RustcWorkspaceCompile,
+    isolation_domain: "rabs.canonical-workspace-native-terminal-metadata.isolation.v1",
+    semantics_domain: "rabs.canonical-workspace-native-terminal-metadata.semantics.v1",
+    dependencies_domain: "rabs.canonical-workspace-native-terminal-metadata.dependencies.v1",
+    profile: NATIVE_TERMINAL_METADATA_ISOLATION_PROFILE,
+};
 
 fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContract> {
     match policy {
@@ -529,6 +575,12 @@ fn dag_contract(policy: CommittedDependencyPolicy) -> Option<&'static DagContrac
         }
         CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
             Some(&GENERATED_WORKSPACE_TERMINAL_METADATA)
+        }
+        CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata => {
+            Some(&NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA)
+        }
+        CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata => {
+            Some(&NATIVE_WORKSPACE_TERMINAL_METADATA)
         }
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib => Some(&generated::RLIB),
         CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata => Some(&generated::METADATA),
@@ -575,7 +627,7 @@ pub fn plan_terminal_workspace_metadata(
 pub fn validate_terminal_workspace_metadata_plan(
     plan: &DependencyActionPlan,
 ) -> Result<(), LiveRefusal> {
-    validate_terminal_metadata_plan(plan, false)
+    validate_terminal_metadata_plan(plan, TerminalInputs::Pure)
 }
 
 /// Refine a selected terminal check with its own completed generated inputs.
@@ -606,14 +658,66 @@ pub fn plan_generated_terminal_workspace_metadata(
 pub fn validate_generated_terminal_workspace_metadata_plan(
     plan: &DependencyActionPlan,
 ) -> Result<(), LiveRefusal> {
-    validate_terminal_metadata_plan(plan, true)
+    validate_terminal_metadata_plan(plan, TerminalInputs::Generated)
+}
+
+/// Refine a fresh selected terminal check with complete retained static native
+/// inputs. The driver still supplies selected-root and committed-input authority.
+///
+/// # Errors
+/// A nonfresh plan, nonterminal output, or missing/unclosed native inputs.
+pub fn plan_native_terminal_workspace_metadata(
+    execution: &DependencyActionPlan,
+) -> Result<DependencyActionPlan, LiveRefusal> {
+    if execution.source_kind != DependencySourceKind::WorkspaceExecutionOnly {
+        return Err(LiveRefusal::Facts(
+            "native terminal planning requires the original fresh workspace plan".into(),
+        ));
+    }
+    let mut plan = execution.clone();
+    plan.source_kind = DependencySourceKind::WorkspaceTerminalMetadata;
+    validate_native_terminal_workspace_metadata_plan(&plan)?;
+    Ok(plan)
+}
+
+/// Validate terminal metadata with native searches bound to complete own or
+/// foreign Cargo OUT_DIR trees. This grants no input or publication authority.
+///
+/// # Errors
+/// A nonterminal invocation, no native searches, or an unclosed native input.
+pub fn validate_native_terminal_workspace_metadata_plan(
+    plan: &DependencyActionPlan,
+) -> Result<(), LiveRefusal> {
+    validate_terminal_metadata_plan(plan, TerminalInputs::Native)
+}
+
+#[derive(Clone, Copy)]
+enum TerminalInputs {
+    Pure,
+    Generated,
+    Native,
 }
 
 fn validate_terminal_metadata_plan(
     plan: &DependencyActionPlan,
-    generated: bool,
+    inputs: TerminalInputs,
 ) -> Result<(), LiveRefusal> {
     workspace_layout(plan)?;
+    let inputs_match = match inputs {
+        TerminalInputs::Pure => {
+            plan.generated_root.is_none()
+                && plan.native_roots.is_empty()
+                && plan.invocation.native_libs.is_empty()
+                && remote::validate_plan_native_roots(plan)?.is_empty()
+        }
+        TerminalInputs::Generated => {
+            plan.generated_root.is_some()
+                && plan.native_roots.is_empty()
+                && plan.invocation.native_libs.is_empty()
+                && remote::validate_plan_native_roots(plan)?.is_empty()
+        }
+        TerminalInputs::Native => !remote::validate_plan_native_roots(plan)?.is_empty(),
+    };
     let harness = plan
         .invocation
         .passthrough
@@ -627,18 +731,15 @@ fn validate_terminal_metadata_plan(
         || plan.invocation.emit.len() != 2
         || !plan.invocation.emit.iter().any(|emit| emit == "metadata")
         || !plan.invocation.emit.iter().any(|emit| emit == "dep-info")
-        || plan.generated_root.is_some() != generated
-        || !plan.native_roots.is_empty()
-        || !plan.invocation.native_libs.is_empty()
-        || (generated && !remote::validate_plan_native_roots(plan)?.is_empty())
+        || !inputs_match
         || remote::remote_dependency_output_class(&plan.invocation)
             != Ok(RemoteDependencyOutputClass::Metadata)
     {
         return Err(LiveRefusal::Facts(
-            if generated {
-                "generated terminal workspace caching requires an exact binary or harness metadata check with own OUT_DIR and no native inputs"
-            } else {
-                "terminal workspace caching requires an exact binary or harness metadata check without generated or native inputs"
+            match inputs {
+                TerminalInputs::Generated => "generated terminal workspace caching requires an exact binary or harness metadata check with own OUT_DIR and no native inputs",
+                TerminalInputs::Pure => "terminal workspace caching requires an exact binary or harness metadata check without generated or native inputs",
+                TerminalInputs::Native => "native terminal workspace caching requires an exact binary or harness metadata check with complete retained static native inputs",
             }.into(),
         ));
     }
@@ -950,7 +1051,9 @@ pub fn remote_committed_dependency_shape(
         CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
         | CommittedDependencyPolicy::WorkspaceTerminalMetadata
         | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
-        | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
+        | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+        | CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata
+        | CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata => {
             remote::remote_execution_shape(plan, directories, toolchain_root)?;
             validate_committed_dependency_inventory(policy, directories, dependencies)?;
             let externs = remote::remote_extern_facts(plan, directories)?;
@@ -1182,6 +1285,8 @@ pub fn committed_dependency_descriptor_policy(
         CommittedDependencyPolicy::WorkspaceTerminalMetadata,
         CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata,
         CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
+        CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata,
+        CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata,
         CommittedDependencyPolicy::GeneratedWorkspaceDagRlib,
         CommittedDependencyPolicy::GeneratedWorkspaceDagMetadata,
         CommittedDependencyPolicy::NativeGeneratedWorkspaceDagRlib,
@@ -1216,7 +1321,7 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
     (10..=15).contains(&descriptor.key_epoch)
         || (18..=25).contains(&descriptor.key_epoch)
         || (28..=29).contains(&descriptor.key_epoch)
-        || matches!(descriptor.key_epoch, 31 | 33 | 34 | 35 | 36 | 37)
+        || matches!(descriptor.key_epoch, 31 | 33 | 34 | 35 | 36 | 37 | 38 | 39)
         || [
             descriptor.sandbox_semantic_policy.domain,
             descriptor.execution_semantics.domain,
@@ -1235,6 +1340,8 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
                 "rabs.canonical-workspace-terminal-metadata.",
                 "rabs.canonical-workspace-generated-terminal-leaf-metadata.",
                 "rabs.canonical-workspace-generated-terminal-metadata.",
+                "rabs.canonical-workspace-native-terminal-leaf-metadata.",
+                "rabs.canonical-workspace-native-terminal-metadata.",
                 "rabs.canonical-workspace-generated-dag-rlib.",
                 "rabs.canonical-workspace-native-generated-dag-rlib.",
                 "rabs.canonical-workspace-native-generated-dag-metadata.",
@@ -1254,6 +1361,8 @@ pub fn uses_committed_dependency_namespace(descriptor: &ActionDescriptor) -> boo
             &WORKSPACE_TERMINAL_METADATA,
             &GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA,
             &GENERATED_WORKSPACE_TERMINAL_METADATA,
+            &NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA,
+            &NATIVE_WORKSPACE_TERMINAL_METADATA,
             &generated::RLIB,
             &generated::METADATA,
         ]
@@ -1426,6 +1535,8 @@ pub fn remote_committed_dependency_key(
             | CommittedDependencyPolicy::WorkspaceTerminalMetadata
             | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
             | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+            | CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata
+            | CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata
     ) {
         return remote_terminal_workspace_metadata_key(
             plan,
@@ -1566,11 +1677,17 @@ fn remote_terminal_workspace_metadata_key(
     retained_toolchain_sha256: &[u8; 32],
     runtime: &TypedDigest,
 ) -> Result<LiveDependencyKey, RemoteDependencyRefusal> {
-    let generated = matches!(
+    let native = matches!(
         policy,
-        CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
-            | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+        CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata
+            | CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata
     );
+    let generated = native
+        || matches!(
+            policy,
+            CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
+                | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+        );
     if !generated && build_script_output.is_some() {
         return Err(LiveRefusal::Facts(
             "terminal metadata caching cannot consume a build-script run record".into(),
@@ -1619,7 +1736,9 @@ fn remote_terminal_workspace_metadata_key(
         encoder.str(name).str(value);
     });
     key.descriptor.environment = compute(
-        if generated {
+        if native {
+            "rabs.canonical-workspace-native-terminal-metadata.environment.v1"
+        } else if generated {
             "rabs.canonical-workspace-generated-terminal-metadata.environment.v1"
         } else {
             "rabs.canonical-workspace-terminal-metadata.environment.v2"
@@ -1642,7 +1761,9 @@ fn remote_terminal_workspace_metadata_key(
         encoder.str(flag);
     });
     key.descriptor.normalized_invocation = compute(
-        if generated {
+        if native {
+            "rabs.canonical-workspace-native-terminal-metadata.invocation.v1"
+        } else if generated {
             "rabs.canonical-workspace-generated-terminal-metadata.invocation.v1"
         } else {
             "rabs.canonical-workspace-terminal-metadata.invocation.v2"
@@ -2160,6 +2281,177 @@ mod tests {
             &[39; 32],
             &compute(remote::RUNTIME_COHORT_DOMAIN, b"runtime"),
         )
+    }
+
+    #[test]
+    fn native_terminal_metadata_binds_complete_own_and_propagated_inputs() {
+        const FOREIGN: &str = "/__rabs/out/cargo/debug/build/provider-456/out";
+        for (own, foreign) in [(true, false), (false, true), (true, true)] {
+            for committed in [false, true] {
+                for flags in [vec!["--crate-type=bin"], vec!["--test"], vec!["--cfg=test"]] {
+                    let mut fresh = terminal_execution_with_generated(
+                        &flags,
+                        committed,
+                        "native terminal",
+                        own,
+                    );
+                    if own {
+                        fresh
+                            .invocation
+                            .lib_search
+                            .push(format!("native={TERMINAL_GENERATED}"));
+                        fresh.invocation.native_libs.push("static=terminal".into());
+                    }
+                    if foreign {
+                        fresh.native_roots.push(FOREIGN.into());
+                        fresh
+                            .invocation
+                            .lib_search
+                            .push(format!("native={FOREIGN}"));
+                    }
+                    assert!(plan_terminal_workspace_metadata(&fresh).is_err());
+                    assert!(plan_generated_terminal_workspace_metadata(&fresh).is_err());
+                    let plan = plan_native_terminal_workspace_metadata(&fresh).unwrap();
+                    let policy = if committed {
+                        CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata
+                    } else {
+                        CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata
+                    };
+                    let dependencies = if committed {
+                        vec![candidate("libupstream.rmeta")]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut captured = if own {
+                        generated_terminal_inputs(&plan)
+                    } else {
+                        inputs(&plan)
+                    };
+                    let mut native_paths = Vec::new();
+                    if own {
+                        let root = plan.generated_virtual_root();
+                        let listing = captured
+                            .directory_enumerations
+                            .iter_mut()
+                            .find(|entry| entry.virtual_path.as_bytes() == root.as_bytes())
+                            .unwrap();
+                        listing.entries.insert(1, RawBytes::from("libterminal.a"));
+                        native_paths.push(plan.generated_input_virtual_path("libterminal.a"));
+                    }
+                    if foreign {
+                        captured.directory_enumerations.extend([
+                            DirectoryEnumeration {
+                                virtual_path: RawBytes::new(
+                                    plan.native_input_virtual_root(0).into_bytes(),
+                                ),
+                                entries: vec![
+                                    RawBytes::from("empty"),
+                                    RawBytes::from("libprovider.a"),
+                                ],
+                            },
+                            DirectoryEnumeration {
+                                virtual_path: RawBytes::new(
+                                    plan.native_input_virtual_path(0, "empty").into_bytes(),
+                                ),
+                                entries: Vec::new(),
+                            },
+                        ]);
+                        native_paths.push(plan.native_input_virtual_path(0, "libprovider.a"));
+                        native_paths.push(plan.native_record_virtual_path(0));
+                    }
+                    for path in &native_paths {
+                        captured.inputs.push(PositiveInput {
+                            virtual_path: RawBytes::new(path.as_bytes().to_vec()),
+                            object: ObjectId(digest(path.as_bytes())),
+                            file_type: InputFileType::Regular,
+                            executable: false,
+                            symlink_resolution: Vec::new(),
+                        });
+                    }
+                    let record = own.then_some(TERMINAL_RECORD);
+                    let keyed = |plan: &DependencyActionPlan, inputs: &ActionInputManifest| {
+                        generated_terminal_key(plan, policy, &dependencies, inputs, record)
+                    };
+                    let key = keyed(&plan, &captured).unwrap();
+                    assert_eq!(key.descriptor.key_epoch, if committed { 39 } else { 38 });
+                    assert_eq!(
+                        committed_dependency_descriptor_policy(&key.descriptor),
+                        Some(policy)
+                    );
+                    assert!(uses_committed_dependency_namespace(&key.descriptor));
+                    for path in &native_paths {
+                        let mut changed = captured.clone();
+                        let input = changed
+                            .inputs
+                            .iter_mut()
+                            .find(|input| input.virtual_path.as_bytes() == path.as_bytes())
+                            .unwrap();
+                        input.object = ObjectId(digest(b"changed archive or Cargo record"));
+                        assert_ne!(key.action_key, keyed(&plan, &changed).unwrap().action_key);
+                        let mut missing = captured.clone();
+                        missing
+                            .inputs
+                            .retain(|input| input.virtual_path.as_bytes() != path.as_bytes());
+                        assert!(keyed(&plan, &missing).is_err());
+                    }
+                    let mut topology = captured.clone();
+                    let root = if foreign {
+                        plan.native_input_virtual_root(0)
+                    } else {
+                        plan.generated_virtual_root()
+                    };
+                    topology
+                        .directory_enumerations
+                        .iter_mut()
+                        .find(|entry| entry.virtual_path.as_bytes() == root.as_bytes())
+                        .unwrap()
+                        .entries
+                        .insert(0, RawBytes::from("another-empty"));
+                    topology.directory_enumerations.push(DirectoryEnumeration {
+                        virtual_path: RawBytes::new(format!("{root}/another-empty").into_bytes()),
+                        entries: Vec::new(),
+                    });
+                    assert_ne!(key.action_key, keyed(&plan, &topology).unwrap().action_key);
+                    topology.directory_enumerations.pop();
+                    assert!(keyed(&plan, &topology).is_err());
+                    for other in [
+                        CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata,
+                        CommittedDependencyPolicy::WorkspaceTerminalMetadata,
+                        CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata,
+                        CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
+                    ] {
+                        assert!(
+                            generated_terminal_key(&plan, other, &dependencies, &captured, record)
+                                .is_err()
+                        );
+                    }
+                    for mutation in 0..7 {
+                        let mut invalid = plan.clone();
+                        match mutation {
+                            0 => invalid.invocation.lib_search.push("native=/usr/lib".into()),
+                            1 => invalid
+                                .invocation
+                                .lib_search
+                                .push("framework=/System/Library".into()),
+                            2 => invalid.invocation.native_libs.push("dylib=host".into()),
+                            3 => invalid.invocation.emit.push("link".into()),
+                            4 => invalid.invocation.crate_types = vec!["proc-macro".into()],
+                            5 => invalid.invocation.codegen.push((
+                                "incremental".into(),
+                                Some("/__rabs/out/incremental".into()),
+                            )),
+                            _ => invalid
+                                .native_roots
+                                .push("/__rabs/out/cargo/debug/build/unbound/out".into()),
+                        }
+                        assert!(
+                            keyed(&invalid, &captured).is_err(),
+                            "native terminal mutation {mutation}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

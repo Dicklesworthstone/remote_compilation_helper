@@ -69,7 +69,9 @@ impl ProducerPolicy {
             CommittedDependencyPolicy::WorkspaceTerminalLeafMetadata
             | CommittedDependencyPolicy::WorkspaceTerminalMetadata
             | CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata
-            | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
+            | CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
+            | CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata
+            | CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata => {
                 (true, ProducerDomain::WorkspaceDag)
             }
         };
@@ -121,6 +123,9 @@ impl ProducerPolicy {
             ActionClassRisk::GeneratedWorkspaceTerminalMetadata => {
                 CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata
             }
+            ActionClassRisk::NativeWorkspaceTerminalMetadata => {
+                CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata
+            }
             _ => return None,
         };
         Some(Self::for_consumer(policy))
@@ -170,7 +175,9 @@ impl ProducerPolicy {
             ActionClassRisk::WorkspaceTerminalLeafMetadata
             | ActionClassRisk::WorkspaceTerminalMetadata
             | ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata
-            | ActionClassRisk::GeneratedWorkspaceTerminalMetadata => false,
+            | ActionClassRisk::GeneratedWorkspaceTerminalMetadata
+            | ActionClassRisk::NativeWorkspaceTerminalLeafMetadata
+            | ActionClassRisk::NativeWorkspaceTerminalMetadata => false,
             _ => false,
         }
     }
@@ -296,6 +303,12 @@ impl CoordLive {
             }
             CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
                 (ActionClassRisk::GeneratedWorkspaceTerminalMetadata, 35)
+            }
+            CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata => {
+                (ActionClassRisk::NativeWorkspaceTerminalLeafMetadata, 38)
+            }
+            CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata => {
+                (ActionClassRisk::NativeWorkspaceTerminalMetadata, 39)
             }
             _ => return Err("terminal completion has a nonterminal policy".into()),
         };
@@ -540,6 +553,7 @@ pub(super) fn check_offer(
         risk,
         ActionClassRisk::WorkspaceTerminalLeafMetadata
             | ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata
+            | ActionClassRisk::NativeWorkspaceTerminalLeafMetadata
     ) {
         return if offer.provisional_ancestors.is_empty() {
             Ok(())
@@ -600,6 +614,7 @@ pub(super) fn check_serving(
         risk,
         ActionClassRisk::WorkspaceTerminalLeafMetadata
             | ActionClassRisk::GeneratedWorkspaceTerminalLeafMetadata
+            | ActionClassRisk::NativeWorkspaceTerminalLeafMetadata
     ) {
         return if store
             .list_provisional_ancestors(&digest_key(action))
@@ -1185,6 +1200,12 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata => {
                     LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS
                 }
+                CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata => {
+                    LIVE_NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+                }
+                CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata => {
+                    LIVE_NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS
+                }
                 _ => panic!("terminal fixture requires an independently keyed terminal policy"),
             };
             self.prepare_class(tag, parents, outputs, class)
@@ -1254,6 +1275,8 @@ pub(crate) mod tests {
                 LIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 25,
                 LIVE_GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 34,
                 LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS => 35,
+                LIVE_NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => 38,
+                LIVE_NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS => 39,
                 _ => manifest.key_epoch,
             });
             manifest.logical_outputs = logical_outputs;
@@ -2116,6 +2139,8 @@ pub(crate) mod tests {
             CommittedDependencyPolicy::WorkspaceTerminalMetadata,
             CommittedDependencyPolicy::GeneratedWorkspaceTerminalLeafMetadata,
             CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
+            CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata,
+            CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata,
         ] {
             let fixture = WorkspaceLineageFixture::new();
             let parents = if !policy.is_terminal_leaf() {
@@ -2234,6 +2259,16 @@ pub(crate) mod tests {
                 CommittedDependencyPolicy::GeneratedWorkspaceTerminalMetadata,
                 LIVE_GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS,
                 25,
+            ),
+            (
+                CommittedDependencyPolicy::NativeWorkspaceTerminalLeafMetadata,
+                LIVE_NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+                34,
+            ),
+            (
+                CommittedDependencyPolicy::NativeWorkspaceTerminalMetadata,
+                LIVE_NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS,
+                35,
             ),
         ] {
             let fixture = WorkspaceLineageFixture::new();

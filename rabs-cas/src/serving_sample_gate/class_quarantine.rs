@@ -50,6 +50,10 @@ const GENERATED_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
     "rustc-workspace-generated-terminal-leaf-metadata-v1";
 const GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS: &str =
     "rustc-workspace-generated-terminal-metadata-v1";
+const NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS: &str =
+    "rustc-workspace-native-terminal-leaf-metadata-v1";
+const NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS: &str =
+    "rustc-workspace-native-terminal-metadata-v1";
 
 const CLASS_SQL: &str = r#"
 SELECT decision FROM decision_receipts
@@ -184,6 +188,12 @@ pub(super) fn refusal(
             }
             [SqlValue::Text(class)] if class == GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS => {
                 GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS => {
+                NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS
+            }
+            [SqlValue::Text(class)] if class == NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS => {
+                NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS
             }
             // A caller's LowRiskRegistry flag cannot overrule a recorded
             // private/unknown class, even if its per-action evidence passes.
@@ -763,6 +773,14 @@ mod tests {
             (
                 GENERATED_WORKSPACE_TERMINAL_METADATA_CLASS,
                 ActionClassRisk::GeneratedWorkspaceTerminalMetadata,
+            ),
+            (
+                NATIVE_WORKSPACE_TERMINAL_LEAF_METADATA_CLASS,
+                ActionClassRisk::NativeWorkspaceTerminalLeafMetadata,
+            ),
+            (
+                NATIVE_WORKSPACE_TERMINAL_METADATA_CLASS,
+                ActionClassRisk::NativeWorkspaceTerminalMetadata,
             ),
         ] {
             let mut store =

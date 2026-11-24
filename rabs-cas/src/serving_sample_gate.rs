@@ -142,6 +142,12 @@ pub enum ActionClassRisk {
     /// Selected terminal checks with complete own generated inputs and exact
     /// committed ancestry, independently sampled from every other terminal class.
     GeneratedWorkspaceTerminalMetadata,
+    /// Terminal metadata with retained own/propagated static native inputs and
+    /// an empty Rust candidate inventory; separately sampled from all libraries.
+    NativeWorkspaceTerminalLeafMetadata,
+    /// Terminal metadata with retained static native inputs and exact committed
+    /// ancestry; no other terminal or native-library samples confer authority.
+    NativeWorkspaceTerminalMetadata,
     /// Anything else: general workspace outputs, tool-generated code, unknown
     /// classes. Never sampled.
     Elevated,

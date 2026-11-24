@@ -381,8 +381,7 @@ fn validate_propagated_native_plan(
             .any(|arg| arg == "--test")
         || plan.native_roots.is_empty()
         || remote::validate_plan_native_roots(plan)?.is_empty()
-        || remote::remote_dependency_output_class(&plan.invocation)
-            != Ok(policy.output_class())
+        || remote::remote_dependency_output_class(&plan.invocation) != Ok(policy.output_class())
     {
         return Err(LiveRefusal::Facts(
             "propagated native workspace caching requires its exact ordinary library output class, complete foreign Cargo OUT_DIR inputs and committed Rust ancestry"
@@ -1459,7 +1458,7 @@ mod tests {
                     );
                     assert_eq!(
                         plan.output_names(),
-                        ["consumer.d", "libconsumer.rmeta", "libconsumer.rlib"]
+                        ["consumer.d", "libconsumer.rlib", "libconsumer.rmeta"]
                     );
                     assert!(plan_propagated_native_workspace_dag_rlib(&plan).is_err());
                     assert!(plan_propagated_native_workspace_dag_metadata(&fresh).is_err());
@@ -1542,7 +1541,9 @@ mod tests {
         reordered.invocation.lib_search.reverse();
         assert_ne!(
             original.action_key,
-            keyed(&reordered, &captured, &dependencies).unwrap().action_key
+            keyed(&reordered, &captured, &dependencies)
+                .unwrap()
+                .action_key
         );
         for index in 0..plan.native_roots.len() {
             for path in [
@@ -1617,7 +1618,10 @@ mod tests {
                 5 => changed.invocation.native_libs = vec!["static:-bundle=provider".into()],
                 6 => changed.invocation.native_libs = vec!["static:+verbatim=../outside.a".into()],
                 7 => changed.invocation.lib_search.push("native=/usr/lib".into()),
-                8 => changed.invocation.lib_search.push("framework=/System/Library".into()),
+                8 => changed
+                    .invocation
+                    .lib_search
+                    .push("framework=/System/Library".into()),
                 9 => changed.invocation.emit.retain(|kind| kind != "link"),
                 10 => changed.invocation.crate_types = vec!["bin".into()],
                 _ => changed.invocation.passthrough.push("--test".into()),
