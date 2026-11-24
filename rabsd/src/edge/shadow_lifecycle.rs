@@ -4,6 +4,7 @@
 //! Runs the ATP control plane IN SHADOW alongside the existing RCH
 //! control path: the daemon's lifecycle event stream (`build_queued`,
 //! `build_started`, `cancellation_requested`, `build_completed`,
+//! `build_preparation_completed`,
 //! `build_heartbeat` — the EventBus JSON-line schema) is translated to
 //! J012's `RabsMessage` catalog, folded through the pure
 //! [`SessionState`] decision function, and each ATP-plane outcome is
@@ -26,11 +27,12 @@ use rabs_protocol::messages::{HandlerOutcome, RabsMessage, SessionState};
 
 /// The lifecycle events the comparator understands. Anything else on
 /// the bus is ignored (the stream carries ops-domain noise too).
-pub const KNOWN_EVENTS: [&str; 5] = [
+pub const KNOWN_EVENTS: [&str; 6] = [
     "build_queued",
     "build_started",
     "cancellation_requested",
     "build_completed",
+    "build_preparation_completed",
     "build_heartbeat",
 ];
 
@@ -196,7 +198,7 @@ impl LifecycleTranslator {
                     },
                 }
             }
-            "build_completed" => ShadowStep {
+            "build_completed" | "build_preparation_completed" => ShadowStep {
                 label,
                 message: RabsMessage::AttemptEvent {
                     identity: identity(build_id),
@@ -378,6 +380,19 @@ mod tests {
         assert_eq!(report.steps_compared, 3); // heartbeat skipped
         assert!(report.zero_disagreement());
         assert!(report.to_ndjson().is_empty());
+    }
+
+    #[test]
+    fn preparation_completion_settles_the_admitted_lifecycle() {
+        let lines = [
+            line("build_queued", 43),
+            line("build_started", 43),
+            line("build_heartbeat", 43),
+            line("build_preparation_completed", 43),
+        ];
+        let report = compare_rch_stream(&lines).unwrap();
+        assert_eq!(report.steps_compared, 3);
+        assert!(report.zero_disagreement());
     }
 
     #[test]

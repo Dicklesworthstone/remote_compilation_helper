@@ -8317,6 +8317,7 @@ fn runtime_recovery_reporting_only_uses_observed_direct_or_cargo_wrapped_sigill(
             disk_peak_output_bytes: None,
             disk_observation: None,
             cargo_stdout: None,
+            source_sync: None,
         };
         assert_eq!(
             remote_result_requires_runtime_recovery(&result),
@@ -9571,6 +9572,7 @@ fn source_upload_disk_release_never_infers_worker_pressure_from_untyped_transfer
             disk_peak_output_bytes: None,
             disk_observation: None,
             cargo_stdout: None,
+            source_sync: None,
         });
         let faults = remote_release_faults(&result, &worker);
         assert_eq!(faults.worker_fault, exit_code != 0);
@@ -9622,6 +9624,7 @@ fn live_checkout_refusal_reaches_the_release_only_from_the_source_sync() {
         disk_peak_output_bytes: None,
         disk_observation: None,
         cargo_stdout: None,
+        source_sync: None,
     });
     assert!(!remote_release_faults(&build, &worker).live_checkout_refused);
 
@@ -13705,6 +13708,7 @@ async fn native_budget_refusal_precedes_transfer_and_does_not_blame_the_worker()
             &policy,
             None,
             false,
+            false,
             &[],
             None,
             false,
@@ -13816,6 +13820,7 @@ async fn registered_preflight_rejection_sends_heartbeat_and_stops_guard() {
         &policy,
         None,
         true,
+        false,
         &[],
         None,
         false,
@@ -13949,6 +13954,7 @@ async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts
         &policy,
         None,
         false,
+        false,
         &[],
         None,
         false,
@@ -14074,6 +14080,7 @@ async fn test_terminal_source_sync_failure_never_launches_remote_cargo() {
         None,
         &policy,
         None,
+        false,
         false,
         &[],
         None,
@@ -14272,6 +14279,7 @@ async fn test_layer0_pack_reaches_the_executed_remote_command() {
         &policy,
         None,
         false,
+        false,
         &[],
         None,
         false,
@@ -14384,6 +14392,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         &policy,
         None,
         false,
+        false,
         &[],
         None,
         false,
@@ -14414,6 +14423,7 @@ async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
         None,
         &policy,
         None,
+        false,
         false,
         &[],
         None,

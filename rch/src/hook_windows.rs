@@ -55,6 +55,7 @@ pub async fn run_exec(
     overlay_paths: Vec<PathBuf>,
     no_overlay: bool,
     source_content_receipt: bool,
+    sync_only: bool,
     job: bool,
     result_dirs: Vec<PathBuf>,
     result_dest: Option<PathBuf>,
@@ -65,6 +66,11 @@ pub async fn run_exec(
     command_parts: Vec<String>,
     _out_ctx: &crate::ui::context::OutputContext,
 ) -> anyhow::Result<()> {
+    if sync_only {
+        anyhow::bail!(
+            "--sync-only requires source admission and upload through the Unix daemon transport; no local command was started"
+        );
+    }
     if exact_worker.is_some() {
         anyhow::bail!("--worker remote admission requires the Unix daemon transport");
     }

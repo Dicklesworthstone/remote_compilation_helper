@@ -664,6 +664,7 @@ wiped. Without --force (or with --dry-run) it only previews the plan."#)]
     rch exec -- cargo build --release
     rch exec -- cargo test
     rch exec -- bun test
+    rch exec --sync-only -- cargo build --release
     rch exec --base HEAD --clean-overlay --overlay-path src/lib.rs -- cargo test
     rch exec --base HEAD --clean-overlay --no-overlay -- cargo check
     rch exec --job -- sharded_tests/run.sh
@@ -702,6 +703,25 @@ USAGE:
         /// Emit a worker-verified per-root manifest for the exact transferred source bytes
         #[arg(long)]
         source_content_receipt: bool,
+        /// Upload the admitted source closure for this build without running it.
+        /// Requires a remote worker and reports every synchronized root. No
+        /// compiler, test, artifact retrieval, or local fallback is performed.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "job",
+                "result_dir",
+                "result_dest",
+                "fresh_result_dirs",
+                "clean_overlay",
+                "source_content_receipt",
+                "base",
+                "dependency_base",
+                "overlay_path",
+                "no_overlay",
+            ]
+        )]
+        sync_only: bool,
         /// Admit an arbitrary NON-compilation job (sharded tests, fuzzing,
         /// benchmarks, mutation testing). Bypasses ONLY the compilation
         /// classifier: the command rides the normal selection/sync/execute/
@@ -2615,6 +2635,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                 overlay_path,
                 no_overlay,
                 source_content_receipt,
+                sync_only,
                 job,
                 result_dir,
                 result_dest,
@@ -2631,6 +2652,7 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
                     overlay_path,
                     no_overlay,
                     source_content_receipt,
+                    sync_only,
                     job,
                     result_dir,
                     result_dest,
@@ -8741,6 +8763,7 @@ mod tests {
                 overlay_path,
                 no_overlay,
                 source_content_receipt,
+                sync_only,
                 job,
                 result_dir,
                 result_dest: _,
@@ -8758,6 +8781,7 @@ mod tests {
                 );
                 assert!(!no_overlay);
                 assert!(!source_content_receipt);
+                assert!(!sync_only);
                 assert!(!job);
                 assert!(result_dir.is_empty());
                 assert!(!fresh_result_dirs);
@@ -8792,6 +8816,7 @@ mod tests {
                 overlay_path,
                 no_overlay,
                 source_content_receipt,
+                sync_only,
                 job,
                 result_dir,
                 result_dest: _,
@@ -8807,6 +8832,7 @@ mod tests {
                 assert!(overlay_path.is_empty());
                 assert!(no_overlay);
                 assert!(!source_content_receipt);
+                assert!(!sync_only);
                 assert!(!job);
                 assert!(result_dir.is_empty());
                 assert!(!fresh_result_dirs);
@@ -9063,6 +9089,91 @@ mod tests {
             parsed(&["rch", "exec", "--job", "--require-remote", "--", "true"]),
             (true, true, vec!["true".to_string()])
         );
+    }
+
+    #[test]
+    fn cli_parses_source_sync_with_exact_worker_and_build_command() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "--json",
+            "exec",
+            "--sync-only",
+            "--worker",
+            "build-worker",
+            "--require-tool",
+            "clang",
+            "--require-remote",
+            "--",
+            "cargo",
+            "build",
+            "--release",
+            "--package",
+            "project",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        let Some(Commands::Exec {
+            sync_only,
+            worker,
+            require_tool,
+            require_remote,
+            command,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected source-only exec command");
+        };
+        assert!(sync_only && require_remote);
+        assert_eq!(worker, Some(rch_common::WorkerId::new("build-worker")));
+        assert_eq!(require_tool, ["clang"]);
+        assert_eq!(
+            command,
+            ["cargo", "build", "--release", "--package", "project"]
+        );
+        assert!(Cli::try_parse_from(["rch", "exec", "--sync-only"]).is_err());
+    }
+
+    #[test]
+    fn cli_rejects_source_sync_with_execution_or_ephemeral_source_options() {
+        let _guard = test_guard!();
+        for incompatible in [
+            vec!["--job"],
+            vec!["--result-dir", "reports"],
+            vec!["--result-dest", "/tmp/reports"],
+            vec!["--fresh-result-dirs"],
+            vec!["--clean-overlay"],
+            vec!["--source-content-receipt"],
+            vec!["--base", "HEAD"],
+            vec!["--dependency-base", "../dep=HEAD"],
+            vec!["--overlay-path", "src/lib.rs"],
+            vec!["--no-overlay"],
+        ] {
+            let mut arguments = vec!["rch", "exec", "--sync-only"];
+            arguments.extend(incompatible);
+            arguments.extend(["--", "cargo", "check"]);
+            let error = Cli::try_parse_from(&arguments).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "unexpected parser error for {arguments:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_keeps_source_sync_opt_in_and_preserves_command_arguments() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "exec", "--", "cargo", "test", "--", "--sync-only"])
+            .unwrap();
+        let Some(Commands::Exec {
+            sync_only, command, ..
+        }) = cli.command
+        else {
+            panic!("expected ordinary exec command");
+        };
+        assert!(!sync_only);
+        assert_eq!(command, ["cargo", "test", "--", "--sync-only"]);
     }
 
     #[test]

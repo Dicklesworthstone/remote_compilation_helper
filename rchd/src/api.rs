@@ -4697,11 +4697,17 @@ async fn handle_release_worker_from(
         }
         if !cfg!(test) {
             metrics::dec_active_builds("remote");
-            let outcome = if exit_code == 0 { "success" } else { "failure" };
-            metrics::inc_build_total(outcome, "remote");
+            if remote_command_started {
+                let outcome = if exit_code == 0 { "success" } else { "failure" };
+                metrics::inc_build_total(outcome, "remote");
+            }
         }
         ctx.events.emit(
-            "build_completed",
+            if remote_command_started {
+                "build_completed"
+            } else {
+                "build_preparation_completed"
+            },
             &serde_json::json!({
                 "build_id": rec.id,
                 "project_id": rec.project_id,
@@ -4716,7 +4722,8 @@ async fn handle_release_worker_from(
         // Only successful command completions are positive worker-health
         // signals. A nonzero command exit is a build/test result, not an
         // infrastructure failure for the worker circuit.
-        if let Some(endpoint) = worker_endpoint.as_ref()
+        if remote_command_started
+            && let Some(endpoint) = worker_endpoint.as_ref()
             && let Some(worker) = ctx.pool.get(&endpoint.config.id).await
         {
             if exit_code == 0
@@ -7370,6 +7377,7 @@ mod tests {
                     .is_none()
             );
             let build_id = selected.build_id.unwrap();
+            observe_test_execution(&ctx, build_id);
             let line = format!(
                 "POST /release-worker?worker=warm-worker&build_id={build_id}&local_wrapper_id={owner}&exit_code=0&disk_peak_output_bytes={}&disk_observation={encoded}",
                 81 * gib,
@@ -7478,6 +7486,7 @@ mod tests {
         let build_id = selected.build_id.unwrap();
         let budget = selected.worker.unwrap().disk_budget.unwrap();
         assert_eq!(budget.max_growth_bytes, 30 * gib);
+        observe_test_execution(&ctx, build_id);
         let line = format!(
             "POST /release-worker?worker=growth-worker&build_id={build_id}&local_wrapper_id=growth-owner&exit_code=137&worker_fault=1&disk_peak_output_bytes={}&disk_peak_growth_bytes={}",
             82 * gib,
@@ -10327,6 +10336,7 @@ mod tests {
         );
         assert_eq!(active.slots, 2);
 
+        observe_test_execution(&ctx, build_id);
         // Release should finalize the active build and move it into history
         handle_release_worker(
             &ctx,
@@ -15243,6 +15253,23 @@ mod tests {
         (response.build_id.unwrap(), wrapper)
     }
 
+    fn observe_test_execution(ctx: &DaemonContext, build_id: u64) {
+        let state = ctx.history.active_build(build_id).unwrap();
+        ctx.history
+            .record_build_heartbeat(rch_common::BuildHeartbeatRequest {
+                build_id,
+                worker_id: WorkerId::new(state.worker_id),
+                hook_pid: None,
+                local_wrapper_id: state.local_wrapper_id,
+                remote_pgid_file: None,
+                phase: rch_common::BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: Some(1),
+                progress_percent: None,
+            })
+            .expect("completed build fixture entered execution");
+    }
+
     /// Serve one request over a real socket pair, so the daemon reads its peer
     /// from the kernel exactly as it does in production.
     async fn serve_socket_request(ctx: &DaemonContext, line: &str) -> (Result<()>, String) {
@@ -15425,6 +15452,7 @@ mod tests {
 
         // Reserve slots
         worker.reserve_slots(4).await;
+        observe_test_execution(&ctx, build_id);
 
         let request = ReleaseRequest {
             worker_source_topology_mismatch: None,
@@ -15463,6 +15491,112 @@ mod tests {
                 .get_fallback_worker("test-project")
                 .await,
             Some("worker1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_preparation_releases_once_without_compiler_feedback() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool.clone());
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        worker
+            .record_failure(Some("prior compiler failure".into()))
+            .await;
+        let wrapper = "source-only-owner";
+        let build = ctx
+            .history
+            .try_start_active_build_with_waiter(
+                "source-project".into(),
+                "worker1".into(),
+                "cargo build".into(),
+                12345,
+                Some(wrapper.into()),
+                2,
+                rch_common::BuildLocation::Remote,
+                None,
+                crate::disk_pressure::DiskHeadroomAdmission::default(),
+                Some(worker.endpoint_snapshot().await),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!build.remote_command_started());
+        assert!(worker.reserve_slots(2).await);
+        let mut events = ctx.events.subscribe();
+        let release = ReleaseRequest {
+            worker_source_topology_mismatch: None,
+            local_wrapper_id: Some(wrapper.into()),
+            worker_id: WorkerId::new("worker1"),
+            slots: 2,
+            build_id: Some(build.id),
+            exit_code: Some(0),
+            disk_peak_output_bytes: None,
+            disk_peak_growth_bytes: None,
+            disk_observation: None,
+            duration_ms: None,
+            bytes_transferred: Some(1024),
+            timing: None,
+            worker_fault: false,
+            worker_disk_full: false,
+            worker_live_checkout_refused: false,
+            worker_source_busy: false,
+            worker_disk_roots: Vec::new(),
+        };
+        let mut forged = release.clone();
+        forged.local_wrapper_id = Some("different-owner".into());
+        assert!(handle_release_worker(&ctx, forged).await.is_err());
+        assert_eq!(worker.used_slots(), 2);
+        assert!(ctx.history.active_build(build.id).is_some());
+
+        handle_release_worker(&ctx, release.clone()).await.unwrap();
+        assert_eq!(worker.used_slots(), 0);
+        assert!(ctx.history.active_build(build.id).is_none());
+        assert_eq!(
+            ctx.history
+                .terminal_build(build.id, wrapper)
+                .unwrap()
+                .exit_code,
+            0
+        );
+        assert!(ctx.history.recent(10).is_empty());
+        assert_eq!(worker.circuit_stats().await.recent_results(), &[false]);
+        assert_eq!(
+            ctx.worker_selector
+                .get_fallback_worker("source-project")
+                .await,
+            None
+        );
+        assert_eq!(
+            ctx.worker_selector
+                .get_pinned_worker("source-project")
+                .await,
+            None
+        );
+        assert_eq!(
+            ctx.worker_selector
+                .cache_warmth(
+                    "worker1",
+                    "source-project",
+                    crate::selection::CacheUse::Build
+                )
+                .await,
+            0.0
+        );
+        let event: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(event["event"], "build_preparation_completed");
+        assert_eq!(event["data"]["build_id"], build.id);
+
+        assert!(worker.reserve_slots(1).await);
+        handle_release_worker(&ctx, release).await.unwrap();
+        assert_eq!(
+            worker.used_slots(),
+            1,
+            "duplicate release cannot free a later reservation"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a duplicate produces no second terminal event"
         );
     }
 
@@ -15543,6 +15677,7 @@ mod tests {
                 id
             };
             assert_eq!(worker.used_slots(), 3);
+            observe_test_execution(&ctx, build_id);
             if matches!(change, "retarget" | "aba") {
                 let mut replacement = original.clone();
                 replacement.host = "replacement.host".into();

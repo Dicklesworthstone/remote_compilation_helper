@@ -1461,6 +1461,196 @@ pub fn source_recovery_resources_retired(recipe: &serde_json::Value) -> bool {
         && acknowledged("tree_retired", has_tree)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceSyncRecoveryState {
+    report: SourceSyncRecoveryReport,
+    uploads_complete: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceSyncRecoveryReport {
+    roots: Vec<SourceSyncRecoveryRoot>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceSyncRecoveryRoot {
+    local_root: PathBuf,
+    remote_root: String,
+    mode: String,
+}
+
+/// Validate the distinct version 3 source-only operation without interpreting
+/// its wrapper success as compiler completion. This is shared admission and
+/// settlement evidence; the client still reloads the complete typed recipe
+/// under its journal owner before any worker operation.
+#[must_use]
+pub fn source_sync_recovery_is_valid(recipe: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    let Some(object) = recipe.as_object() else {
+        return false;
+    };
+    let Some(sync) = object
+        .get("source_sync")
+        .and_then(|value| serde_json::from_value::<SourceSyncRecoveryState>(value.clone()).ok())
+    else {
+        return false;
+    };
+    let Ok(worker) = serde_json::from_value::<crate::WorkerConfig>(recipe["worker"].clone()) else {
+        return false;
+    };
+    let flag = |name: &str| object.get(name).and_then(Value::as_bool);
+    let absent = |name: &str| object.get(name).is_none_or(Value::is_null);
+    if recipe["version"].as_u64() != Some(3)
+        || recipe["source_authority_namespace"].as_str() != Some("current")
+        || crate::declared_os(&worker.tags).as_deref() == Some("windows")
+        || [
+            "prepared",
+            "execution_started",
+            "allow_foreign",
+            "package_archive",
+        ]
+        .iter()
+        .any(|name| flag(name) != Some(false))
+        || !matches!(
+            object.get("staging_released"),
+            None | Some(Value::Bool(false))
+        )
+        || recipe["expected_triple"].as_str() != Some("")
+        || !recipe["phases"].as_array().is_some_and(Vec::is_empty)
+        || [
+            "exit_code",
+            "kind",
+            "pinned_triple",
+            "pair",
+            "retire_root",
+            "retained_root",
+            "retained_materialized",
+            "staging_ownership",
+            "result_destination",
+            "fresh_job_results",
+            "cargo_output_capture",
+            "build_system_output_capture",
+            "go_coverage_capture",
+            "go_compilation_only",
+            "prepared_dependencies",
+            "cargo_stdout",
+            "cargo_stderr",
+            "caller_json_policy",
+            "caller_json_local_source_root",
+            "caller_delivery",
+        ]
+        .iter()
+        .any(|name| !absent(name))
+    {
+        return false;
+    }
+    let identity_valid = recipe["identity"].as_str().is_some_and(|identity| {
+        !identity.is_empty()
+            && identity.len() <= 128
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b'-')
+    });
+    // Source-only work currently uses Unix grants. Require their original
+    // spelling; do not normalize an ambiguous path into broader authority.
+    let valid_path = |path: &str| {
+        path.starts_with('/')
+            && !path.chars().any(char::is_control)
+            && (path == "/"
+                || path
+                    .split('/')
+                    .skip(1)
+                    .all(|part| !part.is_empty() && part != "." && part != ".."))
+    };
+    let Some(project) = recipe["project_root"]
+        .as_str()
+        .filter(|path| valid_path(path))
+    else {
+        return false;
+    };
+    let Some(granted) = recipe["source_roots"].as_array() else {
+        return false;
+    };
+    let mut grant_roots = BTreeSet::new();
+    for root in granted {
+        let Some(root) = root.as_str().filter(|root| valid_path(root)) else {
+            return false;
+        };
+        if !grant_roots.insert(root.to_owned()) {
+            return false;
+        }
+    }
+    let mut local_roots = BTreeSet::new();
+    let mut remote_roots = BTreeSet::new();
+    let mut invocation_covered = false;
+    for root in &sync.report.roots {
+        if !root.local_root.to_str().is_some_and(valid_path)
+            || !valid_path(&root.remote_root)
+            || !matches!(root.mode.as_str(), "full" | "workspace_metadata")
+            || !local_roots.insert(root.local_root.clone())
+            || !remote_roots.insert(root.remote_root.clone())
+        {
+            return false;
+        }
+        invocation_covered |=
+            root.mode == "full" && std::path::Path::new(project).starts_with(&root.local_root);
+    }
+    if !identity_valid || !invocation_covered || remote_roots != grant_roots {
+        return false;
+    }
+    let returned = match object.get("returned") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_i64().and_then(|exit| i32::try_from(exit).ok()) {
+            Some(exit) => Some(exit),
+            None => return false,
+        },
+    };
+    let cancellation = match object.get("source_cancellation_settled") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(settled)) => Some(*settled),
+        _ => return false,
+    };
+    let (Some(cancelled), Some(released), Some(tree_retired), Some(pair_released), Some(retired)) = (
+        flag("preparation_cancelled"),
+        flag("sources_released"),
+        flag("tree_retired"),
+        flag("pair_released"),
+        flag("retired"),
+    ) else {
+        return false;
+    };
+    if cancellation == Some(true) && !(released && returned.is_some_and(|exit| exit != 0)) {
+        return false;
+    }
+    if sync.uploads_complete {
+        !cancelled
+            && cancellation.is_none()
+            && !tree_retired
+            && !pair_released
+            && returned.is_none_or(|exit| exit == 0)
+            && (returned.is_none() || released)
+            && (!retired || (released && returned == Some(0)))
+    } else {
+        returned.is_none_or(|exit| exit != 0)
+            && (cancelled
+                || (returned.is_none()
+                    && cancellation.is_none()
+                    && !released
+                    && !tree_retired
+                    && !pair_released
+                    && !retired))
+            && (!retired
+                || (released
+                    && returned.is_some_and(|exit| exit != 0)
+                    && cancellation == Some(true)))
+    }
+}
+
 /// Select a retired delivery whose remaining settlement can use local daemon IPC.
 ///
 /// This is a structural admission check, not permission to run general recovery.
@@ -1493,7 +1683,6 @@ pub fn local_terminal_settlement_candidate(lease: &DurableJobLease) -> bool {
             lease.state,
             JobLifecycleState::Running | JobLifecycleState::Finished | JobLifecycleState::Abandoned
         )
-        || recipe["version"].as_u64() != Some(2)
         || recipe["wrapper_id"].as_str() != Some(lease.identity.local_wrapper_id.as_str())
         || recipe["build_id"].as_u64() != Some(build_id)
         || recipe["worker"]["id"].as_str() != Some(worker_id)
@@ -1512,6 +1701,11 @@ pub fn local_terminal_settlement_candidate(lease: &DurableJobLease) -> bool {
         && (lease.state != JobLifecycleState::Finished || lease.exit_code != Some(returned))
     {
         return false;
+    }
+    match recipe["version"].as_u64() {
+        Some(3) => return source_sync_recovery_is_valid(recipe),
+        Some(2) if recipe.get("source_sync").is_none_or(Value::is_null) => {}
+        _ => return false,
     }
     let optional_flag = |name: &str| match recipe.get(name) {
         None => Some(false),
@@ -1617,6 +1811,149 @@ mod tests {
             "future_custody": {"original": true}
         }));
         lease
+    }
+
+    fn source_sync_settlement_lease() -> DurableJobLease {
+        let mut lease = local_settlement_lease(0);
+        lease.recovery = Some(serde_json::json!({
+            "version": 3, "wrapper_id": lease.identity.local_wrapper_id,
+            "build_id": 7,
+            "worker": {"id": "worker", "host": "worker.invalid", "user": "builder",
+                "identity_file": "/unused/key", "total_slots": 1, "priority": 100, "tags": []},
+            "identity": "abc123", "completion": "/worker/recovery-7-abc123.done",
+            "source_authority_namespace": "current", "source_roots": ["/worker/source", "/worker/workspace"],
+            "project_root": "/caller/source/subdirectory", "expected_triple": "",
+            "prepared": false, "execution_started": false, "preparation_cancelled": false,
+            "allow_foreign": false, "package_archive": false, "exit_code": null,
+            "returned": 0, "retired": true, "sources_released": true,
+            "tree_retired": false, "pair_released": false, "phases": [],
+            "source_sync": {"uploads_complete": true, "report": {"roots": [
+                {"local_root": "/caller/source", "remote_root": "/worker/source", "mode": "full"},
+                {"local_root": "/caller/workspace", "remote_root": "/worker/workspace", "mode": "workspace_metadata"}
+            ]}}
+        }));
+        lease
+    }
+
+    #[test]
+    fn source_sync_settlement_requires_release_but_never_compiler_completion() {
+        let settled = source_sync_settlement_lease();
+        assert!(source_sync_recovery_is_valid(
+            settled.recovery.as_ref().unwrap()
+        ));
+        assert!(local_terminal_settlement_candidate(&settled));
+        let mut pending = settled.clone();
+        let recipe = pending.recovery.as_mut().unwrap();
+        recipe["sources_released"] = serde_json::json!(false);
+        recipe["returned"] = serde_json::Value::Null;
+        recipe["retired"] = serde_json::json!(false);
+        assert!(source_sync_recovery_is_valid(recipe));
+        assert!(!local_terminal_settlement_candidate(&pending));
+        pending.recovery.as_mut().unwrap()["sources_released"] = serde_json::json!(true);
+        assert!(!local_terminal_settlement_candidate(&pending));
+        let mut acknowledged = settled;
+        acknowledged.exit_code = Some(0);
+        acknowledged.acknowledge_terminal(2);
+        assert!(local_terminal_settlement_candidate(&acknowledged));
+        acknowledged.exit_code = Some(137);
+        assert!(!local_terminal_settlement_candidate(&acknowledged));
+    }
+
+    #[test]
+    fn source_sync_settlement_preserves_normalized_filesystem_root_spelling() {
+        let mut lease = source_sync_settlement_lease();
+        let recipe = lease.recovery.as_mut().unwrap();
+        recipe["project_root"] = serde_json::json!("/");
+        recipe["source_roots"] = serde_json::json!(["/", "/worker/workspace"]);
+        recipe["source_sync"]["report"]["roots"][0]["local_root"] = serde_json::json!("/");
+        recipe["source_sync"]["report"]["roots"][0]["remote_root"] = serde_json::json!("/");
+        assert!(source_sync_recovery_is_valid(recipe));
+        assert!(local_terminal_settlement_candidate(&lease));
+    }
+
+    #[test]
+    fn source_sync_settlement_refuses_malformed_or_unrelated_authority() {
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("source_sync", serde_json::Value::Null),
+            ("source_roots", serde_json::json!(["/worker/source"])),
+            (
+                "source_roots",
+                serde_json::json!(["/worker/source", "/worker/workspace", "/worker/target"]),
+            ),
+            ("project_root", serde_json::json!("/outside/invocation")),
+            ("prepared", serde_json::json!(true)),
+            ("execution_started", serde_json::json!(true)),
+            ("preparation_cancelled", serde_json::json!(true)),
+            ("exit_code", serde_json::json!(0)),
+            ("tree_retired", serde_json::json!(true)),
+            ("pair_released", serde_json::json!(true)),
+            ("pair", serde_json::json!(["/worker/source", "abc123"])),
+            ("retire_root", serde_json::json!("/worker/source")),
+            ("go_compilation_only", serde_json::json!({})),
+            ("cargo_stdout", serde_json::json!({})),
+            ("source_cancellation_settled", serde_json::json!(true)),
+            ("source_authority_namespace", serde_json::json!("legacy")),
+        ] {
+            let mut lease = source_sync_settlement_lease();
+            lease.recovery.as_mut().unwrap()[field] = value;
+            assert!(
+                !source_sync_recovery_is_valid(lease.recovery.as_ref().unwrap()),
+                "{field}"
+            );
+            assert!(!local_terminal_settlement_candidate(&lease), "{field}");
+        }
+        for field in [
+            "prepared",
+            "execution_started",
+            "sources_released",
+            "tree_retired",
+            "pair_released",
+            "retired",
+        ] {
+            for value in [serde_json::Value::Null, serde_json::json!("false")] {
+                let mut lease = source_sync_settlement_lease();
+                lease.recovery.as_mut().unwrap()[field] = value;
+                assert!(
+                    !source_sync_recovery_is_valid(lease.recovery.as_ref().unwrap()),
+                    "{field}"
+                );
+            }
+        }
+        for (field, value) in [
+            ("local_root", serde_json::json!("/outside/source")),
+            ("remote_root", serde_json::json!("/worker/unadmitted")),
+            ("mode", serde_json::json!("workspace_metadata")),
+            ("mode", serde_json::json!("unknown")),
+            ("mode", serde_json::Value::Null),
+            ("future_authority", serde_json::json!(true)),
+        ] {
+            let mut lease = source_sync_settlement_lease();
+            lease.recovery.as_mut().unwrap()["source_sync"]["report"]["roots"][0][field] = value;
+            assert!(
+                !source_sync_recovery_is_valid(lease.recovery.as_ref().unwrap()),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_source_sync_settlement_requires_failed_drained_cancellation() {
+        let mut lease = source_sync_settlement_lease();
+        let recipe = lease.recovery.as_mut().unwrap();
+        recipe["source_sync"]["uploads_complete"] = serde_json::json!(false);
+        assert!(!source_sync_recovery_is_valid(recipe));
+        recipe["preparation_cancelled"] = serde_json::json!(true);
+        recipe["returned"] = serde_json::json!(101);
+        recipe["tree_retired"] = serde_json::json!(true);
+        recipe["pair_released"] = serde_json::json!(true);
+        recipe["source_cancellation_settled"] = serde_json::json!(false);
+        assert!(!source_sync_recovery_is_valid(recipe));
+        recipe["source_cancellation_settled"] = serde_json::json!(true);
+        assert!(source_sync_recovery_is_valid(recipe));
+        assert!(local_terminal_settlement_candidate(&lease));
+        lease.recovery.as_mut().unwrap()["returned"] = serde_json::json!(0);
+        assert!(!local_terminal_settlement_candidate(&lease));
     }
 
     #[test]

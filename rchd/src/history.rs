@@ -121,6 +121,10 @@ const MAX_TERMINAL_RECEIPTS: usize = 500;
 struct TerminalOwnership {
     record: BuildRecord,
     local_wrapper_id: Option<String>,
+    /// This owner finished source preparation without starting its command.
+    /// Keep its release receipt without teaching compiler history a success.
+    #[serde(default)]
+    preparation_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_topology_mismatch: Option<rch_common::SourceTopologyMismatch>,
     /// Completion must not erase an owner-validated infrastructure fault
@@ -1238,7 +1242,7 @@ impl BuildHistory {
         disk_observation: Option<rch_common::BuildDiskObservation>,
         cancelled: bool,
     ) {
-        if state.location != BuildLocation::Remote {
+        if !state.remote_command_started() {
             return;
         }
         let now = Utc::now().timestamp();
@@ -2824,6 +2828,13 @@ impl BuildHistory {
                 }
                 for receipt in snapshot.completed {
                     let id = receipt.record.id;
+                    if receipt.preparation_only && receipt.record.location != BuildLocation::Remote
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "source preparation receipt is not a remote operation",
+                        ));
+                    }
                     if let Some(mismatch) = &receipt.source_topology_mismatch {
                         mismatch.validate().map_err(|error| {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, error)
@@ -2896,7 +2907,9 @@ impl BuildHistory {
                         ));
                     }
                     max_id = max_id.max(id);
-                    if !records.iter().any(|record| record.id == id) {
+                    if receipt.preparation_only && receipt.record.exit_code == 0 {
+                        records.retain(|record| record.id != id);
+                    } else if !records.iter().any(|record| record.id == id) {
                         records.push_back(receipt.record.clone());
                     }
                     terminal.insert(id, receipt);
@@ -3362,6 +3375,8 @@ impl BuildHistory {
         let receipt = TerminalOwnership {
             record: record.clone(),
             local_wrapper_id: state.local_wrapper_id.clone(),
+            preparation_only: state.location == BuildLocation::Remote
+                && !state.remote_command_started(),
             source_topology_mismatch: state.source_topology_mismatch.clone(),
             pending_disk_fault,
             unapplied_disk_fault,
@@ -3420,7 +3435,15 @@ impl BuildHistory {
             disk_observation,
             record.cancellation.is_some(),
         );
-        self.record(record.clone());
+        // Failed preparation remains useful diagnostic history. A successful
+        // upload is an operation result retained by its ownership receipt,
+        // not a completed build for duration, saved-time or success statistics.
+        if state.location != BuildLocation::Remote
+            || state.remote_command_started()
+            || exit_code != 0
+        {
+            self.record(record.clone());
+        }
         Ok(Some((state, record)))
     }
 
@@ -4429,6 +4452,7 @@ mod tests {
     }
 
     fn finish_owned(history: &BuildHistory, active: &ActiveBuildState, exit_code: i32) {
+        record_test_execution(history, active);
         history
             .complete_durable(
                 active.id,
@@ -4438,6 +4462,22 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+    }
+
+    fn record_test_execution(history: &BuildHistory, active: &ActiveBuildState) {
+        history
+            .record_build_heartbeat(BuildHeartbeatRequest {
+                build_id: active.id,
+                worker_id: WorkerId::new(&active.worker_id),
+                hook_pid: None,
+                local_wrapper_id: active.local_wrapper_id.clone(),
+                remote_pgid_file: None,
+                phase: BuildHeartbeatPhase::Execute,
+                detail: None,
+                progress_counter: Some(1),
+                progress_percent: None,
+            })
+            .expect("completed build fixture entered execution");
     }
 
     async fn warm_test_endpoint() -> WorkerEndpointSnapshot {
@@ -4543,6 +4583,7 @@ mod tests {
         observation: Option<rch_common::BuildDiskObservation>,
         exit_code: i32,
     ) {
+        record_test_execution(history, state);
         history
             .complete_durable(
                 state.id,
@@ -4977,6 +5018,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(budget.max_growth_bytes, 30 * GIB);
+        record_test_execution(&history, &active);
         let completion = |peak, growth, exit_code| BuildCompletion {
             disk_peak_output_bytes: peak,
             disk_peak_growth_bytes: Some(growth),
@@ -5086,6 +5128,7 @@ mod tests {
             220.0,
         )
         .unwrap();
+        record_test_execution(&history, &active);
         let completion = |growth| BuildCompletion {
             disk_peak_output_bytes: Some(3 * GIB),
             disk_peak_growth_bytes: Some(growth),
@@ -6096,6 +6139,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn preparation_receipts_do_not_train_build_history_or_disk_budgets() {
+        for exit_code in [0, 101] {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("history.jsonl");
+            let history = BuildHistory::new(10).with_persistence(path.clone());
+            let state = disk_budget_admit(&history, "sources", "worker", 0, 100.0).unwrap();
+            let wrapper = state.local_wrapper_id.as_deref().unwrap();
+            assert!(!state.remote_command_started());
+            history.observe_build_disk("worker", 20, Instant::now());
+            let completion = || BuildCompletion {
+                duration_ms: Some(250),
+                bytes_transferred: Some(1024),
+                // Neither a caller-supplied output observation nor filesystem
+                // growth can turn preparation into a compiler measurement.
+                disk_peak_output_bytes: Some(80 * rch_common::BuildDiskBudget::GIB),
+                disk_observation: Some(cold_test_observation(80)),
+                ..disk_budget_completion(exit_code)
+            };
+            assert!(
+                history
+                    .complete_durable(state.id, "worker", Some("different-owner"), completion())
+                    .is_err()
+            );
+            assert!(history.active_build(state.id).is_some());
+            history
+                .complete_durable(state.id, "worker", Some(wrapper), completion())
+                .unwrap()
+                .unwrap();
+            assert!(history.active_build(state.id).is_none());
+            assert_eq!(history.learned_footprint_gib("sources", "cargo test"), None);
+            assert_eq!(history.stats().success_count, 0);
+            assert_eq!(history.saved_time_stats().builds_counted, 0);
+            assert_eq!(history.recent(10).len(), usize::from(exit_code != 0));
+            assert_eq!(
+                history.terminal_build(state.id, wrapper).unwrap().exit_code,
+                exit_code
+            );
+            assert!(
+                history
+                    .complete_durable(state.id, "worker", Some(wrapper), completion())
+                    .unwrap()
+                    .is_none(),
+                "the exact completed preparation is acknowledged without a second release"
+            );
+
+            let restored = BuildHistory::load_from_file(&path, 10).unwrap();
+            assert_eq!(
+                restored.learned_footprint_gib("sources", "cargo test"),
+                None
+            );
+            assert_eq!(restored.stats().success_count, 0);
+            assert_eq!(restored.saved_time_stats().builds_counted, 0);
+            assert_eq!(restored.recent(10).len(), usize::from(exit_code != 0));
+            assert_eq!(
+                restored
+                    .terminal_build(state.id, wrapper)
+                    .unwrap()
+                    .exit_code,
+                exit_code,
+                "restart preserves the operation receipt separately from compiler success"
+            );
+        }
+    }
+
     #[test]
     fn footprint_is_not_learned_from_shared_cancelled_or_unprobed_builds() {
         let history = BuildHistory::new(10);
@@ -6192,6 +6300,7 @@ mod tests {
     fn attributed_empty_baseline_is_required_to_lower_cold_build_estimates() {
         let history = BuildHistory::new(20);
         let measured = |state: &ActiveBuildState, gib: u64, exit_code| {
+            record_test_execution(&history, state);
             history
                 .complete_durable(
                     state.id,
@@ -6284,6 +6393,7 @@ mod tests {
     fn output_measurement_requires_the_owner_and_first_terminal_completion() {
         let history = BuildHistory::new(10);
         let state = disk_budget_admit(&history, "numpy", "w", 0, 100.0).unwrap();
+        record_test_execution(&history, &state);
         let completion = |gib| BuildCompletion {
             disk_peak_output_bytes: Some(gib * rch_common::BuildDiskBudget::GIB),
             disk_observation: Some(cold_test_observation(gib)),
@@ -8350,6 +8460,7 @@ mod tests {
                     source_topology_mismatch: None,
                     record,
                     local_wrapper_id: None,
+                    preparation_only: false,
                     pending_disk_fault: None,
                     unapplied_disk_fault: None,
                 },
@@ -8388,6 +8499,7 @@ mod tests {
                     TerminalOwnership {
                         record,
                         local_wrapper_id: None,
+                        preparation_only: false,
                         source_topology_mismatch: None,
                         pending_disk_fault: None,
                         unapplied_disk_fault: None,

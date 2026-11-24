@@ -74,6 +74,77 @@ pub(crate) mod recovery;
 mod source_namespace;
 pub(super) use source_namespace::SourceTopologyIncompatible;
 
+fn source_sync_report<'a>(
+    roots: impl IntoIterator<Item = &'a SyncClosurePlanEntry>,
+) -> SourceSyncReport {
+    let mut roots: Vec<_> = roots
+        .into_iter()
+        .map(|entry| SourceSyncRoot {
+            local_root: entry.local_root.clone(),
+            remote_root: entry.remote_root.clone(),
+            mode: match entry.mode {
+                SyncClosureMode::Full => "full",
+                SyncClosureMode::WorkspaceMetadata => "workspace_metadata",
+            }
+            .to_owned(),
+        })
+        .collect();
+    roots.sort_by(|left, right| {
+        left.remote_root
+            .cmp(&right.remote_root)
+            .then_with(|| left.local_root.cmp(&right.local_root))
+    });
+    SourceSyncReport { roots }
+}
+
+fn completed_source_sync_report(
+    plan: &[SyncClosurePlanEntry],
+    outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
+) -> anyhow::Result<SourceSyncReport> {
+    for (entry, outcome) in outcomes {
+        match outcome {
+            SyncRootOutcome::Synced => {}
+            SyncRootOutcome::Skipped { reason } => anyhow::bail!(
+                "source-only preparation skipped required root {}: {reason}",
+                entry.local_root.display()
+            ),
+            SyncRootOutcome::Failed { error } => anyhow::bail!(
+                "source-only preparation failed required root {}: {error}",
+                entry.local_root.display()
+            ),
+        }
+    }
+    let report = source_sync_report(outcomes.iter().map(|(entry, _)| entry));
+    anyhow::ensure!(
+        !plan.is_empty() && report == source_sync_report(plan.iter()),
+        "source-only uploads do not exactly cover the required closure"
+    );
+    Ok(report)
+}
+
+async fn verify_uploaded_cargo_closure(
+    worker: &WorkerConfig,
+    root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
+    package_roots: &[PathBuf],
+    selected_manifest: bool,
+    policy: &PathTopologyPolicy,
+    reporter: &HookReporter,
+    source_identity: Option<&str>,
+) -> anyhow::Result<()> {
+    // Collapsed package transfers still require every original manifest.
+    // Preserve the actual uploaded mapping rather than inventing a manifest
+    // at the repository root for either execution or source-only work.
+    let manifest_outcomes;
+    let preflight_outcomes = if selected_manifest {
+        manifest_outcomes =
+            cargo_manifest::manifest_preflight_outcomes(root_outcomes, package_roots, policy)?;
+        &manifest_outcomes
+    } else {
+        root_outcomes
+    };
+    verify_remote_dependency_manifests(worker, preflight_outcomes, reporter, source_identity).await
+}
+
 /// Read the durable completion receipt after the execution SSH session exits.
 ///
 /// The read is idempotent (it only `cat`s an immutable, identity-bound file),
@@ -1001,6 +1072,7 @@ pub(super) async fn execute_remote_compilation(
     topology_policy: &PathTopologyPolicy,
     clean_overlay: Option<&CleanOverlaySpec>,
     source_content_receipt: bool,
+    sync_only: bool,
     // Declared job result directories (bd-p0yoo), repository-relative.
     // Retrieved after the command completes on ANY exit code; a directory
     // that is missing or only partially transferable fails the invocation
@@ -1050,6 +1122,7 @@ pub(super) async fn execute_remote_compilation(
                 topology_policy,
                 clean_overlay,
                 source_content_receipt,
+                sync_only,
                 result_dirs,
                 result_destination,
                 fresh_result_dirs,
@@ -1222,6 +1295,7 @@ async fn execute_remote_compilation_inner(
     topology_policy: &PathTopologyPolicy,
     clean_overlay: Option<&CleanOverlaySpec>,
     source_content_receipt: bool,
+    sync_only: bool,
     result_dirs: &[PathBuf],
     result_destination: Option<&recovery::JobResultDestination>,
     fresh_result_dirs: bool,
@@ -1230,6 +1304,20 @@ async fn execute_remote_compilation_inner(
     pooled_target_store_base: Option<&str>,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
+    if sync_only {
+        anyhow::ensure!(
+            durable_lease.is_some()
+                && !WorkerPlatform::from_worker(&worker_config).is_windows()
+                && !super::ssh::should_skip_remote_preflight(&worker_config)
+                && clean_overlay.is_none()
+                && !source_content_receipt
+                && kind.is_some_and(|kind| kind != CompilationKind::Job)
+                && result_dirs.is_empty()
+                && result_destination.is_none()
+                && !fresh_result_dirs,
+            "--sync-only requires an admitted Unix build closure without jobs, output collection, or owned source retirement"
+        );
+    }
     if fresh_result_dirs {
         anyhow::ensure!(
             kind == Some(CompilationKind::Job)
@@ -1245,7 +1333,8 @@ async fn execute_remote_compilation_inner(
         );
         super::fresh_job_results::validate_directories(result_dirs)?;
     }
-    if !transfer_config.cargo_retrieval_exclude_dirs.is_empty()
+    if !sync_only
+        && !transfer_config.cargo_retrieval_exclude_dirs.is_empty()
         && super::artifact_patterns::cargo_retrieval_exclusions_apply(artifact_delivery_kind(
             kind,
             Some(command),
@@ -1533,13 +1622,13 @@ async fn execute_remote_compilation_inner(
                     report_json
                 ));
             }
-            if source_content_receipt || explicit_manifest_root.is_some() {
+            if sync_only || source_content_receipt || explicit_manifest_root.is_some() {
                 warn!(
-                    "Dependency planner could not prove the exact source closure on {} [{}]: refusing selected-manifest/receipt execution ({})",
+                    "Dependency planner could not prove the exact source closure on {} [{}]: refusing required closure preparation ({})",
                     worker_config.id, decision.reason_code, decision.remediation
                 );
                 reporter.verbose(&format!(
-                    "[RCH] dependency planner refusal [{}]: selected-manifest and receipt modes require an exact closure — {}",
+                    "[RCH] dependency planner refusal [{}]: selected source mode requires an exact closure — {}",
                     decision.reason_code, decision.remediation
                 ));
                 return Err(DependencyPreflightFailure::from_report(report).into());
@@ -2229,7 +2318,11 @@ async fn execute_remote_compilation_inner(
         planned_pair.as_ref().map(|(root, _)| root.as_str()),
         retained_source_root.as_deref(),
         source_freshness_control.as_deref(),
-        source_target_root.as_deref(),
+        if sync_only {
+            None
+        } else {
+            source_target_root.as_deref()
+        },
     );
     let fresh_results_request = fresh_result_dirs
         .then(|| {
@@ -2266,6 +2359,14 @@ async fn execute_remote_compilation_inner(
             recovery_identity.clone(),
         )?;
     }
+    let mut source_sync_session = if sync_only {
+        Some(recovery::RecoverySession::require_source_sync(
+            durable_lease.context("source-only preparation requires its durable admission")?,
+            source_sync_report(sync_plan.iter()),
+        )?)
+    } else {
+        None
+    };
     let mut source_pair_lock = if durable_sources {
         if let Some((root, token)) = planned_pair.as_ref() {
             reporter.verbose("[RCH] waiting for the owned source/target pair; same-pool jobs serialize through retrieval and source retirement");
@@ -2487,7 +2588,8 @@ async fn execute_remote_compilation_inner(
         }
         root_pipeline = apply_source_sync_integrity_policy(
             root_pipeline,
-            exact_dependency_closure_sync
+            sync_only
+                || exact_dependency_closure_sync
                 || go_source_plan.is_some()
                 || native_source_root.is_some(),
             source_content_receipt,
@@ -2563,7 +2665,8 @@ async fn execute_remote_compilation_inner(
                 "[RCH] clean-overlay transfer estimator bypassed for immutable base {}",
                 spec.base_commit()
             ));
-        } else if exact_dependency_closure_sync
+        } else if sync_only
+            || exact_dependency_closure_sync
             || source_content_receipt
             || go_source_plan.is_some()
         {
@@ -2863,7 +2966,7 @@ async fn execute_remote_compilation_inner(
         .count();
     if failed_count > 0 {
         warn!(
-            "Partial sync: {}/{} closure roots had issues (build continues with available roots)",
+            "Partial sync: {}/{} closure roots had issues",
             failed_count,
             sync_plan.len()
         );
@@ -2889,6 +2992,66 @@ async fn execute_remote_compilation_inner(
     }
     let sync_result = aggregate_sync_result
         .ok_or_else(|| anyhow::anyhow!("dependency sync produced no transfer result"))?;
+    if let Some(mut session) = source_sync_session.take() {
+        let report = completed_source_sync_report(&sync_plan, &root_outcomes)?;
+        if exact_dependency_closure_sync {
+            verify_uploaded_cargo_closure(
+                &worker_config,
+                &root_outcomes,
+                &raw_sync_roots,
+                explicit_manifest_root.is_some(),
+                topology_policy,
+                reporter,
+                source_identity,
+            )
+            .await?;
+        }
+        source_authority_lock
+            .as_mut()
+            .context("source-only preparation lost its admitted source grant")?
+            .ensure_held()?;
+        // Every upload has settled. Persist that distinct operation boundary
+        // BEFORE release: recovery can finish the exact existing grant even
+        // if the release reply or local checkpoint is lost.
+        session.source_sync_uploaded(&report)?;
+        source_authority_lock
+            .take()
+            .context("source-only preparation lost its admitted source grant")?
+            .release()
+            .await?;
+        session.sources_released()?;
+        session.returned(0)?;
+        session.retired()?;
+        if let Some(progress) = &mut upload_progress {
+            progress.apply_summary(sync_result.bytes_transferred, sync_result.files_transferred);
+            progress.finish();
+        }
+        if let Some(loop_ref) = heartbeat_loop.take() {
+            // The daemon must never infer compiler execution from this job.
+            loop_ref
+                .finish(
+                    BuildHeartbeatPhase::SyncUp,
+                    Some("source_sync_complete".into()),
+                )
+                .await;
+        }
+        return Ok(RemoteExecutionResult {
+            deadline_triggered: false,
+            exit_code: 0,
+            stderr: String::new(),
+            duration_ms: 0,
+            timing: CommandTimingBreakdown {
+                sync_up: Some(Duration::from_millis(sync_result.duration_ms)),
+                ..Default::default()
+            },
+            result_dirs: Vec::new(),
+            disk_roots: mutable_source_authority_roots,
+            disk_peak_output_bytes: None,
+            disk_observation: None,
+            cargo_stdout: None,
+            source_sync: Some(report),
+        });
+    }
     let pipeline = primary_pipeline.ok_or_else(|| {
         anyhow::anyhow!(
             "dependency sync did not include primary project root {}",
@@ -3117,23 +3280,12 @@ async fn execute_remote_compilation_inner(
     }
 
     if exact_dependency_closure_sync {
-        // Verify package authorities even when their transfers were collapsed
-        // into a manifest-less repository basis. Use the actual remote mapping
-        // and sync outcomes rather than inventing a root Cargo.toml (#70).
-        let manifest_outcomes;
-        let preflight_outcomes = if explicit_manifest_root.is_some() {
-            manifest_outcomes = cargo_manifest::manifest_preflight_outcomes(
-                &root_outcomes,
-                &raw_sync_roots,
-                topology_policy,
-            )?;
-            &manifest_outcomes
-        } else {
-            &root_outcomes
-        };
-        verify_remote_dependency_manifests(
+        verify_uploaded_cargo_closure(
             &worker_config,
-            preflight_outcomes,
+            &root_outcomes,
+            &raw_sync_roots,
+            explicit_manifest_root.is_some(),
+            topology_policy,
             reporter,
             source_identity,
         )
@@ -4804,11 +4956,64 @@ async fn execute_remote_compilation_inner(
         disk_peak_output_bytes,
         disk_observation,
         cargo_stdout,
+        source_sync: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_only_success_requires_every_original_root_and_mode() {
+        use super::*;
+
+        let entry = |name: &str, mode| SyncClosurePlanEntry {
+            local_root: PathBuf::from(format!("/caller/{name}")),
+            project_id: name.to_owned(),
+            root_hash: format!("hash-{name}"),
+            remote_root: format!("/worker/{name}"),
+            is_primary: name == "app",
+            mode,
+        };
+        let plan = vec![
+            entry("workspace", SyncClosureMode::WorkspaceMetadata),
+            entry("app", SyncClosureMode::Full),
+            entry("dependency", SyncClosureMode::Full),
+        ];
+        let complete: Vec<_> = plan
+            .iter()
+            .rev()
+            .cloned()
+            .map(|entry| (entry, SyncRootOutcome::Synced))
+            .collect();
+        let report = completed_source_sync_report(&plan, &complete).unwrap();
+        assert_eq!(report, source_sync_report(plan.iter()));
+        assert_eq!(report.roots.len(), 3);
+        assert_eq!(report.roots[2].mode, "workspace_metadata");
+        assert!(completed_source_sync_report(&plan, &complete[..2]).is_err());
+        for outcome in [
+            SyncRootOutcome::Skipped {
+                reason: "transfer estimate".into(),
+            },
+            SyncRootOutcome::Failed {
+                error: "receiver disconnected".into(),
+            },
+        ] {
+            let mut partial = complete.clone();
+            partial[0].1 = outcome;
+            assert!(completed_source_sync_report(&plan, &partial).is_err());
+        }
+        let mut duplicate = complete.clone();
+        duplicate.push(complete[0].clone());
+        assert!(completed_source_sync_report(&plan, &duplicate).is_err());
+        let mut remapped = complete.clone();
+        remapped[0].0.remote_root = "/worker/unadmitted".into();
+        assert!(completed_source_sync_report(&plan, &remapped).is_err());
+        let mut wrong_mode = complete;
+        wrong_mode[0].0.mode = SyncClosureMode::WorkspaceMetadata;
+        assert!(completed_source_sync_report(&plan, &wrong_mode).is_err());
+        assert!(completed_source_sync_report(&[], &[]).is_err());
+    }
+
     fn staging_worker(remote_base: Option<&str>) -> super::SelectedWorker {
         super::SelectedWorker {
             id: super::WorkerId::new("staging-worker"),

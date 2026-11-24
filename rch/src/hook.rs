@@ -5047,6 +5047,7 @@ pub async fn run_exec(
     overlay_paths: Vec<PathBuf>,
     no_overlay: bool,
     source_content_receipt: bool,
+    sync_only: bool,
     job: bool,
     result_dirs: Vec<PathBuf>,
     result_dest: Option<PathBuf>,
@@ -5066,6 +5067,20 @@ pub async fn run_exec(
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");
     }
+    anyhow::ensure!(
+        !sync_only
+            || (!job
+                && result_dirs.is_empty()
+                && result_dest.is_none()
+                && !fresh_result_dirs
+                && !clean_overlay
+                && !source_content_receipt
+                && base.is_none()
+                && dependency_bases.is_empty()
+                && overlay_paths.is_empty()
+                && !no_overlay),
+        "--sync-only requires ordinary working-tree sources and conflicts with jobs, result collection, clean overlays, and source-content receipts"
+    );
     if shell_wrapped_cargo_command(&command_parts) {
         let reporter = HookReporter::new(OutputVisibility::Summary);
         reporter.summary_critical(
@@ -5096,8 +5111,8 @@ pub async fn run_exec(
         std::env::var("RCH_CARGO_JSON_STDOUT").is_ok_and(|value| env_flag_enabled(&value));
     if cargo_json_stdout {
         anyhow::ensure!(
-            !out_ctx.is_json() && !job,
-            "RCH_CARGO_JSON_STDOUT conflicts with machine envelopes and arbitrary jobs"
+            !out_ctx.is_json() && !job && !sync_only,
+            "RCH_CARGO_JSON_STDOUT conflicts with machine envelopes, arbitrary jobs, and --sync-only"
         );
         let classified = classify_command(&command);
         anyhow::ensure!(
@@ -5115,6 +5130,7 @@ pub async fn run_exec(
         || caller_requires_remote
         || clean_overlay
         || source_content_receipt
+        || sync_only
         || cargo_json_stdout
         || exact_worker_requested
         || result_dest.is_some()
@@ -5237,6 +5253,7 @@ pub async fn run_exec(
         let refuse_local = if policy.overrides_require_remote() {
             clean_overlay
                 || source_content_receipt
+                || sync_only
                 || cargo_json_stdout
                 || exact_worker_requested
                 || result_destination.is_some()
@@ -5311,6 +5328,7 @@ pub async fn run_exec(
             job,
             strict_remote_mode: clean_overlay
                 || source_content_receipt
+                || sync_only
                 || cargo_json_stdout
                 || exact_worker_requested
                 || required_tools_requested,
@@ -5916,6 +5934,7 @@ pub async fn run_exec(
             &topology_policy,
             clean_overlay_spec.as_ref(),
             source_content_receipt,
+            sync_only,
             &result_dirs,
             result_destination.as_ref(),
             fresh_result_dirs,
@@ -5947,11 +5966,15 @@ pub async fn run_exec(
             .as_ref()
             .map(|ok| ok.exit_code)
             .unwrap_or_else(remote_failure_exit_code);
-        let release_timing = result.as_ref().ok().map(|ok| {
-            let mut timing = ok.timing.clone();
-            timing.total = Some(remote_elapsed);
-            timing
-        });
+        let release_timing = result
+            .as_ref()
+            .ok()
+            .filter(|ok| ok.source_sync.is_none())
+            .map(|ok| {
+                let mut timing = ok.timing.clone();
+                timing.total = Some(remote_elapsed);
+                timing
+            });
         // A worker-caused failure must not warm that worker's cache for the
         // project (review of GH #81), or the next build is routed back to it.
         let release_faults = remote_release_faults(&result, &worker.id);
@@ -6142,6 +6165,55 @@ pub async fn run_exec(
         // worker-fault cases yield a `RetryableRemoteFault` handled below.
         let fault: RetryableRemoteFault = match result {
             Ok(result) => {
+                if let Some(source_sync) = result.source_sync.as_ref() {
+                    anyhow::ensure!(
+                        sync_only && result.exit_code == 0,
+                        "unexpected source-only completion for this invocation"
+                    );
+                    durable_lease.acknowledge_terminal().context(
+                        "source upload completed but durable terminal acknowledgment failed",
+                    )?;
+                    reporter.summary_critical(&format!(
+                        "[RCH] synchronized {} source root(s) on {} ({}); command was not executed",
+                        source_sync.roots.len(),
+                        worker.id,
+                        format_duration_ms(remote_elapsed)
+                    ));
+                    for root in &source_sync.roots {
+                        reporter.summary_critical(&format!(
+                            "[RCH] {} -> {} ({})",
+                            root.local_root.display(),
+                            root.remote_root,
+                            root.mode
+                        ));
+                    }
+                    emit_source_sync_envelope(
+                        &ExecResultEnvelope {
+                            api_version: "1.0",
+                            command: &remote_command,
+                            outcome: "synced",
+                            location: "remote",
+                            fallback_reason: None,
+                            worker_id: Some(worker.id.as_str()),
+                            remote_exit_code: None,
+                            duration_ms: Some(exec_start.elapsed().as_millis() as u64),
+                            timing: Some(&result.timing),
+                            result_dirs: None,
+                            error_code: None,
+                            admission: durable_lease.machine_admission_reference(
+                                &wrapper_id,
+                                remote_build_id,
+                                &worker.id,
+                            )?,
+                        },
+                        source_sync,
+                    );
+                    std::process::exit(0);
+                }
+                anyhow::ensure!(
+                    !sync_only,
+                    "source-only invocation returned without a completed source upload report"
+                );
                 // RABS B002: completed exec-path invocations join the
                 // corpus too (off the latency path; fail-open inside).
                 {
@@ -7109,12 +7181,12 @@ mod source_fidelity;
 // directly from `super::remote_result`.
 mod remote_result;
 use remote_result::{
-    ExecAdmissionReference, ExecResultDirStat, ExecResultEnvelope,
-    detect_cargo_workspace_inheritance_failure, detect_worker_system_dependency_failure,
-    emit_exec_envelope, is_runtime_fault_signal, is_signal_killed, is_toolchain_failure,
-    remote_failure_is_disk_full, remote_failure_is_worker_fault,
-    remote_result_requires_runtime_recovery, set_machine_output, signal_name,
-    wrapped_runtime_fault_signal,
+    ExecAdmissionReference, ExecResultDirStat, ExecResultEnvelope, SourceSyncReport,
+    SourceSyncRoot, detect_cargo_workspace_inheritance_failure,
+    detect_worker_system_dependency_failure, emit_exec_envelope, emit_source_sync_envelope,
+    is_runtime_fault_signal, is_signal_killed, is_toolchain_failure, remote_failure_is_disk_full,
+    remote_failure_is_worker_fault, remote_result_requires_runtime_recovery, set_machine_output,
+    signal_name, wrapped_runtime_fault_signal,
 };
 
 // The remote cargo target-dir resolution / naming / command-rewrite cluster
@@ -7570,6 +7642,7 @@ async fn handle_selection_response(
         None,
         &topology_policy,
         None,
+        false,
         false,
         &[],
         None,

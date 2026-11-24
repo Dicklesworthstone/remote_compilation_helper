@@ -23,7 +23,7 @@ use rch_common::WorkerConfig;
 use rch_common::bypass_record::{AdminDisableStore, AdminNetworkPermit};
 use rch_common::job_identity::{
     DurableJobLease, default_job_lease_directory, local_terminal_settlement_candidate,
-    source_recovery_resources_retired,
+    source_recovery_resources_retired, source_sync_recovery_is_valid,
 };
 use rch_common::job_recovery::{
     AUTOMATIC_RECOVERY_DEFERRED_EXIT_CODE, AUTOMATIC_RECOVERY_PENDING_EXIT_CODE,
@@ -184,7 +184,14 @@ fn retired_delivery(lease: &DurableJobLease) -> Option<i32> {
     let recipe = lease.recovery.as_ref()?;
     let build_id = lease.identity.remote_build_id.filter(|id| *id > 0)?;
     let worker = lease.worker_id.as_deref().filter(|id| !id.is_empty())?;
-    if recipe["version"].as_u64() != Some(2)
+    let valid_operation = match recipe["version"].as_u64() {
+        Some(2) => recipe
+            .get("source_sync")
+            .is_none_or(serde_json::Value::is_null),
+        Some(3) => source_sync_recovery_is_valid(recipe),
+        _ => false,
+    };
+    if !valid_operation
         || recipe["wrapper_id"].as_str() != Some(lease.identity.local_wrapper_id.as_str())
         || recipe["build_id"].as_u64() != Some(build_id)
         || recipe["worker"]["id"].as_str() != Some(worker)
@@ -281,6 +288,40 @@ fn verify_recovery_completion(
         || before.command_fingerprint != after.command_fingerprint
     {
         return Err("recovery journal identity changed; completion not confirmed".into());
+    }
+    let source_only = |recipe: &serde_json::Value| {
+        recipe["version"].as_u64() == Some(3)
+            || recipe
+                .get("source_sync")
+                .is_some_and(|sync| !sync.is_null())
+    };
+    if before.recovery.as_ref().is_some_and(source_only)
+        || after.recovery.as_ref().is_some_and(source_only)
+    {
+        let (Some(original), Some(recovered)) = (&before.recovery, &after.recovery) else {
+            return Err("source-only recovery lost its original operation".into());
+        };
+        // Recovery may settle an already-complete upload or cancel incomplete
+        // preparation. It cannot upload, change the plan, or turn a compiler
+        // admission into a source-only success.
+        if !source_sync_recovery_is_valid(original)
+            || !source_sync_recovery_is_valid(recovered)
+            || [
+                "version",
+                "identity",
+                "worker",
+                "source_roots",
+                "project_root",
+                "completion",
+                "source_sync",
+            ]
+            .iter()
+            .any(|key| original[*key] != recovered[*key])
+        {
+            return Err(
+                "source-only recovery changed its admitted closure or upload checkpoint".into(),
+            );
+        }
     }
     let before_namespace =
         before.recovery.as_ref().map_or(
@@ -4414,6 +4455,132 @@ mod tests {
         after.exit_code = Some(exit);
         after.acknowledge_terminal(before.heartbeat_unix_ms + 1);
         after
+    }
+
+    fn source_sync_handoff(uploads_complete: bool) -> DurableJobLease {
+        let mut before = handoff_lease(1, 11, 0);
+        before.recovery = Some(serde_json::json!({
+            "version": 3, "wrapper_id": before.identity.local_wrapper_id, "build_id": 7,
+            "worker": {"id": "worker1", "host": "worker.invalid", "user": "builder",
+                "identity_file": "/unused/key", "total_slots": 1, "priority": 100, "tags": []},
+            "identity": "abc123", "completion": "/worker/recovery-7-abc123.done",
+            "source_authority_namespace": "current", "source_roots": ["/worker/source"],
+            "project_root": "/caller/source", "expected_triple": "",
+            "prepared": false, "execution_started": false, "preparation_cancelled": false,
+            "allow_foreign": false, "package_archive": false, "exit_code": null,
+            "returned": null, "retired": false, "sources_released": false,
+            "tree_retired": false, "pair_released": false, "phases": [],
+            "source_sync": {"uploads_complete": uploads_complete, "report": {"roots": [
+                {"local_root": "/caller/source", "remote_root": "/worker/source", "mode": "full"}
+            ]}}
+        }));
+        before
+    }
+
+    #[test]
+    fn source_sync_recovery_requires_exact_release_and_daemon_acknowledgment() {
+        let before = source_sync_handoff(true);
+        assert!(retired_delivery(&before).is_none());
+        assert!(!local_terminal_settlement_candidate(&before));
+        let mut settled = before.clone();
+        let recipe = settled.recovery.as_mut().unwrap();
+        recipe["sources_released"] = serde_json::json!(true);
+        recipe["returned"] = serde_json::json!(0);
+        recipe["retired"] = serde_json::json!(true);
+        assert_eq!(retired_delivery(&settled), Some(0));
+        assert!(local_terminal_settlement_candidate(&settled));
+        assert!(verify_recovery_completion(&before, &settled).is_err());
+        let completed = completed_lease(&settled, 0, 0);
+        verify_recovery_completion(&before, &completed).unwrap();
+        for (field, value) in [
+            ("sources_released", serde_json::json!(false)),
+            ("retired", serde_json::json!(false)),
+            ("exit_code", serde_json::json!(0)),
+            ("execution_started", serde_json::json!(true)),
+            ("prepared", serde_json::json!(true)),
+            ("preparation_cancelled", serde_json::json!(true)),
+            ("source_cancellation_settled", serde_json::json!(true)),
+            ("source_sync", serde_json::Value::Null),
+            ("go_compilation_only", serde_json::json!(true)),
+        ] {
+            let mut changed = completed.clone();
+            changed.recovery.as_mut().unwrap()[field] = value;
+            assert!(retired_delivery(&changed).is_none(), "{field}");
+            assert!(
+                verify_recovery_completion(&before, &changed).is_err(),
+                "{field}"
+            );
+        }
+        let mut lost_daemon_reply = completed;
+        lost_daemon_reply.recovery.as_mut().unwrap()["daemon_exit_code"] = serde_json::Value::Null;
+        assert!(verify_recovery_completion(&before, &lost_daemon_reply).is_err());
+    }
+
+    #[test]
+    fn source_sync_recovery_cannot_create_or_change_upload_evidence() {
+        let before = source_sync_handoff(true);
+        let mut retired = before.clone();
+        retired.recovery.as_mut().unwrap()["sources_released"] = serde_json::json!(true);
+        retired.recovery.as_mut().unwrap()["retired"] = serde_json::json!(true);
+        let completed = completed_lease(&retired, 0, 0);
+        verify_recovery_completion(&before, &completed).unwrap();
+        let mut incomplete = before.clone();
+        incomplete.recovery.as_mut().unwrap()["source_sync"]["uploads_complete"] =
+            serde_json::json!(false);
+        assert!(source_sync_recovery_is_valid(
+            incomplete.recovery.as_ref().unwrap()
+        ));
+        assert!(verify_recovery_completion(&incomplete, &completed).is_err());
+        for field in ["identity", "completion", "project_root"] {
+            let mut changed = completed.clone();
+            changed.recovery.as_mut().unwrap()[field] = match field {
+                "identity" => serde_json::json!("def456"),
+                "completion" => serde_json::json!("/worker/another-completion"),
+                "project_root" => serde_json::json!("/caller/source/nested"),
+                _ => unreachable!(),
+            };
+            assert!(source_sync_recovery_is_valid(
+                changed.recovery.as_ref().unwrap()
+            ));
+            assert!(
+                verify_recovery_completion(&before, &changed).is_err(),
+                "{field}"
+            );
+        }
+        let mut remapped = completed.clone();
+        let recipe = remapped.recovery.as_mut().unwrap();
+        recipe["source_roots"] = serde_json::json!(["/worker/other"]);
+        recipe["source_sync"]["report"]["roots"][0]["remote_root"] =
+            serde_json::json!("/worker/other");
+        assert!(source_sync_recovery_is_valid(recipe));
+        assert!(verify_recovery_completion(&before, &remapped).is_err());
+        let mut compiler = before.clone();
+        compiler.recovery.as_mut().unwrap()["version"] = serde_json::json!(2);
+        compiler.recovery.as_mut().unwrap()["source_sync"] = serde_json::Value::Null;
+        assert!(verify_recovery_completion(&compiler, &completed).is_err());
+    }
+
+    #[test]
+    fn source_sync_recovery_preserves_failed_preparation_cancellation() {
+        let before = source_sync_handoff(false);
+        let mut retired = before.clone();
+        let recipe = retired.recovery.as_mut().unwrap();
+        recipe["preparation_cancelled"] = serde_json::json!(true);
+        recipe["sources_released"] = serde_json::json!(true);
+        recipe["tree_retired"] = serde_json::json!(true);
+        recipe["pair_released"] = serde_json::json!(true);
+        recipe["source_cancellation_settled"] = serde_json::json!(true);
+        recipe["returned"] = serde_json::json!(101);
+        recipe["retired"] = serde_json::json!(true);
+        let completed = completed_lease(&retired, 101, 137);
+        assert_eq!(retired_delivery(&completed), Some(101));
+        assert!(local_terminal_settlement_candidate(&completed));
+        verify_recovery_completion(&before, &completed).unwrap();
+        let mut premature = completed;
+        premature.recovery.as_mut().unwrap()["source_cancellation_settled"] =
+            serde_json::json!(false);
+        assert!(retired_delivery(&premature).is_none());
+        assert!(verify_recovery_completion(&before, &premature).is_err());
     }
 
     fn terminal_cancellation_lease(stale: u64, pid: u32) -> DurableJobLease {

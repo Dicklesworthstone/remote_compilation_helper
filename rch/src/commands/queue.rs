@@ -497,6 +497,23 @@ fn format_build_event(
                 style.muted("→"),
             ))
         }
+        "build_preparation_completed" => {
+            let cmd = data.get("command").and_then(|v| v.as_str()).unwrap_or("?");
+            let id = data
+                .get("build_id")
+                .and_then(|v| v.as_u64())
+                .map(|n| format!("b-{n}"))
+                .unwrap_or_else(|| "?".to_string());
+            let exit_code = data.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let status = if exit_code == 0 {
+                style.success("PREPARED  ")
+            } else {
+                style.error("PREP FAILED")
+            };
+            Some(format!(
+                "{ts_display} {status} {id} {cmd} (command not executed, preparation exit {exit_code})"
+            ))
+        }
         "build_completed" => {
             let cmd = data.get("command").and_then(|v| v.as_str()).unwrap_or("?");
             let id = data
@@ -909,6 +926,31 @@ mod tests {
             formatted.contains("css"),
             "should contain worker: {formatted}"
         );
+    }
+
+    #[test]
+    fn format_preparation_completion_never_claims_the_command_ran() {
+        let _guard = test_guard!();
+        let style = crate::ui::theme::Style::new(false, true, false);
+        for exit_code in [0, 101] {
+            let event = serde_json::json!({
+                "event": "build_preparation_completed",
+                "data": {
+                    "build_id": 42,
+                    "command": "cargo build",
+                    "exit_code": exit_code,
+                },
+            });
+            let formatted = format_build_event(&event, &style).unwrap();
+            assert!(formatted.contains(if exit_code == 0 {
+                "PREPARED"
+            } else {
+                "PREP FAILED"
+            }));
+            assert!(formatted.contains("command not executed"));
+            assert!(formatted.contains("b-42"));
+            assert!(!formatted.contains("COMPLETE"));
+        }
     }
 
     #[test]

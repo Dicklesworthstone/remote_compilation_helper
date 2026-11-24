@@ -80,9 +80,17 @@ fn completed(reply: &Value, build_id: u64, worker: &str, wrapper: &str) -> Resul
 /// Validate retained evidence only: another build may legitimately have
 /// replaced a shared output path since this invocation published it.
 fn validate_successful_delivery(recipe: &RecoveryRecipe) -> Result<()> {
+    recipe.validate_operation()?;
     if recipe.returned != Some(0) {
         // A truthful failed delivery may have incomplete phases. It must still
         // reconcile its reservation, retaining the original compiler outcome.
+        return Ok(());
+    }
+    if recipe.source_sync.is_some() {
+        anyhow::ensure!(
+            recipe.source_sync_complete() && recipe.sources_released,
+            "successful source-only recovery requires complete uploads and exact source release"
+        );
         return Ok(());
     }
     anyhow::ensure!(
@@ -173,8 +181,7 @@ pub(super) fn validate_recorded_delivery(
     let recipe = decode_recipe_value(value.clone(), ownership)
         .context("successful recovery has an invalid retained delivery recipe")?;
     anyhow::ensure!(
-        recipe.version == 2
-            && recipe.wrapper_id == lease.identity.local_wrapper_id
+        recipe.wrapper_id == lease.identity.local_wrapper_id
             && recipe.build_id > 0
             && Some(recipe.build_id) == lease.identity.remote_build_id
             && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),

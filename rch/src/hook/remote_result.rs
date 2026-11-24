@@ -51,6 +51,25 @@ pub(super) struct RemoteExecutionResult {
     /// Opt-in Cargo stdout, released only after daemon acknowledgment. A
     /// delivery failure supplies no caller-local success records.
     pub(super) cargo_stdout: Option<Vec<u8>>,
+    /// Completed source preparation. No command ran when this is present.
+    pub(super) source_sync: Option<SourceSyncReport>,
+}
+
+/// One admitted source root uploaded by a source-only invocation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourceSyncRoot {
+    pub(super) local_root: PathBuf,
+    pub(super) remote_root: String,
+    /// `full` or `workspace_metadata`, matching the admitted closure plan.
+    pub(super) mode: String,
+}
+
+/// Complete upload checkpoint, also retained for interrupted release recovery.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourceSyncReport {
+    pub(super) roots: Vec<SourceSyncRoot>,
 }
 
 /// Collection outcome of one declared job result directory (bd-uoh4x).
@@ -111,6 +130,15 @@ pub(crate) struct ExecResultEnvelope<'a> {
     pub admission: Option<ExecAdmissionReference>,
 }
 
+/// Source-only success extends the usual envelope without inventing a command
+/// exit code or artifact collection results for work that was never executed.
+#[derive(Debug, serde::Serialize)]
+struct SourceSyncResultEnvelope<'a> {
+    #[serde(flatten)]
+    execution: &'a ExecResultEnvelope<'a>,
+    source_sync: &'a SourceSyncReport,
+}
+
 /// Whether THIS invocation requested machine output on stdout (bd-uoh4x).
 /// Set once by `run_exec` from its OutputContext; the PreToolUse hook path
 /// never sets it, so hook protocol stdout stays pristine.
@@ -127,6 +155,20 @@ pub(super) fn machine_output() -> bool {
 /// Print the execution envelope to stdout when machine output is active.
 /// Never prints otherwise; delivery failures use stderr and a nonzero exit.
 pub(super) fn emit_exec_envelope(env: &ExecResultEnvelope<'_>) {
+    emit_serialized_envelope(env);
+}
+
+pub(super) fn emit_source_sync_envelope(
+    env: &ExecResultEnvelope<'_>,
+    source_sync: &SourceSyncReport,
+) {
+    emit_serialized_envelope(&SourceSyncResultEnvelope {
+        execution: env,
+        source_sync,
+    });
+}
+
+fn emit_serialized_envelope(env: &impl serde::Serialize) {
     if !machine_output() {
         return;
     }
@@ -463,6 +505,64 @@ fn extract_workspace_package_field(line: &str) -> Option<String> {
         .next()?
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
     (!field.is_empty()).then(|| field.to_string())
+}
+
+#[cfg(test)]
+mod source_sync_output_tests {
+    use super::*;
+
+    #[test]
+    fn source_sync_output_reports_each_root_without_claiming_command_execution() {
+        let report = SourceSyncReport {
+            roots: vec![
+                SourceSyncRoot {
+                    local_root: PathBuf::from("/work/app"),
+                    remote_root: "/data/projects/app".into(),
+                    mode: "full".into(),
+                },
+                SourceSyncRoot {
+                    local_root: PathBuf::from("/work/workspace"),
+                    remote_root: "/data/projects/workspace".into(),
+                    mode: "workspace_metadata".into(),
+                },
+            ],
+        };
+        let envelope = ExecResultEnvelope {
+            api_version: "1.0",
+            command: "cargo build --release",
+            outcome: "synced",
+            location: "remote",
+            fallback_reason: None,
+            worker_id: Some("worker-a"),
+            remote_exit_code: None,
+            duration_ms: Some(125),
+            timing: None,
+            result_dirs: None,
+            error_code: None,
+            admission: None,
+        };
+        let output = serde_json::to_value(SourceSyncResultEnvelope {
+            execution: &envelope,
+            source_sync: &report,
+        })
+        .unwrap();
+        assert_eq!(output["outcome"], "synced");
+        assert_eq!(output["command"], "cargo build --release");
+        assert_eq!(output["worker_id"], "worker-a");
+        assert!(output.get("remote_exit_code").is_none());
+        assert!(output.get("result_dirs").is_none());
+        assert_eq!(
+            serde_json::from_value::<SourceSyncReport>(output["source_sync"].clone()).unwrap(),
+            report
+        );
+        assert!(
+            serde_json::to_value(&envelope)
+                .unwrap()
+                .get("source_sync")
+                .is_none(),
+            "ordinary envelopes retain their existing shape"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use super::super::cargo_output_contract::{
 };
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
@@ -54,6 +54,10 @@ pub(crate) struct RecoveryRecipe {
     /// mutates a claim, pair, source tree, or cancellation receipt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_authority_namespace: Option<SourceAuthorityNamespace>,
+    /// Version 3 is a source-only admission. Older readers must refuse it,
+    /// rather than canceling successful preparation as an unstarted build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_sync: Option<SourceSyncState>,
     pair: Option<(String, String)>,
     retire_root: Option<String>,
     /// An owned source pair retires by moving to this exact sibling. Persist
@@ -159,6 +163,15 @@ pub(crate) struct RecoveryRecipe {
     pair_released: bool,
     #[serde(default)]
     retired: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceSyncState {
+    /// Persisted before source acquisition; the completion checkpoint must
+    /// cover this exact local-to-worker closure under the original grant.
+    report: SourceSyncReport,
+    uploads_complete: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -607,6 +620,111 @@ impl HeldRetrievalStage {
 }
 
 impl RecoveryRecipe {
+    fn validate_operation(&self) -> anyhow::Result<()> {
+        let Some(sync) = &self.source_sync else {
+            anyhow::ensure!(self.version == 2, "unsupported recovery operation version");
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.version == 3
+                && self.source_authority_namespace == Some(SourceAuthorityNamespace::Current)
+                && !WorkerPlatform::from_worker(&self.worker).is_windows()
+                && !self.prepared
+                && !self.execution_started
+                && self.exit_code.is_none()
+                && self.kind.is_none()
+                && self.expected_triple.is_empty()
+                && self.pinned_triple.is_none()
+                && !self.allow_foreign
+                && !self.package_archive
+                && self.pair.is_none()
+                && self.retire_root.is_none()
+                && self.retained_root.is_none()
+                && self.retained_materialized.is_none()
+                && self.staging_ownership.is_none()
+                && !self.staging_released
+                && self.result_destination.is_none()
+                && self.fresh_job_results.is_none()
+                && self.cargo_output_capture.is_none()
+                && self.build_system_output_capture.is_none()
+                && self.go_coverage_capture.is_none()
+                && self.go_compilation_only.is_none()
+                && self.prepared_dependencies.is_none()
+                && self.cargo_stdout.is_none()
+                && self.cargo_stderr.is_none()
+                && self.caller_json_policy.is_none()
+                && self.caller_json_local_source_root.is_none()
+                && self.caller_delivery.is_none()
+                && self.phases.is_empty(),
+            "source-only recovery contradicts its admitted operation or owns execution/output state"
+        );
+        super::super::ssh::validate_source_authority_intent(&self.source_roots, &self.identity)?;
+        let mut local_roots = BTreeSet::new();
+        let mut remote_roots = BTreeSet::new();
+        for root in &sync.report.roots {
+            anyhow::ensure!(
+                root.local_root.is_absolute()
+                    && root.local_root.components().all(|part| matches!(
+                        part,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    ))
+                    && !root
+                        .local_root
+                        .to_string_lossy()
+                        .chars()
+                        .any(char::is_control)
+                    && matches!(root.mode.as_str(), "full" | "workspace_metadata")
+                    && local_roots.insert(root.local_root.clone())
+                    && remote_roots.insert(root.remote_root.clone()),
+                "source-only closure has invalid, duplicate, or ambiguous roots"
+            );
+        }
+        anyhow::ensure!(
+            !sync.report.roots.is_empty()
+                && remote_roots.len() == self.source_roots.len()
+                && remote_roots == self.source_roots.iter().cloned().collect()
+                && sync.report.roots.iter().any(|root| {
+                    root.mode == "full" && self.project_root.starts_with(&root.local_root)
+                }),
+            "source-only closure does not exactly cover its admitted grant and invocation root"
+        );
+        if sync.uploads_complete {
+            anyhow::ensure!(
+                !self.preparation_cancelled
+                    && self.source_cancellation_settled.is_none()
+                    && !self.tree_retired
+                    && !self.pair_released
+                    && self.returned.is_none_or(|exit| exit == 0)
+                    && (self.returned.is_none() || self.sources_released)
+                    && (!self.retired || (self.sources_released && self.returned == Some(0))),
+                "completed source-only preparation contradicts release, cancellation, or retirement"
+            );
+        } else {
+            anyhow::ensure!(
+                self.returned.is_none_or(|exit| exit != 0)
+                    && (self.preparation_cancelled
+                        || (self.returned.is_none()
+                            && self.source_cancellation_settled.is_none()
+                            && !self.sources_released
+                            && !self.tree_retired
+                            && !self.pair_released
+                            && !self.retired))
+                    && (!self.retired
+                        || (self.source_resources_retired()
+                            && self.returned.is_some_and(|exit| exit != 0)
+                            && self.source_cancellation_settled == Some(true))),
+                "incomplete source-only preparation cannot acknowledge success or release without cancellation"
+            );
+        }
+        Ok(())
+    }
+
+    fn source_sync_complete(&self) -> bool {
+        self.source_sync
+            .as_ref()
+            .is_some_and(|sync| sync.uploads_complete)
+    }
+
     pub(super) fn validate_fresh_job_results_contract(&self) -> anyhow::Result<()> {
         let Some(preparation) = &self.fresh_job_results else {
             return Ok(());
@@ -964,9 +1082,11 @@ pub(in crate::hook) fn ensure_local_retirement_complete(
     ownership: Option<&recovery_owner::RecoveryOwnership>,
 ) -> anyhow::Result<()> {
     let Some(value) = lease.recovery.as_ref().filter(|value| {
-        value
-            .get("staging_ownership")
-            .is_some_and(|ownership| !ownership.is_null())
+        value.get("version").and_then(serde_json::Value::as_u64) == Some(3)
+            || value.get("source_sync").is_some_and(|sync| !sync.is_null())
+            || value
+                .get("staging_ownership")
+                .is_some_and(|ownership| !ownership.is_null())
             || value
                 .get("phases")
                 .and_then(serde_json::Value::as_array)
@@ -984,6 +1104,16 @@ pub(in crate::hook) fn ensure_local_retirement_complete(
         wrapper_id: lease.identity.local_wrapper_id.clone(),
     };
     let recipe = decode_recipe_value(value.clone(), ownership).with_context(pending)?;
+    if recipe.version == 3 || recipe.source_sync.is_some() {
+        recipe.validate_operation()?;
+        anyhow::ensure!(
+            recipe.wrapper_id == lease.identity.local_wrapper_id
+                && recipe.build_id > 0
+                && Some(recipe.build_id) == lease.identity.remote_build_id
+                && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),
+            "source-only terminal evidence has a different admission identity"
+        );
+    }
     anyhow::ensure!(!recipe.staging_release_pending(), pending());
     Ok(())
 }
@@ -1864,6 +1994,7 @@ impl RecoverySession {
             completion,
             source_roots,
             source_authority_namespace: Some(SourceAuthorityNamespace::Current),
+            source_sync: None,
             pair,
             retire_root,
             retained_root,
@@ -1906,6 +2037,120 @@ impl RecoverySession {
         writer.set_recovery(recipe.storage_value()?)
     }
 
+    /// Distinguish preparation from execution before any source grant exists.
+    /// The immutable report is also the exact granted root set: source-only
+    /// work receives no target, output, retirement, or pair authority.
+    pub(in crate::hook) fn require_source_sync(
+        writer: &DurableLeaseWriter,
+        report: SourceSyncReport,
+    ) -> anyhow::Result<Self> {
+        let mut recipe = load_recipe(writer)?;
+        anyhow::ensure!(
+            recipe.version == 2
+                && recipe.source_sync.is_none()
+                && !recipe.preparation_cancelled
+                && recipe.returned.is_none()
+                && !recipe.sources_released
+                && !recipe.tree_retired
+                && !recipe.pair_released
+                && !recipe.retired,
+            "source-only operation requires a fresh admitted preparation"
+        );
+        recipe.version = 3;
+        recipe.source_sync = Some(SourceSyncState {
+            report,
+            uploads_complete: false,
+        });
+        recipe.validate_operation()?;
+        let session = Self {
+            recipe,
+            writer: writer.clone(),
+        };
+        session.persist()?;
+        Ok(session)
+    }
+
+    /// Called only after all admitted upload futures have settled while the
+    /// original source guard is still live. A subset or changed mapping may
+    /// never become a successful source-only receipt.
+    pub(in crate::hook) fn source_sync_uploaded(
+        &mut self,
+        report: &SourceSyncReport,
+    ) -> anyhow::Result<()> {
+        self.recipe.validate_operation()?;
+        let sync = self
+            .recipe
+            .source_sync
+            .as_ref()
+            .context("no source-only admission")?;
+        anyhow::ensure!(
+            !sync.uploads_complete
+                && !self.recipe.preparation_cancelled
+                && self.recipe.returned.is_none()
+                && &sync.report == report,
+            "source-only upload completion does not match the original required closure"
+        );
+        let mut next = self.recipe.clone();
+        next.source_sync
+            .as_mut()
+            .expect("validated source-only admission")
+            .uploads_complete = true;
+        self.persist_next_recipe(next)
+    }
+
+    async fn finish_source_sync(&mut self) -> anyhow::Result<()> {
+        self.finish_source_sync_with(async |worker, roots, identity, namespace| {
+            if !super::super::ssh::remote_source_authority_was_released(
+                worker, roots, identity, namespace,
+            )
+            .await?
+            {
+                // Recovery reattaches only the identical live intent. It may
+                // not acquire a fresh grant or reopen prepared source paths.
+                let guard = super::super::ssh::recover_remote_source_authority_lock(
+                    worker,
+                    roots,
+                    None,
+                    identity,
+                    Duration::from_secs(15),
+                    namespace,
+                )
+                .await?;
+                guard.release().await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn finish_source_sync_with(
+        &mut self,
+        mut release: impl AsyncFnMut(
+            &WorkerConfig,
+            &[String],
+            &str,
+            SourceAuthorityNamespace,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.recipe.validate_operation()?;
+        anyhow::ensure!(
+            self.recipe.source_sync_complete(),
+            "source-only preparation is not complete; cancellation must drain partial uploads"
+        );
+        if !self.recipe.sources_released {
+            release(
+                &self.recipe.worker,
+                &self.recipe.source_roots,
+                &self.recipe.identity,
+                SourceAuthorityNamespace::Current,
+            )
+            .await?;
+            self.sources_released()?;
+        }
+        self.returned(0)?;
+        self.retired()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         writer: &DurableLeaseWriter,
@@ -1940,6 +2185,7 @@ impl RecoverySession {
         )?;
         anyhow::ensure!(
             intent.version == 2
+                && intent.source_sync.is_none()
                 && intent.identity == identity
                 && intent.source_authority_namespace == Some(SourceAuthorityNamespace::Current)
                 && intent.wrapper_id == lease.identity.local_wrapper_id
@@ -2093,6 +2339,7 @@ impl RecoverySession {
             completion,
             source_roots,
             source_authority_namespace: Some(SourceAuthorityNamespace::Current),
+            source_sync: None,
             pair,
             retire_root,
             retained_root,
@@ -2257,11 +2504,13 @@ impl RecoverySession {
     }
 
     fn persist(&self) -> anyhow::Result<()> {
+        self.recipe.validate_operation()?;
         self.writer.set_recovery(self.recipe.storage_value()?)
     }
     /// A failed journal publication must not install a successful lifecycle
     /// boundary in this session. Same-session retries use these exact flags.
     fn persist_next_recipe(&mut self, next_recipe: RecoveryRecipe) -> anyhow::Result<()> {
+        next_recipe.validate_operation()?;
         self.writer.set_recovery(next_recipe.storage_value()?)?;
         self.recipe = next_recipe;
         Ok(())
@@ -5052,12 +5301,12 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
         *root = super::super::ssh::canonical_source_authority_root(root);
     }
     anyhow::ensure!(
-        recipe.version == 2
-            && recipe.wrapper_id == lease.identity.local_wrapper_id
+        recipe.wrapper_id == lease.identity.local_wrapper_id
             && Some(recipe.build_id) == lease.identity.remote_build_id
             && lease.worker_id.as_deref() == Some(recipe.worker.id.as_str()),
         "recovery recipe identity mismatch or unsupported source ownership version"
     );
+    recipe.validate_operation()?;
     // Structural validation only: an unavailable output root must not prevent
     // cancellation or retirement of a job that has not exposed any outputs.
     // Publication rechecks the original physical root before every write.
@@ -5259,6 +5508,12 @@ fn load_recipe(writer: &DurableLeaseWriter) -> anyhow::Result<RecoveryRecipe> {
 /// Once execution might have started, only its exact completion can retire it.
 pub(crate) async fn cancel_preparation(writer: &DurableLeaseWriter) -> anyhow::Result<bool> {
     let recipe = load_recipe(writer)?;
+    // A complete source-only upload is an independent successful operation.
+    // Lost release acknowledgments must retain that checkpoint for exact
+    // release recovery, never turn it into cancelled preparation.
+    if recipe.source_sync_complete() {
+        return Ok(false);
+    }
     if recipe.retired {
         RecoverySession {
             recipe,
@@ -5852,6 +6107,10 @@ async fn recover_owned_job_until_retired(writer: &DurableLeaseWriter) -> anyhow:
             .recipe
             .returned
             .context("retired recovery lacks a delivery result");
+    }
+    if session.recipe.source_sync_complete() {
+        session.finish_source_sync().await?;
+        return Ok(0);
     }
     if !session.recipe.execution_started {
         cancel_preparation(writer).await?;
@@ -17192,6 +17451,199 @@ func TestValue(t *testing.T) {{
         assert!(writer.admit(42, &worker.id).is_err());
         assert_eq!(writer.snapshot().identity.remote_build_id, Some(41));
         assert!(writer.acknowledge_terminal().is_err());
+    }
+
+    fn source_sync_fixture() -> (tempfile::TempDir, RecoverySession, SourceSyncReport) {
+        let (directory, writer, _worker) = preparation_fixture();
+        let report = SourceSyncReport {
+            roots: vec![SourceSyncRoot {
+                local_root: directory.path().to_owned(),
+                remote_root: "/data/projects/source-recovery".into(),
+                mode: "full".into(),
+            }],
+        };
+        let session = RecoverySession::require_source_sync(&writer, report.clone()).unwrap();
+        (directory, session, report)
+    }
+
+    #[test]
+    fn source_sync_requires_exact_admitted_closure_before_success() {
+        let (_directory, mut session, report) = source_sync_fixture();
+        let writer = session.writer.clone();
+        let before = writer.snapshot();
+        let pending = load_recipe(&writer).unwrap();
+        assert_eq!(pending.version, 3);
+        assert!(!pending.source_sync_complete());
+        assert!(!pending.prepared);
+        assert!(!pending.execution_started);
+        assert!(session.starting_execution().is_err());
+        assert!(session.returned(0).is_err());
+        let mut wrong_remote = report.clone();
+        wrong_remote.roots[0].remote_root = "/data/projects/unadmitted".into();
+        assert!(session.source_sync_uploaded(&wrong_remote).is_err());
+        assert!(
+            session
+                .source_sync_uploaded(&SourceSyncReport { roots: Vec::new() })
+                .is_err()
+        );
+        let mut wrong_mode = report.clone();
+        wrong_mode.roots[0].mode = "workspace_metadata".into();
+        assert!(session.source_sync_uploaded(&wrong_mode).is_err());
+        let mut wrong_local = report.clone();
+        wrong_local.roots[0].local_root = PathBuf::from("/different/local/source");
+        assert!(session.source_sync_uploaded(&wrong_local).is_err());
+        assert_eq!(writer.snapshot(), before);
+
+        session.source_sync_uploaded(&report).unwrap();
+        assert!(load_recipe(&writer).unwrap().source_sync_complete());
+        assert!(
+            session.returned(0).is_err(),
+            "upload success is not release acknowledgment"
+        );
+        assert!(session.source_sync_uploaded(&report).is_err());
+        session.sources_released().unwrap();
+        session.returned(0).unwrap();
+        session.retired().unwrap();
+        let finished = load_recipe(&writer).unwrap();
+        assert_eq!(finished.returned, Some(0));
+        assert_eq!(finished.exit_code, None);
+        assert!(
+            !finished.prepared && !finished.execution_started && !finished.preparation_cancelled
+        );
+        assert!(!finished.tree_retired && !finished.pair_released);
+        assert!(finished.retired && finished.sources_released);
+        assert!(finished.phases.is_empty());
+        writer.record_exit(0).unwrap();
+        writer.acknowledge_terminal().unwrap();
+    }
+
+    #[test]
+    fn source_sync_recovery_rejects_conflicting_operation_and_grant_evidence() {
+        let (_directory, mut session, report) = source_sync_fixture();
+        session.source_sync_uploaded(&report).unwrap();
+        let original = session.writer.snapshot().recovery.unwrap();
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("source_sync", serde_json::Value::Null),
+            ("prepared", serde_json::json!(true)),
+            ("execution_started", serde_json::json!(true)),
+            ("exit_code", serde_json::json!(0)),
+            ("preparation_cancelled", serde_json::json!(true)),
+            ("source_cancellation_settled", serde_json::json!(false)),
+            ("tree_retired", serde_json::json!(true)),
+            ("pair_released", serde_json::json!(true)),
+            ("retired", serde_json::json!(true)),
+            ("source_roots", serde_json::json!(["/data/projects/other"])),
+            ("source_authority_namespace", serde_json::Value::Null),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            let mut lease = session.writer.snapshot();
+            lease.recovery = Some(changed);
+            let forged = DurableLeaseWriter {
+                path: session.writer.path.clone(),
+                recovery_ownership: None,
+                lease: Arc::new(Mutex::new(lease)),
+            };
+            assert!(
+                load_recipe(&forged).is_err(),
+                "accepted contradictory {field}"
+            );
+        }
+        let mut changed = original;
+        changed["source_sync"]["report"]["roots"][0]["mode"] = serde_json::json!("unknown");
+        assert!(
+            serde_json::from_value::<RecoveryRecipe>(changed)
+                .unwrap()
+                .validate_operation()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_source_sync_recovers_release_without_execution_or_cancellation() {
+        let (_directory, mut session, report) = source_sync_fixture();
+        session.source_sync_uploaded(&report).unwrap();
+        let writer = session.writer.clone();
+        assert!(!cancel_preparation(&writer).await.unwrap());
+        let pending = writer.snapshot();
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            session
+                .finish_source_sync_with(async |_, _, _, _| {
+                    calls.set(calls.get() + 1);
+                    anyhow::bail!("release confirmation lost")
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(writer.snapshot(), pending);
+        assert!(!writer.snapshot().terminal_acknowledged);
+        let mut resumed = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer: writer.clone(),
+        };
+        resumed
+            .finish_source_sync_with(async |worker, roots, identity, namespace| {
+                calls.set(calls.get() + 1);
+                assert_eq!(worker.id.as_str(), "source-recovery");
+                assert_eq!(roots, ["/data/projects/source-recovery"]);
+                assert_eq!(identity, "abc123");
+                assert_eq!(namespace, SourceAuthorityNamespace::Current);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(!cancel_preparation(&writer).await.unwrap());
+        let mut settled = RecoverySession {
+            recipe: load_recipe(&writer).unwrap(),
+            writer: writer.clone(),
+        };
+        settled
+            .finish_source_sync_with(async |_, _, _, _| {
+                panic!("acknowledged source release must not reopen the worker")
+            })
+            .await
+            .unwrap();
+        let finished = load_recipe(&writer).unwrap();
+        assert_eq!(finished.returned, Some(0));
+        assert!(finished.retired && finished.sources_released);
+        assert!(
+            !finished.execution_started && !finished.prepared && !finished.preparation_cancelled
+        );
+        assert!(finished.exit_code.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_source_sync_before_upload_checkpoint_stays_failed_preparation() {
+        let (_directory, mut session, _report) = source_sync_fixture();
+        assert!(
+            session
+                .finish_source_sync_with(async |_, _, _, _| {
+                    panic!("partial uploads cannot use successful release")
+                })
+                .await
+                .is_err()
+        );
+        let mut cancelled = session.recipe.clone();
+        cancelled.preparation_cancelled = true;
+        session.persist_next_recipe(cancelled).unwrap();
+        session.tree_retired().unwrap();
+        session.pair_released().unwrap();
+        session.sources_released().unwrap();
+        session.returned(EXIT_BUILD_ERROR).unwrap();
+        session
+            .reconcile_source_cancellation_with(async |_, _, _| Ok(()))
+            .await
+            .unwrap();
+        session.retired().unwrap();
+        let finished = load_recipe(&session.writer).unwrap();
+        assert!(!finished.source_sync_complete());
+        assert_eq!(finished.returned, Some(EXIT_BUILD_ERROR));
+        assert!(finished.preparation_cancelled && finished.retired);
+        assert_eq!(finished.source_cancellation_settled, Some(true));
+        assert!(!finished.execution_started);
     }
 
     #[test]
