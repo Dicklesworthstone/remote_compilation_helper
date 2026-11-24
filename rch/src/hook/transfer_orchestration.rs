@@ -1099,6 +1099,7 @@ fn invocation_execution_pipeline(
     pipeline
         .with_local_root(invocation_root.to_owned())
         .with_retrieval_reference_root(invocation_root.to_owned())
+        .with_retrieval_filter_root(invocation_root.to_owned())
         .with_remote_path_override(remote_invocation_root)
         .with_remote_cargo_target_dir_override(target_root)
         .with_disk_source_root(source_root)
@@ -4066,6 +4067,7 @@ async fn execute_remote_compilation_inner(
                     ),
                     transfer_config.clone(),
                 )
+                .with_retrieval_filter_root(normalized_invocation_root.clone())
                 .with_color_mode(color_mode)
                 .with_command_timeout(command_timeout)
                 .with_compilation_config(compilation_config.clone())

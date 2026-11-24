@@ -2624,11 +2624,85 @@ fn retrieval_exclude_can_block_artifacts(pattern: &str, artifact_patterns: &[Str
         return true;
     }
 
+    let Ok(exclude) = WindowsArtifactFilter::new(trimmed, false) else {
+        return true;
+    };
     artifact_patterns.iter().any(|artifact| {
-        first_path_component(artifact)
-            .map(|artifact_root| artifact_root == exclude_root)
-            .unwrap_or(false)
+        // Exact receipt-qualified outputs have includes (and ancestor includes)
+        // before these optional excludes. They do not require returning every
+        // other file in the same excluded cache directory.
+        if artifact_pattern_exclude(artifact).is_some()
+            || artifact_pattern_priority(artifact).is_some()
+        {
+            return false;
+        }
+
+        // Protect every literal ancestor needed by an include, but allow a
+        // directory below a broad output tree to be pruned. Comparing only the
+        // first component discarded target/debug/.worker-cache/ whenever the
+        // command included target/debug/**.
+        let mut ancestor = String::new();
+        for component in artifact.trim_start_matches('/').split('/') {
+            if has_rsync_glob_meta(component) || component.contains('\\') {
+                break;
+            }
+            if component.is_empty() {
+                continue;
+            }
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(component);
+            if exclude.matches(&ancestor, true) {
+                return true;
+            }
+        }
+        false
     })
+}
+
+/// Preserve the scope of an ignore rule when retrieval starts below its
+/// original project root. Unanchored rsync patterns still match suffixes in
+/// the new tree; a prefix matching the new root also needs a rooted remainder.
+/// For an external target directory only the portable, unanchored rules apply.
+fn rebase_retrieval_exclude(
+    pattern: &str,
+    policy_root: &Path,
+    retrieval_root: &Path,
+) -> Vec<String> {
+    if policy_root == retrieval_root {
+        return vec![pattern.to_owned()];
+    }
+
+    let mut rebased = Vec::new();
+    if !pattern.starts_with('/') {
+        rebased.push(pattern.to_owned());
+    }
+    let Ok(relative) = retrieval_root.strip_prefix(policy_root) else {
+        return rebased;
+    };
+    let relative = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    for (index, _) in pattern.match_indices('/') {
+        let remainder = &pattern[index + 1..];
+        if index == 0 || remainder.is_empty() {
+            continue;
+        }
+        let prefix = &pattern[..=index];
+        if WindowsArtifactFilter::new(prefix, false)
+            .is_ok_and(|filter| filter.matches(&relative, true))
+        {
+            let rule = format!("/{remainder}");
+            if !rebased.contains(&rule) {
+                rebased.push(rule);
+            }
+        }
+    }
+    rebased
 }
 
 fn path_matches_transfer_exclude(relative: &Path, is_dir: bool, excludes: &[String]) -> bool {
@@ -3172,6 +3246,9 @@ pub struct TransferPipeline {
     /// Caller-owned tree used to distinguish source from artifact roots. A
     /// private retrieval staging directory must not replace this evidence.
     retrieval_reference_root: PathBuf,
+    /// Original caller tree whose configured and .rchignore rules also apply
+    /// to separately rooted Cargo targets and retained-result recovery.
+    retrieval_filter_root: PathBuf,
     /// Project identifier (usually directory name).
     project_id: String,
     /// Project hash for cache invalidation.
@@ -3370,6 +3447,7 @@ impl TransferPipeline {
             cargo_disk_cache_base: None,
             cargo_disk_scope_captured: false,
             retrieval_reference_root: project_root.clone(),
+            retrieval_filter_root: project_root.clone(),
             project_root,
             project_id: safe_project_id,
             project_hash: safe_project_hash,
@@ -3756,6 +3834,11 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
         self
     }
 
+    pub(crate) fn with_retrieval_filter_root(mut self, root: PathBuf) -> Self {
+        self.retrieval_filter_root = root;
+        self
+    }
+
     pub(crate) fn with_disk_source_root(mut self, root: String) -> Self {
         self.disk_source_root = Some(root);
         self
@@ -3773,7 +3856,7 @@ exec env RCH_TIMING_SCALE={scale} "$RCH_WKR" disk-supervise {budget} {floor} {ma
     fn artifact_retrieval_filters(&self, artifact_patterns: &[String]) -> Result<ArtifactFilters> {
         self.validate_transfer_roots(&self.remote_path())?;
         let (caller_excludes, includes) = partition_artifact_filters(artifact_patterns);
-        let mut excludes = self.get_retrieval_excludes(&includes);
+        let mut excludes = self.get_retrieval_excludes(artifact_patterns);
         excludes.extend(caller_excludes);
         excludes.extend(
             self.local_source_roots_to_exclude(&allowed_artifact_roots(&includes), &includes),
@@ -6054,13 +6137,12 @@ mkdir -p {source}
 
     /// Retrieval-side excludes used when pulling artifacts back from the worker.
     ///
-    /// This is intentionally narrower than upload filtering. Upload wants broad
-    /// project hygiene exclusions (`target/`, `dist/`, coverage caches, etc.),
-    /// but retrieval still needs to descend into artifact roots like `target/`
-    /// and `build/`. The retrieval pass applies runtime scratch guards plus
-    /// project-local `.rchignore` directory patterns that cannot hide the
-    /// requested artifacts. File globs and artifact-root directories are skipped
-    /// because rsync evaluates these excludes before the artifact includes.
+    /// This is intentionally narrower than upload filtering. Whole artifact
+    /// roots and file globs cannot suppress requested outputs, but directory
+    /// rules may prune caches beneath a broad artifact include. Read policy
+    /// from the original project and the caller-owned target tree, never the
+    /// private staging directory. Rebase project-relative rules when pulling
+    /// from a separate Cargo target root (issue #148).
     fn get_retrieval_excludes(&self, artifact_patterns: &[String]) -> Vec<String> {
         let mut excludes = Vec::new();
 
@@ -6070,29 +6152,59 @@ mkdir -p {source}
             }
         }
 
-        let rchignore_path = self.retrieval_reference_root.join(".rchignore");
-        if let Ok(patterns) = parse_rchignore(&rchignore_path) {
-            let original_count = excludes.len();
+        let mut policies = vec![(
+            &self.retrieval_filter_root,
+            self.transfer_config
+                .exclude_patterns
+                .iter()
+                .map(|pattern| normalize_config_exclude_pattern(pattern).to_owned())
+                .collect::<Vec<_>>(),
+        )];
+        if let Ok(patterns) = parse_rchignore(&self.retrieval_filter_root.join(".rchignore")) {
+            policies.push((&self.retrieval_filter_root, patterns));
+        }
+        if self.retrieval_reference_root != self.retrieval_filter_root
+            && let Ok(patterns) =
+                parse_rchignore(&self.retrieval_reference_root.join(".rchignore"))
+        {
+            policies.push((&self.retrieval_reference_root, patterns));
+        }
+
+        let original_count = excludes.len();
+        for (policy_root, patterns) in policies {
             for pattern in patterns {
-                if retrieval_exclude_can_block_artifacts(&pattern, artifact_patterns) {
-                    debug!(
-                        "Skipping retrieval exclude pattern '{}' because it may hide requested artifacts",
-                        pattern
-                    );
-                    continue;
-                }
-                if !excludes.contains(&pattern) {
-                    excludes.push(pattern);
+                for pattern in rebase_retrieval_exclude(
+                    &pattern,
+                    policy_root,
+                    &self.retrieval_reference_root,
+                ) {
+                    if retrieval_exclude_can_block_artifacts(&pattern, artifact_patterns) {
+                        debug!(
+                            "Skipping retrieval exclude pattern '{}' because it may hide requested artifacts",
+                            pattern
+                        );
+                        continue;
+                    }
+                    // A priority include may open an otherwise excluded
+                    // directory to reach one required output. Exclude its
+                    // descendants too, so rsync cannot then include every
+                    // sibling through a broad artifact pattern.
+                    let descendants = format!("{pattern}**");
+                    for rule in [pattern, descendants] {
+                        if !excludes.contains(&rule) {
+                            excludes.push(rule);
+                        }
+                    }
                 }
             }
-            let added = excludes.len() - original_count;
-            if added > 0 {
-                info!(
-                    "Loaded {} retrieval exclude pattern(s) from .rchignore (total: {})",
-                    added,
-                    excludes.len()
-                );
-            }
+        }
+        let added = excludes.len() - original_count;
+        if added > 0 {
+            info!(
+                "Loaded {} retrieval exclude pattern(s) from project policy (total: {})",
+                added,
+                excludes.len()
+            );
         }
 
         excludes
@@ -9073,7 +9185,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
         // Apply retrieval-safe excludes before the directory include so rsync
         // never descends into known junk trees like `.beads/recovery_*` on the
         // worker, while still allowing traversal into declared artifact roots.
-        for pattern in self.get_retrieval_excludes(&include_patterns) {
+        for pattern in self.get_retrieval_excludes(artifact_patterns) {
             cmd.arg("--exclude").arg(pattern);
         }
 
@@ -9176,7 +9288,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         // Reuse the retrieval-safe excludes so streaming downloads skip stale
         // worker-local junk trees without excluding legitimate artifact roots.
-        for pattern in self.get_retrieval_excludes(&include_patterns) {
+        for pattern in self.get_retrieval_excludes(artifact_patterns) {
             cmd.arg("--exclude").arg(pattern);
         }
 
@@ -18170,6 +18282,206 @@ Number of files transferred: 42
     }
 
     #[test]
+    fn retrieval_directory_rules_protect_outputs_and_prune_nested_worker_caches() {
+        let broad = vec!["target/debug/**".to_owned()];
+        for ancestor in ["target/", "debug/", "/target/debug/"] {
+            assert!(retrieval_exclude_can_block_artifacts(ancestor, &broad));
+        }
+        assert!(retrieval_exclude_can_block_artifacts("*.rlib", &broad));
+        let cache = "target/debug/.kache-build-script-shims/";
+        assert!(!retrieval_exclude_can_block_artifacts(cache, &broad));
+        assert!(retrieval_exclude_can_block_artifacts(
+            cache,
+            &["target/debug/.kache-build-script-shims/required".to_owned()],
+        ));
+        let mut with_required = broad;
+        with_required.push("+ target/debug/.kache-build-script-shims/required".to_owned());
+        assert!(!retrieval_exclude_can_block_artifacts(cache, &with_required));
+    }
+
+    #[test]
+    fn retrieval_policy_rebases_scoped_rules_without_broadening_external_targets() {
+        let project = Path::new("/project");
+        let target = Path::new("/project/target");
+        assert_eq!(
+            rebase_retrieval_exclude("/target/debug/cache/", project, target),
+            ["/debug/cache/"]
+        );
+        assert_eq!(
+            rebase_retrieval_exclude("target/debug/cache/", project, target),
+            ["target/debug/cache/", "/debug/cache/"]
+        );
+        assert_eq!(
+            rebase_retrieval_exclude(
+                "/target[[]3[]]/debug/cache/",
+                project,
+                Path::new("/project/target[3]"),
+            ),
+            ["/debug/cache/"]
+        );
+        let external = Path::new("/external-target");
+        assert!(
+            rebase_retrieval_exclude("/target/debug/cache/", project, external).is_empty()
+        );
+        assert_eq!(
+            rebase_retrieval_exclude(".worker-cache/", project, external),
+            [".worker-cache/"]
+        );
+        assert!(
+            rebase_retrieval_exclude("/target/", project, target).is_empty(),
+            "an upload exclusion of the entire target cannot hide every output"
+        );
+    }
+
+    #[test]
+    fn separate_target_retrieval_inherits_project_config_and_ignore_policy() {
+        let _guard = test_guard!();
+        let project = tempfile::tempdir().unwrap();
+        let target = project.path().join("target");
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(
+            project.path().join(".rchignore"),
+            "/target/debug/.kache-build-script-shims/\nshared-cache/\ntarget/\n*.rlib\n",
+        )
+        .unwrap();
+        std::fs::write(target.join(".rchignore"), "target-local-cache/\n").unwrap();
+        std::fs::write(stage.path().join(".rchignore"), "/debug/stage-only/\n").unwrap();
+        let config = TransferConfig {
+            exclude_patterns: vec!["/target/debug/config-cache/".into(), "target/".into()],
+            ..Default::default()
+        };
+        let live = TransferPipeline::new(
+            target.clone(),
+            "target".into(),
+            "identity".into(),
+            config.clone(),
+        )
+        .with_retrieval_filter_root(project.path().to_owned())
+        .with_local_root(stage.path().to_owned());
+        // Detached recovery starts with the recipe's original caller root and
+        // then rebinds the phase reference and its private staging destination.
+        let recovered = TransferPipeline::new(
+            project.path().to_owned(),
+            "recovery".into(),
+            "identity".into(),
+            config,
+        )
+        .with_retrieval_reference_root(target)
+        .with_local_root(stage.path().to_owned());
+        let patterns = vec![
+            "debug/**".to_owned(),
+            "+ debug/.kache-build-script-shims/required".to_owned(),
+        ];
+        let inventory = b"4 ./debug/app\0\
+            4 ./debug/.kache-build-script-shims/private\0\
+            4 ./debug/.kache-build-script-shims/required\0\
+            4 ./debug/config-cache/private\0\
+            4 ./debug/shared-cache/private\0\
+            4 ./debug/target-local-cache/private\0\
+            4 ./debug/stage-only/keep\0";
+        let worker = worker_with_os(Some("linux"));
+        for pipeline in [live, recovered] {
+            let filters = pipeline.artifact_retrieval_filters(&patterns).unwrap();
+            let selected = windows_artifact_selection(inventory, &filters).unwrap();
+            assert_eq!(
+                selected.into_keys().collect::<Vec<_>>(),
+                [
+                    "debug/.kache-build-script-shims/required",
+                    "debug/app",
+                    "debug/stage-only/keep",
+                ]
+            );
+            for command in [
+                pipeline.build_retrieve_command(&worker, "/remote-target", &patterns),
+                pipeline.build_retrieve_streaming_command(&worker, "/remote-target", &patterns),
+            ] {
+                let args = command_args(&command);
+                let cache = arg_pair_position(
+                    &args,
+                    "--exclude",
+                    "/debug/.kache-build-script-shims/",
+                )
+                .unwrap();
+                let required = arg_pair_position(
+                    &args,
+                    "--include",
+                    "/debug/.kache-build-script-shims/required",
+                )
+                .unwrap();
+                let traversal = arg_pair_position(&args, "--include", "*/").unwrap();
+                let descendants = arg_pair_position(
+                    &args,
+                    "--exclude",
+                    "/debug/.kache-build-script-shims/**",
+                )
+                .unwrap();
+                assert!(required < cache && cache < descendants && descendants < traversal);
+                assert!(
+                    arg_pair_position(&args, "--exclude", "/debug/config-cache/").is_some()
+                );
+                assert!(arg_pair_position(&args, "--exclude", "*.rlib").is_none());
+                assert!(
+                    arg_pair_position(&args, "--exclude", "/debug/stage-only/").is_none()
+                );
+
+                #[cfg(unix)]
+                {
+                    let remote = tempfile::tempdir().unwrap();
+                    let delivered = tempfile::tempdir().unwrap();
+                    let kept = [
+                        "debug/app",
+                        "debug/.kache-build-script-shims/required",
+                        "debug/stage-only/keep",
+                    ];
+                    let pruned = [
+                        "debug/.kache-build-script-shims/private",
+                        "debug/config-cache/private",
+                        "debug/shared-cache/private",
+                        "debug/target-local-cache/private",
+                    ];
+                    for path in kept.iter().chain(pruned.iter()) {
+                        let file = remote.path().join(path);
+                        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                        std::fs::write(&file, path.as_bytes()).unwrap();
+                    }
+                    // Exercise the actual rsync selection for both builders.
+                    // Only SSH and source/destination addresses are replaced
+                    // with local directories; every filter stays unchanged.
+                    let mut local =
+                        std::process::Command::new(command.as_std().get_program());
+                    let mut index = 0;
+                    while index < args.len() - 2 {
+                        if matches!(args[index].as_str(), "-e" | "--rsync-path") {
+                            index += 2;
+                        } else {
+                            local.arg(&args[index]);
+                            index += 1;
+                        }
+                    }
+                    let output = local
+                        .arg(format!("{}/", remote.path().display()))
+                        .arg(format!("{}/", delivered.path().display()))
+                        .output()
+                        .expect("real rsync must execute");
+                    assert!(output.status.success(), "{output:?}");
+                    for path in kept {
+                        assert_eq!(
+                            std::fs::read(delivered.path().join(path)).unwrap(),
+                            path.as_bytes(),
+                            "{path}"
+                        );
+                    }
+                    for path in pruned {
+                        assert!(!delivered.path().join(path).exists(), "{path}");
+                        assert!(remote.path().join(path).is_file(), "{path}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_build_retrieve_command_applies_rchignore_excludes_before_directory_include() {
         let _guard = test_guard!();
         let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -24162,15 +24474,13 @@ fn main() {
         .unwrap();
         assert_eq!(
             selected.into_keys().collect::<Vec<_>>(),
-            [
-                "ignored/release/kept.exe",
-                "x86_64-pc-windows-msvc/release/app.exe"
-            ]
+            ["x86_64-pc-windows-msvc/release/app.exe"]
         );
         for path in [
             "private.txt",
             "Cargo.toml",
             "private-build/release/secret.exe",
+            "ignored/release/kept.exe",
         ] {
             assert!(
                 recovered
@@ -24181,10 +24491,7 @@ fn main() {
         }
         recovered
             .validate_staged_artifact_paths(
-                &[
-                    PathBuf::from("ignored/release/kept.exe"),
-                    PathBuf::from("x86_64-pc-windows-msvc/release/app.exe"),
-                ],
+                &[PathBuf::from("x86_64-pc-windows-msvc/release/app.exe")],
                 &patterns,
             )
             .unwrap();
