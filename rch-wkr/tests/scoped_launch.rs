@@ -415,3 +415,178 @@ exit 0
     assert_eq!(output.stdout, b"first:second:456789");
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn path_absence_distinguishes_missing_components_from_unobservable_paths() {
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::symlink;
+
+    let owner = tempfile::Builder::new()
+        .prefix("rch-native-path-absence-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let root = owner.path();
+    let directory = root.join("directory");
+    let file = root.join("record.pgid");
+    let alias = root.join("directory-alias");
+    let dangling = root.join("dangling");
+    let looping = root.join("looping");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(&file, b"owned record\n").unwrap();
+    symlink(&directory, &alias).unwrap();
+    symlink(root.join("missing-target"), &dangling).unwrap();
+    symlink("looping", &looping).unwrap();
+    let probe = |path: &std::path::Path| helper().arg("path-absent").arg(path).output().unwrap();
+    for path in [
+        root.join("missing.pgid"),
+        root.join("never-created/child/record.pgid"),
+        directory.join("missing.pgid"),
+        alias.join("missing.pgid"),
+        root.join("missing 'quote $dollar;\u{0060}tick\u{0060}.pgid"),
+        root.join(std::ffi::OsString::from_vec(b"missing-\xff.pgid".to_vec())),
+    ] {
+        let output = probe(&path);
+        assert!(output.status.success(), "{path:?}: {output:?}");
+        assert_eq!(output.stdout, b"RCH_PATH_ABSENT_V1\n");
+        assert!(output.stderr.is_empty());
+    }
+    for path in [&file, &directory, &alias, &dangling, &looping] {
+        let output = probe(path);
+        assert_eq!(output.status.code(), Some(1), "{path:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+    for path in [
+        file.join("record"),
+        dangling.join("record"),
+        looping.join("record"),
+        directory.join("x".repeat(256)),
+    ] {
+        let output = probe(&path);
+        assert_eq!(output.status.code(), Some(125), "{path:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("RCH_SCOPED_LAUNCH_UNAVAILABLE"));
+    }
+    assert_eq!(std::fs::read(&file).unwrap(), b"owned record\n");
+    assert_eq!(std::fs::read_link(&alias).unwrap(), directory);
+    assert_eq!(
+        std::fs::read_link(&dangling).unwrap(),
+        root.join("missing-target")
+    );
+}
+
+#[test]
+fn path_absence_refuses_normalized_or_unbounded_path_spellings() {
+    for path in [
+        "",
+        "relative",
+        "/",
+        "/missing/",
+        "/missing/.",
+        "/missing/../record",
+        "/missing//record",
+    ] {
+        let output = helper().args(["path-absent", path]).output().unwrap();
+        assert_eq!(output.status.code(), Some(125), "{path:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+    }
+    let path = format!("/{}record", "missing/".repeat(256));
+    let output = helper().args(["path-absent", &path]).output().unwrap();
+    assert_eq!(output.status.code(), Some(125), "{output:?}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn path_absence_never_hides_a_record_behind_denied_directory_access() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let owner = tempfile::Builder::new()
+        .prefix("rch-native-denied-record-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let directory = owner.path().join("private");
+    let path = directory.join("record.pgid");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(&path, b"still owned\n").unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0)).unwrap();
+    let observation = std::fs::symlink_metadata(&path);
+    let result = helper().arg("path-absent").arg(&path).output();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = result.unwrap();
+    match observation {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            assert_eq!(output.status.code(), Some(125), "{output:?}");
+        }
+        // A privileged runner can traverse mode 000. It must observe the
+        // actual record instead; this branch is not permission-error proof.
+        Ok(_) => assert_eq!(output.status.code(), Some(1), "{output:?}"),
+        other => panic!("unexpected permission fixture observation: {other:?}"),
+    }
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), b"still owned\n");
+}
+
+#[test]
+fn path_absence_shell_receipt_is_diskless_and_requires_exact_native_output() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let owner = tempfile::Builder::new()
+        .prefix("rch-path-absence-receipt-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let missing = owner.path().join("not-created/record.pgid");
+    let script = format!(
+        "{}\nrch_path_absent \"$1\" || exit 44\nprintf 'accepted\\n'\n",
+        rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT
+    );
+    let invoke = |worker: &std::path::Path| {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &script, "rch-path-absence-test"])
+            .arg(&missing)
+            .env("RCH_WKR_BIN", worker)
+            .env("RCH_TIMING_SCALE", "1")
+            .env("TMPDIR", "/dev/null/not-writable");
+        command
+    };
+    let output = invoke(std::path::Path::new(WORKER)).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"accepted\n");
+    assert!(output.stderr.is_empty());
+
+    let unavailable = invoke(&owner.path().join("no-worker")).output().unwrap();
+    assert_eq!(unavailable.status.code(), Some(44), "{unavailable:?}");
+    assert!(unavailable.stdout.is_empty());
+
+    // Only the absence command is doubled. The timeout, memory capture and
+    // shell protocol remain the production implementations.
+    let double = owner.path().join("rch-wkr-double");
+    std::fs::write(
+        &double,
+        b"#!/bin/sh\nif [ \"$1:$2\" = scoped-launch:path-absent ]; then\n\
+          printf '%s' \"$RCH_TEST_ABSENCE_OUTPUT\"\n\
+          exit \"$RCH_TEST_ABSENCE_STATUS\"\nfi\n\
+          exec \"$RCH_TEST_NATIVE_WORKER\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&double, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (marker, code) in [
+        ("", "0"),
+        ("RCH_PATH_ABSENT_V1", "0"),
+        ("RCH_PATH_ABSENT_V1\n\n", "0"),
+        ("RCH_PATH_ABSENT_V1\njunk\n", "0"),
+        ("RCH_PATH_ABSENT_V1\n", "125"),
+    ] {
+        let output = invoke(&double)
+            .env("RCH_TEST_NATIVE_WORKER", WORKER)
+            .env("RCH_TEST_ABSENCE_OUTPUT", marker)
+            .env("RCH_TEST_ABSENCE_STATUS", code)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(44), "{marker:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{marker:?}: {output:?}");
+    }
+}

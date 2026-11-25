@@ -3133,14 +3133,18 @@ wait
             tokio::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(build_remote_kill_script(path.to_str(), 42))
+                .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
+                .env("TMPDIR", "/dev/null/no-control-storage")
                 .stdin(std::process::Stdio::null())
                 .output()
                 .await
                 .unwrap()
         };
-        let absent = probe(path.clone()).await;
-        assert!(remote_record_absent(&absent, 42), "{absent:?}");
-        assert!(!remote_record_absent(&absent, 41));
+        for missing in [path.clone(), root.path().join("not-created/yet/group.pgid")] {
+            let absent = probe(missing).await;
+            assert!(remote_record_absent(&absent, 42), "{absent:?}");
+            assert!(!remote_record_absent(&absent, 41));
+        }
 
         let unverified_record = format!("unverified legacy pid {}\n", std::process::id());
         std::fs::write(&path, &unverified_record).unwrap();
@@ -3149,6 +3153,28 @@ wait
         assert!(present.stdout.is_empty());
         assert!(!remote_record_absent(&present, 42));
         assert!(!remote_kill_confirmed(&present, 42));
+
+        let dangling = root.path().join("dangling");
+        std::os::unix::fs::symlink(root.path().join("missing-target"), &dangling).unwrap();
+        for unknown in [
+            path.join("child.pgid"),
+            dangling.join("child.pgid"),
+            root.path().join("x".repeat(256)),
+        ] {
+            let output = probe(unknown).await;
+            assert_eq!(output.status.code(), Some(44), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(!remote_record_absent(&output, 42));
+            assert!(!remote_kill_confirmed(&output, 42));
+        }
+        let output = probe(dangling.clone()).await;
+        assert_eq!(output.status.code(), Some(42), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!remote_record_absent(&output, 42));
+        assert_eq!(
+            std::fs::read_link(&dangling).unwrap(),
+            root.path().join("missing-target")
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), unverified_record);
     }
 
@@ -5086,6 +5112,7 @@ exec /bin/sh -c "$payload"
                 .arg("rch-cancel-fixture")
                 .arg(path)
                 .arg("42")
+                .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true)
                 .output(),

@@ -1,9 +1,10 @@
 //! Native lifecycle primitives for the shared owned-group launch protocol.
 //!
-//! An absence witness proves only ESRCH for one process. Group signals are
-//! limited to this helper's own kernel-confirmed membership, never a historical
-//! receipt or a reaped child PID. The timeout monitor owns its private session
-//! until exit, so its identity cannot be recycled while the watchdog is armed.
+//! A process-absence witness proves only ESRCH for one process. Path absence
+//! requires exact ENOENT under a retained, revalidated directory chain. Group
+//! signals are limited to this helper's own kernel-confirmed membership, never
+//! a historical receipt or a reaped child PID. The timeout monitor owns its
+//! private session until exit, so its identity cannot be recycled while armed.
 
 use std::ffi::OsString;
 
@@ -34,6 +35,7 @@ mod unix {
     use super::REFUSED;
     use std::ffi::{OsStr, OsString};
     use std::io::{self, Write as _};
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
     use std::sync::Arc;
@@ -41,6 +43,8 @@ mod unix {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
+    use rustix::fd::OwnedFd;
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use rustix::io::Errno;
     use rustix::process::{Pid, Signal};
 
@@ -82,6 +86,76 @@ mod unix {
             .ok_or_else(|| invalid("process identity exceeds the kernel PID domain"))
     }
 
+    /// Retained descriptors bind each observed directory to the named path.
+    /// Follow directory aliases (including Darwin's /tmp), but never interpret
+    /// a dangling symlink or an unobservable ancestor as a missing component.
+    fn verify_path_prefix(directories: &[OwnedFd], names: &[&OsStr]) -> io::Result<()> {
+        for (edge, name) in directories.windows(2).zip(names).rev() {
+            let named = rustix::fs::statat(&edge[0], *name, AtFlags::empty())?;
+            let held = rustix::fs::fstat(&edge[1])?;
+            if named.st_dev != held.st_dev || named.st_ino != held.st_ino {
+                return Err(invalid("absence observation directory changed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn path_absent(argument: &OsStr) -> io::Result<bool> {
+        let bytes = argument.as_bytes();
+        if !bytes.starts_with(b"/") || bytes.ends_with(b"/") {
+            return Err(invalid("absence observation requires an absolute literal path"));
+        }
+        let components: Vec<&OsStr> = bytes[1..]
+            .split(|byte| *byte == b'/')
+            .take(257)
+            .map(OsStr::from_bytes)
+            .collect();
+        if components.len() > 256
+            || components.iter().any(|name| {
+                name.is_empty() || *name == OsStr::new(".") || *name == OsStr::new("..")
+            })
+        {
+            return Err(invalid("invalid absence observation path components"));
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut directories = vec![rustix::fs::open("/", flags, Mode::empty())?];
+        for (index, name) in components.iter().enumerate() {
+            let parent = directories.last().expect("root descriptor retained");
+            match rustix::fs::statat(parent, *name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(Errno::NOENT) => {
+                    // Only the exact failing lookup grants absence. Validate
+                    // its retained ancestry on both sides of a second lookup;
+                    // EACCES, ENOTDIR, EIO and aliases that cannot be followed
+                    // remain unknown. No temporary file or receipt is needed.
+                    verify_path_prefix(&directories, &components[..index])?;
+                    match rustix::fs::statat(parent, *name, AtFlags::SYMLINK_NOFOLLOW) {
+                        Err(Errno::NOENT) => {}
+                        Ok(_) => return Ok(false),
+                        Err(error) => return Err(error.into()),
+                    }
+                    verify_path_prefix(&directories, &components[..index])?;
+                    return Ok(true);
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) if index + 1 == components.len() => return Ok(false),
+                Ok(metadata) => {
+                    if !matches!(
+                        FileType::from_raw_mode(metadata.st_mode),
+                        FileType::Directory | FileType::Symlink
+                    ) {
+                        return Err(Errno::NOTDIR.into());
+                    }
+                    // A symlink exists even when its target does not. Failed
+                    // directory opening is never converted into absent proof.
+                    let child = rustix::fs::openat(parent, *name, flags, Mode::empty())?;
+                    directories.push(child);
+                    verify_path_prefix(&directories, &components[..=index])?;
+                }
+            }
+        }
+        Err(invalid("absence observation has no final component"))
+    }
+
     pub(super) fn run(arguments: &[OsString]) -> io::Result<i32> {
         if arguments.len() == 1 && arguments[0] == "probe" {
             io::stdout()
@@ -90,6 +164,14 @@ mod unix {
             return Ok(0);
         }
         match arguments.first().and_then(|argument| argument.to_str()) {
+            Some("path-absent") if arguments.len() == 2 => {
+                if path_absent(&arguments[1])? {
+                    io::stdout().lock().write_all(b"RCH_PATH_ABSENT_V1\n")?;
+                    Ok(0)
+                } else {
+                    Ok(1)
+                }
+            }
             Some("absent") if arguments.len() == 2 => {
                 let pid = process(&arguments[1])?;
                 match rustix::process::getpgid(Some(pid)) {
@@ -121,7 +203,7 @@ mod unix {
                 Ok(REFUSED)
             }
             Some("timeout") => timeout(&arguments[1..]),
-            _ => Err(invalid("expected probe, absent, kill-self, or timeout")),
+            _ => Err(invalid("expected probe, path-absent, absent, kill-self, or timeout")),
         }
     }
 
@@ -308,7 +390,36 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use super::timeout_deadline;
+        use super::{timeout_deadline, verify_path_prefix};
+
+        #[test]
+        fn replaced_parent_cannot_authorize_missing_record() {
+            use std::ffi::OsStr;
+
+            use rustix::fs::{Mode, OFlags};
+
+            let owner = tempfile::Builder::new()
+                .prefix("rch-absence-parent-race-")
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let parent = owner.path().join("parent");
+            let retained = owner.path().join("retained-parent");
+            std::fs::create_dir(&parent).unwrap();
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            let directories = vec![
+                rustix::fs::open(owner.path(), flags, Mode::empty()).unwrap(),
+                rustix::fs::open(&parent, flags, Mode::empty()).unwrap(),
+            ];
+            let names = [OsStr::new("parent")];
+            verify_path_prefix(&directories, &names).unwrap();
+            std::fs::rename(&parent, &retained).unwrap();
+            std::fs::create_dir(&parent).unwrap();
+            let error = verify_path_prefix(&directories, &names).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(retained.is_dir());
+            assert!(parent.is_dir());
+        }
 
         #[test]
         fn continuous_deadlines_keep_the_original_bounds_without_overflow() {

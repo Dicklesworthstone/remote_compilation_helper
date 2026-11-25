@@ -4,6 +4,9 @@
 # it only once the group is gone. Only the daemon, with durable no-launch
 # evidence or the abandoned-build silence bound, may accept that absence.
 if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+    # Failed shell tests are only a hint. An inaccessible record must retain
+    # ownership just like any other unavailable process observation.
+    rch_path_absent "$1" || exit 44
     printf 'RCH_REMOTE_RECORD_ABSENT_V1:%s\n' "$2"
     exit 42
 fi

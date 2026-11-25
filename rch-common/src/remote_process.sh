@@ -339,6 +339,26 @@ rch_group_state() {
     return "$rch_posix_state"
 }
 
+# Shell file tests cannot distinguish ENOENT from inaccessible ancestry or I/O
+# failure. Only the bounded native lookup can grant absence. Use memory capture
+# even during ordinary scope recovery so a full disk cannot prevent proof.
+rch_path_absent() (
+    [ "$#" -eq 1 ] || exit 125
+    rch_wkr_locate || {
+        printf "%s\n" "RCH_PATH_ABSENCE_UNAVAILABLE: deploy a current rch-wkr" >&2
+        exit 125
+    }
+    rch_control_diskless=1
+    rch_observation_budget
+    rch_path_witness=$(
+        rch_control_capture "${rch_observation_seconds}s" "$RCH_WKR" scoped-launch path-absent "$1" || exit $?
+        # Preserve the exact newline rather than accepting a marker prefix.
+        printf "."
+    ) || exit $?
+    [ "$rch_path_witness" = "RCH_PATH_ABSENT_V1
+." ]
+)
+
 # Capture live birth witnesses while the leader still authenticates the group.
 # They authorize escalation after TERM kills the leader, only in THIS call.
 rch_capture_group_witnesses() {
