@@ -297,3 +297,125 @@ fn kill_nine_leaves_evidence_and_next_boot_reports_recovery() {
         "{stdout}"
     );
 }
+
+
+/// The actual daemon must finish even when its caller stops consuming either
+/// event stream. The child receives a blocking descriptor; the test never
+/// drains it to make progress and checks that its flags remain unchanged.
+#[cfg(target_os = "linux")]
+#[test]
+fn stalled_or_closed_output_does_not_hold_daemon_lifetime() {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use rustix::io::Errno;
+    use rustix::pipe::{PipeFlags, pipe_with};
+    use std::fs::{self, File};
+
+    struct ChildOwner(Child);
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    for stream in ["stdout", "stderr"] {
+        for broken in [false, true] {
+            // Keep sockets short independently of an inherited worker TMPDIR.
+            let root = tempfile::Builder::new()
+                .prefix("rabsd-output-")
+                .tempdir_in("/tmp")
+                .unwrap()
+                .keep();
+            let marker = root.join("boot");
+            let socket = root.join("daemon.sock");
+            let state = root.join("state");
+            let observed = root.join("observed.log");
+            let (reader, writer) = pipe_with(PipeFlags::NONBLOCK | PipeFlags::CLOEXEC).unwrap();
+            let reader = if broken {
+                drop(reader);
+                None
+            } else {
+                let bytes = [0x5a; 4096];
+                loop {
+                    match rustix::io::write(&writer, &bytes) {
+                        Ok(count) => assert!(count > 0),
+                        Err(Errno::AGAIN) => break,
+                        result => panic!("fill daemon {stream}: {result:?}"),
+                    }
+                }
+                assert_eq!(rustix::io::write(&writer, b"x"), Err(Errno::AGAIN));
+                Some(reader)
+            };
+            let flags = fcntl_getfl(&writer).unwrap() & !OFlags::NONBLOCK;
+            fcntl_setfl(&writer, flags).unwrap();
+            let writer = File::from(writer);
+            let log = File::create(&observed).unwrap();
+            let mut command = rabsd();
+            command
+                .args(["--run-for-ms", "1000"])
+                .env("RABS_BOOT_MARKER", &marker)
+                .env("RABS_SOCKET_PATH", &socket)
+                .env("RABS_STATE_DIR", &state)
+                .env("RABS_CONFIG", root.join("missing-config.toml"))
+                .env("RABS_GC_RECLAIM", "0")
+                .env("RABS_GC_INTERVAL_SECS", "60")
+                .env("RABS_GC_GRACE_SECS", "300")
+                .env("RABS_GC_MAX_LOCATIONS", "64")
+                .env("RABS_LIVE_DEPENDENCY", "0")
+                .stdin(Stdio::null());
+            if stream == "stdout" {
+                command.stdout(writer.try_clone().unwrap()).stderr(log);
+            } else {
+                command.stdout(log).stderr(writer.try_clone().unwrap());
+            }
+            let mut child = ChildOwner(command.spawn().expect("spawn actual rabsd"));
+            wait_for_marker(&mut child.0, &marker);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{stream} (broken={broken}) retained the daemon: {}",
+                    fs::read_to_string(&observed).unwrap(),
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(
+                fcntl_getfl(&writer).unwrap(),
+                flags,
+                "the caller's blocking output description must not be changed",
+            );
+            assert!(
+                !marker.exists(),
+                "{stream} (broken={broken}) did not complete clean ownership shutdown",
+            );
+            let captured = fs::read_to_string(&observed).unwrap();
+            assert!(
+                !captured.contains("panicked at"),
+                "{stream} (broken={broken}) panicked: {captured}",
+            );
+            if stream == "stdout" {
+                assert_eq!(status.code(), Some(1), "{captured}");
+                assert!(
+                    captured.contains("shutdown receipt delivery failed after ownership drained"),
+                    "undelivered receipt must be an explicit error: {captured}",
+                );
+            } else {
+                assert_eq!(status.code(), Some(0), "{captured}");
+                let receipt: serde_json::Value =
+                    serde_json::from_str(captured.lines().last().unwrap()).unwrap();
+                assert_eq!(receipt["clean"], true, "{captured}");
+            }
+            // Reopen the real store to check it remains usable after daemon
+            // teardown. The same-process janitor regressions separately prove
+            // mount release before their test child exits.
+            let reopened = rabsd::janitor::store::mount_and_reconcile(&state.join("cas")).unwrap();
+            drop(reopened);
+            drop(reader);
+        }
+    }
+}

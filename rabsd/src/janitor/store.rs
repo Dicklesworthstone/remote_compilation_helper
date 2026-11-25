@@ -478,12 +478,15 @@ pub fn janitor_work_holding(mounted: Result<Arc<LiveCas>, String>) -> SubsystemW
     Box::new(move |cx, mut shutdown| {
         Box::pin(async move {
             let mounted = mounted?;
-            println!(
-                "{{\"v\":1,\"kind\":\"janitor-cas-mounted\",\"root\":{:?},\"serving_refused\":{},\"repaired\":{},\"reported\":{}}}",
-                mounted.cas_root().display().to_string(),
-                mounted.serving_refused,
-                mounted.repaired,
-                mounted.reported,
+            super::maintenance::report_event(
+                &format!(
+                    "{{\"v\":1,\"kind\":\"janitor-cas-mounted\",\"root\":{:?},\"serving_refused\":{},\"repaired\":{},\"reported\":{}}}",
+                    mounted.cas_root().display().to_string(),
+                    mounted.serving_refused,
+                    mounted.repaired,
+                    mounted.reported,
+                ),
+                &std::sync::atomic::AtomicBool::new(false),
             );
             cx.trace("janitor region up: rabs-cas store mounted + reconciled");
             let _held = mounted;

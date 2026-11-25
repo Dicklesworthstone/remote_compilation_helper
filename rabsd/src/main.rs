@@ -225,7 +225,7 @@ fn log_line(kind: &str, fields: &[(&str, &str)]) {
         line.push_str(&format!(",\"{}\":\"{}\"", key, value.replace('"', "'")));
     }
     line.push('}');
-    eprintln!("{line}");
+    report_canonical_error(format_args!("{line}"));
 }
 
 fn report_canonical_error(message: std::fmt::Arguments<'_>) {
@@ -233,6 +233,29 @@ fn report_canonical_error(message: std::fmt::Arguments<'_>) {
     rabsd::coord::canonical_local::report_cli_error(message);
     #[cfg(not(target_os = "linux"))]
     eprintln!("{message}");
+}
+
+/// Deliver the final receipt without retaining an otherwise drained daemon
+/// behind a stopped output consumer. A delivery failure remains an error:
+/// clean ownership alone does not prove that the caller received its receipt.
+fn write_shutdown_receipt(line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let frame = format!("{line}\n");
+    #[cfg(target_os = "linux")]
+    {
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let mut output = rabsd::ControlledOutput::new(
+            &std::io::stdout(),
+            &stopped,
+            Instant::now() + Duration::from_millis(100),
+        )?;
+        output.write_all(frame.as_bytes())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::io::stdout().lock().write_all(frame.as_bytes())
+    }
 }
 
 /// Gather installation facts and run the doctor. Exit code: 0 ok/warn
@@ -817,7 +840,7 @@ fn main() {
     let config = match load_config() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("rabsd: config error: {error}");
+            report_canonical_error(format_args!("rabsd: config error: {error}"));
             std::process::exit(1);
         }
     };
@@ -923,11 +946,16 @@ fn main() {
                     &[("prior_incarnation", "died-unclean (boot marker present)")],
                 );
             }
-            println!("{}", receipt.to_json_line());
-            std::process::exit(i32::from(!receipt.clean()));
+            let delivered = write_shutdown_receipt(&receipt.to_json_line());
+            if let Err(error) = &delivered {
+                report_canonical_error(format_args!(
+                    "rabsd: shutdown receipt delivery failed after ownership drained: {error}"
+                ));
+            }
+            std::process::exit(i32::from(!receipt.clean() || delivered.is_err()));
         }
         Err(error) => {
-            eprintln!("rabsd: {error}");
+            report_canonical_error(format_args!("rabsd: {error}"));
             std::process::exit(1);
         }
     }
