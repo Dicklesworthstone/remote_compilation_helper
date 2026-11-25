@@ -7,12 +7,12 @@
 use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use rch_common::WorkerConfig;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use rch_common::ssh::capture_control_output;
+use tokio::time::Instant;
 
 use super::super::ssh::{run_offload_ssh_command_with_stdin, wrap_remote_source_activity};
 
@@ -115,65 +115,42 @@ fn local_command() -> tokio::process::Command {
     command
 }
 
-async fn bounded_stream(
-    reader: impl AsyncRead + Unpin,
-    maximum: usize,
-) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .take((maximum + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > maximum {
-        return Err(std::io::Error::other(
-            "repository status stream exceeded its bound",
-        ));
-    }
-    Ok(bytes)
-}
-
 async fn local_batch(
     mut command: tokio::process::Command,
     roots: &[PathBuf],
     allowance: Duration,
 ) -> Result<Vec<Status>> {
+    let deadline = Instant::now()
+        .checked_add(allowance)
+        .context("invalid local repository status census deadline")?;
     let payload = request(roots)?;
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("cannot start local repository status census")?;
-    let mut input = child.stdin.take().context("missing census stdin")?;
-    let output = child.stdout.take().context("missing census stdout")?;
-    let diagnostic = child.stderr.take().context("missing census stderr")?;
-    // Feed and drain concurrently: a large closure cannot deadlock with a
-    // full output pipe. One deadline includes write, both reads and process
-    // completion. Dropping the future kills its directly owned shell child;
-    // this does not claim process-tree cancellation of arbitrary Git helpers.
-    let exchange = async {
-        let write = async {
-            input.write_all(&payload).await?;
-            input.shutdown().await?;
-            drop(input);
-            Ok::<_, std::io::Error>(())
+    // Git and its ordinary helpers share the shell's owned process group.
+    // Timeout, overflow and caller cancellation must stop them together. Keep
+    // the leader unreaped until both bounded streams reach natural EOF, so an
+    // exited shell cannot leave a pipe holder behind or authorize a partial
+    // census. The same deadline includes input upload and process completion.
+    let output = capture_control_output(
+        &mut command,
+        Some(&payload),
+        MAX_RESPONSE_BYTES,
+        MAX_RESPONSE_BYTES,
+        deadline,
+    )
+    .await
+    .map_err(|error| {
+        let context = if error.kind() == std::io::ErrorKind::TimedOut {
+            "local repository status census timed out"
+        } else {
+            "cannot collect local repository status census"
         };
-        let ((), bytes, _) = tokio::try_join!(
-            write,
-            bounded_stream(output, MAX_RESPONSE_BYTES),
-            bounded_stream(diagnostic, MAX_RESPONSE_BYTES),
-        )?;
-        let status = child.wait().await?;
-        ensure!(
-            status.success(),
-            "local repository status census failed: {status}"
-        );
-        response(&bytes, roots.len())
-    };
-    tokio::time::timeout(allowance, exchange)
-        .await
-        .context("local repository status census timed out")?
+        anyhow::Error::new(error).context(context)
+    })?;
+    ensure!(
+        output.status.success(),
+        "local repository status census failed: {}",
+        output.status
+    );
+    response(&output.stdout, roots.len())
 }
 
 pub(super) async fn local(roots: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
@@ -391,6 +368,152 @@ mod tests {
         .await
         .expect("local census escaped its deadline");
         assert!(format!("{:#}", result.unwrap_err()).contains("timed out"));
+    }
+
+    /// The status shell starts Git processes and may inherit a pipe-holding
+    /// helper. A directly killed shell is not sufficient cleanup for either.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_pipeline_stops_descendants_on_timeout_abort_overflow_and_exit() {
+        use rustix::process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions};
+        use std::os::fd::{AsFd, OwnedFd};
+
+        struct Processes {
+            leader: OwnedFd,
+            descendant: OwnedFd,
+        }
+
+        impl Drop for Processes {
+            fn drop(&mut self) {
+                // Stable handles also clean up the failing regression without
+                // signalling an unrelated process if a PID has been reused.
+                let _ = rustix::process::pidfd_send_signal(&self.descendant, Signal::KILL);
+                let _ = rustix::process::pidfd_send_signal(&self.leader, Signal::KILL);
+            }
+        }
+
+        for mode in [
+            "timeout",
+            "abort",
+            "stdout-overflow",
+            "stderr-overflow",
+            "pipe-holder",
+            "complete",
+        ] {
+            let retained = tempfile::tempdir().unwrap().keep();
+            let ready = retained.join("ready");
+            let release = retained.join("release");
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    r#"
+cat >/dev/null || exit 91
+if [ "$1" = complete ]; then
+    sleep 60 >/dev/null 2>&1 &
+else
+    sleep 60 &
+fi
+descendant=$!
+printf '%s %s\n' "$$" "$descendant" > "$2"
+while [ ! -e "$3" ]; do sleep 0.01; done
+case "$1" in
+    stdout-overflow) printf '%4097s' '';;
+    stderr-overflow) printf '%4097s' '' >&2;;
+    pipe-holder|complete)
+        printf 'RCH_REPO_STATUS_V1\n0 clean\nRCH_REPO_STATUS_END 1\n'
+        exit 0;;
+esac
+wait "$descendant"
+"#,
+                    "rch-status-fixture",
+                    mode,
+                ])
+                .arg(&ready)
+                .arg(&release);
+            let roots = [PathBuf::from("/fixture")];
+            let expires = matches!(mode, "timeout" | "pipe-holder");
+            let allowance = Duration::from_secs(if expires { 2 } else { 30 });
+            let mut census = Box::pin(local_batch(command, &roots, allowance));
+            let identities = tokio::time::timeout(Duration::from_secs(5), async {
+                let announced = async {
+                    loop {
+                        if let Ok(text) = std::fs::read_to_string(&ready)
+                            && text.ends_with('\n')
+                        {
+                            break text
+                                .split_whitespace()
+                                .map(|pid| pid.parse::<i32>().unwrap())
+                                .collect::<Vec<_>>();
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                };
+                tokio::select! {
+                    result = &mut census => panic!("{mode}: census ended before its fixture barrier: {result:?}"),
+                    identities = announced => identities,
+                }
+            })
+            .await
+            .expect("the native status fixture must start both processes");
+            assert_eq!(identities.len(), 2);
+            let open = |pid| {
+                rustix::process::pidfd_open(Pid::from_raw(pid).unwrap(), PidfdFlags::empty())
+                    .unwrap()
+            };
+            let processes = Processes {
+                leader: open(identities[0]),
+                descendant: open(identities[1]),
+            };
+            let leader = tokio::io::unix::AsyncFd::new(processes.leader.as_fd()).unwrap();
+            let descendant =
+                tokio::io::unix::AsyncFd::new(processes.descendant.as_fd()).unwrap();
+            assert!(
+                rustix::process::waitid(
+                    WaitId::PidFd(processes.leader.as_fd()),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                )
+                .unwrap()
+                .is_none(),
+                "{mode}: the status shell must be alive before the tested transition"
+            );
+
+            if mode == "abort" {
+                drop(census);
+            } else {
+                std::fs::write(&release, b"proceed").unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(5), &mut census)
+                    .await
+                    .expect("status collection must remain bounded");
+                if mode == "complete" {
+                    assert_eq!(result.unwrap(), [Status::Clean]);
+                } else if expires {
+                    assert!(
+                        format!("{:#}", result.unwrap_err()).contains("timed out"),
+                        "{mode}: an exited leader cannot confirm a pipe-holding descendant"
+                    );
+                } else {
+                    assert!(result.is_err(), "{mode}: oversized output must refuse");
+                }
+                drop(census);
+            }
+
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let _ = tokio::try_join!(leader.readable(), descendant.readable()).unwrap();
+                loop {
+                    match rustix::process::waitid(
+                        WaitId::PidFd(processes.leader.as_fd()),
+                        WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+                    ) {
+                        Err(rustix::io::Errno::CHILD) => break,
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        Err(error) => panic!("{mode}: observe status-shell reaping: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{mode}: status census leaked its shell or descendant"));
+        }
     }
 
     #[tokio::test]
