@@ -510,7 +510,7 @@ fn path_absence_never_hides_a_record_behind_denied_directory_access() {
     let path = directory.join("record.pgid");
     std::fs::create_dir(&directory).unwrap();
     std::fs::write(&path, b"still owned\n").unwrap();
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o0)).unwrap();
     let observation = std::fs::symlink_metadata(&path);
     let result = helper().arg("path-absent").arg(&path).output();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -700,7 +700,7 @@ fn orphan_quarantine_keeps_an_unobservable_record() {
     let path = directory.join("record.pgid");
     std::fs::create_dir(&directory).unwrap();
     std::fs::write(&path, b"retained ownership\n").unwrap();
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o0)).unwrap();
     let observation = std::fs::symlink_metadata(&path);
     let result = orphan_probe(&path).output();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
