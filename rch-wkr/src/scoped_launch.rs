@@ -103,7 +103,9 @@ mod unix {
     fn path_absent(argument: &OsStr) -> io::Result<bool> {
         let bytes = argument.as_bytes();
         if !bytes.starts_with(b"/") || bytes.ends_with(b"/") {
-            return Err(invalid("absence observation requires an absolute literal path"));
+            return Err(invalid(
+                "absence observation requires an absolute literal path",
+            ));
         }
         let components: Vec<&OsStr> = bytes[1..]
             .split(|byte| *byte == b'/')
@@ -203,7 +205,9 @@ mod unix {
                 Ok(REFUSED)
             }
             Some("timeout") => timeout(&arguments[1..]),
-            _ => Err(invalid("expected probe, path-absent, absent, kill-self, or timeout")),
+            _ => Err(invalid(
+                "expected probe, path-absent, absent, kill-self, or timeout",
+            )),
         }
     }
 

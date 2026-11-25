@@ -144,7 +144,10 @@ fn granted_probe_command(
 ) -> anyhow::Result<String> {
     let prefix = namespace.activity_prefix(identity, false)?;
     let probe = probe_command(root, directory, token)?;
-    Ok(format!("{prefix} sh -c {}", shell_escape::escape(probe.into())))
+    Ok(format!(
+        "{prefix} sh -c {}",
+        shell_escape::escape(probe.into())
+    ))
 }
 
 async fn probe_directory(

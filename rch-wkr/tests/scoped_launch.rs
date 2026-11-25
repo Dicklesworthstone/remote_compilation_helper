@@ -650,7 +650,9 @@ fn orphan_quarantine_absence_requires_the_real_worker_path_observation() {
         assert!(output.stderr.is_empty(), "{path:?}: {output:?}");
         let receipt = String::from_utf8(output.stdout).unwrap();
         assert!(rch_common::orphan_quarantine::probe_record_absent(&receipt));
-        assert!(!rch_common::orphan_quarantine::probe_verified_dead(&receipt));
+        assert!(!rch_common::orphan_quarantine::probe_verified_dead(
+            &receipt
+        ));
     }
 
     for path in [
@@ -672,8 +674,12 @@ fn orphan_quarantine_absence_requires_the_real_worker_path_observation() {
             ),
             "{path:?}: {receipt:?}"
         );
-        assert!(!rch_common::orphan_quarantine::probe_record_absent(&receipt));
-        assert!(!rch_common::orphan_quarantine::probe_verified_dead(&receipt));
+        assert!(!rch_common::orphan_quarantine::probe_record_absent(
+            &receipt
+        ));
+        assert!(!rch_common::orphan_quarantine::probe_verified_dead(
+            &receipt
+        ));
     }
     assert_eq!(
         std::fs::read(&file).unwrap(),
@@ -716,8 +722,12 @@ fn orphan_quarantine_keeps_an_unobservable_record() {
         other => panic!("unexpected permission fixture observation: {other:?}"),
     }
     let receipt = String::from_utf8(output.stdout).unwrap();
-    assert!(!rch_common::orphan_quarantine::probe_record_absent(&receipt));
-    assert!(!rch_common::orphan_quarantine::probe_verified_dead(&receipt));
+    assert!(!rch_common::orphan_quarantine::probe_record_absent(
+        &receipt
+    ));
+    assert!(!rch_common::orphan_quarantine::probe_verified_dead(
+        &receipt
+    ));
     assert_eq!(std::fs::read(&path).unwrap(), b"retained ownership\n");
 }
 

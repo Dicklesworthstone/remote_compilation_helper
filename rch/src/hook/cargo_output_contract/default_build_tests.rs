@@ -54,9 +54,7 @@ fn default_human_builds_capture_complete_outputs_without_exclusion_configuration
             capture.retrieval_baseline().unwrap(),
             get_custom_target_artifact_patterns(Some(kind), Some(command))
         );
-        assert!(capture.suppress_stdout_line(
-            r#"{"reason":"build-finished","success":true}"#
-        ));
+        assert!(capture.suppress_stdout_line(r#"{"reason":"build-finished","success":true}"#));
         for diagnostic in [
             "warning: unused variable: value",
             "custom build output",
@@ -70,10 +68,22 @@ fn default_human_builds_capture_complete_outputs_without_exclusion_configuration
 #[test]
 fn automatic_capture_preserves_explicit_and_unsupported_output_contracts() {
     for (kind, command) in [
-        (CompilationKind::CargoBuild, "cargo build --message-format=json"),
-        (CompilationKind::CargoBuild, "cargo build --message-format=human"),
-        (CompilationKind::CargoBuild, "cargo build --message-format=short"),
-        (CompilationKind::CargoBuild, "cargo build --config build.jobs=1"),
+        (
+            CompilationKind::CargoBuild,
+            "cargo build --message-format=json",
+        ),
+        (
+            CompilationKind::CargoBuild,
+            "cargo build --message-format=human",
+        ),
+        (
+            CompilationKind::CargoBuild,
+            "cargo build --message-format=short",
+        ),
+        (
+            CompilationKind::CargoBuild,
+            "cargo build --config build.jobs=1",
+        ),
         (CompilationKind::CargoBuild, "cargo build --out-dir other"),
         (CompilationKind::CargoBuild, "cargo build && echo done"),
         (CompilationKind::CargoBuild, "cargo package"),
@@ -113,7 +123,9 @@ fn automatic_capture_preserves_explicit_and_unsupported_output_contracts() {
 fn automatic_capture_retains_every_emitted_output_and_complete_receipt_requirements() {
     let capture = default_capture(CompilationKind::CargoBuild, "cargo build --workspace").unwrap();
     let stdout = completed_receipt();
-    let contract = capture.parse_receipt(&stdout, Path::new("/target")).unwrap();
+    let contract = capture
+        .parse_receipt(&stdout, Path::new("/target"))
+        .unwrap();
     assert_eq!(
         contract.required_files,
         BTreeSet::from([
@@ -126,7 +138,9 @@ fn automatic_capture_retains_every_emitted_output_and_complete_receipt_requireme
         serde_json::from_slice(&serde_json::to_vec(&capture).unwrap()).unwrap();
     assert!(restored.automatic_complete_outputs());
     assert_eq!(
-        restored.parse_receipt(&stdout, Path::new("/target")).unwrap(),
+        restored
+            .parse_receipt(&stdout, Path::new("/target"))
+            .unwrap(),
         contract
     );
     for invalid in [
@@ -135,7 +149,11 @@ fn automatic_capture_retains_every_emitted_output_and_complete_receipt_requireme
         &b"{\"reason\":\"build-finished\",\"success\":false}\n"[..],
         &stdout[..stdout.len() - 1],
     ] {
-        assert!(restored.parse_receipt(invalid, Path::new("/target")).is_err());
+        assert!(
+            restored
+                .parse_receipt(invalid, Path::new("/target"))
+                .is_err()
+        );
     }
     let missing_terminal = stdout
         .split_inclusive(|byte| *byte == b'\n')
@@ -152,19 +170,15 @@ fn automatic_capture_retains_every_emitted_output_and_complete_receipt_requireme
 
 #[test]
 fn automatic_capture_provenance_does_not_upgrade_legacy_or_explicit_exclusion_recipes() {
-    let old = CargoOutputCapture::for_command(
-        Some(CompilationKind::CargoBuild),
-        "cargo build --bin app",
-    )
-    .unwrap();
+    let old =
+        CargoOutputCapture::for_command(Some(CompilationKind::CargoBuild), "cargo build --bin app")
+            .unwrap();
     let encoded = serde_json::to_value(&old).unwrap();
     assert!(encoded.get("automatic_complete_outputs").is_none());
     let restored: CargoOutputCapture = serde_json::from_value(encoded).unwrap();
     assert!(!restored.automatic_complete_outputs());
-    let baseline = get_custom_target_artifact_patterns(
-        Some(CompilationKind::CargoBuild),
-        Some("cargo build"),
-    );
+    let baseline =
+        get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild), Some("cargo build"));
     let explicit = CargoOutputCapture::for_retrieval_policy(
         Some(CompilationKind::CargoBuild),
         "cargo build",

@@ -455,7 +455,9 @@ impl CargoOutputCapture {
                         })
                         .collect();
                     let named_example = self.named_example_json
-                        && matched.iter().any(|target| target.kind == TargetKind::Example);
+                        && matched
+                            .iter()
+                            .any(|target| target.kind == TargetKind::Example);
                     if named_example {
                         validate_named_example(&artifact)?;
                         for filename in &artifact.filenames {
@@ -942,10 +944,8 @@ impl CargoOutputCapture {
             } else {
                 // Library examples have no executable. Bind the files and bundle
                 // members copied to this invocation's private delivery directory.
-                let hashes: BTreeMap<_, _> = files
-                    .iter()
-                    .map(|path| (path, &published[path]))
-                    .collect();
+                let hashes: BTreeMap<_, _> =
+                    files.iter().map(|path| (path, &published[path])).collect();
                 value["rch"]["file_blake3"] = serde_json::to_value(hashes)?;
             }
             all_files.extend(files);
@@ -1234,7 +1234,10 @@ mod tests {
             ("cargo build --bins --message-format=json", false),
             ("cargo build --bin cli --message-format=human", false),
             ("cargo build --example cli --message-format=json", true),
-            ("cargo build --bin cli --example cli --message-format=json", true),
+            (
+                "cargo build --bin cli --example cli --message-format=json",
+                true,
+            ),
             (
                 "cargo xwin build --release --target x86_64-pc-windows-msvc --bin cli --message-format=json",
                 true,
@@ -3060,7 +3063,8 @@ mod tests {
         let restored: CargoOutputCapture =
             serde_json::from_slice(&serde_json::to_vec(&capture).unwrap()).unwrap();
         let mut cargo = tokio::process::Command::new(std::env::var_os("CARGO").unwrap());
-        cargo.current_dir(&source)
+        cargo
+            .current_dir(&source)
             .args(command.split_ascii_whitespace().skip(1))
             .env("CARGO_TARGET_DIR", &target)
             .env("CARGO_PROFILE_DEV_DEBUG", "0")
@@ -3127,17 +3131,22 @@ mod tests {
                             record["rch"]["file_blake3"][relative.to_str().unwrap()],
                             json!(published[relative])
                         );
-                        assert!(record["filenames"]
-                            .as_array()
-                            .unwrap()
-                            .contains(&json!(consumer.join(relative))));
+                        assert!(
+                            record["filenames"]
+                                .as_array()
+                                .unwrap()
+                                .contains(&json!(consumer.join(relative)))
+                        );
                     }
                 } else {
                     let relative = Path::new(original["executable"].as_str().unwrap())
                         .strip_prefix(&target)
                         .unwrap();
                     assert_eq!(record["executable"], json!(consumer.join(relative)));
-                    assert_eq!(record["rch"]["executable_blake3"], json!(published[relative]));
+                    assert_eq!(
+                        record["rch"]["executable_blake3"],
+                        json!(published[relative])
+                    );
                 }
             }
         }
@@ -3174,7 +3183,7 @@ mod tests {
             bad[field] = value;
             assert!(validate(&[bad]).is_err(), "{field}");
         }
-        for types in [json!([]), json!(["bin"]), json!(["rlib","staticlib"])] {
+        for types in [json!([]), json!(["bin"]), json!(["rlib", "staticlib"])] {
             let mut bad = library.clone();
             bad["target"]["crate_types"] = types;
             assert!(validate(&[bad]).is_err());

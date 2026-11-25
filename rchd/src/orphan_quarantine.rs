@@ -321,7 +321,12 @@ mod tests {
     async fn local_probe_script(script: &str) -> Option<String> {
         let mut command = Command::new("/bin/sh");
         command.arg("-s");
-        capture_probe_output(&mut command, script, Instant::now() + Duration::from_secs(5)).await
+        capture_probe_output(
+            &mut command,
+            script,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -384,7 +389,10 @@ mod tests {
         )
         .await
         .expect("the probe must honor its original control deadline");
-        assert!(output.is_none(), "a partial receipt cannot prove completion");
+        assert!(
+            output.is_none(),
+            "a partial receipt cannot prove completion"
+        );
     }
 
     struct FakeProber {

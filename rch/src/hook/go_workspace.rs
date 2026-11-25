@@ -276,7 +276,9 @@ fn enclosing_repository(module: &Path, topology: &PathTopologyPolicy) -> Result<
             Err(error) => return Err(error).context("inspect Go repository boundary"),
         }
     }
-    anyhow::bail!("Go source outside the selected module or workfile directory requires an enclosing Git repository")
+    anyhow::bail!(
+        "Go source outside the selected module or workfile directory requires an enclosing Git repository"
+    )
 }
 
 fn require_shared_repository(
@@ -762,13 +764,14 @@ mod tests {
         assert_eq!(planned.vendor_directory, Some(controls.join("vendor")));
         assert!(planned.required_files.contains_key(&local.join("go.mod")));
         assert!(
-            planned.workspace_edit_args.contains(&format!("-use={}", app.display()))
+            planned
+                .workspace_edit_args
+                .contains(&format!("-use={}", app.display()))
         );
-        assert!(
-            planned.workspace_edit_args.contains(&format!(
-                "-replace=example.invalid/library={}", local.display()
-            ))
-        );
+        assert!(planned.workspace_edit_args.contains(&format!(
+            "-replace=example.invalid/library={}",
+            local.display()
+        )));
 
         // A replacement below the outer Git root may itself be an independent
         // checkout. Do not admit it through the expanded transfer root.

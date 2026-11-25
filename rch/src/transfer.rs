@@ -6206,8 +6206,7 @@ mkdir -p {source}
             policies.push((&self.retrieval_filter_root, patterns));
         }
         if self.retrieval_reference_root != self.retrieval_filter_root
-            && let Ok(patterns) =
-                parse_rchignore(&self.retrieval_reference_root.join(".rchignore"))
+            && let Ok(patterns) = parse_rchignore(&self.retrieval_reference_root.join(".rchignore"))
         {
             policies.push((&self.retrieval_reference_root, patterns));
         }
@@ -6215,11 +6214,9 @@ mkdir -p {source}
         let original_count = excludes.len();
         for (policy_root, patterns) in policies {
             for pattern in patterns {
-                for pattern in rebase_retrieval_exclude(
-                    &pattern,
-                    policy_root,
-                    &self.retrieval_reference_root,
-                ) {
+                for pattern in
+                    rebase_retrieval_exclude(&pattern, policy_root, &self.retrieval_reference_root)
+                {
                     if retrieval_exclude_can_block_artifacts(&pattern, artifact_patterns) {
                         debug!(
                             "Skipping retrieval exclude pattern '{}' because it may hide requested artifacts",
@@ -18565,7 +18562,10 @@ Number of files transferred: 42
         ));
         let mut with_required = broad;
         with_required.push("+ target/debug/.kache-build-script-shims/required".to_owned());
-        assert!(!retrieval_exclude_can_block_artifacts(cache, &with_required));
+        assert!(!retrieval_exclude_can_block_artifacts(
+            cache,
+            &with_required
+        ));
     }
 
     #[test]
@@ -18589,9 +18589,7 @@ Number of files transferred: 42
             ["/debug/cache/"]
         );
         let external = Path::new("/external-target");
-        assert!(
-            rebase_retrieval_exclude("/target/debug/cache/", project, external).is_empty()
-        );
+        assert!(rebase_retrieval_exclude("/target/debug/cache/", project, external).is_empty());
         assert_eq!(
             rebase_retrieval_exclude(".worker-cache/", project, external),
             [".worker-cache/"]
@@ -18666,12 +18664,9 @@ Number of files transferred: 42
                 pipeline.build_retrieve_streaming_command(&worker, "/remote-target", &patterns),
             ] {
                 let args = command_args(&command);
-                let cache = arg_pair_position(
-                    &args,
-                    "--exclude",
-                    "/debug/.kache-build-script-shims/",
-                )
-                .unwrap();
+                let cache =
+                    arg_pair_position(&args, "--exclude", "/debug/.kache-build-script-shims/")
+                        .unwrap();
                 let required = arg_pair_position(
                     &args,
                     "--include",
@@ -18679,20 +18674,13 @@ Number of files transferred: 42
                 )
                 .unwrap();
                 let traversal = arg_pair_position(&args, "--include", "*/").unwrap();
-                let descendants = arg_pair_position(
-                    &args,
-                    "--exclude",
-                    "/debug/.kache-build-script-shims/**",
-                )
-                .unwrap();
+                let descendants =
+                    arg_pair_position(&args, "--exclude", "/debug/.kache-build-script-shims/**")
+                        .unwrap();
                 assert!(required < cache && cache < descendants && descendants < traversal);
-                assert!(
-                    arg_pair_position(&args, "--exclude", "/debug/config-cache/").is_some()
-                );
+                assert!(arg_pair_position(&args, "--exclude", "/debug/config-cache/").is_some());
                 assert!(arg_pair_position(&args, "--exclude", "*.rlib").is_none());
-                assert!(
-                    arg_pair_position(&args, "--exclude", "/debug/stage-only/").is_none()
-                );
+                assert!(arg_pair_position(&args, "--exclude", "/debug/stage-only/").is_none());
 
                 #[cfg(unix)]
                 {
@@ -18717,8 +18705,7 @@ Number of files transferred: 42
                     // Exercise the actual rsync selection for both builders.
                     // Only SSH and source/destination addresses are replaced
                     // with local directories; every filter stays unchanged.
-                    let mut local =
-                        std::process::Command::new(command.as_std().get_program());
+                    let mut local = std::process::Command::new(command.as_std().get_program());
                     let mut index = 0;
                     while index < args.len() - 2 {
                         if matches!(args[index].as_str(), "-e" | "--rsync-path") {

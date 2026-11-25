@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 
 pub use audit::{AuditEventType, AuditLogger, DeploymentAuditEntry};
 pub use dry_run::{DryRunResult, PotentialIssue, PredictedAction, WorkerPrediction};
-pub(crate) use executor::{copy_binary_via_scp, run_smoke_worker_scenarios};
 pub use executor::{FleetExecutor, FleetResult};
+pub(crate) use executor::{copy_binary_via_scp, run_smoke_worker_scenarios};
 pub use history::{DeploymentHistoryEntry, HistoryManager};
 pub use plan::{
     DeployOptions, DeployStep, DeploymentPlan, DeploymentStatus, DeploymentStrategy,

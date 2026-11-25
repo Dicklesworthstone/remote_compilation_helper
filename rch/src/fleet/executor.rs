@@ -528,8 +528,7 @@ impl FleetExecutor {
                 }
 
                 if let Err(e) =
-                    copy_binary_via_scp(&worker_config, &local_binary, REMOTE_WORKER_BINARY)
-                        .await
+                    copy_binary_via_scp(&worker_config, &local_binary, REMOTE_WORKER_BINARY).await
                 {
                     progress
                         .worker_failed(&worker_id, &format!("scp failed: {}", e))
@@ -2460,8 +2459,7 @@ mod tests {
         let final_path = directory.path().join("worker with 'quotes");
         let staged = directory.path().join(".worker-upload");
         std::fs::write(&final_path, old).unwrap();
-        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(&staged, new).unwrap();
         let expected = local_file_sha256_hex(&staged).unwrap();
         let install = |digest: &str| {
