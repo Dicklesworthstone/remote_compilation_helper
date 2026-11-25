@@ -9152,7 +9152,9 @@ mod tests {
             let mut arguments = vec!["rch", "exec", "--sync-only"];
             arguments.extend(incompatible);
             arguments.extend(["--", "cargo", "check"]);
-            let error = Cli::try_parse_from(&arguments).unwrap_err();
+            let Err(error) = Cli::try_parse_from(&arguments) else {
+                panic!("expected a parser error for {arguments:?}");
+            };
             assert_eq!(
                 error.kind(),
                 clap::error::ErrorKind::ArgumentConflict,
