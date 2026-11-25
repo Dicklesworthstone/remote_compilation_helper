@@ -91,16 +91,21 @@ pub struct QuarantineEvidence {
 /// (only if its boot/start identity still matches) and verifies it is gone.
 /// Emits exactly one `RCH_E104_KILL=<verdict>` line and always exits 0, so a
 /// non-zero exit means the CHANNEL failed, not the probe. A missing record is
-/// reported as `record_absent`: nothing can re-probe a group without it.
+/// reported only after the native observer proves exact ENOENT through its
+/// retained directory ancestry. An unavailable observation remains unverified.
 ///
 /// Group kill is `kill -KILL -PGID` with NO `--`: dash's kill builtin
 /// mishandles `kill -KILL -- -PGID`.
 pub fn kill_probe_script(pgid_file: &str, build_id: u64) -> String {
     let escaped_file = escape(Cow::from(pgid_file));
     format!(
-        "f={escaped_file}\n\
-         if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then echo RCH_E104_KILL=record_absent; exit 0; fi\n\
-         {identity}\n\
+        "{identity}\n\
+         f={escaped_file}\n\
+         if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then\n\
+         if rch_path_absent \"$f\"; then echo RCH_E104_KILL=record_absent;\n\
+         else echo RCH_E104_KILL=unverified; fi\n\
+         exit 0\n\
+         fi\n\
          if rch_remote_cancel \"$f\" {build_id} kill; then\n\
          echo RCH_E104_KILL=verified_dead\n\
          else echo RCH_E104_KILL=still_alive; fi\n",
@@ -108,22 +113,20 @@ pub fn kill_probe_script(pgid_file: &str, build_id: u64) -> String {
     )
 }
 
-/// Whether the probe's last verdict line proves the group dead.
+/// Whether one complete, uncontaminated probe receipt proves the group dead.
 pub fn probe_verified_dead(stdout: &str) -> bool {
-    probe_verdict(stdout) == Some("RCH_E104_KILL=verified_dead")
+    matches!(
+        stdout,
+        "RCH_E104_KILL=verified_dead" | "RCH_E104_KILL=verified_dead\n"
+    )
 }
 
-/// Whether the probe found no worker-side record for the group.
+/// Whether one complete probe receipt proves the worker-side record absent.
 pub fn probe_record_absent(stdout: &str) -> bool {
-    probe_verdict(stdout) == Some("RCH_E104_KILL=record_absent")
-}
-
-fn probe_verdict(stdout: &str) -> Option<&str> {
-    stdout
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| line.starts_with("RCH_E104_KILL="))
+    matches!(
+        stdout,
+        "RCH_E104_KILL=record_absent" | "RCH_E104_KILL=record_absent\n"
+    )
 }
 
 /// The durable disable reason for an E104 orphan quarantine. With evidence
@@ -188,20 +191,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn probe_reports_an_absent_record_without_touching_anything() {
+    fn an_absent_record_without_a_native_observer_stays_unverified() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("gone/7.pgid");
-        let output = std::process::Command::new("sh")
+        let output = std::process::Command::new("/bin/sh")
             .args(["-c", &kill_probe_script(missing.to_str().unwrap(), 7)])
+            .env("RCH_WKR_BIN", dir.path().join("missing-worker"))
+            .env("RCH_TIMING_SCALE", "1")
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"RCH_E104_KILL=unverified\n");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(probe_record_absent(&stdout), "{stdout}");
+        assert!(!probe_record_absent(&stdout), "{stdout}");
         assert!(!probe_verified_dead(&stdout));
         assert!(!missing.parent().unwrap().exists());
-        assert!(probe_verified_dead("x\nRCH_E104_KILL=verified_dead"));
-        assert!(!probe_record_absent("RCH_E104_KILL=still_alive"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("RCH_PATH_ABSENCE_UNAVAILABLE"),
+            "{output:?}"
+        );
     }
 
     #[test]
@@ -310,14 +318,42 @@ mod tests {
     }
 
     #[test]
-    fn only_a_verified_dead_last_verdict_clears() {
-        assert!(probe_verified_dead("noise\nRCH_E104_KILL=verified_dead\n"));
-        assert!(!probe_verified_dead("RCH_E104_KILL=still_alive"));
-        assert!(!probe_verified_dead(
-            "RCH_E104_KILL=verified_dead\nRCH_E104_KILL=still_alive"
-        ));
-        assert!(!probe_verified_dead(""));
-        assert!(!probe_verified_dead("garbage"));
+    fn only_one_exact_complete_receipt_can_clear_a_quarantine() {
+        for verdict in ["verified_dead", "record_absent"] {
+            let receipt = format!("RCH_E104_KILL={verdict}\n");
+            for accepted in [receipt.as_str(), receipt.trim_end_matches('\n')] {
+                assert_eq!(probe_verified_dead(accepted), verdict == "verified_dead");
+                assert_eq!(probe_record_absent(accepted), verdict == "record_absent");
+            }
+            for malformed in [
+                format!(" {receipt}"),
+                format!("{receipt} "),
+                receipt.replace('\n', "\r\n"),
+                format!("\n{receipt}"),
+                format!("{receipt}\n"),
+                format!("noise\n{receipt}"),
+                format!("{receipt}noise\n"),
+                format!("{receipt}{receipt}"),
+                format!("RCH_E104_KILL=still_alive\n{receipt}"),
+                format!("{receipt}RCH_E104_KILL=still_alive\n"),
+                format!("{receipt}RCH_E104_KILL=unverified\n"),
+                format!("{receipt}\0"),
+            ] {
+                assert!(!probe_verified_dead(&malformed), "{malformed:?}");
+                assert!(!probe_record_absent(&malformed), "{malformed:?}");
+            }
+        }
+        for unsupported in [
+            "",
+            "garbage",
+            "RCH_E104_KILL=still_alive\n",
+            "RCH_E104_KILL=unverified\n",
+            "RCH_E104_KILL=verified_dead\nRCH_E104_KILL=record_absent\n",
+            "RCH_E104_KILL=record_absent\nRCH_E104_KILL=verified_dead\n",
+        ] {
+            assert!(!probe_verified_dead(unsupported), "{unsupported:?}");
+            assert!(!probe_record_absent(unsupported), "{unsupported:?}");
+        }
     }
 
     #[test]
@@ -326,5 +362,7 @@ mod tests {
         assert!(script.contains("/tmp/rch-run/proj-abc/42.pgid"));
         assert!(script.contains("rch_remote_cancel \"$f\" 42 kill"));
         assert!(script.contains("RCH_E104_KILL=verified_dead"));
+        assert!(script.contains("if rch_path_absent \"$f\"; then"));
+        assert!(script.contains("RCH_E104_KILL=unverified"));
     }
 }

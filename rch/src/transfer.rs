@@ -1922,21 +1922,20 @@ exit "$__s""#,
     )
 }
 
-/// Parse the `RCH_E104_KILL=<verdict>` marker from the kill probe's stdout.
-/// `None` means the probe produced no verdict (treated as unverified).
+/// Parse one complete kill-probe receipt. Extra, conflicting, or malformed
+/// output cannot establish that the remote process group stopped.
 pub(crate) fn parse_remote_timeout_kill_output(stdout: &str) -> Option<RemoteTimeoutCleanup> {
-    for line in stdout.lines().rev() {
-        match line.trim() {
-            "RCH_E104_KILL=verified_dead" => return Some(RemoteTimeoutCleanup::Verified),
-            // A missing record cannot exclude a delayed, still-starting job.
-            "RCH_E104_KILL=no_pgid_file" | "RCH_E104_KILL=record_absent" => {
-                return Some(RemoteTimeoutCleanup::Unverified);
-            }
-            "RCH_E104_KILL=still_alive" => return Some(RemoteTimeoutCleanup::Unverified),
-            _ => {}
-        }
+    if rch_common::orphan_quarantine::probe_verified_dead(stdout) {
+        return Some(RemoteTimeoutCleanup::Verified);
     }
-    None
+    match stdout.strip_suffix('\n').unwrap_or(stdout) {
+        // A missing record cannot exclude a delayed, still-starting job.
+        "RCH_E104_KILL=no_pgid_file"
+        | "RCH_E104_KILL=record_absent"
+        | "RCH_E104_KILL=still_alive"
+        | "RCH_E104_KILL=unverified" => Some(RemoteTimeoutCleanup::Unverified),
+        _ => None,
+    }
 }
 
 /// RAM budgeted per concurrent rustc when `compilation.remote_build_jobs =
@@ -23894,7 +23893,7 @@ fn main() {
         assert!(script.contains("RCH_E104_KILL=still_alive"));
 
         assert_eq!(
-            parse_remote_timeout_kill_output("noise\nRCH_E104_KILL=verified_dead\n"),
+            parse_remote_timeout_kill_output("RCH_E104_KILL=verified_dead\n"),
             Some(RemoteTimeoutCleanup::Verified)
         );
         assert_eq!(
@@ -23910,7 +23909,47 @@ fn main() {
             parse_remote_timeout_kill_output("RCH_E104_KILL=still_alive"),
             Some(RemoteTimeoutCleanup::Unverified)
         );
+        assert_eq!(
+            parse_remote_timeout_kill_output("RCH_E104_KILL=unverified\n"),
+            Some(RemoteTimeoutCleanup::Unverified)
+        );
         assert_eq!(parse_remote_timeout_kill_output("garbage"), None);
+    }
+
+    #[test]
+    fn remote_timeout_kill_output_requires_one_complete_receipt() {
+        for valid in [
+            "RCH_E104_KILL=verified_dead",
+            "RCH_E104_KILL=verified_dead\n",
+        ] {
+            assert_eq!(
+                parse_remote_timeout_kill_output(valid),
+                Some(RemoteTimeoutCleanup::Verified)
+            );
+        }
+        for invalid in [
+            "noise\nRCH_E104_KILL=verified_dead\n",
+            "RCH_E104_KILL=verified_dead\nnoise\n",
+            "RCH_E104_KILL=verified_dead\nRCH_E104_KILL=unknown\n",
+            "RCH_E104_KILL=unknown\nRCH_E104_KILL=verified_dead\n",
+            "RCH_E104_KILL=still_alive\nRCH_E104_KILL=verified_dead\n",
+            "RCH_E104_KILL=verified_dead\nRCH_E104_KILL=still_alive\n",
+            "RCH_E104_KILL=verified_dead\nRCH_E104_KILL=verified_dead\n",
+            "RCH_E104_KILL=verified_dead\n\n",
+            "\nRCH_E104_KILL=verified_dead\n",
+            " RCH_E104_KILL=verified_dead\n",
+            "RCH_E104_KILL=verified_dead \n",
+            "RCH_E104_KILL=verified_dead\r\n",
+            "RCH_E104_KILL=verified_dead\0",
+            "RCH_E104_KILL=record_absent\nRCH_E104_KILL=verified_dead\n",
+            "RCH_E104_KILL=record_absent\nnoise\n",
+        ] {
+            assert_eq!(
+                parse_remote_timeout_kill_output(invalid),
+                None,
+                "ambiguous cleanup output must retain quarantine: {invalid:?}"
+            );
+        }
     }
 
     /// Issue #62: the typed timeout error must keep the exact message prefix

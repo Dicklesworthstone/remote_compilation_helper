@@ -588,5 +588,164 @@ fn path_absence_shell_receipt_is_diskless_and_requires_exact_native_output() {
             .unwrap();
         assert_eq!(output.status.code(), Some(44), "{marker:?}: {output:?}");
         assert!(output.stdout.is_empty(), "{marker:?}: {output:?}");
+
+        let quarantine = orphan_probe(&missing)
+            .env("RCH_WKR_BIN", &double)
+            .env("RCH_TEST_NATIVE_WORKER", WORKER)
+            .env("RCH_TEST_ABSENCE_OUTPUT", marker)
+            .env("RCH_TEST_ABSENCE_STATUS", code)
+            .output()
+            .unwrap();
+        assert!(quarantine.status.success(), "{marker:?}: {quarantine:?}");
+        assert_eq!(
+            quarantine.stdout, b"RCH_E104_KILL=unverified\n",
+            "{marker:?}: {quarantine:?}"
+        );
     }
+}
+
+fn orphan_probe(path: &std::path::Path) -> Command {
+    let script = rch_common::orphan_quarantine::kill_probe_script(path.to_str().unwrap(), 7);
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", &script, "rch-orphan-probe-test"])
+        .env("RCH_WKR_BIN", WORKER)
+        .env("RCH_TIMING_SCALE", "1")
+        .env("TOKIO_WORKER_THREADS", "0")
+        .env("RCH_LOG_FILE", "/dev/null/not-a-log")
+        .env("TMPDIR", "/dev/null/not-writable");
+    command
+}
+
+#[test]
+fn orphan_quarantine_absence_requires_the_real_worker_path_observation() {
+    use std::os::unix::fs::symlink;
+
+    let owner = tempfile::Builder::new()
+        .prefix("rch-orphan-record-absence-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let root = owner.path();
+    let directory = root.join("directory");
+    let file = root.join("record.pgid");
+    let alias = root.join("directory-alias");
+    let dangling = root.join("dangling");
+    let looping = root.join("looping");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(&file, b"unparseable but still present\n").unwrap();
+    symlink(&directory, &alias).unwrap();
+    symlink(root.join("missing-target"), &dangling).unwrap();
+    symlink("looping", &looping).unwrap();
+
+    for path in [
+        root.join("missing.pgid"),
+        root.join("never-created/child/record.pgid"),
+        alias.join("missing.pgid"),
+        root.join("missing 'quote $dollar; \u{0060}tick\u{0060}.pgid"),
+    ] {
+        let output = orphan_probe(&path).output().unwrap();
+        assert!(output.status.success(), "{path:?}: {output:?}");
+        assert_eq!(output.stdout, b"RCH_E104_KILL=record_absent\n");
+        assert!(output.stderr.is_empty(), "{path:?}: {output:?}");
+        let receipt = String::from_utf8(output.stdout).unwrap();
+        assert!(rch_common::orphan_quarantine::probe_record_absent(&receipt));
+        assert!(!rch_common::orphan_quarantine::probe_verified_dead(&receipt));
+    }
+
+    for path in [
+        file.clone(),
+        directory.clone(),
+        dangling.clone(),
+        file.join("record"),
+        dangling.join("record"),
+        looping.join("record"),
+        directory.join("x".repeat(256)),
+    ] {
+        let output = orphan_probe(&path).output().unwrap();
+        assert!(output.status.success(), "{path:?}: {output:?}");
+        let receipt = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            matches!(
+                receipt.as_str(),
+                "RCH_E104_KILL=still_alive\n" | "RCH_E104_KILL=unverified\n"
+            ),
+            "{path:?}: {receipt:?}"
+        );
+        assert!(!rch_common::orphan_quarantine::probe_record_absent(&receipt));
+        assert!(!rch_common::orphan_quarantine::probe_verified_dead(&receipt));
+    }
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"unparseable but still present\n"
+    );
+    assert_eq!(std::fs::read_link(&alias).unwrap(), directory);
+    assert_eq!(
+        std::fs::read_link(&dangling).unwrap(),
+        root.join("missing-target")
+    );
+    assert!(!root.join("never-created").exists());
+}
+
+#[test]
+fn orphan_quarantine_keeps_an_unobservable_record() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let owner = tempfile::Builder::new()
+        .prefix("rch-orphan-denied-record-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let directory = owner.path().join("private");
+    let path = directory.join("record.pgid");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(&path, b"retained ownership\n").unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0)).unwrap();
+    let observation = std::fs::symlink_metadata(&path);
+    let result = orphan_probe(&path).output();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = result.unwrap();
+    assert!(output.status.success(), "{output:?}");
+    match observation {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            assert_eq!(output.stdout, b"RCH_E104_KILL=unverified\n", "{output:?}");
+        }
+        // Root can observe the malformed record through mode 000; it must
+        // still retain the quarantine, never reinterpret it as missing.
+        Ok(_) => assert_eq!(output.stdout, b"RCH_E104_KILL=still_alive\n", "{output:?}"),
+        other => panic!("unexpected permission fixture observation: {other:?}"),
+    }
+    let receipt = String::from_utf8(output.stdout).unwrap();
+    assert!(!rch_common::orphan_quarantine::probe_record_absent(&receipt));
+    assert!(!rch_common::orphan_quarantine::probe_verified_dead(&receipt));
+    assert_eq!(std::fs::read(&path).unwrap(), b"retained ownership\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn orphan_quarantine_preserves_verified_prior_boot_retirement_without_signalling() {
+    let mut unrelated = Running::new(timeout("80s", "printf '%s\\n' \"$$\"; sleep 30"));
+    unrelated.pids();
+    let owner = tempfile::Builder::new()
+        .prefix("rch-orphan-prior-boot-")
+        .disable_cleanup(true)
+        .tempdir()
+        .unwrap();
+    let current_boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let prior_boot = if current_boot.trim() == "11111111-1111-1111-1111-111111111111" {
+        "22222222-2222-2222-2222-222222222222"
+    } else {
+        "11111111-1111-1111-1111-111111111111"
+    };
+    let path = owner.path().join("7.pgid");
+    let record = format!(
+        "RCH_REMOTE_PROCESS_V1:7:{prior_boot}:{}:1\n",
+        unrelated.child.id()
+    );
+    std::fs::write(&path, &record).unwrap();
+    let output = orphan_probe(&path).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"RCH_E104_KILL=verified_dead\n");
+    assert!(unrelated.child.try_wait().unwrap().is_none());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), record);
 }

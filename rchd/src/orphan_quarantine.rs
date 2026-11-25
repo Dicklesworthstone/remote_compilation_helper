@@ -664,7 +664,7 @@ mod tests {
         let service = OrphanQuarantineService::new(
             pool.clone(),
             store.clone(),
-            prober(Some("noise\nRCH_E104_KILL=verified_dead\n")),
+            prober(Some("RCH_E104_KILL=verified_dead\n")),
             ORPHAN_QUARANTINE_CHECK_INTERVAL,
         );
         assert_eq!(service.evaluate_once().await, 1);
@@ -675,7 +675,20 @@ mod tests {
 
     #[tokio::test]
     async fn unverified_outcomes_keep_the_quarantine() {
-        for stdout in [Some("RCH_E104_KILL=still_alive"), Some("garbage"), None] {
+        for stdout in [
+            Some("RCH_E104_KILL=still_alive"),
+            Some("RCH_E104_KILL=unverified\n"),
+            Some("noise\nRCH_E104_KILL=verified_dead\n"),
+            Some("RCH_E104_KILL=verified_dead\nRCH_E104_KILL=still_alive\n"),
+            Some("RCH_E104_KILL=still_alive\nRCH_E104_KILL=verified_dead\n"),
+            Some("RCH_E104_KILL=verified_dead\nRCH_E104_KILL=verified_dead\n"),
+            Some("noise\nRCH_E104_KILL=record_absent\n"),
+            Some("RCH_E104_KILL=record_absent\nRCH_E104_KILL=unverified\n"),
+            Some("RCH_E104_KILL=unverified\nRCH_E104_KILL=record_absent\n"),
+            Some("RCH_E104_KILL=record_absent\nRCH_E104_KILL=record_absent\n"),
+            Some("garbage"),
+            None,
+        ] {
             let (_dir, pool, store) = fixture(quarantine_reason(Some(&evidence()))).await;
             let service = OrphanQuarantineService::new(
                 pool,
