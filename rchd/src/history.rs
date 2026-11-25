@@ -1292,21 +1292,36 @@ impl BuildHistory {
         } else {
             None
         };
-        let attributed_growth = observation
-            .map(|observation| observation.additional_bytes())
-            .or_else(|| {
-                disk_peak_growth_bytes.filter(|_| {
-                    state
-                        .worker_endpoint
-                        .as_ref()
-                        .is_some_and(|endpoint| !endpoint.source_was_retargeted())
-                })
+        // A worker's free-space counter includes every writer on its filesystem.
+        // Keep that bound for its conditional pool above, but do not export a
+        // known neighbour's possible allocation into the project's cold history.
+        let cold_sample = observation
+            .zip(disk_peak_output_bytes)
+            .map(|(sample, peak)| {
+                if !state.disk_shared {
+                    return (sample.additional_bytes(), sample.baseline_output_bytes == 0);
+                }
+                let output_added = sample
+                    .peak_added_output_bytes
+                    .max(peak - sample.baseline_output_bytes);
+                let non_pool_baseline =
+                    sample.baseline_output_bytes - sample.baseline_pool.retained_bytes;
+                // Concurrent cleanup can mask allocations outside the scanned
+                // roots, even when free space did not fall. This is a lower bound.
+                (non_pool_baseline.saturating_add(output_added), false)
             });
+        let attributed_growth = cold_sample.map(|(growth, _)| growth).or_else(|| {
+            disk_peak_growth_bytes.filter(|_| {
+                state
+                    .worker_endpoint
+                    .as_ref()
+                    .is_some_and(|endpoint| !endpoint.source_was_retargeted())
+            })
+        });
         let growth = attributed_growth
             .map(|bytes| (bytes as f64 / rch_common::BuildDiskBudget::GIB as f64).max(1.0))
             .or(unshared_df);
-        let complete = exit_code == 0
-            && observation.is_some_and(|observation| observation.baseline_output_bytes == 0);
+        let complete = exit_code == 0 && cold_sample.is_some_and(|(_, complete)| complete);
         if let Some(growth) = growth {
             let exact_key = footprint_key(&state.project_id, &state.command);
             let family_key = family_footprint_key(&state.project_id, &state.command);
@@ -4992,6 +5007,63 @@ mod tests {
                 finish_owned(&history, &neighbour, 130);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shared_supervisor_growth_sizes_later_cold_jobs_from_their_own_outputs() {
+        const GIB: u64 = rch_common::BuildDiskBudget::GIB;
+        let history = Arc::new(BuildHistory::new(20));
+        let endpoint = warm_test_endpoint().await;
+        let selector = crate::daemon_worker_selector(
+            &rch_common::RchConfig::default(),
+            Arc::clone(&history),
+            None,
+        );
+        let budget = |request: &rch_common::SelectionRequest| {
+            selector
+                .build_disk_budget_for_endpoint(request, &endpoint)
+                .unwrap()
+        };
+        let small = warm_test_request("small", "cargo test --test one");
+        let masked = warm_test_request("masked", "cargo test --test masked");
+        let mut large = warm_test_request("large", "cargo test --test one");
+        large.disk_headroom_gib = 100;
+        let first =
+            warm_test_admit(&history, &endpoint, &small, budget(&small), "first", 220.0).unwrap();
+        let second =
+            warm_test_admit(&history, &endpoint, &large, budget(&large), "second", 220.0).unwrap();
+        let third =
+            warm_test_admit(&history, &endpoint, &masked, budget(&masked), "third", 220.0).unwrap();
+        for (active, output_gib, free_drop_gib) in
+            [(&first, 2, 80), (&second, 78, 80), (&third, 2, 0)]
+        {
+            assert!(history.active_build(active.id).unwrap().disk_shared);
+            let receipt = rch_common::BuildDiskObservation {
+                peak_free_drop_bytes: free_drop_gib * GIB,
+                ..cold_test_observation(output_gib)
+            };
+            warm_test_complete(&history, active, output_gib, Some(receipt), 0);
+        }
+        // Both jobs saw the same 80 GiB decline. The small job retains its
+        // cold prior and the large job raises its family's budget from 30 to 98 GiB.
+        assert_eq!(budget(&small).max_growth_bytes, 30 * GIB);
+        assert_eq!(budget(&masked).max_growth_bytes, 30 * GIB);
+        let unseen = warm_test_request("small", "cargo test --test two");
+        assert_eq!(budget(&unseen).max_growth_bytes, 30 * GIB);
+        let unseen_large = warm_test_request("large", "cargo test --test two");
+        assert_eq!(budget(&unseen_large).max_growth_bytes, 98 * GIB);
+
+        // Run the unseen small job alone on 50 GiB. With no known overlap,
+        // the supported filesystem evidence can still raise future budgets.
+        let lone =
+            warm_test_admit(&history, &endpoint, &unseen, budget(&unseen), "lone", 50.0).unwrap();
+        assert!(!lone.disk_shared);
+        let receipt = rch_common::BuildDiskObservation {
+            peak_free_drop_bytes: 32 * GIB,
+            ..cold_test_observation(2)
+        };
+        warm_test_complete(&history, &lone, 2, Some(receipt), 0);
+        assert_eq!(budget(&unseen).max_growth_bytes, 40 * GIB);
     }
 
     #[tokio::test]
