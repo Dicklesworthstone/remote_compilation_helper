@@ -4123,6 +4123,20 @@ pub async fn handle_worker_drain(ctx: &DaemonContext, worker_id: &WorkerId) -> W
     }
 }
 
+fn clear_bypass_for_enable(
+    ctx: &DaemonContext,
+    worker_id: &WorkerId,
+    store: Option<&mut rch_common::BypassRecordStore>,
+) -> std::io::Result<()> {
+    if let Some(store) = store {
+        if let Some(record) = store.get(worker_id.as_str()) {
+            ctx.history.retain_cancel_incidents(record)?;
+        }
+        store.remove(worker_id.as_str())?;
+    }
+    Ok(())
+}
+
 /// Handle a worker enable request.
 pub async fn handle_worker_enable(
     ctx: &DaemonContext,
@@ -4141,6 +4155,12 @@ pub async fn handle_worker_enable(
         None => None,
     };
     let workers = ctx.pool.workers.read().await;
+    // Keep retirement and live enable ordered with fault publication. A
+    // different build's new incident must win if it arrives after enable.
+    let mut bypass = match &ctx.bypass_store {
+        Some(store) => Some(store.lock().await),
+        None => None,
+    };
     match workers.get(worker_id) {
         Some(worker) => {
             let old_status = worker.status().await;
@@ -4150,9 +4170,7 @@ pub async fn handle_worker_enable(
             // re-quarantines the worker from it on the next daemon restart (and
             // the live recovery loop can re-touch it). Mirrors `rejoin`'s
             // `store.remove(worker_id)`. (2026-07-16 offload meltdown follow-up.)
-            if let Some(store) = &ctx.bypass_store
-                && let Err(error) = store.lock().await.remove(worker_id.as_str())
-            {
+            if let Err(error) = clear_bypass_for_enable(ctx, worker_id, bypass.as_deref_mut()) {
                 return WorkerStateResponse {
                     status: "error".into(),
                     worker_id: worker_id.to_string(),
@@ -4222,9 +4240,7 @@ pub async fn handle_worker_enable(
                 );
                 return response;
             };
-            if let Some(bypass) = &ctx.bypass_store
-                && let Err(error) = bypass.lock().await.remove(worker_id.as_str())
-            {
+            if let Err(error) = clear_bypass_for_enable(ctx, worker_id, bypass.as_deref_mut()) {
                 response.message = Some(format!(
                     "Could not clear durable bypass for historical worker: {error}"
                 ));

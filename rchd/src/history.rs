@@ -316,6 +316,11 @@ pub struct ActiveBuildState {
     /// joined with the client-side durable lease without relying on a reusable PID.
     pub local_wrapper_id: Option<String>,
     pub remote_pgid_file: Option<String>,
+    /// Recovery or an operator already retired this owner's cancellation
+    /// incident. Retrying cancellation must still inspect the process but
+    /// cannot put the worker back into bypass for that same incident.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) cancel_incident_retired: bool,
     pub slots: u32,
     /// Which of the worker's project lanes this build holds (bd-sgvod). Lane
     /// 0 is the canonical mirror; lane k > 0 is `<root>.rch-lane-<k>`.
@@ -688,6 +693,7 @@ impl BuildHistory {
             hook_pid,
             local_wrapper_id,
             remote_pgid_file: None,
+            cancel_incident_retired: false,
             slots,
             project_lane: 0,
             disk_headroom_gib: 0,
@@ -875,6 +881,7 @@ impl BuildHistory {
             hook_pid,
             local_wrapper_id,
             remote_pgid_file: None,
+            cancel_incident_retired: false,
             slots,
             project_lane: 0,
             disk_headroom_gib: disk.requested_gib,
@@ -1563,6 +1570,43 @@ impl BuildHistory {
             persisted.insert(heartbeat.build_id, now);
         }
         Some(updated)
+    }
+
+    /// Transfer deduplication evidence to the active owner before retiring a
+    /// worker bypass. Both paths take the bypass store lock before this lock.
+    /// Completed and unrelated owners need no entry, including fresh builds
+    /// with the same worker or an ID reused by an imported ownership journal.
+    pub(crate) fn retain_cancel_incidents(
+        &self,
+        record: &rch_common::BypassRecord,
+    ) -> std::io::Result<()> {
+        let Some(json) = record.details.get("process_observation_incidents") else {
+            return Ok(());
+        };
+        let incidents: HashSet<String> = serde_json::from_str(json)?;
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        let mut changed = Vec::new();
+        for owner in active.values_mut() {
+            if !owner.cancel_incident_retired
+                && owner.worker_id == record.worker_id
+                && incidents.contains(&format!("cancel:{}:{}", owner.id, owner.started_at))
+            {
+                owner.cancel_incident_retired = true;
+                changed.push(owner.id);
+            }
+        }
+        if !changed.is_empty()
+            && let Err(error) = self.persist_ownership(&active, None)
+        {
+            for id in changed {
+                active
+                    .get_mut(&id)
+                    .expect("active lock is held")
+                    .cancel_incident_retired = false;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Record the latest stuck-detector evidence snapshot for an active build.

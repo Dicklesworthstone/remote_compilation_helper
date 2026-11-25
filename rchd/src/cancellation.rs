@@ -1528,7 +1528,8 @@ impl CancellationOrchestrator {
         let Some(owner) = ctx.history.active_build(record.build_id) else {
             return;
         };
-        if owner.worker_id != record.worker_id
+        if owner.cancel_incident_retired
+            || owner.worker_id != record.worker_id
             || owner.location != rch_common::BuildLocation::Remote
             || owner.remote_pgid_file != record.remote_pgid_file
         {
@@ -1563,17 +1564,12 @@ impl CancellationOrchestrator {
             }
             return;
         };
-        if let Err(error) = crate::bypass_recovery_service::record_process_observation_failure(
+        if let Err(error) = crate::bypass_recovery_service::record_cancellation_observation_failure(
             store,
             &worker,
             endpoint,
-            // A retry still describes the same unresolved build, not a new
-            // worker incident. Use durable ownership rather than this
-            // attempt's Instant so retries and daemon restarts cannot keep
-            // extending quarantine or erase successful recovery probes.
-            // The admission timestamp distinguishes a new build incarnation
-            // even if an imported history reuses its numeric ID.
-            &format!("cancel:{}:{}", owner.id, owner.started_at),
+            &ctx.history,
+            owner.id,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         )
         .await
@@ -4384,6 +4380,34 @@ wait
                 assert!(!ctx.history.has_terminal_build(owner.id));
             }
         }
+
+        // An operator may restore admission while cancellation still owns
+        // these slots. Recreate the daemon's journals, then retry both owners
+        // through cleanup: neither may undo the acknowledged enable.
+        assert_eq!(
+            crate::workers::handle_worker_enable(&ctx, &config.id)
+                .await
+                .status,
+            "ok"
+        );
+        ctx.history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+        ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
+            rch_common::BypassRecordStore::load(&bypass_path),
+        )));
+        for owner in owners {
+            let mut record = test_record(CancellationState::Failed, 1, true);
+            record.build_id = owner.id;
+            record.worker_id = owner.worker_id;
+            record.worker_endpoint = owner.worker_endpoint;
+            record.remote_pgid_file = owner.remote_pgid_file;
+            record.slots = owner.slots;
+            orch.run_cleanup(&ctx, &mut record).await;
+            assert!(ctx.history.active_build(owner.id).is_some());
+            assert!(!ctx.history.has_terminal_build(owner.id));
+        }
+        assert!(!rch_common::BypassRecordStore::load(&bypass_path).contains(config.id.as_str()));
+        assert_eq!(worker.used_slots(), 4);
+        assert!(worker.reserve_slots(1).await);
     }
 
     #[tokio::test]

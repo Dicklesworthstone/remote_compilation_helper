@@ -1128,7 +1128,7 @@ pub(crate) async fn record_process_observation_failure(
     now_ms: u64,
 ) -> anyhow::Result<()> {
     record_owned_execution_failure(
-        store,
+        &mut *store.lock().await,
         worker,
         endpoint,
         incident,
@@ -1149,7 +1149,7 @@ pub(crate) async fn record_runtime_execution_failure(
     now_ms: u64,
 ) -> anyhow::Result<()> {
     record_owned_execution_failure(
-        store,
+        &mut *store.lock().await,
         worker,
         endpoint,
         incident,
@@ -1166,7 +1166,7 @@ enum OwnedExecutionFailure {
 }
 
 async fn record_owned_execution_failure(
-    store: &Arc<Mutex<BypassRecordStore>>,
+    store: &mut BypassRecordStore,
     worker: &Arc<WorkerState>,
     endpoint: &WorkerEndpointSnapshot,
     incident: &str,
@@ -1189,7 +1189,6 @@ async fn record_owned_execution_failure(
             "SIGILL observed; runtime cause unverified",
         ),
     };
-    let mut store = store.lock().await;
     let Some(config) = worker.lock_current_endpoint(endpoint).await else {
         anyhow::bail!("execution failure belongs to a replaced worker endpoint");
     };
@@ -1256,6 +1255,35 @@ async fn record_owned_execution_failure(
     remediation::record_bypass_transition(BypassTransition::Bypassed);
     remediation::record_worker_ineligible(requested_class);
     Ok(())
+}
+
+/// Check the live owner *under the same store lock* used to retire its
+/// previous bypass. A retry queued behind a canary or manual enable must
+/// observe that retirement even if cancellation began before it.
+pub(crate) async fn record_cancellation_observation_failure(
+    store: &Arc<Mutex<BypassRecordStore>>,
+    worker: &Arc<WorkerState>,
+    endpoint: &WorkerEndpointSnapshot,
+    history: &BuildHistory,
+    build_id: u64,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    let mut store = store.lock().await;
+    let Some(owner) = history.active_build(build_id) else {
+        return Ok(());
+    };
+    if owner.cancel_incident_retired {
+        return Ok(());
+    }
+    record_owned_execution_failure(
+        &mut store,
+        worker,
+        endpoint,
+        &format!("cancel:{}:{}", owner.id, owner.started_at),
+        now_ms,
+        OwnedExecutionFailure::ProcessObservation,
+    )
+    .await
 }
 
 /// Validate remote paths without interpreting them on the dispatcher's
@@ -2106,6 +2134,12 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         if !publication.current()
             || store.get(&publication.record.worker_id) != Some(publication.record)
         {
+            return false;
+        }
+        if let Some(history) = &self.history
+            && let Err(error) = history.retain_cancel_incidents(publication.record)
+        {
+            warn!(%error, "cannot preserve cancellation incidents; retaining worker bypass");
             return false;
         }
         let prepared = match store.prepare_remove(&publication.record.worker_id) {
@@ -3615,7 +3649,7 @@ mod tests {
 
         async fn canary(&self, worker: Arc<WorkerState>, _deadline: Instant) -> CanaryOutcome {
             record_owned_execution_failure(
-                &self.store,
+                &mut *self.store.lock().await,
                 &worker,
                 &worker.endpoint_snapshot().await,
                 if self.new_incident { "job-2" } else { "job-1" },
@@ -3675,7 +3709,7 @@ mod tests {
                 assert!(worker.reserve_slots(1).await);
                 let store = store();
                 record_owned_execution_failure(
-                    &store,
+                    &mut *store.lock().await,
                     &worker,
                     &worker.endpoint_snapshot().await,
                     "job-1",
@@ -3717,6 +3751,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn recovered_worker_rejects_duplicate_cancel_incident_but_records_a_new_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_path = dir.path().join("history.jsonl");
+        let history = Arc::new(BuildHistory::new(10).with_persistence(history_path.clone()));
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        let endpoint = worker.endpoint_snapshot().await;
+        let store = Arc::new(Mutex::new(BypassRecordStore::with_path(
+            dir.path().join("bypass.json"),
+        )));
+        let start = |project: &str| {
+            history
+                .try_start_active_build_with_waiter(
+                    project.into(),
+                    "css".into(),
+                    "cargo test".into(),
+                    0,
+                    None,
+                    1,
+                    rch_common::BuildLocation::Remote,
+                    None,
+                    crate::disk_pressure::DiskHeadroomAdmission::default(),
+                    Some(endpoint.clone()),
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let old = start("first");
+        let fresh = start("second");
+        assert!(worker.reserve_slots(2).await);
+        record_cancellation_observation_failure(&store, &worker, &endpoint, &history, old.id, T0)
+            .await
+            .unwrap();
+        let service = BypassRecoveryService::new(
+            pool,
+            store.clone(),
+            FakeProber::new(vec![], RecoveryProbe::all_ok(), CanaryOutcome::Passed),
+            BypassRecoveryConfig::default(),
+        )
+        .with_history(history.clone());
+        for _ in 0..2 {
+            let due = store.lock().await.get("css").unwrap().next_probe_unix_ms;
+            service.evaluate_once(due).await;
+        }
+        assert!(worker.lifecycle().await.is_schedulable());
+        assert!(!store.lock().await.contains("css"));
+        let restored = BuildHistory::load_from_file(&history_path, 10).unwrap();
+        record_cancellation_observation_failure(
+            &store,
+            &worker,
+            &endpoint,
+            &restored,
+            old.id,
+            T0 + 1,
+        )
+        .await
+        .unwrap();
+        assert!(worker.lifecycle().await.is_schedulable());
+        assert!(!store.lock().await.contains("css"));
+        record_cancellation_observation_failure(
+            &store,
+            &worker,
+            &endpoint,
+            &restored,
+            fresh.id,
+            T0 + 2,
+        )
+        .await
+        .unwrap();
+        assert!(!worker.lifecycle().await.is_schedulable());
+        assert_eq!(
+            store.lock().await.get("css").unwrap().consecutive_failures,
+            1
+        );
+        assert_eq!(restored.active_builds().len(), 2);
+        assert_eq!(worker.used_slots(), 2);
     }
 
     #[tokio::test]
