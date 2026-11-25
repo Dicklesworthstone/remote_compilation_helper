@@ -24,18 +24,24 @@ use rch_common::orphan_quarantine::{
     QuarantineEvidence, kill_probe_script, parse_quarantine_reason, probe_record_absent,
     probe_verified_dead,
 };
-use rch_common::ssh::{SshClient, SshOptions};
+use rch_common::ssh::{SshClient, SshOptions, capture_control_output};
 use rch_common::timing::{scale_duration, shell_prefix};
 use rch_common::{BuildLocation, WorkerConfig, WorkerId};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 /// How often quarantined workers with evidence are re-probed.
 pub const ORPHAN_QUARANTINE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+// A probe emits one short receipt. Bound diagnostics independently and reject
+// either stream on overflow instead of treating a truncated preview as evidence.
+const PROBE_STDOUT_LIMIT: usize = 4 * 1024;
+const PROBE_STDERR_LIMIT: usize = 64 * 1024;
 /// How long a quarantine's worker-side record must have been absent before
 /// that absence clears it. Longer than the cache sweep's 240-minute orphan
 /// window, so a missing record is the watchdog's verdict, not a race.
@@ -59,23 +65,64 @@ pub struct SshOrphanProber;
 impl OrphanProber for SshOrphanProber {
     async fn probe(&self, worker: WorkerConfig, evidence: QuarantineEvidence) -> Option<String> {
         let budget = scale_duration(PROBE_TIMEOUT);
+        let deadline = Instant::now().checked_add(budget)?;
         let options = SshOptions {
             command_timeout: budget,
             connect_timeout: budget,
             ..Default::default()
         };
+        let destination = format!("{}@{}", worker.user, worker.host);
         let mut client = SshClient::new(worker, options);
-        client.connect().await.ok()?;
+        client.connect_until(deadline).await.ok()?;
+        let transport = client.external_transport().ok()?;
         let script = format!(
             "{}{}",
             shell_prefix(),
             kill_probe_script(&evidence.pgid_file, evidence.build_id)
         );
-        let command = format!("sh -c {}", shell_escape::escape(script.into()));
-        let result = client.execute(&command).await.ok()?;
-        // The probe always exits 0; anything else is a channel failure.
-        (result.exit_code == 0).then_some(result.stdout)
+        // Attach only to the authenticated master for this recorded endpoint.
+        // Its attachment arguments refuse a fresh dial if that master exits.
+        // Keep the program off argv: nested shell quoting must not constrain
+        // how much identity/recovery logic the finite probe can contain.
+        let mut command = Command::new("ssh");
+        command
+            .args(transport.arguments().ok()?)
+            .arg("--")
+            .arg(destination)
+            .arg("sh -s");
+        let stdout = tokio::select! {
+            biased;
+            () = transport.closed() => None,
+            output = capture_probe_output(&mut command, &script, deadline) => output,
+        }?;
+        transport.complete();
+        Some(stdout)
     }
+}
+
+/// Write the finite program and drain both pipes concurrently under the original
+/// deadline. The shared capture owner stops the local transport group on timeout,
+/// overflow or cancellation; none of those outcomes proves remote completion.
+async fn capture_probe_output(
+    command: &mut Command,
+    script: &str,
+    deadline: Instant,
+) -> Option<String> {
+    let output = capture_control_output(
+        command,
+        Some(script.as_bytes()),
+        PROBE_STDOUT_LIMIT,
+        PROBE_STDERR_LIMIT,
+        deadline,
+    )
+    .await
+    .ok()?;
+    // The probe always exits 0; anything else is a channel failure. Keep exact
+    // bytes through UTF-8 validation: only the common parser selects a verdict.
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 pub struct OrphanQuarantineService<P: OrphanProber> {
@@ -268,6 +315,77 @@ mod tests {
     use rch_common::orphan_quarantine::{QuarantineEndpoint, quarantine_reason};
     use rch_common::{BuildHeartbeatPhase, BuildHeartbeatRequest};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    // These execute the real finite-input/capture path through a native shell.
+    // They do not establish SSH authentication or a worker process verdict.
+    async fn local_probe_script(script: &str) -> Option<String> {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-s");
+        capture_probe_output(&mut command, script, Instant::now() + Duration::from_secs(5)).await
+    }
+
+    #[tokio::test]
+    async fn probe_program_streams_past_single_argument_limits() {
+        let mut script = "# finite probe program\n".repeat(8 * 1024);
+        script.push_str("printf '%s\\n' RCH_E104_KILL=verified_dead\n");
+        assert!(script.len() > 128 * 1024);
+        assert_eq!(
+            local_probe_script(&script).await.as_deref(),
+            Some("RCH_E104_KILL=verified_dead\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_capture_rejects_failed_incomplete_and_oversized_output() {
+        let scripts = [
+            "printf '%s\\n' RCH_E104_KILL=verified_dead; exit 7\n".to_owned(),
+            "printf '\\377'; printf '%s\\n' RCH_E104_KILL=verified_dead\n".to_owned(),
+            format!("printf '%s' '{}'\n", "x".repeat(PROBE_STDOUT_LIMIT + 1)),
+            format!(
+                "printf '%s' '{}' >&2\nprintf '%s\\n' RCH_E104_KILL=verified_dead\n",
+                "x".repeat(PROBE_STDERR_LIMIT + 1)
+            ),
+        ];
+        for (case, script) in scripts.iter().enumerate() {
+            assert!(
+                local_probe_script(script).await.is_none(),
+                "accepted incomplete probe capture case {case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_capture_preserves_noisy_receipts_for_strict_rejection() {
+        for receipt in [
+            "noise\nRCH_E104_KILL=verified_dead\n",
+            "RCH_E104_KILL=verified_dead\nnoise\n",
+            "RCH_E104_KILL=still_alive\nRCH_E104_KILL=record_absent\n",
+            "RCH_E104_KILL=verified_dead\nRCH_E104_KILL=verified_dead\n",
+        ] {
+            let script = format!("printf '%s' {}\n", shell_escape::escape(receipt.into()));
+            let stdout = local_probe_script(&script).await.unwrap();
+            assert_eq!(stdout, receipt);
+            assert!(!probe_verified_dead(&stdout), "{stdout:?}");
+            assert!(!probe_record_absent(&stdout), "{stdout:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_receipt_without_process_completion_cannot_outlive_the_probe_deadline() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-s");
+        let output = tokio::time::timeout(
+            Duration::from_secs(3),
+            capture_probe_output(
+                &mut command,
+                "printf '%s\\n' RCH_E104_KILL=verified_dead; exec sleep 30\n",
+                Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("the probe must honor its original control deadline");
+        assert!(output.is_none(), "a partial receipt cannot prove completion");
+    }
 
     struct FakeProber {
         stdout: Option<&'static str>,
