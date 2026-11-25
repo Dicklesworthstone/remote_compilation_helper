@@ -1169,7 +1169,12 @@ rch_scope_path_state() {
         [ -d "$rch_scope_walk" ] && [ ! -L "$rch_scope_walk" ] &&
             [ -r "$rch_scope_walk" ] && [ -x "$rch_scope_walk" ] || return 2
         rch_scope_walk="$rch_scope_walk/${rch_scope_rest%%/*}"
-        if [ ! -e "$rch_scope_walk" ] && [ ! -L "$rch_scope_walk" ]; then return 0; fi
+        if [ ! -e "$rch_scope_walk" ] && [ ! -L "$rch_scope_walk" ]; then
+            # A terminal manager snapshot does not make a failed filesystem
+            # observation authoritative. Keep both proofs independent.
+            rch_path_absent "$rch_scope_walk" || return 2
+            return 0
+        fi
         case "$rch_scope_rest" in
             */*) rch_scope_rest=${rch_scope_rest#*/};;
             *) rch_scope_rest=;;

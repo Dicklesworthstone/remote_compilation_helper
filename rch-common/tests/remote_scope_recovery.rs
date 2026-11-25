@@ -52,6 +52,7 @@ fn remote_scope_recovery_contract() {
             "ScopeProtocol.test_symlinked_scope_does_not_authorize_kill_or_absence",
             "ScopeProtocol.test_concurrent_scopes_keep_distinct_cleanup_authority",
         ])
+        .env("RCH_WKR_BIN", rch_common::testing::worker_binary())
         .status()
         .expect("Linux scope-recovery integration tests require python3");
     assert!(status.success(), "remote scope recovery contract failed");
@@ -294,6 +295,66 @@ const TEST_CLOCK: &str = r#"
 rch_observation_clock() { read -r rch_observation_now < "$RCH_SCOPE_TEST_ROOT/clock"; }
 rch_remote_cancel "$1" 42 kill
 "#;
+
+#[test]
+fn native_missing_scope_requires_physical_absence_and_a_terminal_manager() {
+    let fixture = ScopeFixture::new();
+    let receipt = fixture.receipt();
+    let retained = fixture.root().join("retained-scope");
+    std::fs::rename(&fixture.scope, &retained).unwrap();
+
+    // Physical absence alone cannot override a manager that still says active.
+    status(&fixture.operation("state"), 2);
+    write(
+        &fixture.snapshot,
+        "LoadState=not-found\nActiveState=inactive\nInvocationID=\nControlGroup=\n",
+    );
+    status(&fixture.operation("state"), 0);
+    status(&fixture.operation("kill"), 0);
+    status(&fixture.operation("probe"), 2);
+    fixture.unchanged(&receipt);
+    assert_eq!(read(retained.join("cgroup.kill")), "");
+}
+
+#[test]
+fn native_scope_lookup_errors_and_unavailable_helpers_never_prove_absence() {
+    let mut fixture = ScopeFixture::new();
+    let receipt = fixture.receipt();
+
+    // ENAMETOOLONG makes both shell existence tests fail, just like ENOENT.
+    // Drive the production path observer with that real kernel error.
+    let invalid = format!("/jobs.slice/{}", "x".repeat(256));
+    let output = fixture.run(
+        "rch_scope_mount=\"$RCH_SCOPE_TEST_ROOT/cgroups\"\n\
+         rch_scope_cgroup=$1\nrch_scope_path_state",
+        &[Path::new(&invalid)],
+    );
+    status(&output, 2);
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(fixture.kill(), "");
+
+    let retained = fixture.root().join("retained-scope");
+    std::fs::rename(&fixture.scope, &retained).unwrap();
+    write(
+        &fixture.snapshot,
+        "LoadState=not-found\nActiveState=inactive\nInvocationID=\nControlGroup=\n",
+    );
+    // These helpers are deliberately unavailable/incompatible. The manager's
+    // terminal state cannot replace the missing native filesystem witness.
+    fixture.executable("old-worker", "exit 0");
+    for worker in [
+        fixture.root().join("missing-worker"),
+        fixture.root().join("bin/old-worker"),
+    ] {
+        let worker = worker.to_str().unwrap().to_owned();
+        fixture.env.insert("RCH_WKR_BIN".into(), worker);
+        let output = fixture.operation("state");
+        status(&output, 2);
+        assert!(output.stdout.is_empty(), "{output:?}");
+        fixture.unchanged(&receipt);
+        assert_eq!(read(retained.join("cgroup.kill")), "");
+    }
+}
 
 #[test]
 fn native_unavailable_post_exit_observation_retains_record_until_recovery() {
