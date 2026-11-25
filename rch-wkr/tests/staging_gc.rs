@@ -13,6 +13,64 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// A build can write inside deps/ while its top directory is old enough for
+/// the transfer's shallow age filter. Run the worker's actual CLI on the batch.
+#[test]
+fn transfer_cache_gc_preserves_active_descendants_through_a_project_alias() {
+    let root = tempfile::tempdir().unwrap();
+    let physical = root.path().join("physical project");
+    let alias = root.path().join("alias");
+    let pool = ".rch-target-worker-pool-abc";
+    let cache = "rch-cargo-cache-worker";
+    let job = ".rch-target-worker-job-1";
+    for name in [pool, cache, job] {
+        let path = physical.join(name);
+        fs::create_dir_all(path.join("deps")).unwrap();
+        fs::write(path.join("deps/artifact"), b"current build").unwrap();
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+    }
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let run = |args: &[&str], paths: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rch-wkr"))
+            .arg("collect-idle-caches")
+            .args(args)
+            .args(paths.iter().map(|name| alias.join(name)))
+            .env("TMPDIR", root.path())
+            .output()
+            .unwrap()
+    };
+    let caches = run(&["1440"], &[pool, cache]);
+    let sibling = run(&["--per-job", "60"], &[job]);
+    for output in [&caches, &sibling] {
+        assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("RCH_GC_GATES "));
+    }
+    for (result, name, trigger) in [
+        (&caches, pool, "pooled-ttl"),
+        (&caches, cache, "cache-ttl"),
+        (&sibling, job, "ttl"),
+    ] {
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let path = physical.join(name).canonicalize().unwrap();
+        assert!(
+            stdout.contains(&format!("RCH_GC_SKIP {trigger} active {}", path.display())),
+            "{stdout}"
+        );
+        assert_eq!(fs::read(path.join("deps/artifact")).unwrap(), b"current build");
+    }
+    assert!(!run(&["1"], &[pool]).status.success());
+    assert!(!run(&["1440"], &["src"]).status.success());
+    assert!(!run(&["--per-job", "10080"], &[pool]).status.success());
+    let link = ".rch-target-worker-pool-link";
+    std::os::unix::fs::symlink(physical.join(pool), physical.join(link)).unwrap();
+    assert!(!run(&["1440"], &[link]).status.success());
+    assert!(physical.join(link).is_symlink());
+    assert!(physical.join(pool).join("deps/artifact").is_file());
+}
+
 struct Fixture {
     root: PathBuf,
     base: PathBuf,

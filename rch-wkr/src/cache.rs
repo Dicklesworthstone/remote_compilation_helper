@@ -7,6 +7,74 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 
+/// A transfer's top-directory age filter only proposes candidates. Run the
+/// same whole-tree age, process, handle, retention and claim checks as GC.
+#[cfg(unix)]
+pub(crate) fn collect_idle_caches(per_job: bool, idle_minutes: u64, paths: &[String]) -> Result<()> {
+    use anyhow::{Context as _, ensure};
+    use rch_common::stale_target_reap::{
+        GcClass, GcCollectTarget, MIN_CARGO_CACHE_IDLE_MINUTES, MIN_POOLED_IDLE_MINUTES,
+        collect_transfer_paths_command, idle_minutes_from_hours, is_safe_gc_path,
+    };
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut targets = Vec::with_capacity(paths.len());
+    for path in paths {
+        ensure!(is_safe_gc_path(path), "invalid cache candidate {path:?}");
+        let class = GcClass::from_path(path);
+        let floor = match (per_job, class) {
+            (true, GcClass::PerJob) => idle_minutes_from_hours(1),
+            (false, GcClass::Pooled) => MIN_POOLED_IDLE_MINUTES,
+            (false, GcClass::CargoCache) => MIN_CARGO_CACHE_IDLE_MINUTES,
+            _ => anyhow::bail!("cache candidate outside transfer cleanup scope: {path:?}"),
+        };
+        ensure!(
+            idle_minutes >= floor,
+            "cache idle window below {floor} minutes"
+        );
+        // Kernel handle evidence names the physical path even if transfer
+        // used a project alias. Keep the final component unresolved so GC
+        // rechecks it for symlink replacement when acquiring the claim.
+        let path = Path::new(path);
+        let parent = path
+            .parent()
+            .context("missing cache parent")?
+            .canonicalize()?;
+        let physical = parent.join(path.file_name().context("missing cache name")?);
+        ensure!(
+            physical.symlink_metadata()?.is_dir(),
+            "cache candidate is not a physical directory: {physical:?}"
+        );
+        targets.push(GcCollectTarget {
+            path: physical
+                .to_str()
+                .context("non-UTF-8 cache path")?
+                .to_owned(),
+            idle_minutes,
+            trigger: class.trigger(),
+        });
+    }
+
+    let script = collect_transfer_paths_command(&targets).map_err(anyhow::Error::msg)?;
+    // A large find -exec batch plus the quoted script can exceed a single
+    // exec argument. Keep the transfer's stdin private to the rsync server.
+    let mut child = Command::new("sh")
+        .arg("-s")
+        .env("RCH_WKR_BIN", crate::native_worker_executable()?)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    let delivered = child
+        .stdin
+        .take()
+        .context("missing GC script pipe")?
+        .write_all(script.as_bytes());
+    let status = child.wait()?;
+    delivered.context("deliver cache GC script")?;
+    ensure!(status.success(), "cache collection exited {status}");
+    Ok(())
+}
+
 /// Get the base directory for RCH project caches.
 /// Uses `dirs::cache_dir()` (e.g. `~/.cache/rch`) to isolate caches per-user
 /// and prevent symlink attacks on shared `/tmp` partitions. Falls back to `/tmp/rch-$USER`.

@@ -984,28 +984,35 @@ fn worker_cache_prune_rsync_path_prefix(
     let tmp_mins = WORKER_TMP_PRUNE_MAX_AGE_MINS;
     let durable_mins = WORKER_DURABLE_CACHE_PRUNE_MAX_AGE_MINS;
     let mut prefix = format!(
-        "find {p}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{tmp_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; \
-         find {p}/.rch-tmp -mindepth 1 -maxdepth 1 -name 'rch-cargo-cache-*' -mmin +{durable_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
-        p = escaped_remote_path
+        "find {p}/.rch-tmp -mindepth 1 -maxdepth 1 ! -name 'rch-cargo-cache-*' -mmin +{tmp_mins} -exec rm -rf -- '{{}}' + 2>/dev/null || :; \
+         {locate} if rch_wkr_locate; then \
+         find {p}/.rch-tmp -mindepth 1 -maxdepth 1 -type d -name 'rch-cargo-cache-*' -mmin +{durable_mins} -exec \"$RCH_WKR\" collect-idle-caches {durable_mins} '{{}}' + >/dev/null 2>&1 || :; ",
+        p = escaped_remote_path,
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
     );
     if let Some(pooled_mins) = pooled_target_prune_max_age_mins(pooled_target_idle_hours) {
-        prefix.push_str(&format!(
-            "find {p} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{pooled_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
-            p = escaped_remote_path
-        ));
-        // Issue #60: a clean-overlay run relocates its pooled target store to a
-        // stable parent OUTSIDE the (nonce-unique, teardown-reaped) remote
-        // root. Sweep that parent on the same configured retention so
-        // relocated pools age out exactly like in-root ones.
-        if let Some(pool_parent) = escaped_stable_pool_parent
-            && pool_parent != escaped_remote_path
+        for parent in std::iter::once(escaped_remote_path)
+            .chain(escaped_stable_pool_parent.filter(|parent| *parent != escaped_remote_path))
         {
             prefix.push_str(&format!(
-                "find {pool_parent} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{pooled_mins} -exec rm -rf -- '{{}}' + 2>/dev/null; ",
+                "find {parent} -mindepth 1 -maxdepth 1 -type d -name '.rch-target-*-pool-*' -mmin +{pooled_mins} -exec \"$RCH_WKR\" collect-idle-caches {pooled_mins} '{{}}' + >/dev/null 2>&1 || :; ",
             ));
         }
     }
+    prefix.push_str("fi; ");
     prefix
+}
+
+/// A shallow candidate list for per-job cleanup. Reuse the native collector
+/// so a quiet process, an active recovery claim or a failed scan keeps a target.
+fn sibling_target_prune_command(project_dir: &str, current: &str, idle_minutes: u64) -> String {
+    format!(
+        "{locate} rch_wkr_locate || exit 0; cd -P \"{project_dir}\" || exit 0; \
+         find \"$PWD\" -mindepth 1 -maxdepth 1 -type d \\( -name '.rch-target-*-job-*' -o -name '.rch-target-*-pid-*' \\) \
+         ! -name '.rch-target-*-pool-*' ! -name \"{current}\" -mmin +{idle_minutes} \
+         -exec \"$RCH_WKR\" collect-idle-caches --per-job {idle_minutes} '{{}}' +",
+        locate = rch_common::wkr_locate::WKR_LOCATE_SHELL,
+    )
 }
 
 /// Minimum minutes between two guarded TMPDIR sweeps of one durable mirror.
@@ -10501,9 +10508,9 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
     /// per-job dir must *never* be removed merely because some build finished; that
     /// could clip a build still in flight. Instead we remove only dirs that
     /// have seen **no file activity for `idle_hours`** — i.e. finished/abandoned
-    /// ones. A dir idle that long cannot be a live job (an active build touches its
-    /// dir continuously), so this never races a concurrent build on the same
-    /// project, even when multiple agents build it on the same worker at once.
+    /// ones. A quiet test process may still be using an old target. The worker
+    /// also verifies process and open-file evidence and acquires the same
+    /// ownership claim used by explicit GC before reclamation.
     ///
     /// The sweep is confined to the *single current project dir* (`remote_path()`),
     /// reaping only its abandoned sibling per-job dirs. The expensive cross-project
@@ -10570,18 +10577,7 @@ exit \"$__s\"; }}; }} 3>&2 4>&1",
 
         #[cfg(unix)]
         {
-            // For each per-job sibling dir apply the SHARED reap predicate
-            // (`rch_common::stale_target_reap::reap_loop_body`): keep it if the dir
-            // OR any descendant was modified within the idle window (an active or
-            // just-created build); otherwise remove it. This job's own dir is
-            // always excluded. The glob list is the shared `REAP_GLOBS`.
-            let globs = rch_common::stale_target_reap::REAP_GLOBS.join(" ");
-            let loop_body =
-                rch_common::stale_target_reap::reap_loop_body(idle_minutes, Some(&current), "", "");
-            let script = format!(
-                "cd \"{project_dir}\" 2>/dev/null || exit 0; \
-                 for d in {globs}; do {loop_body} done"
-            );
+            let script = sibling_target_prune_command(&project_dir, &current, idle_minutes);
             // Detach on the worker so a large reclaim runs concurrently with the
             // build rather than blocking it. The detached operation joins the
             // source activity barrier itself, so release either drains it or
@@ -13935,8 +13931,8 @@ esac
         let bystander = project_dir.join("target");
         fs::create_dir_all(&bystander).expect("mkdir bystander");
 
-        // Build the script EXACTLY as the reaper does (shared globs + loop body,
-        // excluding the current job dir), then run it single-quote wrapped.
+        // Exercise the legacy shared shell predicate (including its pool veto)
+        // on real directories. The current dispatch path adds worker GC checks.
         let globs = rch_common::stale_target_reap::REAP_GLOBS.join(" ");
         let loop_body = rch_common::stale_target_reap::reap_loop_body(720, Some(current), "", "");
         let project_dir_str = project_dir.to_str().unwrap();
@@ -18506,6 +18502,78 @@ Number of files transferred: 42
         )));
         assert_eq!(pooled_target_prune_max_age_mins(0), None);
         assert_eq!(pooled_target_prune_max_age_mins(168), Some(168 * 60));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transfer_start_keeps_cache_candidates_when_the_guard_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let root = tempfile::tempdir().unwrap();
+        let physical = root.path().canonicalize().unwrap();
+        let project = physical.join("project with spaces");
+        let stable = physical.join("stable");
+        let own = ".rch-target-w-job-current";
+        let paths = [
+            project.join(".rch-target-night-job-worker-pool-key"),
+            stable.join(".rch-target-w-pool-relocated"),
+            project.join(".rch-tmp/rch-cargo-cache-w"),
+            project.join(".rch-target-w-job-previous"),
+            project.join(own),
+        ];
+        for path in &paths {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("artifact"), b"keep").unwrap();
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH)
+                .unwrap();
+        }
+        let prefix = worker_cache_prune_rsync_path_prefix(
+            &escape(project.to_string_lossy()),
+            168,
+            Some(&escape(stable.to_string_lossy())),
+        );
+        let siblings = sibling_target_prune_command(project.to_str().unwrap(), own, 720);
+        // The historical worker rejects the command. Its stdout must never
+        // enter the following rsync receiver's byte stream.
+        let old_worker = root.path().join("old-worker");
+        std::fs::write(
+            &old_worker,
+            "#!/bin/sh\nprintf 'old CLI help\\n'\nprintf '%s\\n' \"$@\" >> \"$CALLS\"\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&old_worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let calls = root.path().join("calls");
+        for helper in [root.path().join("absent"), old_worker] {
+            let run = |script: &str| {
+                Command::new("sh")
+                    .args(["-c", script])
+                    .env("RCH_WKR_BIN", &helper)
+                    .env("CALLS", &calls)
+                    .output()
+                    .unwrap()
+            };
+            let upload = run(&format!("{prefix}printf receiver"));
+            assert!(upload.status.success(), "{upload:?}");
+            assert_eq!(upload.stdout, b"receiver");
+            let _detached = run(&siblings);
+            for path in &paths {
+                assert_eq!(std::fs::read(path.join("artifact")).unwrap(), b"keep");
+            }
+        }
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert_eq!(calls.lines().filter(|s| *s == "collect-idle-caches").count(), 4);
+        assert_eq!(calls.lines().filter(|s| *s == "--per-job").count(), 1);
+        for path in &paths[..4] {
+            assert_eq!(
+                calls.lines().filter(|s| Path::new(s) == path).count(),
+                1,
+                "{calls}"
+            );
+        }
+        assert!(!calls.contains(own));
     }
 
     #[test]

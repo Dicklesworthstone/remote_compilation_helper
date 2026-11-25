@@ -2264,6 +2264,21 @@ fn collect_paths_command_with_registry(
     targets: &[GcCollectTarget],
     registry: &str,
 ) -> Result<String, String> {
+    collect_paths_script(targets, registry, false)
+}
+
+/// Transfers prefilter by the top directory's age, so many proposed caches
+/// still have recent descendants. Take the expensive worker-wide snapshots
+/// only when the whole-tree age check finds the first truly idle candidate.
+pub fn collect_transfer_paths_command(targets: &[GcCollectTarget]) -> Result<String, String> {
+    collect_paths_script(targets, SOURCE_CLAIM_REGISTRY, true)
+}
+
+fn collect_paths_script(
+    targets: &[GcCollectTarget],
+    registry: &str,
+    defer_snapshots: bool,
+) -> Result<String, String> {
     if targets.is_empty() {
         return Err("no targets to collect".to_string());
     }
@@ -2280,17 +2295,24 @@ fn collect_paths_command_with_registry(
     // resolved by the very prelude that creates the dirs being collected.
     let tmp_base_prelude = crate::gc_roots::remote_cargo_home_base_prelude();
     let tmp_base_var = crate::gc_roots::RCH_CARGO_HOME_BASE_VAR;
+    let first_snapshot = if defer_snapshots {
+        ""
+    } else {
+        "__gc_start_gates; __gc_gates_started=1; "
+    };
     Ok(format!(
         "set -u; \
          {tmp_base_prelude}; \
          __tmpbase=\"${{{tmp_base_var}}}\"; \
-         {gates}\
+         __held=\"\"; __proc=\"\"; __gc_gates_started=0; \
+         __gc_start_gates() {{ {gates} }}; {first_snapshot}\
          {source_gate}\
          removed=0; freed_kb=0; \
          for __e in{list}; do \
            __mins=${{__e%%:*}}; __r=${{__e#*:}}; __tag=${{__r%%:*}}; d=${{__r#*:}}; \
            if [ ! -d \"$d\" ]; then printf 'RCH_GC_SKIP %s missing %s\\n' \"$__tag\" \"$d\"; continue; fi; \
            {early_recent}\
+           if [ \"$__gc_gates_started\" -eq 0 ]; then __gc_start_gates; __gc_gates_started=1; fi; \
            if ! __gc_gates_ok \"$d\"; then printf 'RCH_GC_SKIP %s gate %s\\n' \"$__tag\" \"$d\"; continue; fi; \
            {source_begin}\
            {held_recent}\

@@ -88,6 +88,17 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<std::ffi::OsString>,
     },
+    /// Recheck transfer-discovered targets under the worker GC guards.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    CollectIdleCaches {
+        /// Limit this pass to run-specific targets under the per-job idle policy.
+        #[arg(long)]
+        per_job: bool,
+        idle_minutes: u64,
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
     /// Internal descriptor-bound removal for explicitly requested force-resync.
     #[command(hide = true)]
     ForceResync {
@@ -519,6 +530,15 @@ fn main() -> Result<()> {
     if let Commands::StagingGc { arguments } = &cli.command {
         std::process::exit(staging_gc::main(arguments));
     }
+    #[cfg(unix)]
+    if let Commands::CollectIdleCaches {
+        per_job,
+        idle_minutes,
+        paths,
+    } = &cli.command
+    {
+        return cache::collect_idle_caches(*per_job, *idle_minutes, paths);
+    }
     if let Commands::ForceResync { arguments } = &cli.command {
         std::process::exit(staging_gc::force_resync_main(arguments));
     }
@@ -689,6 +709,10 @@ async fn run_worker(cli: Cli) -> Result<()> {
         }
         Commands::StagingGc { .. } => {
             anyhow::bail!("staging-gc requires the synchronous worker entry point")
+        }
+        #[cfg(unix)]
+        Commands::CollectIdleCaches { .. } => {
+            anyhow::bail!("collect-idle-caches requires the synchronous worker entry point")
         }
         Commands::ForceResync { .. } => {
             anyhow::bail!("force-resync requires the synchronous worker entry point")
