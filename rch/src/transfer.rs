@@ -13923,6 +13923,9 @@ esac
         let current = ".rch-target-host-job-9-999-1";
         let idle = make(".rch-target-host-job-1-111-0", true);
         let idle_pid = make(".rch-target-host-pid-2-222-0", true);
+        let old_pool = make(".rch-target-host-pool-key", true);
+        let overlapping_pool = make(".rch-target-night-job-worker-pool-key", true);
+        let unreadable = make(".rch-target-host-job-unreadable", true);
         let live = make(".rch-target-host-job-3-333-0", false);
         let current_dir = make(current, true); // aged but must be EXCLUDED by name
         // Empty just-created dir (mkdir, no first write) must be kept.
@@ -13948,6 +13951,11 @@ esac
             !script.contains('\''),
             "orchestrator script must contain no single quotes: {script}"
         );
+        // A failed age scan yields no rows, just like a completely idle tree.
+        // The reaper must check the scan's exit status before removal.
+        let script = format!(
+            "find() {{ case \"$1\" in *-unreadable) return 1;; esac; command find \"$@\"; }}; {script}"
+        );
         let status = Command::new("sh") // ubs:ignore — fixed reaper script over this test's generated temporary tree
             .arg("-c")
             .arg(format!("sh -c '{script}'"))
@@ -13957,6 +13965,9 @@ esac
 
         assert!(!idle.exists(), "idle -job- sibling must be reaped");
         assert!(!idle_pid.exists(), "idle -pid- sibling must be reaped");
+        for protected in [old_pool, overlapping_pool, unreadable] {
+            assert_eq!(fs::read(protected.join("deps/a.rlib")).unwrap(), b"x");
+        }
         assert!(live.exists(), "freshly-touched sibling must be kept");
         assert!(
             current_dir.exists(),

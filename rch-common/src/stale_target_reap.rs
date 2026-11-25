@@ -340,6 +340,13 @@ fn reap_loop_body_with_source_gate(
         Some(tok) => format!("[ \"$d\" = \"{tok}\" ] && continue; "),
         None => String::new(),
     };
+    // Only the pooled pass owns shared target stores. A worker id containing
+    // "-job-" or "-pid-" makes a pool match the per-job discovery glob too.
+    let exclude_pool = if trigger == Some("pooled-ttl") {
+        ""
+    } else {
+        "case \"${d##*/}\" in .rch-target-*-pool-*) continue;; esac; "
+    };
     let (claim, unlock, recent) = if source_gate {
         (
             checked_source_admission(&shell_escape::escape(trigger.unwrap_or("ttl").into())),
@@ -355,7 +362,8 @@ fn reap_loop_body_with_source_gate(
             String::new(),
             "",
             format!(
-                "if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; "
+                "__recent=$(find \"$d\" -mmin -{idle_minutes} -print -quit) || continue; \
+                 [ -z \"$__recent\" ] || continue; "
             ),
         )
     };
@@ -389,7 +397,7 @@ fn reap_loop_body_with_source_gate(
     };
     format!(
         "[ -d \"$d\" ] || continue; \
-         {exclude}\
+         {exclude}{exclude_pool}\
          {claim}\
          {recent}\
          {size_capture}{removal}{unlock}"
@@ -4622,7 +4630,8 @@ exec /usr/bin/find "$@"
     fn worker_sweep_pooled_pass_is_optional_and_floored() {
         // Without a pooled window, pool dirs are never touched.
         let cmd = worker_sweep_command("/data/projects", 720, None, None);
-        assert!(!cmd.contains("-pool-"));
+        assert!(!cmd.contains("-name \".rch-target-*-pool-*\""));
+        assert!(!cmd.contains("RCH_REAP_RM %s pooled-ttl"));
 
         // With one, a second pass targets exactly the pool glob and the shared
         // default target under its own (floored) window, feeding the same
