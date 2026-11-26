@@ -3107,8 +3107,39 @@ impl DurableLeaseWriter {
     fn publish_transition(
         &self,
         lease: &mut DurableJobLease,
-        next: DurableJobLease,
+        mut next: DurableJobLease,
     ) -> anyhow::Result<()> {
+        if let Some(release) = &lease.custody_release {
+            // Once payload deletion is authorized, this epoch cannot acquire
+            // another recovery obligation or relinquish its final receipt.
+            release.validate_for(&next)?;
+            anyhow::ensure!(
+                next.custody_release.as_ref() == Some(release)
+                    && next.identity == lease.identity
+                    && next.worker_id == lease.worker_id,
+                "final custody release cannot be superseded"
+            );
+        }
+        #[cfg(unix)]
+        if !lease.terminal_acknowledged
+            && next.terminal_acknowledged
+            && next.custody_release.is_none()
+            && let Some(owner) = self.recovery_ownership.as_deref()
+        {
+            match transfer_orchestration::recovery::completed_custody_release(
+                &next, &self.path, owner,
+            ) {
+                Ok(Some(release)) if owner.reserve_custody_release() => {
+                    next.custody_release = Some(release);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // Reclamation is optional; an uncertain payload must not
+                    // turn a completed command into another execution attempt.
+                    tracing::debug!(%error, "retaining completed job recovery custody");
+                }
+            }
+        }
         let bytes = serde_json::to_vec_pretty(&next)?;
         let supersedes_recovery = lease.recovery.is_some() && next.recovery.is_none();
         #[cfg(unix)]

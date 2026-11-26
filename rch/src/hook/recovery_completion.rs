@@ -79,7 +79,7 @@ fn completed(reply: &Value, build_id: u64, worker: &str, wrapper: &str) -> Resul
 /// contract to catch an incomplete phase at this final handoff (#107).
 /// Validate retained evidence only: another build may legitimately have
 /// replaced a shared output path since this invocation published it.
-fn validate_successful_delivery(recipe: &RecoveryRecipe) -> Result<()> {
+pub(super) fn validate_successful_delivery(recipe: &RecoveryRecipe) -> Result<()> {
     recipe.validate_operation()?;
     if recipe.returned != Some(0) {
         // A truthful failed delivery may have incomplete phases. It must still

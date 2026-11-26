@@ -4204,6 +4204,11 @@ fn scan_client_leases_with(
 
     let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
     let mut blocked = Vec::new();
+    // Cleanup shares the admission scan. Bound logical payload bytes separately
+    // from the mandatory census (the gate reads each payload at most three
+    // times). Exhaustion defers cleanup, never blockers.
+    let mut payload_cleanup_jobs = 64_usize;
+    let mut payload_cleanup_bytes = rch_common::job_identity::JOB_CUSTODY_RELEASE_MAX_BYTES;
     for entry in entries {
         let entry =
             entry.map_err(|error| anyhow!("cannot enumerate {}: {error}", lease_dir.display()))?;
@@ -4242,10 +4247,32 @@ fn scan_client_leases_with(
             }) {
                 blocked.push(current.identity.local_wrapper_id);
             } else if current == lease && lease_reap_candidate(&path, &current, now_unix_ms) {
-                // Retain the old bounded-history policy only for leases with
-                // no current recipe. The gate and exact opened inode/bytes
-                // remain bound through this best-effort unlink. Never remove
-                // the gate, source trees, retrieval stages or caller sidecars.
+                if let Some(release) = &current.custody_release {
+                    let bytes = release
+                        .payloads
+                        .iter()
+                        .map(|payload| payload.bytes)
+                        .sum::<u64>();
+                    if payload_cleanup_jobs == 0 || bytes > payload_cleanup_bytes {
+                        continue;
+                    }
+                    payload_cleanup_jobs -= 1;
+                    payload_cleanup_bytes -= bytes;
+                    match gate.remove_released_payloads_if_unchanged(&snapshot, &current_bytes) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            // Unknown/changed payloads retain the exact index.
+                            // Optional history cleanup cannot make a finished
+                            // job block restart admission for everyone else.
+                            debug!(path = %path.display(), %error, "retaining released job evidence");
+                            continue;
+                        }
+                    }
+                }
+                // A released recipe follows its explicit bounded payload set;
+                // no-recipe history retains the original policy. Keep gates,
+                // source trees, staging tombstones and caller outputs intact.
                 let _ = gate.remove_journal_if_unchanged(&snapshot, &current_bytes)?;
             }
         }
@@ -4273,7 +4300,7 @@ fn torn_legacy_lease(path: &std::path::Path, bytes: &[u8]) -> bool {
 /// Scheduling release does not release evidence custody. Recovery is an opaque
 /// hook-owned recipe: even a retired one can name retained staging, failed
 /// delivery, original Cargo replay evidence or a predecessor journal. Keep its
-/// durable index until the hook has an explicit custody-release protocol.
+/// durable index unless the hook issues an exact final custody-release receipt.
 /// Unacknowledged no-recipe leases also remain inputs to background daemon
 /// settlement, whose abandoned-build threshold is longer than this history TTL.
 /// This predicate must not be used for restart blocking or source fencing.
@@ -4289,13 +4316,17 @@ fn lease_reap_candidate(path: &std::path::Path, lease: &DurableJobLease, now_uni
         && path.file_stem().and_then(|stem| stem.to_str()) == Some(wrapper.as_str())
         && lease.state.is_terminal()
         && lease.terminal_acknowledged
-        && lease.recovery.is_none()
+        && match (&lease.recovery, &lease.custody_release) {
+            (None, None) => true,
+            (Some(_), Some(release)) => release.validate_for(lease).is_ok(),
+            _ => false,
+        }
         && now_unix_ms.saturating_sub(lease.heartbeat_unix_ms) >= LEASE_REAP_RETENTION_MS
 }
 
 /// How long an acknowledged terminal lease is kept after its last heartbeat
-/// before the scan may reap its file if it has no current recovery recipe.
-/// This bounds ordinary history, not evidence-carrying leases or their payloads.
+/// before the scan may reap its explicitly released evidence or no-recipe file.
+/// Failed, archived, recovered and legacy evidence retains its existing policy.
 const LEASE_REAP_RETENTION_MS: u64 = 60 * 60 * 1000;
 
 /// Heartbeat age past which a lease whose wrapper owner is provably absent is
@@ -9222,6 +9253,117 @@ mod tests {
         assert!(recent_path.exists(), "recent non-blocker kept");
         assert!(fresh_path.exists(), "blocker kept");
         assert!(dir.join("README.txt").exists(), "non-json untouched");
+    }
+
+    #[test]
+    fn scan_reaps_explicitly_released_payloads_before_their_index() {
+        use rch_common::job_identity::{JobLeaseCustodyRelease, JobLeasePayload};
+
+        for case in [
+            "released",
+            "partial-retry",
+            "recent",
+            "changed-payload",
+            "wrong-recipe",
+            "unknown-receipt-field",
+            "busy",
+        ] {
+            let directory = tempfile::Builder::new()
+                .disable_cleanup(true)
+                .tempdir()
+                .unwrap();
+            let dir = directory.path();
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+            let age = if case == "recent" {
+                1000
+            } else {
+                LEASE_REAP_RETENTION_MS + 1
+            };
+            let mut lease = make_test_lease(now - age, std::process::id());
+            lease.acknowledge_terminal(now - age);
+            lease.exit_code = Some(0);
+            // The hook integration tests prove issuance. Here the daemon
+            // consumes the recipe as opaque bytes, as it must in production.
+            lease.recovery = Some(serde_json::json!({"completed-hook-proof": true}));
+            let payloads = [
+                (
+                    format!(
+                        "{}.cargo-stdout-{}",
+                        lease.identity.local_wrapper_id,
+                        Uuid::new_v4()
+                    ),
+                    b"original stdout".as_slice(),
+                ),
+                (
+                    format!(".rch-publication-{}.journal", Uuid::new_v4().simple()),
+                    b"sealed publication bytes".as_slice(),
+                ),
+            ];
+            for (index, (name, bytes)) in payloads.iter().enumerate() {
+                if !(case == "partial-retry" && index == 0) {
+                    write_private_test_journal(&dir.join(name), bytes);
+                }
+            }
+            lease.custody_release = Some(JobLeaseCustodyRelease {
+                version: 1,
+                recovery_blake3: blake3::hash(
+                    &serde_json::to_vec(lease.recovery.as_ref().unwrap()).unwrap(),
+                )
+                .to_hex()
+                .to_string(),
+                payloads: payloads
+                    .iter()
+                    .map(|(name, bytes)| JobLeasePayload {
+                        name: name.clone(),
+                        bytes: bytes.len() as u64,
+                        blake3: blake3::hash(bytes).to_hex().to_string(),
+                    })
+                    .collect(),
+            });
+            if case == "wrong-recipe" {
+                lease.recovery = Some(serde_json::json!({"new-custody": "must survive"}));
+            }
+            let path = dir.join(format!("{}.json", lease.identity.local_wrapper_id));
+            let mut journal_value = serde_json::to_value(&lease).unwrap();
+            if case == "unknown-receipt-field" {
+                journal_value["custody_release"]["future_evidence"] =
+                    serde_json::json!("retain without blocking admission");
+            }
+            let journal = serde_json::to_vec(&journal_value).unwrap();
+            write_private_test_journal(&path, &journal);
+            if case == "changed-payload" {
+                std::fs::write(dir.join(&payloads[1].0), b"replacement evidence").unwrap();
+            }
+            let _gate = if case == "busy" {
+                JobJournalGate::try_acquire(&path).unwrap()
+            } else {
+                None
+            };
+            let fresh = make_test_lease(now, std::process::id());
+            let fresh_path = dir.join(format!("{}.json", fresh.identity.local_wrapper_id));
+            write_private_test_journal(&fresh_path, &serde_json::to_vec(&fresh).unwrap());
+            let unrelated = dir.join("caller-output");
+            std::fs::write(&unrelated, b"caller-owned output").unwrap();
+
+            assert_eq!(
+                scan_client_leases(dir).unwrap(),
+                vec![fresh.identity.local_wrapper_id]
+            );
+            let removed = matches!(case, "released" | "partial-retry");
+            assert_eq!(!path.exists(), removed, "{case}");
+            if !removed {
+                assert_eq!(std::fs::read(&path).unwrap(), journal, "{case}");
+                assert_eq!(
+                    std::fs::read(dir.join(&payloads[0].0)).unwrap(),
+                    payloads[0].1
+                );
+            } else {
+                assert!(payloads.iter().all(|(name, _)| !dir.join(name).exists()));
+                assert!(path.with_extension("recovery.lock").is_file());
+            }
+            assert_eq!(std::fs::read(unrelated).unwrap(), b"caller-owned output");
+            assert!(fresh_path.is_file(), "{case}: cleanup lost a live blocker");
+        }
     }
 
     #[test]

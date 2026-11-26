@@ -583,6 +583,49 @@ impl JournalRef {
         self.terminal.is_some()
     }
 
+    /// Export the exact private log only after a complete validated replay.
+    /// The daemon never interprets publication events or caller output paths;
+    /// its final cleanup consumes this bounded byte binding under our gate.
+    pub(super) fn released_payload(
+        &self,
+        directory: &File,
+    ) -> Result<rch_common::job_identity::JobLeasePayload> {
+        let cursor = self
+            .cursor
+            .as_ref()
+            .context("publication release requires replay")?;
+        ensure!(
+            cursor.sealed
+                && !cursor.torn_tail
+                && cursor.pending.is_none()
+                && self.terminal.as_ref() == Some(&cursor.checkpoint),
+            "publication release requires an exact terminal seal"
+        );
+        let file = self.open(directory, false)?;
+        let observed = self.verify_file(&file)?;
+        ensure!(
+            observed == cursor.observed
+                && observed.length == cursor.checkpoint.offset
+                && observed.length <= rch_common::job_identity::JOB_CUSTODY_RELEASE_MAX_BYTES,
+            "publication release changed or exceeds its byte bound"
+        );
+        let mut hash = blake3::Hasher::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut offset = 0;
+        while offset < observed.length {
+            let length = usize::try_from((observed.length - offset).min(buffer.len() as u64))?;
+            file.read_exact_at(&mut buffer[..length], offset)?;
+            hash.update(&buffer[..length]);
+            offset += length as u64;
+        }
+        self.verify_named(directory, &file, &observed)?;
+        Ok(rch_common::job_identity::JobLeasePayload {
+            name: self.name.clone(),
+            bytes: observed.length,
+            blake3: hash.finalize().to_hex().to_string(),
+        })
+    }
+
     pub(super) fn binding(&self) -> &str {
         &self.binding
     }

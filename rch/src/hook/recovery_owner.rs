@@ -9,6 +9,7 @@ use super::*;
 use rch_common::job_identity::journal::JobJournalGate;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 #[path = "recovery_artifact_policy.rs"]
 mod artifact_policy;
@@ -17,7 +18,15 @@ mod artifact_policy;
 /// lock the old inode while a new recovery command locks its replacement.
 pub(in crate::hook) struct RecoveryOwnership {
     gate: JobJournalGate,
+    // Only an exclusively created live wrapper can prove it has no archived
+    // predecessors. Loaded/recovered owners start protected. Reservation is
+    // final so a concurrent snapshot cannot acquire custody after release.
+    custody: AtomicU8,
 }
+
+const CUSTODY_PROTECTED: u8 = 0;
+const CUSTODY_FRESH: u8 = 1;
+const CUSTODY_RELEASE_RESERVED: u8 = 2;
 
 impl RecoveryOwnership {
     /// Both the persistent gate and journal must still name the held directory.
@@ -44,7 +53,31 @@ impl RecoveryOwnership {
         &self,
         expected: &DurableJobLease,
     ) -> anyhow::Result<PathBuf> {
+        self.custody
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state != CUSTODY_RELEASE_RESERVED).then_some(CUSTODY_PROTECTED)
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("final custody release refuses a new recovery snapshot")
+            })?;
         self.gate.retain_snapshot(expected)
+    }
+
+    pub(in crate::hook) fn has_fresh_custody(&self) -> bool {
+        self.custody.load(Ordering::Acquire) == CUSTODY_FRESH
+    }
+
+    /// Reserve the final handoff against every snapshot using this owner.
+    /// A failed publication keeps the reservation: its durability is unknown.
+    pub(in crate::hook) fn reserve_custody_release(&self) -> bool {
+        self.custody
+            .compare_exchange(
+                CUSTODY_FRESH,
+                CUSTODY_RELEASE_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// The first lease must never replace an existing wrapper's evidence.
@@ -79,7 +112,9 @@ impl RecoveryOwnership {
             return Err(error.into());
         }
         file.sync_all()?;
-        self.finish_initialization(&file, bytes)
+        self.finish_initialization(&file, bytes)?;
+        self.custody.store(CUSTODY_FRESH, Ordering::Release);
+        Ok(())
     }
 
     fn finish_initialization(&self, file: &File, expected: &[u8]) -> anyhow::Result<()> {
@@ -107,6 +142,11 @@ impl RecoveryOwnership {
         // these exact serialized bytes, not a snapshot from the writer.
         let prospective: DurableJobLease =
             serde_json::from_slice(bytes).context("invalid prospective recovery journal")?;
+        anyhow::ensure!(
+            self.custody.load(Ordering::Acquire) != CUSTODY_RELEASE_RESERVED
+                || prospective.custody_release.is_some(),
+            "reserved final custody release cannot be rolled back"
+        );
         super::recovery_completion::validate_recorded_delivery(&prospective, Some(self))?;
         // An exclusive fresh name cannot truncate an existing receipt. A failed
         // publication retains its temporary bytes for diagnosis, never cleanup.
@@ -181,6 +221,7 @@ impl RecoveryOwnership {
 pub(in crate::hook) fn acquire_gate(lease_path: &Path) -> anyhow::Result<RecoveryOwnership> {
     Ok(RecoveryOwnership {
         gate: JobJournalGate::try_acquire(lease_path)?.ok_or(JobJournalBusy)?,
+        custody: AtomicU8::new(CUSTODY_PROTECTED),
     })
 }
 

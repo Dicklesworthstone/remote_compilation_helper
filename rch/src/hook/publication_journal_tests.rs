@@ -258,6 +258,101 @@ fn stale_clones_and_deserialized_refs_cannot_append_until_replayed() {
 }
 
 #[test]
+fn released_payload_requires_exact_sealed_replay_and_unchanged_owned_log() {
+    let fixture = Fixture::new();
+    let mut reference = fixture.empty();
+    let relative = Path::new("out/result");
+    let digest = hash("result");
+    assert!(reference.released_payload(&fixture.directory).is_err());
+    reference
+        .append_pending(&fixture.directory, relative, &digest, None)
+        .unwrap();
+    assert!(reference.released_payload(&fixture.directory).is_err());
+    reference
+        .append_published(&fixture.directory, relative, &digest)
+        .unwrap();
+    assert!(reference.released_payload(&fixture.directory).is_err());
+    reference.seal(&fixture.directory).unwrap();
+
+    let bytes = std::fs::read(fixture.path(&reference)).unwrap();
+    let payload = reference.released_payload(&fixture.directory).unwrap();
+    assert_eq!(payload.name, reference.name);
+    assert_eq!(payload.bytes, bytes.len() as u64);
+    assert_eq!(payload.blake3, blake3::hash(&bytes).to_hex().to_string());
+    assert_eq!(std::fs::read(fixture.path(&reference)).unwrap(), bytes);
+
+    let mut reloaded: JournalRef =
+        serde_json::from_value(serde_json::to_value(&reference).unwrap()).unwrap();
+    assert!(reloaded.released_payload(&fixture.directory).is_err());
+    let replay = reloaded
+        .replay(&fixture.directory, &fixture.binding)
+        .unwrap();
+    assert!(replay.sealed && !replay.torn_tail && replay.pending.is_none());
+    assert_eq!(
+        reloaded.released_payload(&fixture.directory).unwrap(),
+        payload
+    );
+
+    for mutation in [
+        "same-length-content",
+        "trailing-bytes",
+        "replace",
+        "symlink",
+        "hardlink",
+        "permissions",
+    ] {
+        let fixture = Fixture::new();
+        let mut reference = fixture.empty();
+        reference.seal(&fixture.directory).unwrap();
+        reference.released_payload(&fixture.directory).unwrap();
+        let path = fixture.path(&reference);
+        let kept = fixture.root.path().join("kept-original");
+        match mutation {
+            "same-length-content" => {
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[0] ^= 1;
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all_at(&bytes, 0)
+                    .unwrap();
+            }
+            "trailing-bytes" => OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&[0])
+                .unwrap(),
+            "replace" => {
+                let bytes = std::fs::read(&path).unwrap();
+                std::fs::rename(&path, &kept).unwrap();
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "symlink" => {
+                std::fs::rename(&path, &kept).unwrap();
+                symlink(&kept, &path).unwrap();
+            }
+            "hardlink" => std::fs::hard_link(&path, &kept).unwrap(),
+            "permissions" => {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let preserved = std::fs::read(&path).unwrap();
+        assert!(
+            reference.released_payload(&fixture.directory).is_err(),
+            "{mutation}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), preserved, "{mutation}");
+        if matches!(mutation, "replace" | "symlink" | "hardlink") {
+            assert!(kept.is_file(), "{mutation}");
+        }
+    }
+}
+
+#[test]
 fn complete_corruption_and_out_of_order_frames_are_not_torn_tail() {
     let fixture = Fixture::new();
     let mut reference = fixture.empty();

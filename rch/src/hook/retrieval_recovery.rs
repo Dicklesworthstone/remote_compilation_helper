@@ -35,6 +35,11 @@ mod publication_runtime_tests;
 #[path = "recovery_completion.rs"]
 mod recovery_completion;
 pub(crate) use recovery_completion::{daemon_absence_is_conclusive, unix_ms_now};
+#[cfg(unix)]
+#[path = "recovery_custody.rs"]
+mod recovery_custody;
+#[cfg(unix)]
+pub(in crate::hook) use recovery_custody::completed_custody_release;
 #[path = "recovery_owner.rs"]
 pub(in crate::hook) mod recovery_owner;
 #[path = "result_recovery.rs"]
@@ -14379,6 +14384,25 @@ func TestValue(t *testing.T) {{
         bundle: bool,
     ) -> (PathBuf, RecoverySession) {
         let (directory, writer, _worker) = retained_preparation_fixture();
+        caller_delivery_fixture_with_writer(
+            directory,
+            writer,
+            retained_source,
+            custom_target,
+            bundle,
+            true,
+        )
+    }
+
+    #[cfg(unix)]
+    fn caller_delivery_fixture_with_writer(
+        directory: PathBuf,
+        writer: DurableLeaseWriter,
+        retained_source: bool,
+        custom_target: bool,
+        bundle: bool,
+        caller_json: bool,
+    ) -> (PathBuf, RecoverySession) {
         std::fs::create_dir_all(default_job_lease_directory()).unwrap();
         let mut session = RecoverySession {
             recipe: load_recipe(&writer).unwrap(),
@@ -14458,9 +14482,11 @@ func TestValue(t *testing.T) {{
             missing_result: None,
         });
         session.recipe.prepared = true;
-        session
-            .request_caller_json(&remote, &session.recipe.project_root.clone())
-            .unwrap();
+        if caller_json {
+            session
+                .request_caller_json(&remote, &session.recipe.project_root.clone())
+                .unwrap();
+        }
         session.starting_execution().unwrap();
         session.completed(0).unwrap();
 
@@ -14537,6 +14563,233 @@ func TestValue(t *testing.T) {{
             std::fs::write(root.join("Contents/Resources/DWARF/app"), b"debug symbols").unwrap();
         }
         (directory, session)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_cargo_publication_releases_disposable_evidence_but_keeps_caller_json() {
+        use rch_common::job_identity::journal::JobJournalGate;
+
+        let _guard = test_guard!();
+        for caller_json in [false, true] {
+            let (directory, _fixture_writer, worker) = admitted_preparation_fixture();
+            let directory = directory.keep();
+            let writer = DurableLeaseWriter::create_in(
+                &directory.join("leases"),
+                "cargo build --message-format=json",
+                true,
+                false,
+            )
+            .unwrap();
+            writer.admit(41, &worker.id).unwrap();
+            let identity = "0123456789abcdef0123456789abcdef";
+            let remote = "/data/tmp/rch/source-content-pair-recovery";
+            let retained = format!("{remote}.retained-{identity}");
+            RecoverySession::begin(
+                &writer,
+                &worker,
+                vec![remote.into(), retained.clone()],
+                Some((remote.into(), identity.into())),
+                Some(remote.into()),
+                Some(retained),
+                TransferConfig::default(),
+                directory.clone(),
+                identity.into(),
+            )
+            .unwrap();
+            let (_, mut session) = caller_delivery_fixture_with_writer(
+                directory,
+                writer,
+                true,
+                false,
+                false,
+                caller_json,
+            );
+            assert!(
+                session
+                    .writer
+                    .recovery_ownership
+                    .as_ref()
+                    .unwrap()
+                    .has_fresh_custody(),
+                "the fixture must exercise the original live owner"
+            );
+            let lease_directory = session.writer.path.parent().unwrap().to_owned();
+            let retain_beside_lease = |path: &mut PathBuf| {
+                // Production uses the default lease directory. This live fixture
+                // uses create_in, so copy only its own exact stream bytes beside
+                // that canonical journal before persisting the custom location.
+                let destination = lease_directory.join(path.file_name().unwrap());
+                std::fs::copy(&*path, &destination).unwrap();
+                File::open(&destination).unwrap().sync_all().unwrap();
+                File::open(&lease_directory).unwrap().sync_all().unwrap();
+                *path = destination;
+            };
+            retain_beside_lease(&mut session.recipe.cargo_stdout.as_mut().unwrap().path);
+            retain_beside_lease(&mut session.recipe.cargo_stderr.as_mut().unwrap().path);
+            session.persist().unwrap();
+            let stage = session.stage(0);
+            let marker = stage.parent().unwrap().join(STAGING_OWNERSHIP_MARKER);
+            let marker_bytes = std::fs::read(&marker).unwrap();
+            assert!(stage.join("collector-source.c").is_file());
+
+            // The compiler records and worker release acknowledgments below are
+            // fixture inputs. Publication, Cargo projection, owned-stage cleanup,
+            // final lease publication and exact payload reclamation use real files.
+            session.writer.record_exit(0).unwrap();
+            assert!(session.writer.acknowledge_terminal().is_err());
+            assert!(session.writer.snapshot().custody_release.is_none());
+            session.publish("project").await.unwrap();
+            session.returned(0).unwrap();
+            let caller_stdout = if caller_json {
+                let stdout = session.caller_cargo_json().await.unwrap();
+                assert!(!stdout.is_empty());
+                retain_beside_lease(&mut session.recipe.caller_delivery.as_mut().unwrap().path);
+                session.persist().unwrap();
+                Some(stdout)
+            } else {
+                assert!(session.recipe.caller_json_policy.is_none());
+                assert!(session.recipe.caller_delivery.is_none());
+                None
+            };
+
+            let phase = &session.recipe.phases[0];
+            assert!(phase.complete && phase.pending.is_none());
+            let publication =
+                serde_json::to_value(phase.publication_journal.as_ref().unwrap()).unwrap();
+            assert!(
+                !publication["terminal"].is_null(),
+                "publication must be sealed"
+            );
+            let publication_path = lease_directory.join(publication["name"].as_str().unwrap());
+            let mut evidence_paths = vec![
+                session.recipe.cargo_stdout.as_ref().unwrap().path.clone(),
+                session.recipe.cargo_stderr.as_ref().unwrap().path.clone(),
+                publication_path,
+            ];
+            let mut caller_files = Vec::new();
+            for relative in phase.published.keys() {
+                let path = phase.local.join(relative);
+                caller_files.push((path.clone(), std::fs::read(path).unwrap()));
+            }
+            if let Some(delivery) = &session.recipe.caller_delivery {
+                assert_eq!(
+                    std::fs::read(&delivery.path).unwrap(),
+                    caller_stdout.as_ref().unwrap().as_slice()
+                );
+                evidence_paths.push(delivery.path.clone());
+                for relative in delivery.files.keys() {
+                    let path = delivery.output_root.join(relative);
+                    caller_files.push((path.clone(), std::fs::read(path).unwrap()));
+                }
+            }
+            assert_eq!(
+                caller_files.len(),
+                if caller_json { 4 } else { 2 },
+                "both binaries have their required published/caller copies"
+            );
+            assert_eq!(evidence_paths.len(), if caller_json { 4 } else { 3 });
+            let manifest = session.recipe.project_root.join("Cargo.toml");
+            let manifest_bytes = std::fs::read(&manifest).unwrap();
+
+            session.persist_tree_retirement(Some(true)).unwrap();
+            session.pair_released().unwrap();
+            session.sources_released().unwrap();
+            // A crash can leave the durable retired checkpoint before the local
+            // stage is released. Neither acknowledgment nor custody may skip it.
+            let mut retired = session.recipe.clone();
+            retired.retired = true;
+            session.persist_next_recipe(retired).unwrap();
+            assert!(stage.is_dir());
+            assert!(session.writer.acknowledge_terminal().is_err());
+            assert!(session.writer.snapshot().custody_release.is_none());
+            assert!(evidence_paths.iter().all(|path| path.is_file()));
+            session.release_retired_staging().unwrap();
+            assert!(!stage.exists());
+            assert!(session.recipe.staging_released);
+            assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
+
+            session.writer.acknowledge_terminal().unwrap();
+            let completed = session.writer.snapshot();
+            assert_eq!(completed.custody_release.is_some(), !caller_json);
+            if let Some(release) = &completed.custody_release {
+                release.validate_for(&completed).unwrap();
+                assert_eq!(release.payloads.len(), evidence_paths.len());
+                let expected: BTreeSet<_> = evidence_paths
+                    .iter()
+                    .map(|path| path.file_name().unwrap().to_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(
+                    release
+                        .payloads
+                        .iter()
+                        .map(|payload| payload.name.clone())
+                        .collect::<BTreeSet<_>>(),
+                    expected
+                );
+                for payload in &release.payloads {
+                    let bytes = std::fs::read(lease_directory.join(&payload.name)).unwrap();
+                    assert_eq!(payload.bytes, bytes.len() as u64);
+                    assert_eq!(payload.blake3, blake3::hash(&bytes).to_hex().as_str());
+                }
+            } else {
+                // Terminal acknowledgment precedes caller consumption. The first
+                // JSON reply must remain replayable after a broken stdout pipe.
+                assert_eq!(
+                    session.caller_cargo_json().await.unwrap(),
+                    caller_stdout.unwrap()
+                );
+            }
+            let evidence_bytes: Vec<_> = evidence_paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect();
+            let lease_path = session.writer.path.clone();
+            assert_eq!(
+                DurableLeaseWriter::read_journal(&lease_path, &session.writer.wrapper_id())
+                    .unwrap(),
+                completed
+            );
+            drop(session);
+
+            let gate = crate::hook::after_gate_release(|| async {
+                JobJournalGate::try_acquire(&lease_path)?
+                    .ok_or_else(|| crate::hook::JobJournalBusy.into())
+            })
+            .await
+            .unwrap();
+            let (snapshot, bytes) = gate.read_snapshot().unwrap();
+            if caller_json {
+                let error = gate
+                    .remove_released_payloads_if_unchanged(&snapshot, &bytes)
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("no explicit custody release"),
+                    "{error:#}"
+                );
+                assert!(lease_path.is_file());
+                for (path, expected) in evidence_paths.iter().zip(evidence_bytes) {
+                    assert_eq!(std::fs::read(path).unwrap(), expected);
+                }
+            } else {
+                assert!(
+                    gate.remove_released_payloads_if_unchanged(&snapshot, &bytes)
+                        .unwrap()
+                );
+                assert!(
+                    lease_path.is_file(),
+                    "the final recipe remains until payload removal is durable"
+                );
+                assert!(evidence_paths.iter().all(|path| !path.exists()));
+                assert!(gate.remove_journal_if_unchanged(&snapshot, &bytes).unwrap());
+                assert!(!lease_path.exists());
+            }
+            assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
+            assert_eq!(std::fs::read(&manifest).unwrap(), manifest_bytes);
+            for (path, bytes) in caller_files {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -17515,6 +17768,105 @@ func TestValue(t *testing.T) {{
         assert!(finished.phases.is_empty());
         writer.record_exit(0).unwrap();
         writer.acknowledge_terminal().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_success_releases_custody_but_archived_or_recovered_jobs_keep_it() {
+        // Source-only success exercises the real live writer, final transition
+        // and retained snapshot gate without pretending a worker executed.
+        for custody in ["fresh", "archived", "recovered", "unknown-recipe-field"] {
+            let (directory, _fixture_writer, worker) = admitted_preparation_fixture();
+            let mut writer =
+                DurableLeaseWriter::create_in(directory.path(), "source sync", true, false)
+                    .unwrap();
+            writer.admit(41, &worker.id).unwrap();
+            RecoverySession::begin(
+                &writer,
+                &worker,
+                vec!["/data/projects/source-recovery".into()],
+                None,
+                None,
+                None,
+                TransferConfig::default(),
+                directory.path().to_owned(),
+                "abc123".into(),
+            )
+            .unwrap();
+            let report = SourceSyncReport {
+                roots: vec![SourceSyncRoot {
+                    local_root: directory.path().to_owned(),
+                    remote_root: "/data/projects/source-recovery".into(),
+                    mode: "full".into(),
+                }],
+            };
+            let mut session =
+                RecoverySession::require_source_sync(&writer, report.clone()).unwrap();
+            session.source_sync_uploaded(&report).unwrap();
+            session.sources_released().unwrap();
+            session.returned(0).unwrap();
+            session.retired().unwrap();
+            drop(session);
+            let retained = if custody == "archived" {
+                Some(
+                    writer
+                        .recovery_ownership
+                        .as_ref()
+                        .unwrap()
+                        .retain_snapshot(&writer.snapshot())
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            if custody == "recovered" {
+                let path = writer.path.clone();
+                writer.recovery_ownership = None;
+                writer.recovery_ownership = Some(Arc::new(
+                    crate::hook::after_gate_release(|| async {
+                        recovery_owner::acquire_gate(&path)
+                    })
+                    .await
+                    .unwrap(),
+                ));
+            }
+            if custody == "unknown-recipe-field" {
+                let mut recipe = writer.snapshot().recovery.unwrap();
+                recipe["future_retained_evidence"] = serde_json::json!("must remain indexed");
+                writer.set_recovery(recipe).unwrap();
+            }
+            writer.record_exit(0).unwrap();
+            writer.acknowledge_terminal().unwrap();
+            let completed = writer.snapshot();
+            assert_eq!(
+                completed.custody_release.is_some(),
+                custody == "fresh",
+                "{custody}"
+            );
+            if let Some(release) = &completed.custody_release {
+                release.validate_for(&completed).unwrap();
+                assert!(release.payloads.is_empty());
+                assert!(
+                    writer
+                        .recovery_ownership
+                        .as_ref()
+                        .unwrap()
+                        .retain_snapshot(&completed)
+                        .is_err()
+                );
+                assert!(
+                    writer.admit(42, &worker.id).is_err(),
+                    "final release cannot be readmitted"
+                );
+                writer.acknowledge_terminal().unwrap();
+            }
+            if let Some(retained) = retained {
+                assert!(retained.is_file());
+            }
+            let persisted =
+                DurableLeaseWriter::read_journal(&writer.path, &writer.wrapper_id()).unwrap();
+            assert_eq!(persisted, writer.snapshot());
+        }
     }
 
     #[test]

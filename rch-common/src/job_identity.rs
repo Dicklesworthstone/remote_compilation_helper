@@ -58,7 +58,7 @@ pub fn default_job_lease_directory() -> PathBuf {
 /// the daemon's history reaper. The persistent lock inode is never unlinked.
 #[cfg(unix)]
 pub mod journal {
-    use super::{DurableJobLease, LOCAL_WRAPPER_ID_PREFIX};
+    use super::{DurableJobLease, JobLeasePayload, LOCAL_WRAPPER_ID_PREFIX};
     use anyhow::{Context, Result, ensure};
     use rustix::fs::{Mode, OFlags};
     use serde::Serialize;
@@ -207,6 +207,78 @@ pub mod journal {
                 Self::Current => owned_regular(metadata) && metadata.mode() & 0o022 == 0,
                 Self::Retained => private_regular(metadata),
             }
+        }
+    }
+
+    fn read_released_payload_at(
+        directory: BorrowedFd<'_>,
+        name: &CStr,
+        expected: &JobLeasePayload,
+    ) -> Result<Option<File>> {
+        let mut file = match rustix::fs::openat(directory, name, READ_FLAGS, Mode::empty()) {
+            Ok(file) => File::from(file),
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let before = file.metadata()?;
+        ensure!(
+            JournalFileRole::Current.accepts(&before) && before.len() == expected.bytes,
+            "released payload is unsafe or has changed length"
+        );
+        // The receipt bounds both total storage and each read. A file that is
+        // extended while observed cannot turn reclamation into an unbounded
+        // allocation or scan. Keep its inode until the final named check.
+        let mut bounded = (&mut file).take(expected.bytes.saturating_add(1));
+        let mut hasher = blake3::Hasher::new();
+        let mut observed = 0_u64;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let count = match bounded.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
+            observed += count as u64;
+            hasher.update(&buffer[..count]);
+        }
+        let after = file.metadata()?;
+        ensure!(
+            observed == expected.bytes
+                && hasher.finalize().to_hex().as_str() == expected.blake3
+                && JournalFileRole::Current.accepts(&after)
+                && before.len() == after.len()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec()
+                && before.ctime() == after.ctime()
+                && before.ctime_nsec() == after.ctime_nsec(),
+            "released payload changed or failed its exact byte binding"
+        );
+        Ok(Some(file))
+    }
+
+    fn require_released_payload_at(
+        directory: BorrowedFd<'_>,
+        name: &CStr,
+        held: Option<&File>,
+        expected: &JobLeasePayload,
+    ) -> Result<()> {
+        let named = read_released_payload_at(directory, name, expected)?;
+        match (held, named) {
+            (None, None) => Ok(()),
+            (Some(held), Some(named)) => {
+                let held = held.metadata()?;
+                let named = named.metadata()?;
+                ensure!(
+                    JournalFileRole::Current.accepts(&held)
+                        && held.dev() == named.dev()
+                        && held.ino() == named.ino()
+                        && held.len() == expected.bytes,
+                    "released payload name or held inode changed"
+                );
+                Ok(())
+            }
+            _ => anyhow::bail!("released payload presence changed during reclamation"),
         }
     }
 
@@ -440,6 +512,10 @@ pub mod journal {
             before_publication: impl FnOnce(&Path) -> Result<()>,
         ) -> Result<PathBuf> {
             ensure!(
+                expected.custody_release.is_none(),
+                "released recovery custody cannot become a retained snapshot"
+            );
+            ensure!(
                 expected.schema_version == 1
                     && canonical_wrapper(&expected.identity.local_wrapper_id),
                 "cannot retain an unsupported journal identity or schema"
@@ -548,6 +624,105 @@ pub mod journal {
             )?;
             self.verify()?;
             Ok(self.parent.join(name.to_str()?))
+        }
+
+        /// Remove only the final release's exact payloads, retaining the recipe
+        /// index until all unlinks are durable. The caller owns age/retention
+        /// policy and must remove the unchanged journal only after `true`.
+        /// Missing files support an interrupted cleanup retry; a replacement,
+        /// alias, changed file or unknown receipt retains the journal instead.
+        pub fn remove_released_payloads_if_unchanged(
+            &self,
+            snapshot: &File,
+            expected: &[u8],
+        ) -> Result<bool> {
+            self.remove_released_payloads_with(snapshot, expected, || Ok(()))
+        }
+
+        fn remove_released_payloads_with(
+            &self,
+            snapshot: &File,
+            expected: &[u8],
+            before_mutation: impl FnOnce() -> Result<()>,
+        ) -> Result<bool> {
+            self.verify()?;
+            require_named_bytes(
+                self.directory.as_fd(),
+                &self.journal_name,
+                snapshot,
+                expected,
+                JournalFileRole::Current,
+            )?;
+            let lease: DurableJobLease = serde_json::from_slice(expected)?;
+            ensure!(
+                serde_json::from_slice::<serde_json::Value>(expected)?
+                    == serde_json::to_value(&lease)?,
+                "unmodeled job journal fields retain evidence custody"
+            );
+            ensure!(
+                self.journal_name.to_str()? == format!("{}.json", lease.identity.local_wrapper_id),
+                "custody release is not under its canonical wrapper journal"
+            );
+            let release = lease
+                .custody_release
+                .as_ref()
+                .context("job journal has no explicit custody release")?;
+            release.validate_for(&lease)?;
+            let mut payloads = Vec::with_capacity(release.payloads.len());
+            for payload in &release.payloads {
+                let name = CString::new(payload.name.as_str())?;
+                let held = read_released_payload_at(self.directory.as_fd(), &name, payload)?;
+                payloads.push((name, held, payload));
+            }
+            before_mutation()?;
+            self.verify()?;
+            require_named_bytes(
+                self.directory.as_fd(),
+                &self.journal_name,
+                snapshot,
+                expected,
+                JournalFileRole::Current,
+            )?;
+            // Validate the complete set before the first unlink, including
+            // names already absent on entry. Never remove a good first payload
+            // after discovering that another one was replaced or corrupted.
+            for (name, held, payload) in &payloads {
+                require_released_payload_at(self.directory.as_fd(), name, held.as_ref(), payload)?;
+            }
+            for (name, held, payload) in &payloads {
+                self.verify()?;
+                require_named_bytes(
+                    self.directory.as_fd(),
+                    &self.journal_name,
+                    snapshot,
+                    expected,
+                    JournalFileRole::Current,
+                )?;
+                require_released_payload_at(self.directory.as_fd(), name, held.as_ref(), payload)?;
+                if held.is_some()
+                    && rustix::fs::unlinkat(
+                        self.directory.as_fd(),
+                        name.as_c_str(),
+                        rustix::fs::AtFlags::empty(),
+                    )
+                    .is_err()
+                {
+                    let _ = self.directory.sync_all();
+                    return Ok(false);
+                }
+            }
+            if self.directory.sync_all().is_err() {
+                return Ok(false);
+            }
+            self.verify()?;
+            require_named_bytes(
+                self.directory.as_fd(),
+                &self.journal_name,
+                snapshot,
+                expected,
+                JournalFileRole::Current,
+            )?;
+            Ok(true)
         }
 
         /// The caller supplies its history-retention policy. This operation
@@ -727,6 +902,451 @@ pub mod journal {
                     })
                     .collect()
             }
+
+            fn released() -> Self {
+                use super::super::{JobIdentity, JobLeaseCustodyRelease};
+
+                let root = tempfile::Builder::new()
+                    .disable_cleanup(true)
+                    .tempdir()
+                    .unwrap();
+                let directory = root.path().join("jobs");
+                std::fs::create_dir(&directory).unwrap();
+                let mut lease = DurableJobLease::new(
+                    JobIdentity::new_local(),
+                    12345,
+                    None,
+                    None,
+                    1,
+                    true,
+                    false,
+                    "blake3:released-fixture".into(),
+                );
+                lease.admit(41, "first-worker".into(), 2);
+                lease.exit_code = Some(0);
+                lease.acknowledge_terminal(3);
+                // The common layer binds these bytes without interpreting
+                // delivery flags or acquiring any resource named inside them.
+                lease.recovery = Some(serde_json::json!({
+                    "version": 2, "returned": 0, "retired": true,
+                    "opaque_hook_evidence": {"preserve": [1, "exactly"]},
+                }));
+                let mut payloads = Vec::new();
+                for label in [
+                    "cargo-stdout",
+                    "cargo-stderr",
+                    "cargo-delivery",
+                    "publication",
+                ] {
+                    let name = if label == "publication" {
+                        format!(".rch-publication-{}.journal", uuid::Uuid::new_v4().simple())
+                    } else {
+                        format!(
+                            "{}.{label}-{}",
+                            lease.identity.local_wrapper_id,
+                            uuid::Uuid::new_v4()
+                        )
+                    };
+                    let bytes = format!("exact completed {label} bytes").into_bytes();
+                    write_private(&directory.join(&name), &bytes);
+                    payloads.push(JobLeasePayload {
+                        name,
+                        bytes: bytes.len() as u64,
+                        blake3: blake3::hash(&bytes).to_hex().to_string(),
+                    });
+                }
+                lease.custody_release = Some(JobLeaseCustodyRelease {
+                    version: 1,
+                    recovery_blake3: blake3::hash(
+                        &serde_json::to_vec(lease.recovery.as_ref().unwrap()).unwrap(),
+                    )
+                    .to_hex()
+                    .to_string(),
+                    payloads,
+                });
+                let path = directory.join(format!("{}.json", lease.identity.local_wrapper_id));
+                let bytes = serde_json::to_vec_pretty(&lease).unwrap();
+                write_private(&path, &bytes);
+                let gate = JobJournalGate::try_acquire(&path).unwrap().unwrap();
+                Self {
+                    root,
+                    path,
+                    lease,
+                    bytes,
+                    gate,
+                }
+            }
+
+            fn payload_paths(&self) -> Vec<PathBuf> {
+                self.lease
+                    .custody_release
+                    .as_ref()
+                    .unwrap()
+                    .payloads
+                    .iter()
+                    .map(|payload| self.path.parent().unwrap().join(&payload.name))
+                    .collect()
+            }
+        }
+
+        #[test]
+        fn custody_release_reclaims_exact_payloads_before_the_journal_and_can_resume() {
+            for interrupted in [false, true] {
+                let fixture = Fixture::released();
+                let paths = fixture.payload_paths();
+                let unrelated = fixture.path.parent().unwrap().join(format!(
+                    ".rch-publication-{}.journal",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                let cancel = fixture.path.with_extension("cancel");
+                let predecessor = fixture.root.path().join("artifact-policy-preserved.before");
+                let caller_output = fixture.root.path().join("caller-output");
+                for path in [&unrelated, &cancel, &predecessor, &caller_output] {
+                    write_private(path, b"preserve unrelated custody");
+                }
+                let removed_before_restart = fixture.root.path().join("already-unlinked-payload");
+                if interrupted {
+                    // Simulate a crash after one exact name was unlinked, while
+                    // preserving its bytes outside the helper's namespace.
+                    std::fs::rename(&paths[0], &removed_before_restart).unwrap();
+                }
+                let (snapshot, bytes) = fixture.gate.read_snapshot().unwrap();
+                assert!(
+                    fixture
+                        .gate
+                        .remove_released_payloads_if_unchanged(&snapshot, &bytes)
+                        .unwrap()
+                );
+                assert!(paths.iter().all(|path| !path.exists()));
+                assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.bytes);
+                // A crash after the last unlink but before removing the index
+                // also resumes safely from the same persisted release.
+                assert!(
+                    fixture
+                        .gate
+                        .remove_released_payloads_if_unchanged(&snapshot, &bytes)
+                        .unwrap()
+                );
+                assert!(
+                    fixture
+                        .gate
+                        .remove_journal_if_unchanged(&snapshot, &bytes)
+                        .unwrap()
+                );
+                assert!(!fixture.path.exists());
+                assert!(fixture.path.with_extension("recovery.lock").is_file());
+                for path in [&unrelated, &cancel, &predecessor, &caller_output] {
+                    assert_eq!(std::fs::read(path).unwrap(), b"preserve unrelated custody");
+                }
+                if interrupted {
+                    assert!(removed_before_restart.is_file());
+                }
+            }
+        }
+
+        #[test]
+        fn custody_release_refuses_hostile_or_changed_payloads_before_any_unlink() {
+            for change in [
+                "symlink",
+                "hardlink",
+                "fifo",
+                "directory",
+                "writable",
+                "length",
+                "digest",
+            ] {
+                let fixture = Fixture::released();
+                let paths = fixture.payload_paths();
+                let target = paths.last().unwrap();
+                let original = std::fs::read(target).unwrap();
+                let preserved = fixture.root.path().join("preserved-payload");
+                let unrelated = fixture.root.path().join("source-file");
+                write_private(&unrelated, b"caller source must remain");
+                match change {
+                    "symlink" | "fifo" | "directory" => {
+                        std::fs::rename(target, &preserved).unwrap();
+                        match change {
+                            "symlink" => std::os::unix::fs::symlink(&unrelated, target).unwrap(),
+                            "fifo" => assert!(
+                                std::process::Command::new("mkfifo")
+                                    .arg(target)
+                                    .status()
+                                    .unwrap()
+                                    .success()
+                            ),
+                            "directory" => std::fs::create_dir(target).unwrap(),
+                            _ => unreachable!(),
+                        }
+                    }
+                    "hardlink" => std::fs::hard_link(target, &preserved).unwrap(),
+                    "writable" => {
+                        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o666))
+                            .unwrap()
+                    }
+                    "length" => std::fs::write(target, b"changed length").unwrap(),
+                    "digest" => {
+                        let mut changed = original.clone();
+                        changed[0] ^= 1;
+                        std::fs::write(target, changed).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let inode = std::fs::symlink_metadata(target).unwrap().ino();
+                let (snapshot, bytes) = fixture.gate.read_snapshot().unwrap();
+                assert!(
+                    fixture
+                        .gate
+                        .remove_released_payloads_if_unchanged(&snapshot, &bytes)
+                        .is_err(),
+                    "{change}"
+                );
+                assert!(paths[..3].iter().all(|path| path.is_file()), "{change}");
+                assert_eq!(std::fs::symlink_metadata(target).unwrap().ino(), inode);
+                assert_eq!(std::fs::read(&fixture.path).unwrap(), fixture.bytes);
+                assert_eq!(
+                    std::fs::read(&unrelated).unwrap(),
+                    b"caller source must remain"
+                );
+            }
+        }
+
+        #[test]
+        fn custody_release_revalidates_the_whole_set_and_held_namespace_before_unlink() {
+            for change in [
+                "parent",
+                "gate",
+                "journal",
+                "journal_inode",
+                "payload_inode",
+                "payload_bytes",
+                "missing_appears",
+            ] {
+                let fixture = Fixture::released();
+                let paths = fixture.payload_paths();
+                let target = paths.last().unwrap();
+                let payload_bytes = std::fs::read(target).unwrap();
+                let preserved = fixture.root.path().join("preserved");
+                if change == "missing_appears" {
+                    std::fs::rename(target, &preserved).unwrap();
+                }
+                let (snapshot, bytes) = fixture.gate.read_snapshot().unwrap();
+                let result = fixture
+                    .gate
+                    .remove_released_payloads_with(&snapshot, &bytes, || {
+                        match change {
+                            "parent" => {
+                                std::fs::rename(fixture.path.parent().unwrap(), &preserved)?;
+                                std::fs::create_dir(fixture.path.parent().unwrap())?;
+                            }
+                            "gate" => {
+                                std::fs::rename(
+                                    fixture.path.with_extension("recovery.lock"),
+                                    &preserved,
+                                )?;
+                                write_private(
+                                    &fixture.path.with_extension("recovery.lock"),
+                                    b"replacement gate",
+                                );
+                            }
+                            "journal" => std::fs::write(&fixture.path, b"replacement journal")?,
+                            "journal_inode" => {
+                                std::fs::rename(&fixture.path, &preserved)?;
+                                write_private(&fixture.path, &fixture.bytes);
+                            }
+                            "payload_inode" => {
+                                std::fs::rename(target, &preserved)?;
+                                write_private(target, &payload_bytes);
+                            }
+                            "payload_bytes" => {
+                                let mut changed = payload_bytes.clone();
+                                changed[0] ^= 1;
+                                std::fs::write(target, changed)?;
+                            }
+                            "missing_appears" => write_private(target, &payload_bytes),
+                            _ => unreachable!(),
+                        }
+                        Ok(())
+                    });
+                assert!(result.is_err(), "accepted {change}");
+                let parent = if change == "parent" {
+                    preserved.as_path()
+                } else {
+                    fixture.path.parent().unwrap()
+                };
+                for path in &paths {
+                    assert!(
+                        parent.join(path.file_name().unwrap()).exists(),
+                        "{change}: {}",
+                        path.display()
+                    );
+                }
+                assert!(parent.join(fixture.path.file_name().unwrap()).exists());
+            }
+        }
+
+        #[test]
+        fn custody_release_refuses_unknown_lease_fields_and_subsequent_snapshots() {
+            let fixture = Fixture::released();
+            assert!(fixture.gate.retain_snapshot(&fixture.lease).is_err());
+            assert!(!fixture.snapshot_path().exists());
+            assert!(fixture.temporary_paths().is_empty());
+            let mut value = serde_json::to_value(&fixture.lease).unwrap();
+            value["future_custody"] = serde_json::json!({"retained": "/unknown/source"});
+            std::fs::write(&fixture.path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let (snapshot, bytes) = fixture.gate.read_snapshot().unwrap();
+            assert!(
+                fixture
+                    .gate
+                    .remove_released_payloads_if_unchanged(&snapshot, &bytes)
+                    .is_err()
+            );
+            assert!(fixture.payload_paths().iter().all(|path| path.is_file()));
+        }
+
+        #[test]
+        fn custody_release_envelope_rejects_unbound_or_excessive_authority() {
+            use super::super::{JOB_CUSTODY_RELEASE_MAX_BYTES, JOB_CUSTODY_RELEASE_MAX_PAYLOADS};
+
+            let fixture = Fixture::released();
+            let original = fixture.lease.custody_release.as_ref().unwrap();
+            original.validate_for(&fixture.lease).unwrap();
+            for change in [
+                "version",
+                "schema",
+                "wrapper",
+                "state",
+                "ack",
+                "exit",
+                "no_recipe",
+                "recipe",
+                "recipe_digest",
+                "payload_digest",
+                "duplicate",
+                "duplicate_role",
+                "absolute",
+                "traversal",
+                "foreign_wrapper",
+                "cancel",
+                "snapshot",
+                "cargo_uuid",
+                "publication_uuid",
+                "too_many",
+                "too_large",
+                "overflow",
+            ] {
+                let mut lease = fixture.lease.clone();
+                let mut release = original.clone();
+                match change {
+                    "version" => release.version = 2,
+                    "schema" => lease.schema_version = 2,
+                    "wrapper" => lease.identity.local_wrapper_id = "rchw-not-canonical".into(),
+                    "state" => lease.state = super::super::JobLifecycleState::Running,
+                    "ack" => lease.terminal_acknowledged = false,
+                    "exit" => lease.exit_code = Some(101),
+                    "no_recipe" => lease.recovery = None,
+                    "recipe" => {
+                        lease.recovery.as_mut().unwrap()["opaque_hook_evidence"] = false.into()
+                    }
+                    "recipe_digest" => release.recovery_blake3 = "0".repeat(64),
+                    "payload_digest" => release.payloads[0].blake3 = "A".repeat(64),
+                    "duplicate" => release.payloads.push(release.payloads[0].clone()),
+                    "duplicate_role" => {
+                        let mut extra = release.payloads[0].clone();
+                        extra.name = format!(
+                            "{}.cargo-stdout-{}",
+                            lease.identity.local_wrapper_id,
+                            uuid::Uuid::new_v4()
+                        );
+                        release.payloads.push(extra);
+                    }
+                    "absolute" => {
+                        release.payloads[0].name = format!("/tmp/{}", release.payloads[0].name)
+                    }
+                    "traversal" => {
+                        release.payloads[0].name = format!("../{}", release.payloads[0].name)
+                    }
+                    "foreign_wrapper" => {
+                        release.payloads[0].name = format!(
+                            "rchw-{}.cargo-stdout-{}",
+                            uuid::Uuid::new_v4(),
+                            uuid::Uuid::new_v4()
+                        )
+                    }
+                    "cancel" => {
+                        release.payloads[0].name =
+                            format!("{}.cancel", lease.identity.local_wrapper_id)
+                    }
+                    "snapshot" => {
+                        release.payloads[0].name = format!(
+                            "{}.recovery-{}.before",
+                            lease.identity.local_wrapper_id,
+                            "0".repeat(64)
+                        )
+                    }
+                    "cargo_uuid" => {
+                        release.payloads[0].name = format!(
+                            "{}.cargo-stdout-{}",
+                            lease.identity.local_wrapper_id,
+                            uuid::Uuid::new_v4().simple()
+                        )
+                    }
+                    "publication_uuid" => {
+                        release.payloads[3].name =
+                            format!(".rch-publication-{}.journal", uuid::Uuid::new_v4())
+                    }
+                    "too_many" => {
+                        release.payloads = (0..=JOB_CUSTODY_RELEASE_MAX_PAYLOADS)
+                            .map(|_| JobLeasePayload {
+                                name: format!(
+                                    ".rch-publication-{}.journal",
+                                    uuid::Uuid::new_v4().simple()
+                                ),
+                                bytes: 0,
+                                blake3: blake3::hash(b"").to_hex().to_string(),
+                            })
+                            .collect();
+                    }
+                    "too_large" => release.payloads[0].bytes = JOB_CUSTODY_RELEASE_MAX_BYTES,
+                    "overflow" => release.payloads[1].bytes = u64::MAX,
+                    _ => unreachable!(),
+                }
+                assert!(release.validate_for(&lease).is_err(), "accepted {change}");
+            }
+            // The limits admit a full exact boundary, and jobs with no retained
+            // local payloads can still release their final recipe index.
+            let mut release = original.clone();
+            release.payloads.clear();
+            release.validate_for(&fixture.lease).unwrap();
+            release.payloads = (0..JOB_CUSTODY_RELEASE_MAX_PAYLOADS)
+                .map(|_| JobLeasePayload {
+                    name: format!(".rch-publication-{}.journal", uuid::Uuid::new_v4().simple()),
+                    bytes: JOB_CUSTODY_RELEASE_MAX_BYTES / JOB_CUSTODY_RELEASE_MAX_PAYLOADS as u64,
+                    blake3: blake3::hash(b"metadata boundary").to_hex().to_string(),
+                })
+                .collect();
+            release.validate_for(&fixture.lease).unwrap();
+            assert!(fixture.payload_paths().iter().all(|path| path.is_file()));
+        }
+
+        #[test]
+        fn successful_legacy_journal_without_explicit_release_keeps_all_payloads() {
+            let fixture = Fixture::released();
+            let mut lease = fixture.lease.clone();
+            lease.custody_release = None;
+            let bytes = serde_json::to_vec(&lease).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("custody_release"));
+            let legacy: DurableJobLease = serde_json::from_slice(&bytes).unwrap();
+            assert!(legacy.custody_release.is_none());
+            std::fs::write(&fixture.path, &bytes).unwrap();
+            let (snapshot, bytes) = fixture.gate.read_snapshot().unwrap();
+            assert!(
+                fixture
+                    .gate
+                    .remove_released_payloads_if_unchanged(&snapshot, &bytes)
+                    .is_err()
+            );
+            assert!(fixture.payload_paths().iter().all(|path| path.is_file()));
+            assert!(fixture.path.is_file());
         }
 
         #[test]
@@ -1287,6 +1907,126 @@ pub struct JobRecord {
     pub exit_code: Option<i32>,
 }
 
+/// Bound automatic reclamation to a small, explicitly released payload set.
+pub const JOB_CUSTODY_RELEASE_MAX_PAYLOADS: usize = 64;
+pub const JOB_CUSTODY_RELEASE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One exact file in the held job-lease directory. This is never a path to a
+/// source tree, retrieval stage, caller output or retained predecessor journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobLeasePayload {
+    pub name: String,
+    pub bytes: u64,
+    pub blake3: String,
+}
+
+/// Final release of one successful recipe's evidence custody. Only a freshly
+/// initialized live hook owner that has never attempted to retain a predecessor
+/// may issue this receipt. Resumed and legacy jobs keep their original custody.
+/// A released recipe cannot subsequently become a retained snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobLeaseCustodyRelease {
+    pub version: u32,
+    /// BLAKE3 of `serde_json::to_vec` of the exact stored recovery value.
+    pub recovery_blake3: String,
+    pub payloads: Vec<JobLeasePayload>,
+}
+
+impl JobLeaseCustodyRelease {
+    /// Validate the receipt envelope, not the hook's typed delivery proof.
+    /// The issuer must separately prove complete delivery and retirement and
+    /// enumerate every sealed publication journal and retained Cargo stream.
+    pub fn validate_for(&self, lease: &DurableJobLease) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+
+        let wrapper = &lease.identity.local_wrapper_id;
+        let canonical_wrapper = wrapper
+            .strip_prefix(LOCAL_WRAPPER_ID_PREFIX)
+            .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok_and(|id| id.to_string() == suffix));
+        ensure!(
+            self.version == 1
+                && lease.schema_version == 1
+                && canonical_wrapper
+                && lease.state == JobLifecycleState::Finished
+                && lease.terminal_acknowledged
+                && lease.exit_code == Some(0),
+            "custody release requires an acknowledged successful canonical job"
+        );
+        let recovery = lease
+            .recovery
+            .as_ref()
+            .context("custody release has no current recovery recipe")?;
+        ensure!(
+            self.recovery_blake3
+                == blake3::hash(&serde_json::to_vec(recovery)?)
+                    .to_hex()
+                    .to_string(),
+            "custody release does not bind the current recovery recipe"
+        );
+        ensure!(
+            self.payloads.len() <= JOB_CUSTODY_RELEASE_MAX_PAYLOADS,
+            "custody release has too many payloads"
+        );
+        let mut names = std::collections::HashSet::new();
+        let mut cargo_roles = [false; 3];
+        let mut total_bytes = 0_u64;
+        for payload in &self.payloads {
+            ensure!(
+                names.insert(&payload.name),
+                "duplicate custody payload name"
+            );
+            ensure!(
+                payload.blake3.len() == 64
+                    && payload
+                        .blake3
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "custody payload has a noncanonical digest"
+            );
+            total_bytes = total_bytes
+                .checked_add(payload.bytes)
+                .context("custody payload size overflow")?;
+            ensure!(
+                total_bytes <= JOB_CUSTODY_RELEASE_MAX_BYTES,
+                "custody release exceeds its byte budget"
+            );
+            if let Some(token) = payload
+                .name
+                .strip_prefix(".rch-publication-")
+                .and_then(|name| name.strip_suffix(".journal"))
+            {
+                ensure!(
+                    Uuid::parse_str(token).is_ok_and(|id| id.simple().to_string() == token),
+                    "custody payload has an invalid publication journal name"
+                );
+            } else {
+                let mut role = None;
+                for (index, label) in ["cargo-stdout", "cargo-stderr", "cargo-delivery"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if let Some(token) = payload.name.strip_prefix(&format!("{wrapper}.{label}-")) {
+                        ensure!(
+                            Uuid::parse_str(token).is_ok_and(|id| id.to_string() == token),
+                            "custody payload has an invalid Cargo stream name"
+                        );
+                        role = Some(index);
+                        break;
+                    }
+                }
+                let role =
+                    role.context("custody payload is outside the owned filename families")?;
+                ensure!(
+                    !cargo_roles[role],
+                    "custody release repeats a Cargo stream role"
+                );
+                cargo_roles[role] = true;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Atomically persisted local evidence for one `rch exec` wrapper.
 ///
 /// The client creates this record before contacting the daemon and rewrites the
@@ -1332,6 +2072,9 @@ pub struct DurableJobLease {
     /// Validated retrieval-only recipe. Never contains command argv or environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<serde_json::Value>,
+    /// Explicit final evidence release, independent of source/slot retirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody_release: Option<JobLeaseCustodyRelease>,
     /// Observed command result, independent of artifact delivery and release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -1368,6 +2111,7 @@ impl DurableJobLease {
             command_fingerprint,
             terminal_acknowledged: false,
             recovery: None,
+            custody_release: None,
             exit_code: None,
         }
     }
