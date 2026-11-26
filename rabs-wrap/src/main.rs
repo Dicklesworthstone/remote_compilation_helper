@@ -1469,7 +1469,13 @@ fn run_wrapper(real_rustc: &OsStr, args: &[OsString]) -> ! {
         panic_fixture("owner-capture");
         let owner = supervision::Owner::capture().ok();
         original_owner.set(Some(owner));
-        run_wrapper_inner(real_rustc, args, owner, &panic_fence);
+        // Interactive stdin, unsupported supervision, and unavailable procfs
+        // require the original compiler. A cache hit or remote offer would
+        // otherwise bypass that compiler before run_attempt checks ownership.
+        match owner {
+            Some(owner) => run_wrapper_inner(real_rustc, args, owner, &panic_fence),
+            None => exec_compiler(real_rustc, real_rustc, args),
+        }
     }));
     let ownership = if outcome.is_err() && panic_fence.permits_panic_retry() {
         original_owner
@@ -1490,7 +1496,7 @@ fn run_wrapper(real_rustc: &OsStr, args: &[OsString]) -> ! {
 fn run_wrapper_inner(
     real_rustc: &OsStr,
     args: &[OsString],
-    owner: Option<supervision::Owner>,
+    owner: supervision::Owner,
     panic_fence: &PanicFence,
 ) -> ! {
     #[cfg(test)]
@@ -1507,7 +1513,7 @@ fn run_wrapper_inner(
         Some((selected, argv))
     });
     if let Some((selected, consult_argv)) = observation {
-        stop_if_caller_lost(owner);
+        stop_if_caller_lost(Some(owner));
         // Name the selected executable before every original rustc argument.
         // The daemon stats this absolute path for toolchain identity. The
         // guard separately preserves Cargo's original argv[0] when executing
@@ -1517,7 +1523,7 @@ fn run_wrapper_inner(
             &socket_path(),
             &breaker_path(),
             &consult_argv,
-            owner,
+            Some(owner),
             panic_fence,
         );
         if matches!(decision, Live::FailClosedSilently) {
@@ -1525,7 +1531,7 @@ fn run_wrapper_inner(
         }
         // Every return path, including errors, an open/contended breaker,
         // legacy decisions and writer-returned fallback, keeps this fence.
-        stop_if_caller_lost(owner);
+        stop_if_caller_lost(Some(owner));
         match decision {
             Live::PassThrough => {}
             Live::Served {
@@ -1539,7 +1545,7 @@ fn run_wrapper_inner(
                 // Preserve the original install budget and caller identity;
                 // partial delivery is terminal and never runs another compiler.
                 if metadata::deliver_transcript(io::stderr(), stderr, install_deadline, &|| {
-                    caller_still_owned(owner)
+                    caller_still_owned(Some(owner))
                 })
                 .is_err()
                 {
@@ -1552,20 +1558,16 @@ fn run_wrapper_inner(
                 attempt,
                 env,
             } => {
-                if let Some(owner) = owner {
-                    panic_fence.forbid_retry();
-                    run_attempt(
-                        selected.as_os_str(),
-                        real_rustc,
-                        args,
-                        *session,
-                        &attempt,
-                        &env,
-                        owner,
-                    );
-                }
-                // No usable supervision evidence: drop the admission and exec
-                // normally. Never claim to have supervised or published it.
+                panic_fence.forbid_retry();
+                run_attempt(
+                    selected.as_os_str(),
+                    real_rustc,
+                    args,
+                    *session,
+                    &attempt,
+                    &env,
+                    owner,
+                );
             }
             Live::FailClosed(reason) => {
                 panic_fence.forbid_retry();
@@ -1580,14 +1582,14 @@ fn run_wrapper_inner(
                         )
                         .into_bytes(),
                         deadline,
-                        &|| caller_still_owned(owner),
+                        &|| caller_still_owned(Some(owner)),
                     );
                 }
                 std::process::exit(1);
             }
             Live::FailClosedSilently => std::process::exit(1),
         }
-        stop_if_caller_lost(owner);
+        stop_if_caller_lost(Some(owner));
     }
 
     // Become the compiler. On success this never returns; exit codes,

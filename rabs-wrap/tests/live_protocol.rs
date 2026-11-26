@@ -159,7 +159,7 @@ impl Fixture {
         })
     }
 
-    fn run(&self, extra_env: &[(&str, &str)]) -> std::process::Output {
+    fn command(&self) -> Command {
         let mut command = Command::new(wrap());
         command
             .arg(&self.compiler)
@@ -167,6 +167,11 @@ impl Fixture {
             .current_dir(self.dir.path())
             .env("RABS_SOCKET_PATH", &self.socket)
             .env("RABS_BREAKER_FILE", self.dir.path().join("breaker"));
+        command
+    }
+
+    fn run(&self, extra_env: &[(&str, &str)]) -> std::process::Output {
+        let mut command = self.command();
         for (name, value) in extra_env {
             command.env(name, value);
         }
@@ -176,6 +181,25 @@ impl Fixture {
     fn compiler_ran(&self) -> bool {
         Path::new(&self.marker).exists()
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interactive_stdin_runs_the_compiler_without_consulting() {
+    use std::io::IsTerminal;
+
+    let fixture = Fixture::new("[ -t 0 ] || exit 42\nprintf 'interactive compiler\\n'\nexit 37\n");
+    let terminal = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/ptmx")
+        .unwrap();
+    assert!(terminal.is_terminal());
+    let output = fixture.command().stdin(terminal).output().unwrap();
+    assert!(fixture.compiler_ran());
+    assert_eq!(output.status.code(), Some(37));
+    assert_eq!(output.stdout, b"interactive compiler\n");
+    assert!(!fixture.dir.path().join("breaker.lock").exists());
 }
 
 #[test]
