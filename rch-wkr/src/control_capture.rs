@@ -37,7 +37,11 @@ pub fn main(arguments: &[OsString]) -> i32 {
     }
     #[cfg(target_os = "linux")]
     if arguments.len() == 1 && arguments[0] == "proc-references-probe" {
-        return if std::io::stdout().lock().write_all(b"rch-wkr proc-references v1\n").is_ok() {
+        return if std::io::stdout()
+            .lock()
+            .write_all(b"rch-wkr proc-references v1\n")
+            .is_ok()
+        {
             0
         } else {
             REFUSED

@@ -6196,9 +6196,9 @@ fn cache_status_worker_report(
         .collect();
     // Attribute physical paths across all completed roots. A later configured
     // root may own an entry already discovered via an overlapping temp tree.
-    let configured = reports.iter().filter_map(|report| {
-        Some((report.resolved.as_deref()?, report.requested.as_deref()?))
-    });
+    let configured = reports
+        .iter()
+        .filter_map(|report| Some((report.resolved.as_deref()?, report.requested.as_deref()?)));
     let temp = reports.iter().filter_map(|report| {
         let path = report.temp_base.as_deref()?;
         Some((path, path))

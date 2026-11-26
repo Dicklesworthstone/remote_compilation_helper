@@ -3044,7 +3044,9 @@ mod tests {
             std::fs::create_dir_all(fixture.path().join(base).join(".rch-target-worker-job-9"))
                 .unwrap();
         }
-        for (index, (base, command)) in enumerate_windows_target_scans(&bases).into_iter().enumerate()
+        for (index, (base, command)) in enumerate_windows_target_scans(&bases)
+            .into_iter()
+            .enumerate()
         {
             let output = std::process::Command::new("sh")
                 .args(["-c", &command.unwrap()])
@@ -5941,11 +5943,16 @@ esac
         std::fs::write(&record, b"/fixture-owned-target\n").unwrap();
         let digest = Command::new("sha256sum").arg(&record).output().unwrap();
         assert!(digest.status.success());
-        let digest = std::str::from_utf8(&digest.stdout).unwrap().split_whitespace().next().unwrap();
+        let digest = std::str::from_utf8(&digest.stdout)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
         let name = format!("fc-00000000-0000-4000-8000-000000000001.{digest}.claim");
         let claim = registry.join(&name);
         std::fs::rename(record, &claim).unwrap();
-        let command = abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0);
+        let command =
+            abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0);
         let run = |mode: &str| {
             std::fs::write(&calls, "").unwrap();
             let output = Command::new("sh")
@@ -5956,7 +5963,8 @@ esac
                 .env_remove("RCH_RECOVERY_GC_CLAIM")
                 .env("RCH_TEST_CAPTURE_MODE", mode)
                 .env("RCH_TEST_CAPTURE_LOG", &calls)
-                .output().unwrap();
+                .output()
+                .unwrap();
             assert!(output.status.success(), "{output:?}");
             parse_gc_claim_reports(&String::from_utf8(output.stdout).unwrap())
         };

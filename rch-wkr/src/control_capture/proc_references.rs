@@ -9,8 +9,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 pub(super) fn capture() -> io::Result<i32> {
-    if !matches!(observe_process(std::process::id()), ProcessObservation::Present(_)) {
-        return Err(io::Error::other("procfs does not identify the observer's PID namespace"));
+    if !matches!(
+        observe_process(std::process::id()),
+        ProcessObservation::Present(_)
+    ) {
+        return Err(io::Error::other(
+            "procfs does not identify the observer's PID namespace",
+        ));
     }
     check_proc_mount(&fs::read_to_string("/proc/self/mountinfo")?)?;
     let mut paths = References {
@@ -35,7 +40,8 @@ pub(super) fn capture() -> io::Result<i32> {
 fn check_proc_mount(info: &str) -> io::Result<()> {
     let mut found = false;
     for line in info.lines() {
-        let (mount, filesystem) = line.split_once(" - ")
+        let (mount, filesystem) = line
+            .split_once(" - ")
             .ok_or_else(|| io::Error::other("invalid proc mount inventory"))?;
         let fields: Vec<_> = mount.split_ascii_whitespace().collect();
         let Some(point) = fields.get(4).copied() else {
@@ -46,14 +52,18 @@ fn check_proc_mount(info: &str) -> io::Result<()> {
             if found || fields.get(3) != Some(&"/") || fs.next() != Some("proc") {
                 return Err(io::Error::other("ambiguous procfs mount"));
             }
-            let options = fs.nth(1).ok_or_else(|| io::Error::other("missing procfs options"))?;
+            let options = fs
+                .nth(1)
+                .ok_or_else(|| io::Error::other("missing procfs options"))?;
             if options.split(',').any(|opt| {
                 opt.starts_with("hidepid=") && !matches!(opt, "hidepid=off" | "hidepid=0")
             }) {
                 return Err(io::Error::other("procfs process visibility is restricted"));
             }
             found = true;
-        } else if point.strip_prefix("/proc/").and_then(|p| p.split('/').next())
+        } else if point
+            .strip_prefix("/proc/")
+            .and_then(|p| p.split('/').next())
             .is_some_and(|name| decimal_id(OsStr::new(name)).is_some())
         {
             return Err(io::Error::other("a process directory has a nested mount"));
@@ -68,7 +78,8 @@ fn check_proc_mount(info: &str) -> io::Result<()> {
 fn decimal_id(value: &OsStr) -> Option<u32> {
     let value = value.to_str()?;
     (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| value.parse().ok()).flatten()
+        .then(|| value.parse().ok())
+        .flatten()
 }
 
 fn disappeared(error: &io::Error) -> bool {
@@ -95,7 +106,9 @@ impl<W: Write> References<W> {
         }
         let target = target.as_os_str();
         if target.as_bytes().contains(&b'\n') {
-            return Err(io::Error::other("proc reference cannot be framed as one pathname"));
+            return Err(io::Error::other(
+                "proc reference cannot be framed as one pathname",
+            ));
         }
         if !self.seen.contains(target) {
             self.output.write_all(target.as_bytes())?;
@@ -134,7 +147,8 @@ fn scan_process<W: Write>(
         let mut saw_leader = false;
         for task in fs::read_dir(process.join("task"))? {
             let task = task?;
-            let tid = decimal_id(&task.file_name()).ok_or_else(|| io::Error::other("invalid task ID"))?;
+            let tid =
+                decimal_id(&task.file_name()).ok_or_else(|| io::Error::other("invalid task ID"))?;
             saw_leader |= tid == pid;
             let path = task.path();
             if let Err(error) = scan_task(&path, paths) {
@@ -162,7 +176,10 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn references() -> References<Vec<u8>> {
-        References { output: Vec::new(), seen: HashSet::new() }
+        References {
+            output: Vec::new(),
+            seen: HashSet::new(),
+        }
     }
 
     fn task(root: &Path, id: u32) -> std::path::PathBuf {
@@ -182,7 +199,10 @@ mod tests {
         symlink("socket:[42]", sibling.join("fd/4")).unwrap();
         let mut paths = references();
         scan_process(root.path(), 10, &mut paths, |_| false).unwrap();
-        let mut lines: Vec<_> = std::str::from_utf8(&paths.output).unwrap().lines().collect();
+        let mut lines: Vec<_> = std::str::from_utf8(&paths.output)
+            .unwrap()
+            .lines()
+            .collect();
         lines.sort_unstable();
         assert_eq!(lines, ["/", "/build/.rch-target/out", "/working directory"]);
     }
@@ -192,12 +212,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let fd = task(root.path(), 10).join("fd/12");
         symlink("/job/held", &fd).unwrap();
-        let listed = fs::read_dir(fd.parent().unwrap()).unwrap().next().unwrap().unwrap().path();
+        let listed = fs::read_dir(fd.parent().unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         fs::remove_file(&fd).unwrap();
         let mut paths = references();
         paths.descriptor(&listed).unwrap();
         assert!(paths.output.is_empty());
-        assert!(!vanished_entry(&listed, &io::ErrorKind::PermissionDenied.into()));
+        assert!(!vanished_entry(
+            &listed,
+            &io::ErrorKind::PermissionDenied.into()
+        ));
     }
 
     #[test]
@@ -239,7 +267,12 @@ mod tests {
         assert!(check_proc_mount(normal).is_ok());
         assert!(check_proc_mount(&normal.replace("hidepid=off", "hidepid=2")).is_err());
         assert!(check_proc_mount(&normal.replace(" / /proc ", " /123 /proc ")).is_err());
-        assert!(check_proc_mount(&format!("{normal}22 15 0:7 / /proc/123/fd rw - tmpfs tmpfs rw\n")).is_err());
+        assert!(
+            check_proc_mount(&format!(
+                "{normal}22 15 0:7 / /proc/123/fd rw - tmpfs tmpfs rw\n"
+            ))
+            .is_err()
+        );
         assert!(check_proc_mount("").is_err());
     }
 }
