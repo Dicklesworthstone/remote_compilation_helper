@@ -362,7 +362,9 @@ fn finish_without_metadata(lane: Lane) {
         let daemon = fixture.daemon(move |peer| {
             lane.accept(peer);
             peer.send(&if success {
-                lane.served(b"whole transcript\n", false)
+                let mut whole = lane.served(b"whole transcript\n", false);
+                whole.as_object_mut().unwrap().remove("metadata_exposed");
+                whole
             } else {
                 lane.failed(false)
             });
@@ -395,6 +397,11 @@ fn refuse_every_uncertain_tail(lane: Lane) {
         .as_object_mut()
         .unwrap()
         .remove("metadata_exposed");
+    let mut whole_after_prefix = lane.served(PREFIX, true);
+    whole_after_prefix
+        .as_object_mut()
+        .unwrap()
+        .remove("metadata_exposed");
     let mut wrong_action = lane.served(b"tail", true);
     wrong_action["action_key"] = json!("another-action");
     let mut wrong_manifest = lane.served(b"tail", true);
@@ -404,6 +411,7 @@ fn refuse_every_uncertain_tail(lane: Lane) {
         Some(lane.failed(true).to_string()),
         Some(lane.failed(false).to_string()),
         Some(false_exposure.to_string()),
+        Some(whole_after_prefix.to_string()),
         Some(wrong_action.to_string()),
         Some(wrong_manifest.to_string()),
         Some(lane.notice(PREFIX).to_string()),

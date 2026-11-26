@@ -335,11 +335,13 @@ fn receive(
             let Some(reported_exposed) = exposure_flag(&answer) else {
                 return failure(exposed, "ambiguous metadata exposure receipt");
             };
+            // The edge omits the flag for a whole transcript and sets it for
+            // a suffix. After delivering a prefix, either false or absent
+            // would allow its artifact notification to be delivered twice.
             if matches!(
                 answer.get("decision").and_then(Value::as_str),
                 Some("served" | "remote-complete")
-            ) && contains(&answer, "metadata_exposed")
-                && reported_exposed != exposed
+            ) && reported_exposed != exposed
             {
                 return failure(
                     exposed,
