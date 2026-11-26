@@ -32,6 +32,7 @@
 mod capture;
 mod metadata;
 mod remote;
+mod request_frame;
 mod singleflight;
 mod supervision;
 
@@ -733,27 +734,6 @@ fn stop_if_caller_lost(owner: Option<supervision::Owner>) {
     }
 }
 
-/// The full live request, or `None` when it cannot be represented
-/// exactly (non-UTF-8 environment) or exceeds the frame bound — such
-/// requests stay names-only shadow consults.
-fn live_request_frame(args: &[String], cwd: &str) -> Option<String> {
-    let mut env = Vec::new();
-    for (name, value) in std::env::vars_os() {
-        let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
-            return None;
-        };
-        env.push(format!("[{},{}]", json_string(&name), json_string(&value)));
-    }
-    let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
-    let frame = format!(
-        "{{\"kind\":\"rustc-request\",\"argv\":[{}],\"cwd\":{},\"env\":[{}],\"wait_for_inflight\":true,\"remote_protocol\":1,\"metadata_protocol\":1}}",
-        argv_json.join(","),
-        json_string(cwd),
-        env.join(","),
-    );
-    (frame.len() <= MAX_REQUEST_BYTES).then_some(frame)
-}
-
 /// Interpret a live decision. `Err(())` = the daemon failed us (breaker).
 fn live_outcome(
     reply: &reply_json::Value,
@@ -932,7 +912,7 @@ fn consult(
     socket: &str,
     connect_timeout_ms: u32,
     decision_timeout_ms: u32,
-    args: &[String],
+    request: &request_frame::RequestFrame,
     owned: &impl Fn() -> bool,
     panic_fence: &PanicFence,
 ) -> Result<Live, ()> {
@@ -945,14 +925,7 @@ fn consult(
         owned,
     )
     .map_err(|_| ())?;
-    let cwd = std::env::current_dir()
-        .map_err(|_| ())?
-        .into_os_string()
-        .into_string()
-        .map_err(|_| ())?;
-    let live_frame = live_request_frame(args, &cwd);
-    let live_requested = live_frame.is_some();
-    let budget = Duration::from_millis(u64::from(if live_requested {
+    let budget = Duration::from_millis(u64::from(if request.live {
         live_decision_timeout_ms(decision_timeout_ms)
     } else {
         decision_timeout_ms
@@ -966,33 +939,14 @@ fn consult(
 
     singleflight::handshake(&mut reader, deadline, owned).map_err(|_| ())?;
 
-    // Live request (full argv, cwd and environment, so the daemon can key
-    // the exact action), or the names-only S4 shadow observation when the
-    // request cannot be represented exactly.
-    let frame = match live_frame {
-        Some(frame) => frame,
-        None => {
-            let argv_json: Vec<String> = args.iter().map(|a| json_string(a)).collect();
-            let env_names: Vec<String> = std::env::vars_os()
-                .filter_map(|(name, _)| name.into_string().ok())
-                .filter(|name| name.starts_with("CARGO") || name.starts_with("RUSTC"))
-                .map(|name| json_string(&name))
-                .collect();
-            format!(
-                "{{\"kind\":\"consult\",\"argv\":[{}],\"cwd\":{},\"env_names\":[{}]}}",
-                argv_json.join(","),
-                json_string(&cwd),
-                env_names.join(","),
-            )
-        }
-    };
+    let frame = &request.text;
     singleflight::write_owned(&mut reader, frame.as_bytes(), deadline, owned).map_err(|_| ())?;
     singleflight::write_owned(&mut reader, b"\n", deadline, owned).map_err(|_| ())?;
     singleflight::read_decision(
         reader,
-        &frame,
+        frame,
         budget,
-        live_requested,
+        request.live,
         socket,
         Duration::from_millis(u64::from(connect_timeout_ms)),
         owned,
@@ -1063,28 +1017,34 @@ fn observe_with_breaker(
             ConnectDecision::Probe {
                 connect_timeout_ms,
                 decision_timeout_ms,
-            } => {
-                // Do not probe unless the reservation was actually published.
-                // Ignoring a write failure permits a storm of same-window probes.
-                let probing = state.probe_started(now);
-                if store_state(path, &probing).is_err() {
-                    trace_bypass("probe-reservation-write-failed", args);
-                    return Live::PassThrough;
-                }
-                (
-                    Some(guard),
-                    Some(probing),
-                    connect_timeout_ms,
-                    decision_timeout_ms,
-                )
-            }
+            } => (
+                Some(guard),
+                Some(state.probe_started(now)),
+                connect_timeout_ms,
+                decision_timeout_ms,
+            ),
         }
     };
+    // An invocation too large for even a names-only observation stays local.
+    // It supplies no evidence of daemon health and consumes no probe window.
+    let request = std::env::current_dir().ok().and_then(|cwd| {
+        request_frame::prepare(args, cwd.to_str()?, std::env::vars_os)
+    });
+    let Some(request) = request else {
+        trace_bypass("request-unrepresentable", args);
+        return Live::PassThrough;
+    };
+    if let Some(probing) = &probing_state
+        && store_state(path, probing).is_err()
+    {
+        trace_bypass("probe-reservation-write-failed", args);
+        return Live::PassThrough;
+    }
     let outcome = consult(
         socket,
         connect_timeout_ms,
         decision_timeout_ms,
-        args,
+        &request,
         &owned,
         panic_fence,
     );
@@ -2505,6 +2465,30 @@ mod tests {
     }
 
     #[test]
+    fn oversized_argv_never_consumes_a_probe_or_records_a_daemon_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("breaker");
+        let path = path.to_str().unwrap();
+        let policy = BreakerPolicy::default();
+        let overdue = BreakerState::Open {
+            opened_at_ms: now_ms().saturating_sub(policy.cooldown_ms * 2),
+            last_probe_started_at_ms: None,
+        };
+        for state in [BreakerState::fresh(), overdue] {
+            store_state(path, &state).unwrap();
+            let outcome = observe_with_breaker(
+                "/nonexistent/rabsd.sock",
+                path,
+                &["x".repeat(MAX_REQUEST_BYTES)],
+                None,
+                &PanicFence::default(),
+            );
+            assert!(matches!(outcome, Live::PassThrough));
+            assert_eq!(load_state(path), state);
+        }
+    }
+
+    #[test]
     fn abandoned_probe_reservation_prevents_a_second_consult() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("breaker");
@@ -2640,7 +2624,7 @@ mod tests {
             "/nonexistent/rabsd.sock",
             25,
             50,
-            &[],
+            &request_frame::prepare(&[], "/", std::iter::empty).unwrap(),
             &|| true,
             &PanicFence::default(),
         );
