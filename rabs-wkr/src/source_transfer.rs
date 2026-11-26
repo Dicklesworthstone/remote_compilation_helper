@@ -202,23 +202,17 @@ pub struct SourceOwner {
 
 /// Exact input mountpoints inside one private writable output directory. The
 /// underlying placeholders remain empty while the compiler sees separately
-/// retained read-only input files mounted over them. After namespace teardown,
-/// only these descriptor-verified names may be excluded from output capture.
+/// retained read-only input files mounted over them. Two retained directories
+/// and per-file generation witnesses keep this bounded independently of the
+/// artifact count. After namespace teardown, only these descriptor-verified
+/// names may be excluded from output capture.
 #[derive(Debug)]
 pub(crate) struct DependencyOutputInputs {
     backing: std::path::PathBuf,
     directory: std::fs::File,
     directory_metadata: std::fs::Metadata,
-    files: std::collections::BTreeMap<String, DependencyOutputInput>,
-}
-
-#[derive(Debug)]
-struct DependencyOutputInput {
-    placeholder: std::fs::File,
-    placeholder_metadata: std::fs::Metadata,
-    retained_path: std::path::PathBuf,
-    retained: std::fs::File,
-    retained_metadata: std::fs::Metadata,
+    files: std::collections::BTreeMap<String, std::fs::Metadata>,
+    retained: Option<Box<PrivateDependencyInputs>>,
 }
 
 /// Holds the complete generated-input inventory across compiler execution and
@@ -563,7 +557,42 @@ impl DependencyOutputInputs {
             directory,
             directory_metadata,
             files: std::collections::BTreeMap::new(),
+            retained: None,
         })
+    }
+
+    fn prepare(
+        backing: &std::path::Path,
+        retained_backing: std::path::PathBuf,
+        files: &[&SourceFile],
+        prefix: &str,
+    ) -> io::Result<Self> {
+        let mut inputs = Self::new(backing)?;
+        // Shared output inputs are flat, nonexecutable .rmeta/.rlib members
+        // admitted by dependency_root. Hash the complete retained tree before
+        // creating any placeholder. The immutable directory generation then
+        // fences every member without an open descriptor per artifact.
+        let retained =
+            PrivateDependencyInputs::capture(retained_backing, files, &[], prefix, &|| false)?;
+        for name in retained.files.keys() {
+            let placeholder = rabs_sandbox::source_transfer::create_staging_file(
+                &inputs.directory,
+                name,
+                &|| false,
+            )?;
+            let metadata = placeholder.metadata()?;
+            if metadata.len() != 0
+                || !dependency_same_file(&metadata, &std::fs::symlink_metadata(backing.join(name))?)
+            {
+                return Err(io::Error::other(
+                    "dependency input placeholder changed during creation",
+                ));
+            }
+            inputs.files.insert(name.clone(), metadata);
+        }
+        inputs.retained = Some(Box::new(retained));
+        inputs.verify(backing)?;
+        Ok(inputs)
     }
 
     /// Input basenames from the sealed manifest, never an arbitrary exclusion
@@ -578,6 +607,29 @@ impl DependencyOutputInputs {
     /// its held inode and every immutable file generation must remain unchanged.
     pub(crate) fn verify(&self, output_backing: &std::path::Path) -> io::Result<()> {
         let refuse = || io::Error::other("dependency input mountpoint or retained backing changed");
+        self.verify_directory(output_backing)?;
+        for (name, metadata) in &self.files {
+            let placeholder =
+                rabs_sandbox::source_transfer::open_staging_file(&self.directory, name)?;
+            if metadata.len() != 0
+                || !dependency_same_file(metadata, &placeholder.metadata()?)
+                || !dependency_same_file(
+                    metadata,
+                    &std::fs::symlink_metadata(self.backing.join(name))?,
+                )
+            {
+                return Err(refuse());
+            }
+        }
+        if let Some(retained) = &self.retained {
+            retained.verify()?;
+        }
+        // The public output root must still name the held directory after the
+        // complete member pass; new compiler outputs may change its membership.
+        self.verify_directory(output_backing)
+    }
+
+    fn verify_directory(&self, output_backing: &std::path::Path) -> io::Result<()> {
         if output_backing != self.backing
             || std::fs::canonicalize(output_backing)? != self.backing
             || !dependency_same_identity(&self.directory_metadata, &self.directory.metadata()?)
@@ -586,27 +638,7 @@ impl DependencyOutputInputs {
                 &std::fs::symlink_metadata(output_backing)?,
             )
         {
-            return Err(refuse());
-        }
-        for (name, input) in &self.files {
-            if input.placeholder_metadata.len() != 0
-                || !dependency_same_file(
-                    &input.placeholder_metadata,
-                    &input.placeholder.metadata()?,
-                )
-                || !dependency_same_file(
-                    &input.placeholder_metadata,
-                    &std::fs::symlink_metadata(self.backing.join(name))?,
-                )
-                || std::fs::canonicalize(&input.retained_path)? != input.retained_path
-                || !dependency_same_file(&input.retained_metadata, &input.retained.metadata()?)
-                || !dependency_same_file(
-                    &input.retained_metadata,
-                    &std::fs::symlink_metadata(&input.retained_path)?,
-                )
-            {
-                return Err(refuse());
-            }
+            return Err(io::Error::other("dependency output root changed"));
         }
         Ok(())
     }
@@ -1116,7 +1148,6 @@ impl SourceOwner {
         spec: &mut rabs_sandbox::canonical_namespace::CanonicalNamespaceSpec,
     ) -> io::Result<DependencyOutputInputs> {
         use rabs_sandbox::canonical_namespace::Bind;
-        use std::io::Read;
         use std::path::Path;
 
         let refuse = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
@@ -1133,13 +1164,12 @@ impl SourceOwner {
         if output.next().is_some() {
             return Err(refuse("dependency output has duplicate writable mounts"));
         }
-        let mut inputs = DependencyOutputInputs::new(&backing)?;
         let Some(shared) = context
             .artifact_roots()
             .iter()
             .find(|root| root.path == context.out_dir())
         else {
-            return Ok(inputs);
+            return DependencyOutputInputs::new(&backing);
         };
         if spec
             .ro_binds
@@ -1153,99 +1183,23 @@ impl SourceOwner {
         let bundle = package
             .parent()
             .ok_or_else(|| refuse("dependency bundle parent is missing"))?;
-        for expected in self.receiver.manifest().files() {
-            let Some(name) = expected
-                .path
-                .strip_prefix(shared.prefix.as_str())
-                .and_then(|suffix| suffix.strip_prefix('/'))
-            else {
-                continue;
-            };
-            let retained_path = bundle.join(&expected.path);
-            if std::fs::canonicalize(&retained_path)? != retained_path {
-                return Err(refuse("retained dependency input has a filesystem alias"));
-            }
-            let mut retained = rabs_sandbox::regular_input::open(&retained_path)?;
-            let retained_metadata = retained.metadata()?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if retained_metadata.permissions().mode() & 0o111 != 0 {
-                    return Err(refuse(
-                        "retained dependency input became executable after its seal",
-                    ));
-                }
-            }
-            if retained_metadata.len() != expected.len
-                || !dependency_same_file(
-                    &retained_metadata,
-                    &std::fs::symlink_metadata(&retained_path)?,
-                )
-            {
-                return Err(refuse(
-                    "retained dependency input differs from its sealed member",
-                ));
-            }
-            let mut hasher = Sha256::new();
-            let mut remaining = expected.len;
-            let mut buffer = [0_u8; MAX_SOURCE_CHUNK];
-            while remaining != 0 {
-                let count = usize::try_from(remaining.min(buffer.len() as u64))
-                    .map_err(|_| refuse("retained dependency input exceeds a chunk"))?;
-                retained.read_exact(&mut buffer[..count])?;
-                hasher.update(&buffer[..count]);
-                remaining -= count as u64;
-            }
-            match retained.read_exact(&mut buffer[..1]) {
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
-                Err(error) => return Err(error),
-                Ok(()) => return Err(refuse("retained dependency input grew after its seal")),
-            }
-            let digest: [u8; 32] = hasher.finalize().into();
-            if digest != expected.sha256
-                || !dependency_same_file(&retained_metadata, &retained.metadata()?)
-                || !dependency_same_file(
-                    &retained_metadata,
-                    &std::fs::symlink_metadata(&retained_path)?,
-                )
-            {
-                return Err(refuse("retained dependency bytes changed after their seal"));
-            }
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let placeholder = options.open(backing.join(name))?;
-            let placeholder_metadata = placeholder.metadata()?;
-            if placeholder_metadata.len() != 0
-                || !dependency_same_file(
-                    &placeholder_metadata,
-                    &std::fs::symlink_metadata(backing.join(name))?,
-                )
-            {
-                return Err(refuse(
-                    "dependency input placeholder changed during creation",
-                ));
-            }
-            inputs.files.insert(
-                name.to_owned(),
-                DependencyOutputInput {
-                    placeholder,
-                    placeholder_metadata,
-                    retained_path: retained_path.clone(),
-                    retained,
-                    retained_metadata,
-                },
-            );
+        let prefix = format!("{}/", shared.prefix);
+        let files = self
+            .receiver
+            .manifest()
+            .files()
+            .iter()
+            .filter(|file| file.path.starts_with(&prefix))
+            .collect::<Vec<_>>();
+        let retained_backing = bundle.join(&shared.prefix);
+        let inputs =
+            DependencyOutputInputs::prepare(&backing, retained_backing.clone(), &files, &prefix)?;
+        for name in inputs.relative_paths() {
             spec.ro_binds.push(Bind::new(
-                retained_path,
+                retained_backing.join(name),
                 Path::new(context.out_dir()).join(name),
             ));
         }
-        inputs.verify(&backing)?;
         Ok(inputs)
     }
 
@@ -2546,8 +2500,14 @@ mod tests {
             generated_directories,
         );
         let runtime = tempfile::tempdir().unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
         for name in ["toolchain", "output", "empty", "home"] {
-            std::fs::create_dir(runtime.path().join(name)).unwrap();
+            builder.create(runtime.path().join(name)).unwrap();
         }
         context
             .prepare_empty_backings(&runtime.path().join("empty"))
@@ -2675,8 +2635,14 @@ mod tests {
             ])
             .unwrap();
             let runtime = tempfile::tempdir().unwrap();
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
             for name in ["toolchain", "output", "empty", "home"] {
-                std::fs::create_dir(runtime.path().join(name)).unwrap();
+                builder.create(runtime.path().join(name)).unwrap();
             }
             context
                 .prepare_empty_backings(&runtime.path().join("empty"))
@@ -3931,9 +3897,7 @@ mod tests {
 
     impl SharedDependencyFixture {
         fn new() -> Self {
-            use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
-
-            let owner = uploaded_dependency_bundle(&[
+            Self::with_files(&[
                 (
                     "package/src/lib.rs",
                     b"pub fn answer() -> u8 { 42 }\n",
@@ -3954,7 +3918,13 @@ mod tests {
                     b"other directory input",
                     false,
                 ),
-            ]);
+            ])
+        }
+
+        fn with_files(files: &[(&str, &[u8], bool)]) -> Self {
+            use rabs_sandbox::dependency_context::{DependencyArtifactRoot, DependencyExecContext};
+
+            let owner = uploaded_dependency_bundle(files);
             let context = DependencyExecContext::new_with_artifacts(
                 "/source/package".to_owned(),
                 "/source/package".to_owned(),
@@ -3978,7 +3948,13 @@ mod tests {
             )
             .unwrap();
             let toolchain = tempfile::tempdir().unwrap();
-            let output = tempfile::tempdir().unwrap();
+            let mut output_builder = tempfile::Builder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                output_builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let output = output_builder.tempdir().unwrap();
             let empty = tempfile::tempdir().unwrap();
             let home = tempfile::tempdir().unwrap();
             context.prepare_empty_backings(empty.path()).unwrap();
@@ -4007,6 +3983,88 @@ mod tests {
             self.owner
                 .prepare_dependency_output(91, &self.context, &mut self.spec)
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_output_inputs_prepare_under_a_low_descriptor_limit() {
+        const CHILD: &str = "RABS_TEST_SHARED_INPUT_DESCRIPTOR_LIMIT";
+        const FILES: usize = 256;
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "source_transfer::tests::shared_output_inputs_prepare_under_a_low_descriptor_limit",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success()
+                    && String::from_utf8_lossy(&child.stdout)
+                        .contains("prepared shared output inputs under the descriptor limit"),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        let resource = rustix::process::Resource::Nofile;
+        let mut limit = rustix::process::getrlimit(resource);
+        limit.current = Some(limit.current.unwrap_or(64).min(64));
+        rustix::process::setrlimit(resource, limit).unwrap();
+        let artifacts = (0..FILES)
+            .map(|index| {
+                let extension = if index % 2 == 0 { "rmeta" } else { "rlib" };
+                (
+                    format!("dependencies/0000/libinput-{index:04}.{extension}"),
+                    format!("complete retained dependency {index}\0").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut files = artifacts
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice(), false))
+            .collect::<Vec<_>>();
+        files.push(("package/src/lib.rs", b"source", false));
+        files.push((
+            "dependencies/0001/libexternal.rmeta",
+            b"separate input directory",
+            false,
+        ));
+        let mut fixture = SharedDependencyFixture::with_files(&files);
+        let descriptors_before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let guard = fixture.prepare().unwrap();
+        let descriptors_after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        assert_eq!(descriptors_after - descriptors_before, 2);
+        assert_eq!(guard.relative_paths().count(), FILES);
+        fixture
+            .owner
+            .protect_dependency(91, &fixture.context, &fixture.spec)
+            .unwrap();
+        for (path, bytes) in &artifacts {
+            let name = path.strip_prefix("dependencies/0000/").unwrap();
+            assert_eq!(
+                std::fs::read(fixture.output.path().join(name)).unwrap(),
+                b""
+            );
+            let visible = std::path::Path::new(fixture.context.out_dir()).join(name);
+            let binding = fixture
+                .spec
+                .ro_binds
+                .iter()
+                .find(|bind| bind.visible == visible)
+                .unwrap();
+            assert_eq!(std::fs::read(&binding.backing).unwrap(), *bytes);
+        }
+        std::fs::write(
+            fixture.output.path().join("libproduced.rmeta"),
+            b"new output",
+        )
+        .unwrap();
+        guard.verify(fixture.output.path()).unwrap();
+        println!("prepared shared output inputs under the descriptor limit");
     }
 
     #[cfg(target_os = "linux")]
@@ -4128,20 +4186,46 @@ mod tests {
 
         for mutation in [
             "bytes",
+            "bytes-restored",
             "replacement",
+            "missing",
+            "symlink",
             "hardlink",
             "permissions",
             "retained",
+            "retained-restored",
         ] {
             let mut fixture = SharedDependencyFixture::new();
             let guard = fixture.prepare().unwrap();
             let placeholder = fixture.output.path().join("libleaf.rmeta");
             match mutation {
                 "bytes" => std::fs::write(&placeholder, b"untrusted output").unwrap(),
+                "bytes-restored" => {
+                    let original = std::fs::metadata(&placeholder).unwrap();
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&placeholder)
+                        .unwrap();
+                    std::io::Write::write_all(&mut file, b"changed").unwrap();
+                    file.set_len(0).unwrap();
+                    file.set_times(
+                        std::fs::FileTimes::new().set_modified(original.modified().unwrap()),
+                    )
+                    .unwrap();
+                }
                 "replacement" => {
                     std::fs::rename(&placeholder, fixture.output.path().join("saved-input"))
                         .unwrap();
                     std::fs::write(&placeholder, b"").unwrap();
+                }
+                "missing" => {
+                    std::fs::rename(&placeholder, fixture._home.path().join("saved-placeholder"))
+                        .unwrap();
+                }
+                "symlink" => {
+                    let saved = fixture._home.path().join("saved-placeholder");
+                    std::fs::rename(&placeholder, &saved).unwrap();
+                    std::os::unix::fs::symlink(saved, &placeholder).unwrap();
                 }
                 "hardlink" => {
                     std::fs::hard_link(&placeholder, fixture.output.path().join("linked-input"))
@@ -4167,9 +4251,152 @@ mod tests {
                     .unwrap();
                     std::fs::write(&binding.backing, b"changed metadata!").unwrap();
                 }
+                "retained-restored" => {
+                    let binding = fixture
+                        .spec
+                        .ro_binds
+                        .iter()
+                        .find(|bind| {
+                            bind.visible == std::path::Path::new("/target/deps/libleaf.rmeta")
+                        })
+                        .unwrap();
+                    let original = std::fs::metadata(&binding.backing).unwrap();
+                    let mut bytes = std::fs::read(&binding.backing).unwrap();
+                    bytes[0] ^= 1;
+                    std::fs::set_permissions(
+                        &binding.backing,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                    std::fs::write(&binding.backing, bytes).unwrap();
+                    std::fs::set_permissions(&binding.backing, original.permissions()).unwrap();
+                    std::fs::File::open(&binding.backing)
+                        .unwrap()
+                        .set_times(
+                            std::fs::FileTimes::new().set_modified(original.modified().unwrap()),
+                        )
+                        .unwrap();
+                }
                 _ => unreachable!(),
             }
             assert!(guard.verify(fixture.output.path()).is_err(), "{mutation}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_inputs_retain_the_complete_artifact_tree_generation() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        for mutation in [
+            "extra-file",
+            "extra-directory",
+            "root-replacement",
+            "root-symlink",
+            "file-replacement",
+            "missing-file",
+            "file-symlink",
+            "file-hardlink",
+        ] {
+            let mut fixture = SharedDependencyFixture::new();
+            let guard = fixture.prepare().unwrap();
+            let retained = fixture
+                .spec
+                .ro_binds
+                .iter()
+                .find(|bind| bind.visible == std::path::Path::new("/target/deps/libleaf.rmeta"))
+                .unwrap()
+                .backing
+                .clone();
+            let root = retained.parent().unwrap();
+            let saved = fixture._home.path().join("saved-retained");
+            match mutation {
+                "extra-file" => std::fs::write(root.join("libundeclared.rmeta"), b"").unwrap(),
+                "extra-directory" => std::fs::create_dir(root.join("undeclared")).unwrap(),
+                "root-replacement" => {
+                    std::fs::rename(root, &saved).unwrap();
+                    std::fs::DirBuilder::new().mode(0o700).create(root).unwrap();
+                    for name in guard.relative_paths() {
+                        std::fs::copy(saved.join(name), root.join(name)).unwrap();
+                    }
+                }
+                "root-symlink" => {
+                    std::fs::rename(root, &saved).unwrap();
+                    std::os::unix::fs::symlink(&saved, root).unwrap();
+                }
+                "file-replacement" => {
+                    let metadata = std::fs::metadata(&retained).unwrap();
+                    let bytes = std::fs::read(&retained).unwrap();
+                    std::fs::rename(&retained, &saved).unwrap();
+                    std::fs::write(&retained, bytes).unwrap();
+                    std::fs::set_permissions(&retained, metadata.permissions()).unwrap();
+                    std::fs::File::open(&retained)
+                        .unwrap()
+                        .set_times(
+                            std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()),
+                        )
+                        .unwrap();
+                }
+                "missing-file" => std::fs::rename(&retained, &saved).unwrap(),
+                "file-symlink" => {
+                    std::fs::rename(&retained, &saved).unwrap();
+                    std::os::unix::fs::symlink(&saved, &retained).unwrap();
+                }
+                "file-hardlink" => std::fs::hard_link(&retained, &saved).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(guard.verify(fixture.output.path()).is_err(), "{mutation}");
+        }
+
+        let mut fixture = SharedDependencyFixture::new();
+        std::fs::set_permissions(
+            fixture.output.path(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(fixture.prepare().is_err(), "output backing must be private");
+        assert_eq!(std::fs::read_dir(fixture.output.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_input_verification_refuses_fifo_replacements_without_waiting() {
+        use rustix::fs::{CWD, Mode, OFlags};
+
+        for retained in [false, true] {
+            let mut fixture = SharedDependencyFixture::new();
+            let guard = fixture.prepare().unwrap();
+            let path = if retained {
+                fixture
+                    .spec
+                    .ro_binds
+                    .iter()
+                    .find(|bind| bind.visible == std::path::Path::new("/target/deps/libleaf.rmeta"))
+                    .unwrap()
+                    .backing
+                    .clone()
+            } else {
+                fixture.output.path().join("libleaf.rmeta")
+            };
+            std::fs::rename(&path, fixture._home.path().join("saved-input")).unwrap();
+            rustix::fs::mkfifoat(CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
+            let backing = fixture.output.path().to_path_buf();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                sender.send(guard.verify(&backing).is_err()).unwrap();
+            });
+            let first = receiver.recv_timeout(Duration::from_secs(1));
+            if first.is_err() {
+                let rescue = rustix::fs::open(
+                    &path,
+                    OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .unwrap();
+                drop(rescue);
+            }
+            thread.join().unwrap();
+            assert_eq!(first, Ok(true), "retained={retained}");
         }
     }
 
@@ -4225,7 +4452,13 @@ mod tests {
         let mut fixture = SharedDependencyFixture::new();
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("output");
-        std::fs::create_dir(&output).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&output).unwrap();
         fixture
             .spec
             .rw_binds
