@@ -72,7 +72,9 @@ impl<'a> Download<'a> {
             false
         };
         let cached = if let Some(cache) = cache.filter(|_| !prefetched) {
-            if let Some(cached_hash) = cache.copy(item, &mut file, &mut checkpoint)? {
+            if let Some(cached_hash) =
+                cache.copy(item, &mut file, offset, &hasher, &mut checkpoint)?
+            {
                 hasher = cached_hash;
                 offset = item.len;
                 true
@@ -221,23 +223,15 @@ fn download_many<'a>(
                 let Some((item, manifest_hash, path)) = targets.next() else {
                     break;
                 };
-                // Explicit local prefixes retain their strict corruption
-                // refusal; no separate byte-cache hit may conceal a bad hint.
-                let file = if let Some(source) = &source {
-                    Download::open(item, manifest_hash, &path, Some(source), None, None, || {
-                        peer.checkpoint()
-                    })?
-                } else {
-                    Download::open(
-                        item,
-                        manifest_hash,
-                        &path,
-                        None,
-                        cache.as_ref(),
-                        prefetch.filter(|_| manifest_hash.is_some()),
-                        || peer.checkpoint(),
-                    )?
-                };
+                let file = Download::open(
+                    item,
+                    manifest_hash,
+                    &path,
+                    source.as_ref(),
+                    cache.as_ref(),
+                    prefetch.filter(|_| source.is_none() && manifest_hash.is_some()),
+                    || peer.checkpoint(),
+                )?;
                 // A complete NONEMPTY local hint needs no range request, but
                 // is not trusted until its full hash, permissions and sync pass.
                 // Empty files still require their ordinary zero-length reply.
@@ -298,19 +292,13 @@ pub(super) fn download_artifacts(
     root: &Path,
     prefetch: Option<&MetadataPrefetch>,
 ) -> io::Result<()> {
-    // A claimed JSON worker identity is insufficient. Local byte hints are
-    // scoped only after trusted session admission, and never override explicit
-    // ResumeSource behavior (including its intentional corruption refusal).
-    let cache = if peer.resume_source().is_none() {
-        peer.artifact_byte_cache()
-            .cloned()
-            .zip(peer.authentication())
-            .map(|(cache, authentication)| {
-                CacheSession::new(cache, worker, authentication, manifest)
-            })
-    } else {
-        None
-    };
+    // Only the authenticated worker may select local cache bytes. An explicit
+    // resume prefix always stays in the receiver's complete-file hash.
+    let cache = peer
+        .artifact_byte_cache()
+        .cloned()
+        .zip(peer.authentication())
+        .map(|(cache, authentication)| CacheSession::new(cache, worker, authentication, manifest));
     download_many(
         peer,
         worker,

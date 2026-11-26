@@ -233,17 +233,19 @@ impl CacheSession {
         Ok(())
     }
 
-    /// Return the hash state for a fully verified copy. An optional-cache fault
-    /// rewinds only this newly created destination before cold network ranges.
+    /// Complete the current prefix with cached bytes and verify the whole file.
+    /// A cache fault removes only the attempted suffix before network ranges.
     /// A checkpoint or destination-write failure never takes that fallback.
     pub(super) fn copy(
         &self,
         item: &Item,
         target: &mut File,
+        prefix_len: u64,
+        prefix_hash: &Sha256,
         mut checkpoint: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Option<Sha256>> {
         checkpoint()?;
-        if item.len == 0 || item.len > self.cache.max_bytes {
+        if prefix_len >= item.len || item.len > self.cache.max_bytes {
             return Ok(None);
         }
         #[cfg(unix)]
@@ -265,8 +267,11 @@ impl CacheSession {
                     metadata.len() == item.len,
                     "artifact byte cache length mismatch",
                 )?;
-                let mut hasher = Sha256::new();
-                let mut left = item.len;
+                if prefix_len != 0 {
+                    input.seek(SeekFrom::Start(prefix_len))?;
+                }
+                let mut hasher = prefix_hash.clone();
+                let mut left = item.len - prefix_len;
                 let mut buffer = [0_u8; CHUNK_BYTES];
                 while left != 0 {
                     checkpoint().map_err(unix::HintError::Stop)?;
@@ -295,15 +300,15 @@ impl CacheSession {
                 Ok(hasher) => Ok(Some(hasher)),
                 Err(unix::HintError::Stop(error)) => Err(error),
                 Err(unix::HintError::Cache) => {
-                    target.set_len(0)?;
-                    target.seek(SeekFrom::Start(0))?;
+                    target.set_len(prefix_len)?;
+                    target.seek(SeekFrom::Start(prefix_len))?;
                     Ok(None)
                 }
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = target;
+            let _ = (target, prefix_hash);
             Ok(None)
         }
     }
@@ -910,7 +915,7 @@ mod tests {
         let item = item(bytes);
         let mut target = tempfile::NamedTempFile::new().unwrap();
         session(cache, std::slice::from_ref(&item))
-            .copy(&item, target.as_file_mut(), || Ok(()))
+            .copy(&item, target.as_file_mut(), 0, &Sha256::new(), || Ok(()))
             .unwrap()?;
         target.seek(SeekFrom::Start(0)).unwrap();
         let mut actual = Vec::new();
@@ -1025,7 +1030,7 @@ mod tests {
         let mut target = tempfile::NamedTempFile::new().unwrap();
         assert!(
             session
-                .copy(&a, target.as_file_mut(), || Ok(()))
+                .copy(&a, target.as_file_mut(), 0, &Sha256::new(), || Ok(()))
                 .unwrap()
                 .is_some()
         );
@@ -1095,7 +1100,7 @@ mod tests {
                 let mut paused = false;
                 assert!(
                     session
-                        .copy(&expected, target.as_file_mut(), || {
+                        .copy(&expected, target.as_file_mut(), 0, &Sha256::new(), || {
                             if !paused && fs::metadata(&target_path)?.len() >= CHUNK_BYTES as u64 {
                                 paused = true;
                                 paused_tx.send(()).unwrap();

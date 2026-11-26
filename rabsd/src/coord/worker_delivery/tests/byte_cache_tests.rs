@@ -136,6 +136,28 @@ impl BytePeer {
         .unwrap()
     }
 
+    fn resume(
+        &mut self,
+        cache: &ArtifactByteCache,
+        source: &ResumeSource,
+    ) -> Result<Delivery, DeliveryFailure> {
+        self.inner.replies[0]["request_high_water"] = json!(self.id);
+        self.inner.replies[0]["result_retentions"] = json!([RESULT_RETENTION]);
+        self.inner.replies[1]["resumed"] = json!(true);
+        self.inner.replies[1]["result_retention"] = json!(RESULT_RETENTION);
+        self.inner.replies[1]["retained_result_sha256"] = json!("ab".repeat(32));
+        let request = self.request();
+        let destination = self.inner.destination.clone();
+        let worker = self.worker.clone();
+        receive_operation(
+            &mut ArtifactCachePeer::new(&mut ResumePeer::new(self, source), cache),
+            &request,
+            &worker,
+            &destination,
+            DeliveryMode::Resume,
+        )
+    }
+
     fn assert_complete(&self) {
         assert!(self.pending.is_empty());
         assert!(self.inner.replies.is_empty());
@@ -553,38 +575,89 @@ fn cached_bytes_cannot_bypass_current_cargo_artifact_report_validation() {
 }
 
 #[test]
-fn explicit_resume_prefix_retains_its_existing_verification_contract() {
+fn resume_mixes_cached_suffixes_and_missing_files_with_only_needed_network_ranges() {
+    let owner = tempfile::tempdir().unwrap();
+    let cache = cache(owner.path());
+    let bytes = vec![0x91; CHUNK_BYTES + 11];
+    let mut files = vec![
+        Artifact::new("a", &bytes, true),
+        Artifact::new("b", b"second cached file", false),
+    ];
+    BytePeer::new(&owner.path().join("first"), 7, files.clone()).deliver(&cache);
+    assert_eq!(objects(&cache).len(), 2);
+
+    files.extend([
+        Artifact::new("c", b"uncached-tail", false),
+        Artifact::new("d", b"complete", false),
+        Artifact::new("e", b"", false),
+    ]);
+    let abandoned = owner.path().join("abandoned");
+    let artifacts = abandoned.join("artifacts");
+    fs::create_dir_all(&artifacts).unwrap();
+    fs::write(artifacts.join("a"), &bytes[..3]).unwrap();
+    fs::write(artifacts.join("c"), b"unc").unwrap();
+    fs::write(artifacts.join("d"), b"complete").unwrap();
+    let source = ResumeSource::open(&abandoned).unwrap();
+    let mut peer = BytePeer::new(&owner.path().join("resumed"), 8, files);
+    let delivery = peer.resume(&cache, &source).unwrap();
+    assert!(delivery.acknowledgments_confirmed);
+    assert_eq!(peer.ranges, [("c".to_owned(), 3), ("e".to_owned(), 0)]);
+    assert_eq!(fs::read(artifacts.join("a")).unwrap(), &bytes[..3]);
+    assert!(!artifacts.join("b").exists());
+    assert!(
+        peer.inner
+            .sent
+            .iter()
+            .all(|frame| frame["kind"] != "canonical-exec")
+    );
+    peer.assert_files();
+}
+
+#[test]
+fn corrupt_cached_suffix_falls_back_to_the_original_unaligned_prefix() {
     let owner = tempfile::tempdir().unwrap();
     let cache = cache(owner.path());
     let files = vec![Artifact::new("a", b"good bytes", false)];
     BytePeer::new(&owner.path().join("first"), 7, files.clone()).deliver(&cache);
+    let object = objects(&cache).pop().unwrap();
+    fs::write(object, b"good WRONG").unwrap();
     let abandoned = owner.path().join("abandoned");
     fs::create_dir_all(abandoned.join("artifacts")).unwrap();
-    fs::write(abandoned.join("artifacts/a"), b"bad! bytes").unwrap();
+    fs::write(abandoned.join("artifacts/a"), b"goo").unwrap();
     let source = ResumeSource::open(&abandoned).unwrap();
-    let destination = owner.path().join("resumed");
-    let mut second = BytePeer::new(&destination, 8, files);
-    second.inner.replies[0]["request_high_water"] = json!(8);
-    second.inner.replies[0]["result_retentions"] = json!([RESULT_RETENTION]);
-    second.inner.replies[1]["resumed"] = json!(true);
-    second.inner.replies[1]["result_retention"] = json!(RESULT_RETENTION);
-    second.inner.replies[1]["retained_result_sha256"] = json!("ab".repeat(32));
-    let request = second.request();
-    let failure = receive_operation(
-        &mut ArtifactCachePeer::new(&mut ResumePeer::new(&mut second, &source), &cache),
-        &request,
-        "worker",
-        &destination,
-        DeliveryMode::Resume,
-    )
-    .unwrap_err();
-    assert!(failure.detail.contains("complete file digest"));
-    assert!(second.ranges.is_empty());
-    assert_eq!(
-        fs::read(destination.join("artifacts/a")).unwrap(),
-        b"bad! bytes"
-    );
-    second.assert_unreleased();
+    let mut peer = BytePeer::new(&owner.path().join("resumed"), 8, files);
+    let delivery = peer.resume(&cache, &source).unwrap();
+    assert!(delivery.acknowledgments_confirmed);
+    assert_eq!(peer.ranges, [("a".to_owned(), 3)]);
+    peer.assert_files();
+}
+
+#[test]
+fn valid_cached_bytes_cannot_conceal_corrupt_partial_or_complete_resume_prefixes() {
+    for prefix in [b"bad!".as_slice(), b"bad! bytes"] {
+        let owner = tempfile::tempdir().unwrap();
+        let cache = cache(owner.path());
+        let files = vec![Artifact::new("a", b"good bytes", false)];
+        BytePeer::new(&owner.path().join("first"), 7, files.clone()).deliver(&cache);
+        let abandoned = owner.path().join("abandoned");
+        fs::create_dir_all(abandoned.join("artifacts")).unwrap();
+        fs::write(abandoned.join("artifacts/a"), prefix).unwrap();
+        let source = ResumeSource::open(&abandoned).unwrap();
+        let destination = owner.path().join("resumed");
+        let mut second = BytePeer::new(&destination, 8, files);
+        let failure = second.resume(&cache, &source).unwrap_err();
+        assert!(failure.detail.contains("complete file digest"));
+        if prefix.len() < b"good bytes".len() {
+            assert_eq!(second.ranges, [("a".to_owned(), prefix.len() as u64)]);
+        } else {
+            assert!(second.ranges.is_empty());
+        }
+        assert_eq!(
+            fs::read(destination.join("artifacts/a")).unwrap(),
+            b"bad! bytes"
+        );
+        second.assert_unreleased();
+    }
 }
 
 #[test]
