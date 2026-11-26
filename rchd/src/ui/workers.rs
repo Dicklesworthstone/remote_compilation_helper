@@ -8,10 +8,10 @@
 
 #![allow(dead_code)]
 
-use crate::workers::WorkerPool;
+use crate::workers::{EligibilityState, WorkerLifecycle, WorkerPool};
 use chrono::Local;
 use rch_common::ui::{Icons, OutputContext};
-use rch_common::{SelectionStrategy, WorkerStatus};
+use rch_common::{BypassFailureClass, BypassState, SelectionStrategy, WorkerStatus};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -46,6 +46,9 @@ pub struct WorkerSnapshot {
     pub total_slots: u32,
     pub speed_score: f64,
     pub tags: Vec<String>,
+    /// Why a worker that reads DOWN is excluded when the cause is a deliberate
+    /// quarantine (temporary bypass or pending canary), not lost connectivity.
+    pub quarantine: Option<String>,
 }
 
 impl WorkerSnapshot {
@@ -64,6 +67,33 @@ impl WorkerSnapshot {
             total_slots,
             speed_score,
             tags,
+            quarantine: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_quarantine(mut self, quarantine: Option<String>) -> Self {
+        self.quarantine = quarantine;
+        self
+    }
+}
+
+/// Describe an eligibility quarantine for transition lines. Both quarantine
+/// states read as DOWN, but neither means the worker stopped answering.
+fn quarantine_event(lifecycle: WorkerLifecycle) -> Option<String> {
+    match lifecycle.eligibility {
+        EligibilityState::TemporaryBypass => Some(format!(
+            "{}: {}",
+            BypassState::TemporaryBypass.label(),
+            lifecycle
+                .bypass_cause
+                .map_or("cause not recorded", BypassFailureClass::label)
+        )),
+        EligibilityState::RecoveredPendingCanary => {
+            Some(BypassState::RecoveredPendingCanary.label().to_string())
+        }
+        EligibilityState::Healthy | EligibilityState::Degraded | EligibilityState::Unreachable => {
+            None
         }
     }
 }
@@ -142,19 +172,17 @@ impl WorkerStatusPanel {
             let tags = config.tags.clone();
             drop(config);
 
-            let status = worker.status().await;
+            // One lifecycle read yields both the legacy status and its cause.
+            let lifecycle = worker.lifecycle().await;
+            let status = lifecycle.legacy_status();
             let total_slots = worker.effective_total_slots().await;
             let used_slots = worker.used_slots();
             let speed_score = worker.get_speed_score();
 
-            snapshots.push(WorkerSnapshot::new(
-                id,
-                status,
-                used_slots,
-                total_slots,
-                speed_score,
-                tags,
-            ));
+            snapshots.push(
+                WorkerSnapshot::new(id, status, used_slots, total_slots, speed_score, tags)
+                    .with_quarantine(quarantine_event(lifecycle)),
+            );
         }
         snapshots.sort_by(|a, b| a.id.cmp(&b.id));
         snapshots
@@ -223,6 +251,7 @@ impl WorkerStatusPanel {
                     id: worker.id.clone(),
                     previous: prev,
                     current: worker.status,
+                    quarantine: worker.quarantine.clone(),
                 };
                 changes.push(change);
                 self.last_statuses.insert(worker.id.clone(), worker.status);
@@ -268,7 +297,13 @@ impl WorkerStatusPanel {
     fn render_change_line(&self, change: &WorkerChange) -> String {
         let prev_label = change.previous.map(status_label).unwrap_or("NEW");
         let current_label = status_label(change.current);
-        let event = connection_event(change.previous, change.current);
+        // A quarantined worker reads DOWN without any failed health check;
+        // name the quarantine rather than reporting a lost connection.
+        let quarantine = change
+            .quarantine
+            .as_deref()
+            .filter(|_| change.current == WorkerStatus::Unreachable);
+        let event = quarantine.or_else(|| connection_event(change.previous, change.current));
 
         if let Some(event) = event {
             format!(
@@ -405,6 +440,7 @@ struct WorkerChange {
     id: String,
     previous: Option<WorkerStatus>,
     current: WorkerStatus,
+    quarantine: Option<String>,
 }
 
 pub fn log_routing_decision(
@@ -1082,6 +1118,7 @@ mod tests {
             id: "w1".to_string(),
             previous: Some(WorkerStatus::Healthy),
             current: WorkerStatus::Unreachable,
+            quarantine: None,
         }];
         let lines = panel.render_changes(&changes);
         assert_eq!(lines.len(), 1);
@@ -1098,6 +1135,7 @@ mod tests {
                 id: format!("w{}", i),
                 previous: Some(WorkerStatus::Healthy),
                 current: WorkerStatus::Unreachable,
+                quarantine: None,
             })
             .collect();
         let lines = panel.render_changes(&changes);
@@ -1114,11 +1152,70 @@ mod tests {
             id: "w1".to_string(),
             previous: Some(WorkerStatus::Healthy),
             current: WorkerStatus::Unreachable,
+            quarantine: None,
         };
         let line = panel.render_change_line(&change);
         assert!(line.contains("w1"));
         assert!(line.contains("HEALTHY -> DOWN"));
         assert!(line.contains("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn test_bypassed_worker_transition_names_quarantine_not_disconnect() {
+        let _guard = test_guard!();
+        // Issue #152: an unconfirmed cancellation quarantines a busy worker
+        // with no failed health check. The DOWN line must name that cause
+        // instead of claiming the connection dropped.
+        let pool = WorkerPool::new();
+        let config = rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("busy-worker"),
+            total_slots: 6,
+            ..Default::default()
+        };
+        pool.add_worker(config.clone()).await;
+        let worker = pool.get(&config.id).await.unwrap();
+        let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain);
+        let healthy = WorkerStatusPanel::collect_snapshot(&pool).await;
+        assert_eq!(healthy[0].status, WorkerStatus::Healthy);
+        assert_eq!(healthy[0].quarantine, None);
+        let _ = panel.render_update(&healthy, 0);
+
+        worker
+            .enter_bypass(BypassFailureClass::ProcessObservation)
+            .await;
+        let bypassed = WorkerStatusPanel::collect_snapshot(&pool).await;
+        assert_eq!(bypassed[0].status, WorkerStatus::Unreachable);
+        let plan = panel.render_update(&bypassed, 0);
+        let line = plan
+            .lines
+            .iter()
+            .find(|line| line.contains("busy-worker: HEALTHY -> DOWN"))
+            .expect("bypass transition line");
+        assert!(
+            line.ends_with("(temporary bypass: process admission/completion unconfirmed)"),
+            "{line}"
+        );
+        assert!(!line.contains("disconnected"), "{line}");
+
+        // A pending canary also reads DOWN; it is not a disconnect either.
+        let change = WorkerChange {
+            id: "canary-worker".to_string(),
+            previous: Some(WorkerStatus::Healthy),
+            current: WorkerStatus::Unreachable,
+            quarantine: Some(BypassState::RecoveredPendingCanary.label().to_string()),
+        };
+        let line = panel.render_change_line(&change);
+        assert!(line.ends_with("(recovered, pending canary)"), "{line}");
+
+        // Admin intent wins over a quarantine label.
+        let change = WorkerChange {
+            id: "disabled-worker".to_string(),
+            previous: Some(WorkerStatus::Unreachable),
+            current: WorkerStatus::Disabled,
+            quarantine: Some("temporary bypass: SSH connection failure".to_string()),
+        };
+        let line = panel.render_change_line(&change);
+        assert!(line.ends_with("DOWN -> DISABLED"), "{line}");
     }
 
     #[test]
@@ -1129,6 +1226,7 @@ mod tests {
             id: "w1".to_string(),
             previous: Some(WorkerStatus::Healthy),
             current: WorkerStatus::Draining,
+            quarantine: None,
         };
         let line = panel.render_change_line(&change);
         assert!(line.contains("w1"));
@@ -1144,6 +1242,7 @@ mod tests {
             id: "w1".to_string(),
             previous: None,
             current: WorkerStatus::Healthy,
+            quarantine: None,
         };
         let line = panel.render_change_line(&change);
         assert!(line.contains("NEW -> HEALTHY"));
@@ -1264,6 +1363,7 @@ mod tests {
             id: "worker-1".to_string(),
             previous: Some(WorkerStatus::Healthy),
             current: WorkerStatus::Unreachable,
+            quarantine: None,
         };
         let cloned = change.clone();
         assert_eq!(change.id, cloned.id);
@@ -1302,6 +1402,7 @@ mod tests {
                 id: format!("w{}", i),
                 previous: None,
                 current: WorkerStatus::Healthy,
+                quarantine: None,
             })
             .collect();
         let lines = panel.render_changes_aggregated(&changes);
@@ -1319,16 +1420,19 @@ mod tests {
                 id: "w1".to_string(),
                 previous: Some(WorkerStatus::Healthy),
                 current: WorkerStatus::Unreachable,
+                quarantine: None,
             },
             WorkerChange {
                 id: "w2".to_string(),
                 previous: Some(WorkerStatus::Healthy),
                 current: WorkerStatus::Unreachable,
+                quarantine: None,
             },
             WorkerChange {
                 id: "w3".to_string(),
                 previous: None,
                 current: WorkerStatus::Healthy,
+                quarantine: None,
             },
         ];
         let lines = panel.render_changes_aggregated(&changes);
