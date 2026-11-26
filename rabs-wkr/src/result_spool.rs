@@ -6,7 +6,7 @@
 //! range handlers deliver the original result without launching an executor.
 //! These files are transport retention, never CAS publication or cache authority.
 
-use crate::artifacts::{ArtifactPlan, PreparedArtifacts};
+use crate::artifacts::{ArtifactPlan, CapturedArtifacts};
 use crate::execution::{ExecutionCompletion, StopReason};
 use crate::output::{CapturedOutputs, CapturedStream, MAX_OUTPUT_CHUNK_BYTES};
 use crate::session::{ExecResult, sha256_hex};
@@ -471,49 +471,38 @@ pub fn load(
             "unknown spool entry",
         )?;
     }
-    let mut captured = Vec::new();
-    for (index, item) in items.iter().enumerate() {
+    let open_item = |index: usize, item: &Item| -> io::Result<File> {
         let path = data_path(&root, index);
         private_path(&path, false)?;
         let file = File::open(&path)?;
+        let metadata = file.metadata()?;
         require(
-            file.metadata()?.is_file() && file.metadata()?.len() == item.len,
+            metadata.is_file() && metadata.len() == item.len,
             "retained file type/size mismatch",
         )?;
-        let snapshot = CapturedStream::from_reader_in(file, item.len, journal_root)?;
+        Ok(file)
+    };
+    let diagnostic = |index: usize| -> io::Result<CapturedStream> {
+        let item = &items[index];
+        let snapshot =
+            CapturedStream::from_reader_in(open_item(index, item)?, item.len, journal_root)?;
         require(
             snapshot.sha256() == item.digest,
             "retained file content mismatch",
         )?;
-        captured.push(snapshot);
-    }
-    let mut streams = captured.into_iter();
-    let stdout = streams.next().ok_or_else(|| invalid("missing stdout"))?;
-    let stderr = streams.next().ok_or_else(|| invalid("missing stderr"))?;
+        Ok(snapshot)
+    };
+    let stdout = diagnostic(0)?;
+    let stderr = diagnostic(1)?;
     let artifacts = match plan {
         None => None,
         Some(plan) => {
-            let prepared = PreparedArtifacts::new_in(plan, journal_root)?;
-            for (item, mut snapshot) in items.iter().skip(2).zip(streams) {
-                let mut file = create_file(&prepared.backing().join(&item.name))?;
-                let mut offset = 0;
-                while offset < item.len {
-                    let bytes = snapshot.read_chunk(offset, MAX_OUTPUT_CHUNK_BYTES)?;
-                    require(!bytes.is_empty(), "empty artifact restore range")?;
-                    file.write_all(&bytes)?;
-                    offset += bytes.len() as u64;
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(fs::Permissions::from_mode(if item.executable {
-                        0o700
-                    } else {
-                        0o600
-                    }))?;
-                }
-            }
-            let bundle = prepared.capture(|| false)?;
+            let bundle = CapturedArtifacts::restore(plan, journal_root, |index, name| {
+                let index = index + 2; // stdout and stderr occupy the first two entries.
+                let item = &items[index];
+                require(item.name == name, "retained artifact name mismatch")?;
+                Ok((open_item(index, item)?, item.executable))
+            })?;
             require(
                 bundle.manifest() == result["artifact_manifest"],
                 "retained artifact manifest disagreement",
@@ -594,6 +583,7 @@ pub fn purge_accepted(journal_root: &Path, digest: &str) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::artifacts::PreparedArtifacts;
     use crate::execution::ExecutionTask;
     use crate::request_journal::{WorkerJournal, request_fingerprint};
     use std::future::Future;
@@ -999,6 +989,26 @@ mod tests {
     fn tree_results_rehydrate_every_file_beyond_the_exact_declaration_limit() {
         use rabs_sandbox::artifact_tree::TREE_FILES_VERSION;
         use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "RABS_TEST_TREE_RECOVERY_WITH_FD_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "result_spool::tests::tree_results_rehydrate_every_file_beyond_the_exact_declaration_limit", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                child.status.success()
+                    && String::from_utf8_lossy(&child.stdout)
+                        .contains("recovered 131 files under the descriptor limit"),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        let resource = rustix::process::Resource::Nofile;
+        let mut limit = rustix::process::getrlimit(resource);
+        limit.current = Some(limit.current.unwrap_or(64).min(64));
+        rustix::process::setrlimit(resource, limit).unwrap();
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let mut journal = WorkerJournal::open(root.path(), "worker", "coord").unwrap();
@@ -1050,6 +1060,12 @@ mod tests {
             b"payload-129"
         );
         assert!(artifacts.file_identity("debug/app").unwrap().2);
+        // Same-length corruption of a later file must invalidate the complete
+        // restore, even though earlier private extents already verified.
+        let last_file = data_path(&root.path().join(DIRECTORY), 132);
+        fs::write(&last_file, b"payload-BAD").unwrap();
+        assert!(load(root.path(), 23, &fingerprint, &digest).is_err());
+        fs::write(last_file, b"payload-129").unwrap();
         let mut changed = request;
         changed["artifacts"].as_object_mut().unwrap().remove("tree");
         assert!(
@@ -1061,6 +1077,7 @@ mod tests {
             )
             .is_err()
         );
+        println!("recovered 131 files under the descriptor limit");
     }
 
     #[test]

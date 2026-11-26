@@ -722,6 +722,30 @@ fn finish_capture(
 }
 
 impl CapturedArtifacts {
+    /// Restore a sealed, complete exact set directly into private range storage.
+    /// The caller opens only its own numbered spool entries and verifies the
+    /// rebuilt manifest against the journal seal before exposing this bundle.
+    pub(crate) fn restore(
+        plan: ArtifactPlan,
+        directory: &Path,
+        mut open: impl FnMut(usize, &str) -> io::Result<(File, bool)>,
+    ) -> io::Result<Self> {
+        let mut data = snapshot_file(directory)?;
+        let mut files = BTreeMap::new();
+        let mut total = 0_u64;
+        for (index, name) in plan.files().enumerate() {
+            let (file, executable) = open(index, name)?;
+            let len = file.metadata()?.len();
+            total = total
+                .checked_add(len)
+                .filter(|bytes| *bytes <= MAX_ARTIFACT_BYTES)
+                .ok_or_else(|| invalid("artifact byte limit exceeded"))?;
+            let bytes = CapturedRange::append(&mut data, file, len)?;
+            files.insert(name.to_owned(), CapturedArtifact { executable, bytes });
+        }
+        finish_capture(plan, data, files)
+    }
+
     /// Original declaration, including whether its files were a tree minimum.
     #[must_use]
     pub fn plan(&self) -> &ArtifactPlan {
