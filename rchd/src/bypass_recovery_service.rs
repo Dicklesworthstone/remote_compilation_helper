@@ -30,11 +30,12 @@
 //! re-derives the lifecycle from the persisted records on daemon startup so a
 //! restart can never silently un-bypass a worker.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, interval};
 use tracing::{debug, info, warn};
@@ -1524,6 +1525,55 @@ async fn record_worker_disk_bypass_locked(
     Ok(())
 }
 
+/// One recovery trial per worker, shared by the periodic task and manual scans.
+/// External demand skipped during a trial requests one catch-up scan on release.
+/// Catch-up scans cannot rearm each other or spin on future-due records.
+#[derive(Default)]
+struct RecoveryFlights {
+    active: StdMutex<HashMap<String, bool>>,
+    ready: Notify,
+}
+
+impl RecoveryFlights {
+    fn claim(self: &Arc<Self>, worker_id: &str, request_recheck: bool) -> Option<RecoveryFlight> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pending) = active.get_mut(worker_id) {
+            if request_recheck {
+                *pending = true;
+            }
+            return None;
+        }
+        active.insert(worker_id.to_owned(), false);
+        Some(RecoveryFlight {
+            flights: Arc::clone(self),
+            worker_id: worker_id.to_owned(),
+        })
+    }
+}
+
+struct RecoveryFlight {
+    flights: Arc<RecoveryFlights>,
+    worker_id: String,
+}
+
+impl Drop for RecoveryFlight {
+    fn drop(&mut self) {
+        let pending = self
+            .flights
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.worker_id)
+            .unwrap_or(false);
+        if pending {
+            self.flights.ready.notify_one();
+        }
+    }
+}
+
 /// Background service that probes bypassed workers and rejoins the ones that
 /// recover, keeping the durable record and live lifecycle in lockstep.
 pub struct BypassRecoveryService<P: RecoveryProber> {
@@ -1533,6 +1583,7 @@ pub struct BypassRecoveryService<P: RecoveryProber> {
     config: BypassRecoveryConfig,
     history: Option<Arc<BuildHistory>>,
     evaluation: Arc<Mutex<()>>,
+    flights: Arc<RecoveryFlights>,
     probe_limit: Arc<Semaphore>,
 }
 
@@ -1545,6 +1596,7 @@ impl<P: RecoveryProber> Clone for BypassRecoveryService<P> {
             config: self.config.clone(),
             history: self.history.clone(),
             evaluation: self.evaluation.clone(),
+            flights: self.flights.clone(),
             probe_limit: self.probe_limit.clone(),
         }
     }
@@ -1567,6 +1619,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             config,
             history: None,
             evaluation: Arc::new(Mutex::new(())),
+            flights: Arc::new(RecoveryFlights::default()),
             probe_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_RECOVERY_PROBES)),
         }
     }
@@ -1589,19 +1642,29 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             self.reconcile_on_start().await;
             let mut ticker = interval(self.config.check_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut evaluations = JoinSet::new();
             loop {
-                tokio::select! {
-                    _ = ticker.tick() => {}
+                let request_recheck = tokio::select! {
+                    _ = ticker.tick() => true,
+                    _ = self.flights.ready.notified() => false,
                     changed = endpoint_changes.changed() => {
                         if changed.is_err() {
                             return;
                         }
+                        true
                     }
-                }
+                    completed = evaluations.join_next(), if !evaluations.is_empty() => {
+                        if let Some(Err(error)) = completed {
+                            warn!(%error, "worker recovery task failed");
+                        }
+                        continue;
+                    }
+                };
                 let now = now_unix_ms();
                 self.replay_pending_disk_faults().await;
                 self.detect_new_bypasses(now).await;
-                self.evaluate_once(now).await;
+                self.schedule_evaluations(now, &mut evaluations, request_recheck)
+                    .await;
             }
         })
     }
@@ -1786,28 +1849,41 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
     }
 
     /// Run one scan: probe every bypassed worker whose backoff window elapsed.
+    #[cfg(test)]
     pub async fn evaluate_once(&self, now_ms: u64) {
-        // A manual scan and the periodic task may race. Share the scan lease
-        // across service clones so a due record cannot run duplicate canaries.
-        let Ok(_evaluation) = self.evaluation.try_lock() else {
-            return;
-        };
+        let mut evaluations = JoinSet::new();
+        self.schedule_evaluations(now_ms, &mut evaluations, true)
+            .await;
+        while let Some(result) = evaluations.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "worker recovery task failed");
+            }
+        }
+    }
+
+    async fn schedule_evaluations(
+        &self,
+        now_ms: u64,
+        evaluations: &mut JoinSet<()>,
+        request_recheck: bool,
+    ) {
+        // Serialize only local admission. A slow peer must not hold this lease
+        // through network work and delay another worker's next confirmation.
+        let _evaluation = self.evaluation.lock().await;
         self.pool.expire_admin_disables(&self.store, now_ms).await;
         let records: Vec<BypassRecord> = {
             let store = self.store.lock().await;
             store.all().into_iter().cloned().collect()
         };
-        let mut evaluations = JoinSet::new();
         for record in records {
+            let Some(flight) = self.flights.claim(&record.worker_id, request_recheck) else {
+                continue;
+            };
             let service = self.clone();
             evaluations.spawn(async move {
+                let _flight = flight;
                 service.evaluate_record(record, now_ms).await;
             });
-        }
-        while let Some(result) = evaluations.join_next().await {
-            if let Err(error) = result {
-                warn!(%error, "worker recovery task failed");
-            }
         }
     }
 
@@ -5590,6 +5666,213 @@ mod tests {
             }
             CanaryOutcome::Passed
         }
+    }
+
+    struct ConfirmationWhileBlockedProber {
+        started: Notify,
+        canceled: Arc<std::sync::atomic::AtomicBool>,
+        blocked_probes: std::sync::atomic::AtomicUsize,
+        healthy_probes: std::sync::atomic::AtomicUsize,
+        healthy_canaries: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecoveryProber for ConfirmationWhileBlockedProber {
+        async fn probe(
+            &self,
+            worker: Arc<WorkerState>,
+            _record: BypassRecord,
+            _deadline: Instant,
+        ) -> RecoveryObservation {
+            use std::sync::atomic::Ordering;
+
+            if worker.config.read().await.id.as_str() == "blocked" {
+                self.blocked_probes.fetch_add(1, Ordering::SeqCst);
+                let _trial = CanceledTrial(Arc::clone(&self.canceled));
+                self.started.notify_one();
+                return std::future::pending().await;
+            }
+            self.healthy_probes.fetch_add(1, Ordering::SeqCst);
+            RecoveryObservation::fixture(RecoveryProbe::all_ok())
+        }
+
+        async fn canary(&self, worker: Arc<WorkerState>, _deadline: Instant) -> CanaryOutcome {
+            assert_eq!(worker.config.read().await.id.as_str(), "healthy");
+            self.healthy_canaries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            CanaryOutcome::Passed
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_confirmation_progresses_independently_of_stalled_peer() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let bound = Duration::from_secs(5);
+        for periodic in [true, false] {
+            let pool = pool_with(&["blocked", "healthy"]).await;
+            let store = store();
+            let healthy = pool.get(&WorkerId::new("healthy")).await.unwrap();
+            assert!(healthy.reserve_slots(1).await);
+            for (id, failure) in [
+                ("blocked", BypassFailureClass::ProcessObservation),
+                ("healthy", BypassFailureClass::Ssh),
+            ] {
+                let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+                record_worker_bypass(&store, &worker, failure, "down", T0).await;
+                let records = store.lock().await;
+                let record = records.get(id).unwrap();
+                assert_eq!(record.auto_rejoin.required_consecutive_passes, 2);
+                assert!(record.auto_rejoin.canary_required);
+            }
+            let canceled = Arc::new(AtomicBool::new(false));
+            let service = BypassRecoveryService::new(
+                pool,
+                store.clone(),
+                ConfirmationWhileBlockedProber {
+                    started: Notify::new(),
+                    canceled: canceled.clone(),
+                    blocked_probes: AtomicUsize::new(0),
+                    healthy_probes: AtomicUsize::new(0),
+                    healthy_canaries: AtomicUsize::new(0),
+                },
+                BypassRecoveryConfig {
+                    check_interval: if periodic {
+                        Duration::from_millis(20)
+                    } else {
+                        Duration::from_secs(30)
+                    },
+                    ..Default::default()
+                },
+            );
+            let task = if periodic {
+                service.clone().start()
+            } else {
+                let service = service.clone();
+                tokio::spawn(async move { service.evaluate_once(T0 + 60_000).await })
+            };
+            tokio::time::timeout(bound, service.prober.started.notified())
+                .await
+                .expect("the blocked worker must enter its original recovery trial");
+
+            if !periodic {
+                tokio::time::timeout(bound, async {
+                    while store
+                        .lock()
+                        .await
+                        .get("healthy")
+                        .unwrap()
+                        .consecutive_passes
+                        != 1
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    service.evaluate_once(T0 + 90_000).await;
+                })
+                .await
+                .expect(
+                    "a second scan must confirm the healthy peer without joining the blocked trial",
+                );
+            }
+            let recovered = tokio::time::timeout(bound, async {
+                while !healthy.lifecycle().await.is_schedulable() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            assert!(
+                recovered.is_ok(),
+                "the healthy peer's second confirmation was blocked (periodic={periodic})"
+            );
+            assert!(!store.lock().await.contains("healthy"));
+            assert!(store.lock().await.contains("blocked"));
+            assert_eq!(service.prober.healthy_probes.load(Ordering::SeqCst), 2);
+            assert_eq!(service.prober.healthy_canaries.load(Ordering::SeqCst), 1);
+            assert_eq!(service.prober.blocked_probes.load(Ordering::SeqCst), 1);
+            assert!(!canceled.load(Ordering::SeqCst));
+            assert_eq!(
+                healthy.used_slots(),
+                1,
+                "recovery preserves existing owners"
+            );
+            assert!(healthy.reserve_slots(1).await);
+
+            task.abort();
+            let _ = task.await;
+            tokio::time::timeout(bound, async {
+                loop {
+                    let idle = service.flights.active.lock().unwrap().is_empty();
+                    if idle && canceled.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("aborting the scan must drop its trials and per-worker leases");
+            assert_eq!(
+                service.probe_limit.available_permits(),
+                MAX_CONCURRENT_RECOVERY_PROBES
+            );
+
+            // An aborted scan must not leave this worker permanently busy.
+            canceled.store(false, Ordering::SeqCst);
+            let retry_at = store
+                .lock()
+                .await
+                .get("blocked")
+                .unwrap()
+                .next_probe_unix_ms;
+            let retry = {
+                let service = service.clone();
+                tokio::spawn(async move { service.evaluate_once(retry_at).await })
+            };
+            tokio::time::timeout(bound, service.prober.started.notified())
+                .await
+                .expect("the canceled worker must admit a fresh trial");
+            assert_eq!(service.prober.blocked_probes.load(Ordering::SeqCst), 2);
+            retry.abort();
+            let _ = retry.await;
+            tokio::time::timeout(bound, async {
+                while !canceled.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the retried probe must remain owned by its scan");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_confirmation_catch_up_scans_cannot_rearm_each_other() {
+        let flights = Arc::new(RecoveryFlights::default());
+        let old_a = flights.claim("a", true).unwrap();
+        let old_b = flights.claim("b", true).unwrap();
+        assert!(flights.claim("a", true).is_none());
+        assert!(flights.claim("b", true).is_none());
+
+        drop(old_a);
+        tokio::time::timeout(Duration::from_secs(1), flights.ready.notified())
+            .await
+            .expect("external demand must wake after the first worker releases");
+        let new_a = flights.claim("a", false).unwrap();
+        assert!(flights.claim("b", false).is_none());
+
+        drop(old_b);
+        tokio::time::timeout(Duration::from_secs(1), flights.ready.notified())
+            .await
+            .expect("a catch-up must preserve the second worker's pending external demand");
+        assert!(flights.claim("a", false).is_none());
+        let new_b = flights.claim("b", false).unwrap();
+
+        drop(new_a);
+        drop(new_b);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), flights.ready.notified())
+                .await
+                .is_err(),
+            "catch-up scans must not create another generation of demand"
+        );
+        assert!(flights.active.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
