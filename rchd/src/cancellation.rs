@@ -4333,17 +4333,28 @@ wait
         let mut expected = None;
 
         // Retry the same build before and after another owner fails. Reload
-        // both durable stores in between: no process-local retry ID or recent
-        // incident alone is sufficient to keep this sequence idempotent.
-        for (attempt, owner_index) in [0, 0, 1, 0, 1].into_iter().enumerate() {
-            if attempt == 1 {
-                ctx.history = Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+        // the bypass journal and the orchestrator in between: no process-local
+        // retry ID or recent incident alone is sufficient to keep this sequence
+        // idempotent. Attempts 5 and 6 follow a restart that also reloads build
+        // history. Restored owners keep their admission coordinates but not the
+        // live endpoint incarnation, so their retries cannot accuse the worker
+        // again; the persisted incidents must come through unchanged.
+        for (attempt, owner_index) in [0, 0, 1, 0, 1, 0, 1].into_iter().enumerate() {
+            if matches!(attempt, 1 | 5) {
+                if attempt == 5 {
+                    ctx.history =
+                        Arc::new(BuildHistory::load_from_file(&history_path, 100).unwrap());
+                }
                 ctx.bypass_store = Some(Arc::new(tokio::sync::Mutex::new(
                     rch_common::BypassRecordStore::load(&bypass_path),
                 )));
                 orch = CancellationOrchestrator::new(test_config(), test_events());
             }
             let owner = ctx.history.active_build(owners[owner_index].id).unwrap();
+            if attempt >= 5 {
+                let restored = owner.worker_endpoint.as_ref().unwrap();
+                assert!(worker.lock_current_endpoint(restored).await.is_none());
+            }
             let mut record = test_record(CancellationState::Failed, 1, true);
             record.build_id = owner.id;
             record.worker_id.clone_from(&owner.worker_id);
