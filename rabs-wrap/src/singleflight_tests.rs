@@ -714,7 +714,7 @@ fn cold_preparation_rolls_over_after_sixty_requests() {
         assert_eq!(hello.trim_end(), HELLO);
         second
             .get_mut()
-            .write_all(b"{\"kind\":\"hello-ok\"}\n")
+            .write_all(b"{\"kind\":\"hello-ok\",\"transport\":1,\"application\":1}\n")
             .unwrap();
         let mut request = String::new();
         second.read_line(&mut request).unwrap();

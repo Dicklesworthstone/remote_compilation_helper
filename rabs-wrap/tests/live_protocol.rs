@@ -179,6 +179,43 @@ impl Fixture {
 }
 
 #[test]
+fn rejected_handshake_keeps_the_compiler_request_local() {
+    for hello_reply in [
+        r#"{"kind":"refused","reason":"expected hello-ok"}"#,
+        r#"{"kind":"hello-ok","transport":1}"#,
+        r#"{"kind":"hello-ok","transport":1,"application":2}"#,
+        r#"{"kind":"hello-ok","transport":1,"transport":1,"application":1}"#,
+    ] {
+        let fixture = Fixture::new("exit 23\n");
+        let listener = UnixListener::bind(&fixture.socket).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                "hello"
+            );
+            writeln!(stream, "{hello_reply}").unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "request after refusal"
+            );
+        });
+        let output = fixture.run(&[]);
+        daemon.join().unwrap();
+        assert!(fixture.compiler_ran());
+        assert_eq!(output.status.code(), Some(23));
+    }
+}
+
+#[test]
 fn a_served_hit_replays_the_transcript_and_never_runs_the_compiler() {
     let fixture = Fixture::new("echo compiled >&2\nexit 0\n");
     let transcript = b"{\"$message_type\":\"artifact\",\"artifact\":\"/o/libdemo.rmeta\"}\n";

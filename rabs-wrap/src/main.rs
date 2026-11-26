@@ -852,6 +852,37 @@ fn accepted_install_reply(line: &str, install_deadline: Instant) -> Live {
     }
 }
 
+/// Authenticate the connected descriptor, including on singleflight reconnect.
+/// A path or a handshake field cannot establish who receives the compiler env.
+fn require_edge_owner(stream: &UnixStream, expected_uid: u32) -> io::Result<()> {
+    let peer_uid: io::Result<u32> = std::cfg_select! {
+        any(target_os = "linux", target_os = "android") => {
+            Ok(nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)?.uid())
+        }
+        any(
+            target_vendor = "apple",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ) => Ok(nix::unistd::getpeereid(stream)?.0.as_raw()),
+        _ => {
+            let _ = stream;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no Unix peer credential adapter on this platform",
+            ))
+        }
+    };
+    if peer_uid? != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "RABS edge socket peer is owned by a different user",
+        ));
+    }
+    Ok(())
+}
+
 /// Establish a bounded socket connection. The helper thread has no authority
 /// to send protocol frames or accept an installation.
 fn connect_owned(
@@ -865,7 +896,11 @@ fn connect_owned(
     let (sender, receiver) = std::sync::mpsc::channel();
     let socket_owned = socket.to_owned();
     std::thread::Builder::new().spawn(move || {
-        let _ = sender.send(UnixStream::connect(socket_owned));
+        let result = UnixStream::connect(socket_owned).and_then(|stream| {
+            require_edge_owner(&stream, nix::unistd::geteuid().as_raw())?;
+            Ok(stream)
+        });
+        let _ = sender.send(result);
     })?;
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -929,13 +964,7 @@ fn consult(
         panic_fence: panic_fence.clone(),
     });
 
-    singleflight::write_owned(&mut reader, HELLO.as_bytes(), deadline, owned).map_err(|_| ())?;
-    singleflight::write_owned(&mut reader, b"\n", deadline, owned).map_err(|_| ())?;
-    let line = singleflight::read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, owned)
-        .map_err(|_| ())?;
-    if !line.contains("hello-ok") {
-        return Err(());
-    }
+    singleflight::handshake(&mut reader, deadline, owned).map_err(|_| ())?;
 
     // Live request (full argv, cwd and environment, so the daemon can key
     // the exact action), or the names-only S4 shadow observation when the
@@ -1575,6 +1604,21 @@ fn run_wrapper_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_identity_comes_from_the_connected_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let stream = UnixStream::connect(path).unwrap();
+        let owner = nix::unistd::geteuid().as_raw();
+        require_edge_owner(&stream, owner).unwrap();
+        let wrong_owner = owner.wrapping_add(1);
+        assert_eq!(
+            require_edge_owner(&stream, wrong_owner).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 
     fn accepted_install_reply(line: &str) -> Live {
         super::accepted_install_reply(line, Instant::now() + Duration::from_secs(2))
@@ -2367,7 +2411,9 @@ mod tests {
             reader.read_line(&mut line).unwrap();
             entered.send(()).unwrap();
             released.recv().unwrap();
-            stream.write_all(b"{\"kind\":\"hello-ok\"}\n").unwrap();
+            stream
+                .write_all(b"{\"kind\":\"hello-ok\",\"transport\":1,\"application\":1}\n")
+                .unwrap();
             line.clear();
             reader.read_line(&mut line).unwrap();
             stream
@@ -2673,7 +2719,10 @@ mod tests {
                     writeln!(peer.get_mut(), "{value}").unwrap();
                 };
                 assert_eq!(read(&mut peer).unwrap()["kind"], "hello");
-                send(&mut peer, json!({"kind":"hello-ok"}));
+                send(
+                    &mut peer,
+                    json!({"kind":"hello-ok", "transport":1, "application":1}),
+                );
                 assert_eq!(read(&mut peer).unwrap()["kind"], "rustc-request");
                 let mut offer = json!({
                     "kind":"rustc-decision", "decision":"hit", "capture_protocol":1,

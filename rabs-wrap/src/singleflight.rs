@@ -237,6 +237,30 @@ fn wait_for(reply: &Value) -> Option<WaitFor<'_>> {
     }
 }
 
+/// Negotiate both protocol layers before releasing the request on this stream.
+pub(super) fn handshake(
+    reader: &mut BufReader<ConsultStream>,
+    deadline: Instant,
+    owned: &impl Fn() -> bool,
+) -> io::Result<()> {
+    write_owned(reader, HELLO.as_bytes(), deadline, owned)?;
+    write_owned(reader, b"\n", deadline, owned)?;
+    let line = read_owned_reply(reader, MAX_REPLY_BYTES, deadline, owned)?;
+    if reply_json::parse(&line).is_some_and(|reply| {
+        reply.get("kind").and_then(Value::as_str) == Some("hello-ok")
+            && ["transport", "application"]
+                .iter()
+                .all(|field| matches!(reply.get(field), Some(Value::Number(n)) if n == "1"))
+    }) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RABS handshake rejected",
+        ))
+    }
+}
+
 /// Start an entirely new, unowned consultation only after the prior
 /// non-owning response was completely parsed. No hit consent or execution
 /// grant can reach this path. A failed/ambiguous handshake never authorizes
@@ -264,15 +288,7 @@ fn reconnect_waiter(
         deadline,
         panic_fence,
     });
-    write_owned(&mut reader, HELLO.as_bytes(), deadline, owned)?;
-    write_owned(&mut reader, b"\n", deadline, owned)?;
-    let hello = read_owned_reply(&mut reader, MAX_REPLY_BYTES, deadline, owned)?;
-    if !hello.contains("hello-ok") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "RABS reconnect handshake rejected",
-        ));
-    }
+    handshake(&mut reader, deadline, owned)?;
     Ok(reader)
 }
 
