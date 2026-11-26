@@ -210,7 +210,8 @@ impl BypassState {
 /// pure doubling step used when a probe fails again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BypassBackoff {
-    /// Current backoff window in milliseconds (gap before the next probe).
+    /// Current failure-backoff window in milliseconds. Successful recovery
+    /// confirmations use the configured normal probe interval instead.
     pub current_ms: u64,
     /// Number of probe attempts scheduled since the bypass began.
     pub attempts: u32,
@@ -409,15 +410,17 @@ impl BypassRecord {
     }
 
     /// Record a successful recovery probe: bump the pass count, reset the
-    /// failure count, and reschedule the next probe. Returns `true` once the
+    /// failure count, and schedule confirmation at `probe_interval_ms` rather
+    /// than the accumulated failure backoff. Preserve that backoff so a failed
+    /// confirmation or canary still slows retries. Returns `true` once the
     /// worker has met [`AutoRejoinCriteria::required_consecutive_passes`]. When
     /// the criteria require a canary, the state advances to
     /// [`BypassState::RecoveredPendingCanary`]; otherwise the caller may rejoin
     /// the worker (removing this record).
-    pub fn record_probe_pass(&mut self, now_unix_ms: u64) -> bool {
+    pub fn record_probe_pass(&mut self, now_unix_ms: u64, probe_interval_ms: u64) -> bool {
         self.consecutive_passes = self.consecutive_passes.saturating_add(1);
         self.consecutive_failures = 0;
-        self.next_probe_unix_ms = now_unix_ms.saturating_add(self.backoff.current_ms);
+        self.next_probe_unix_ms = now_unix_ms.saturating_add(probe_interval_ms);
         let met = self.consecutive_passes >= self.auto_rejoin.required_consecutive_passes;
         if met && self.auto_rejoin.canary_required {
             self.state = BypassState::RecoveredPendingCanary;
@@ -1500,12 +1503,21 @@ mod tests {
     fn probe_pass_advances_to_canary_when_criteria_met() {
         let mut r = record(BypassFailureClass::Ssh);
         // Default criteria: 2 passes, canary required.
-        assert!(!r.record_probe_pass(TS + 1));
+        assert!(!r.record_probe_pass(TS + 1, 30_000));
         assert_eq!(r.state, BypassState::TemporaryBypass);
-        assert!(r.record_probe_pass(TS + 2));
+        assert!(r.record_probe_pass(TS + 2, 30_000));
         assert_eq!(r.state, BypassState::RecoveredPendingCanary);
         assert_eq!(r.consecutive_passes, 2);
         assert_eq!(r.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn probe_pass_schedule_saturates_at_timestamp_limit() {
+        let mut r = record(BypassFailureClass::Ssh);
+        assert!(!r.record_probe_pass(u64::MAX - 10, 30_000));
+        assert_eq!(r.next_probe_unix_ms, u64::MAX);
+        assert!(!r.probe_due(u64::MAX - 1));
+        assert!(r.probe_due(u64::MAX));
     }
 
     #[test]

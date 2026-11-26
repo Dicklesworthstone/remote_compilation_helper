@@ -229,7 +229,8 @@ pub struct AutoRejoinConfig {
     pub required_consecutive_passes: u32,
     /// Whether one canary build is required before full rejoin.
     pub canary_required: bool,
-    /// How often the recovery service scans for due probes (seconds).
+    /// Recovery scan interval and gap between successful confirmation probes
+    /// (seconds). Failed probes use the temporary-bypass backoff instead.
     pub check_interval_secs: u64,
     /// SSH/probe timeout for a single capability probe or canary (seconds).
     pub probe_timeout_secs: u64,

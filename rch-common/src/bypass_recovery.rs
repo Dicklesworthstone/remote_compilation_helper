@@ -183,11 +183,14 @@ pub enum CanaryDecision {
 /// the pass streak (so a flapping worker never accumulates enough passes), and a
 /// fully-healthy probe advances toward — but never directly completes — rejoin
 /// unless the criteria are met and no canary is required.
+/// Successful confirmations use the caller's normal `probe_interval_ms`;
+/// failures retain their independent exponential backoff.
 #[must_use]
 pub fn decide_probe(
     record: BypassRecord,
     probe: &RecoveryProbe,
     now_unix_ms: u64,
+    probe_interval_ms: u64,
 ) -> ProbeDecision {
     let mut record = record;
     if !probe.fully_healthy() {
@@ -202,7 +205,7 @@ pub fn decide_probe(
     // Fully healthy probe — count the pass. `record_probe_pass` returns whether
     // the consecutive-pass criteria are now met (and advances to
     // RecoveredPendingCanary when a canary is required).
-    let criteria_met = record.record_probe_pass(now_unix_ms);
+    let criteria_met = record.record_probe_pass(now_unix_ms, probe_interval_ms);
     if !criteria_met {
         return ProbeDecision::KeepProbing {
             consecutive_passes: record.consecutive_passes,
@@ -245,6 +248,7 @@ mod tests {
     use crate::bypass_record::{AutoRejoinCriteria, BypassFailureClass, BypassRecord, BypassState};
 
     const TS: u64 = 1_700_000_000_000;
+    const PROBE_INTERVAL_MS: u64 = 30_000;
 
     fn record() -> BypassRecord {
         BypassRecord::new("css", "h", "u", BypassFailureClass::Ssh, TS)
@@ -298,7 +302,7 @@ mod tests {
         assert!(!probe.fully_healthy());
         assert_eq!(probe.first_failure(), Some("process_observation"));
         assert!(matches!(
-            decide_probe(record(), &probe, TS + 1),
+            decide_probe(record(), &probe, TS + 1, PROBE_INTERVAL_MS),
             ProbeDecision::StayBypassed { .. }
         ));
     }
@@ -314,7 +318,7 @@ mod tests {
         assert!(!probe.fully_healthy());
         assert_eq!(probe.first_failure(), Some("runtime_execution"));
         assert!(matches!(
-            decide_probe(record(), &probe, TS + 1),
+            decide_probe(record(), &probe, TS + 1, PROBE_INTERVAL_MS),
             ProbeDecision::StayBypassed { .. }
         ));
     }
@@ -323,7 +327,7 @@ mod tests {
     fn failing_probe_stays_bypassed_and_advances_backoff() {
         let r = record();
         let before = r.backoff.current_ms;
-        match decide_probe(r, &probe_failing("disk"), TS + 1) {
+        match decide_probe(r, &probe_failing("disk"), TS + 1, PROBE_INTERVAL_MS) {
             ProbeDecision::StayBypassed {
                 failed_dimension,
                 record,
@@ -342,7 +346,7 @@ mod tests {
         // A single fully-healthy probe with the default 2-pass criteria must NOT
         // rejoin — it only advances the streak.
         let r = record();
-        match decide_probe(r, &RecoveryProbe::all_ok(), TS + 1) {
+        match decide_probe(r, &RecoveryProbe::all_ok(), TS + 1, PROBE_INTERVAL_MS) {
             ProbeDecision::KeepProbing {
                 consecutive_passes,
                 required,
@@ -364,7 +368,7 @@ mod tests {
         p.toolchain_ok = false;
         p.disk_ok = false;
         assert!(p.ssh_ok);
-        match decide_probe(record(), &p, TS + 1) {
+        match decide_probe(record(), &p, TS + 1, PROBE_INTERVAL_MS) {
             ProbeDecision::StayBypassed { .. } => {}
             other => panic!("lucky SSH must stay bypassed, got {other:?}"),
         }
@@ -372,12 +376,26 @@ mod tests {
 
     #[test]
     fn two_consecutive_passes_reach_canary() {
-        let r = record();
-        let r = match decide_probe(r, &RecoveryProbe::all_ok(), TS + 1) {
+        let mut r = record();
+        for _ in 0..5 {
+            let due = r.next_probe_unix_ms;
+            r = match decide_probe(r, &probe_failing("process_observation"), due, 17_000) {
+                ProbeDecision::StayBypassed { record, .. } => *record,
+                other => panic!("failed recovery must stay bypassed, got {other:?}"),
+            };
+        }
+        assert_eq!(r.backoff.current_ms, 900_000);
+        let backoff = r.backoff;
+        let first_pass_at = r.next_probe_unix_ms;
+        let r = match decide_probe(r, &RecoveryProbe::all_ok(), first_pass_at, 17_000) {
             ProbeDecision::KeepProbing { record, .. } => *record,
             other => panic!("expected KeepProbing, got {other:?}"),
         };
-        match decide_probe(r, &RecoveryProbe::all_ok(), TS + 2) {
+        assert_eq!(r.backoff, backoff, "a relapse must retain its penalty");
+        assert_eq!(r.next_probe_unix_ms, first_pass_at + 17_000);
+        assert!(!r.probe_due(first_pass_at + 16_999));
+        assert!(r.probe_due(first_pass_at + 17_000));
+        match decide_probe(r, &RecoveryProbe::all_ok(), first_pass_at + 17_000, 17_000) {
             ProbeDecision::ReadyForCanary { record } => {
                 assert_eq!(record.state, BypassState::RecoveredPendingCanary);
                 assert_eq!(record.consecutive_passes, 2);
@@ -397,7 +415,7 @@ mod tests {
             } else {
                 probe_failing("ssh")
             };
-            r = match decide_probe(r, &probe, TS + i) {
+            r = match decide_probe(r, &probe, TS + i, PROBE_INTERVAL_MS) {
                 ProbeDecision::KeepProbing { record, .. } => *record,
                 ProbeDecision::StayBypassed { record, .. } => *record,
                 other => panic!("flapping must never reach {other:?}"),
@@ -416,13 +434,13 @@ mod tests {
             canary_required: false,
         });
         // First pass keeps probing.
-        r = match decide_probe(r, &RecoveryProbe::all_ok(), TS + 1) {
+        r = match decide_probe(r, &RecoveryProbe::all_ok(), TS + 1, PROBE_INTERVAL_MS) {
             ProbeDecision::KeepProbing { record, .. } => *record,
             other => panic!("expected KeepProbing, got {other:?}"),
         };
         // Second pass meets criteria; no canary required -> rejoin directly.
         assert_eq!(
-            decide_probe(r, &RecoveryProbe::all_ok(), TS + 2),
+            decide_probe(r, &RecoveryProbe::all_ok(), TS + 2, PROBE_INTERVAL_MS),
             ProbeDecision::Rejoin
         );
     }
@@ -431,11 +449,11 @@ mod tests {
     fn canary_pass_rejoins_canary_fail_relapses() {
         // Drive to ReadyForCanary.
         let mut r = record();
-        r = match decide_probe(r, &RecoveryProbe::all_ok(), TS + 1) {
+        r = match decide_probe(r, &RecoveryProbe::all_ok(), TS + 1, PROBE_INTERVAL_MS) {
             ProbeDecision::KeepProbing { record, .. } => *record,
             other => panic!("{other:?}"),
         };
-        let pending = match decide_probe(r, &RecoveryProbe::all_ok(), TS + 2) {
+        let pending = match decide_probe(r, &RecoveryProbe::all_ok(), TS + 2, PROBE_INTERVAL_MS) {
             ProbeDecision::ReadyForCanary { record } => *record,
             other => panic!("{other:?}"),
         };
@@ -460,7 +478,7 @@ mod tests {
     #[test]
     fn wrong_binary_and_stale_telemetry_stay_bypassed() {
         for dim in ["worker_binary", "telemetry"] {
-            match decide_probe(record(), &probe_failing(dim), TS + 1) {
+            match decide_probe(record(), &probe_failing(dim), TS + 1, PROBE_INTERVAL_MS) {
                 ProbeDecision::StayBypassed {
                     failed_dimension, ..
                 } => assert_eq!(failed_dimension, dim),
@@ -471,7 +489,7 @@ mod tests {
 
     #[test]
     fn decisions_serialize_with_stable_tags() {
-        let d = decide_probe(record(), &probe_failing("ssh"), TS + 1);
+        let d = decide_probe(record(), &probe_failing("ssh"), TS + 1, PROBE_INTERVAL_MS);
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["decision"], "stay_bypassed");
         assert_eq!(v["failed_dimension"], "ssh");

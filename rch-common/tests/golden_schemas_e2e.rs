@@ -193,8 +193,8 @@ fn golden_bypass_recovered_pending_canary() {
         FIXED_TS,
     );
     // Two passing probes meet the default criteria → pending canary.
-    assert!(!record.record_probe_pass(FIXED_TS + 30_000));
-    assert!(record.record_probe_pass(FIXED_TS + 60_000));
+    assert!(!record.record_probe_pass(FIXED_TS + 30_000, 30_000));
+    assert!(record.record_probe_pass(FIXED_TS + 60_000, 30_000));
     assert_golden(
         "bypass_recovered_pending_canary",
         &record,
@@ -216,6 +216,81 @@ fn golden_bypass_recovered_pending_canary() {
             "auto_rejoin": { "required_consecutive_passes": 2, "canary_required": true },
             "local_fallback_allowed": true,
         }),
+    );
+}
+
+#[test]
+fn bypass_recovery_confirmation_roundtrip_preserves_backoff_and_canary_gates() {
+    use rch_common::bypass_record::{BypassBackoff, BypassRecordStore, BypassState};
+    use rch_common::bypass_recovery::{
+        CanaryDecision, CanaryOutcome, ProbeDecision, RecoveryProbe, decide_canary, decide_probe,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("bypass.json");
+    let mut record = BypassRecord::new(
+        "css",
+        "203.0.113.20",
+        "ubuntu",
+        BypassFailureClass::ProcessObservation,
+        FIXED_TS,
+    );
+    let failed = RecoveryProbe {
+        process_observation_ok: false,
+        ..RecoveryProbe::all_ok()
+    };
+    for _ in 0..5 {
+        let due = record.next_probe_unix_ms;
+        record = match decide_probe(record, &failed, due, 17_000) {
+            ProbeDecision::StayBypassed { record, .. } => *record,
+            other => panic!("failed recovery must remain bypassed, got {other:?}"),
+        };
+    }
+    let backoff = record.backoff;
+    assert_eq!(backoff.current_ms, BypassBackoff::DEFAULT_MAX_MS);
+    let first_pass_at = record.next_probe_unix_ms;
+    record = match decide_probe(record, &RecoveryProbe::all_ok(), first_pass_at, 17_000) {
+        ProbeDecision::KeepProbing { record, .. } => *record,
+        other => panic!("one healthy observation cannot rejoin, got {other:?}"),
+    };
+    let confirmation_at = first_pass_at + 17_000;
+    assert_eq!(record.next_probe_unix_ms, confirmation_at);
+    assert_eq!(record.backoff, backoff);
+    assert_eq!(record.state, BypassState::TemporaryBypass);
+    assert_eq!(record.consecutive_passes, 1);
+    assert_eq!(record.consecutive_failures, 0);
+
+    let mut store = BypassRecordStore::with_path(&path);
+    store.upsert(record.clone()).unwrap();
+    let restored = BypassRecordStore::load(&path);
+    assert_eq!(restored.get("css"), Some(&record));
+    let record = restored.get("css").cloned().unwrap();
+    assert!(!record.probe_due(confirmation_at - 1));
+    assert!(record.probe_due(confirmation_at));
+    assert_eq!(record.auto_rejoin.required_consecutive_passes, 2);
+    assert!(record.auto_rejoin.canary_required);
+    let pending = match decide_probe(record, &RecoveryProbe::all_ok(), confirmation_at, 17_000) {
+        ProbeDecision::ReadyForCanary { record } => *record,
+        other => panic!("confirmation must retain the canary gate, got {other:?}"),
+    };
+    assert_eq!(pending.state, BypassState::RecoveredPendingCanary);
+    assert_eq!(pending.consecutive_passes, 2);
+    store.upsert(pending.clone()).unwrap();
+    assert_eq!(BypassRecordStore::load(&path).get("css"), Some(&pending));
+
+    let canary_at = confirmation_at + 1;
+    let relapsed = match decide_canary(pending.clone(), CanaryOutcome::Failed, canary_at) {
+        CanaryDecision::Relapse { record } => *record,
+        other => panic!("a failed canary must remain bypassed, got {other:?}"),
+    };
+    assert_eq!(relapsed.state, BypassState::TemporaryBypass);
+    assert_eq!(relapsed.consecutive_passes, 0);
+    assert_eq!(relapsed.consecutive_failures, 1);
+    assert_eq!(relapsed.backoff.current_ms, BypassBackoff::DEFAULT_MAX_MS);
+    assert_eq!(relapsed.next_probe_unix_ms, canary_at + backoff.current_ms);
+    assert_eq!(
+        decide_canary(pending, CanaryOutcome::Passed, canary_at),
+        CanaryDecision::Rejoin
     );
 }
 

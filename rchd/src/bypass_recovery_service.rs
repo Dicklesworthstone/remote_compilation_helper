@@ -461,7 +461,8 @@ pub(crate) async fn request_recovery_after_settlement(
 /// Tunable knobs for the recovery loop and the real SSH prober.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BypassRecoveryConfig {
-    /// How often the service scans for due recovery probes.
+    /// Recovery scan interval and gap between successful confirmation probes.
+    /// Failed probes use the record's exponential backoff instead.
     pub check_interval: Duration,
     /// SSH/probe timeout for a single capability probe or canary command.
     pub probe_timeout: Duration,
@@ -1926,7 +1927,12 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
         } else {
             deadlines.failure_publication(deadlines.probe)
         };
-        let decision = decide_probe(record.clone(), &observation.probe, now_ms);
+        let decision = decide_probe(
+            record.clone(),
+            &observation.probe,
+            now_ms,
+            u64::try_from(self.config.check_interval.as_millis()).unwrap_or(u64::MAX),
+        );
         let canary_record = before_recovery_commit(publication_deadline, async {
             let mut store = self.store.lock().await;
             let Some(endpoint) = worker.lock_current_endpoint(&snapshot).await else {
@@ -1987,7 +1993,9 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                             required,
                             record,
                         } => {
-                            debug!(worker = %worker_id, consecutive_passes, required, "recovery probe passed; keep probing");
+                            info!(worker = %worker_id, consecutive_passes, required,
+                                next_probe_unix_ms = record.next_probe_unix_ms,
+                                "recovery probe passed; confirmation scheduled");
                             remediation::record_bypass_transition(BypassTransition::KeepProbing);
                             if let Err(error) = store.upsert(*record) {
                                 warn!(%error, "failed to persist bypass record");
@@ -4313,6 +4321,193 @@ mod tests {
             "lucky SSH must never rejoin"
         );
         assert_eq!(worker.status().await, rch_common::WorkerStatus::Unreachable);
+    }
+
+    #[tokio::test]
+    async fn recovery_confirmation_rejoins_at_configured_interval_after_maximum_backoff() {
+        // Issue #152: cancellation quarantine can read DOWN with no failed
+        // health checks. Script full recovery observations here; the real
+        // service still owns scheduling, durable state, and slot admission.
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        assert!(worker.reserve_slots(2).await);
+        let store = store();
+        let path = store.lock().await.path().to_path_buf();
+        record_process_observation_failure(
+            &store,
+            &worker,
+            &worker.endpoint_snapshot().await,
+            "cancel:retained-build",
+            T0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(worker.circuit_stats().await.consecutive_failures(), 0);
+
+        let mut probes = vec![probe_failing("process_observation"); 5];
+        probes.extend([RecoveryProbe::all_ok(); 2]);
+        let service = BypassRecoveryService::new(
+            pool,
+            store.clone(),
+            FakeProber::new(
+                probes,
+                probe_failing("process_observation"),
+                CanaryOutcome::Passed,
+            ),
+            BypassRecoveryConfig {
+                check_interval: Duration::from_secs(17),
+                ..Default::default()
+            },
+        );
+        for _ in 0..5 {
+            let due = store.lock().await.get("css").unwrap().next_probe_unix_ms;
+            service.evaluate_once(due).await;
+        }
+        let failed = store.lock().await.get("css").cloned().unwrap();
+        assert_eq!(failed.backoff.current_ms, BypassBackoff::DEFAULT_MAX_MS);
+        assert_eq!(failed.consecutive_passes, 0);
+        assert!(failed.auto_rejoin.canary_required);
+
+        let first_pass_at = failed.next_probe_unix_ms;
+        service.evaluate_once(first_pass_at).await;
+        let passed = store.lock().await.get("css").cloned().unwrap();
+        let confirmation_at = first_pass_at + 17_000;
+        assert_eq!(
+            passed.next_probe_unix_ms, confirmation_at,
+            "a fully recovered worker must not wait another fifteen minutes for confirmation"
+        );
+        assert_eq!(
+            passed.backoff, failed.backoff,
+            "relapse retains its backoff"
+        );
+        assert_eq!(passed.consecutive_passes, 1);
+        assert_eq!(passed.consecutive_failures, 0);
+        assert_eq!(passed.state, BypassState::TemporaryBypass);
+        assert_eq!(BypassRecordStore::load(&path).get("css"), Some(&passed));
+        assert_eq!(worker.used_slots(), 2);
+        assert!(!worker.reserve_slots(1).await);
+
+        service.evaluate_once(confirmation_at - 1).await;
+        assert_eq!(store.lock().await.get("css"), Some(&passed));
+        assert_eq!(service.prober.probes.lock().await.len(), 1);
+
+        service.evaluate_once(confirmation_at).await;
+        assert!(!store.lock().await.contains("css"));
+        assert!(!BypassRecordStore::load(&path).contains("css"));
+        assert_eq!(service.prober.probes.lock().await.len(), 0);
+        assert!(worker.lifecycle().await.is_schedulable());
+        assert_eq!(worker.status().await, rch_common::WorkerStatus::Healthy);
+        assert_eq!(worker.used_slots(), 2, "recovery cannot settle old builds");
+        assert_eq!(worker.available_slots().await, 2);
+        assert!(
+            worker.reserve_slots(1).await,
+            "new work resumes without enable"
+        );
+        assert_eq!(worker.used_slots(), 3);
+    }
+
+    #[tokio::test]
+    async fn recovery_confirmation_failure_preserves_accumulated_backoff() {
+        for canary_fails in [false, true] {
+            let pool = pool_with(&["css"]).await;
+            let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+            assert!(worker.reserve_slots(2).await);
+            let store = store();
+            let path = store.lock().await.path().to_path_buf();
+            record_worker_bypass(
+                &store,
+                &worker,
+                BypassFailureClass::ProcessObservation,
+                "remote completion unconfirmed",
+                T0,
+            )
+            .await;
+            let mut probes = vec![probe_failing("process_observation"); 2];
+            probes.push(RecoveryProbe::all_ok());
+            probes.push(if canary_fails {
+                RecoveryProbe::all_ok()
+            } else {
+                probe_failing("process_observation")
+            });
+            let service = BypassRecoveryService::new(
+                pool,
+                store.clone(),
+                FakeProber::new(
+                    probes,
+                    RecoveryProbe::all_ok(),
+                    if canary_fails {
+                        CanaryOutcome::Failed
+                    } else {
+                        CanaryOutcome::Passed
+                    },
+                ),
+                BypassRecoveryConfig {
+                    check_interval: Duration::from_secs(7),
+                    ..Default::default()
+                },
+            );
+            for _ in 0..2 {
+                let due = store.lock().await.get("css").unwrap().next_probe_unix_ms;
+                service.evaluate_once(due).await;
+            }
+            let failed = store.lock().await.get("css").cloned().unwrap();
+            assert_eq!(failed.backoff.current_ms, 120_000);
+            let first_pass_at = failed.next_probe_unix_ms;
+            service.evaluate_once(first_pass_at).await;
+            let passed = store.lock().await.get("css").cloned().unwrap();
+            let confirmation_at = first_pass_at + 7_000;
+            assert_eq!(passed.next_probe_unix_ms, confirmation_at);
+            assert_eq!(passed.backoff, failed.backoff);
+
+            service.evaluate_once(confirmation_at).await;
+            let relapsed = store.lock().await.get("css").cloned().unwrap();
+            assert_eq!(relapsed.consecutive_passes, 0);
+            assert_eq!(relapsed.consecutive_failures, 1);
+            assert_eq!(relapsed.state, BypassState::TemporaryBypass);
+            assert_eq!(relapsed.backoff.current_ms, 240_000);
+            assert_eq!(relapsed.next_probe_unix_ms, confirmation_at + 240_000);
+            assert_eq!(BypassRecordStore::load(&path).get("css"), Some(&relapsed));
+            assert!(!worker.lifecycle().await.is_schedulable());
+            assert!(!worker.reserve_slots(1).await);
+            assert_eq!(worker.used_slots(), 2);
+
+            service.evaluate_once(relapsed.next_probe_unix_ms - 1).await;
+            assert_eq!(store.lock().await.get("css"), Some(&relapsed));
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_confirmation_respects_disable_after_first_pass() {
+        let pool = pool_with(&["css"]).await;
+        let worker = pool.get(&WorkerId::new("css")).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+        let store = store();
+        record_worker_bypass(&store, &worker, BypassFailureClass::Ssh, "down", T0).await;
+        let service = BypassRecoveryService::new(
+            pool,
+            store.clone(),
+            FakeProber::new(
+                vec![RecoveryProbe::all_ok(); 2],
+                RecoveryProbe::all_ok(),
+                CanaryOutcome::Passed,
+            ),
+            BypassRecoveryConfig {
+                check_interval: Duration::from_secs(7),
+                ..Default::default()
+            },
+        );
+        let first_pass_at = store.lock().await.get("css").unwrap().next_probe_unix_ms;
+        service.evaluate_once(first_pass_at).await;
+        let passed = store.lock().await.get("css").cloned().unwrap();
+        assert_eq!(passed.next_probe_unix_ms, first_pass_at + 7_000);
+        worker.disable(Some("maintenance".to_string())).await;
+
+        service.evaluate_once(passed.next_probe_unix_ms).await;
+        assert_eq!(store.lock().await.get("css"), Some(&passed));
+        assert_eq!(service.prober.probes.lock().await.len(), 1);
+        assert_eq!(worker.status().await, rch_common::WorkerStatus::Disabled);
+        assert_eq!(worker.used_slots(), 1);
+        assert!(!worker.reserve_slots(1).await);
     }
 
     #[tokio::test]

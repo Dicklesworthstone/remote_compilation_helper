@@ -1791,6 +1791,91 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn unreachable_worker_without_health_failures_recovers_on_next_heartbeat() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard;
+        set_mock_enabled_override(Some(true));
+        let mut healthy = MockConfig::success().with_stdout("health_check");
+        healthy.execution_delay_ms = 1;
+        set_mock_ssh_config_override(Some(healthy));
+
+        let pool = WorkerPool::new().with_connection_monitoring();
+        let id = WorkerId::new("unreachable-without-health-failures");
+        pool.add_worker(WorkerConfig {
+            id: id.clone(),
+            total_slots: 4,
+            ..Default::default()
+        })
+        .await;
+        let worker = pool.get(&id).await.unwrap();
+        let heartbeat = Duration::from_secs(30);
+        let monitor = HealthMonitor::new(
+            pool,
+            HealthConfig {
+                check_interval: heartbeat,
+                ..Default::default()
+            },
+        );
+        let handle = monitor.start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while monitor.get_health(id.as_str()).await != Some(WorkerStatus::Healthy) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the initial heartbeat must establish worker health");
+        yield_health_probe_tasks().await;
+
+        // Issue #152: a DOWN transition need not have a counted health
+        // failure. Ordinary Unreachable eligibility must still be rechecked.
+        worker.apply_health_status(WorkerStatus::Unreachable).await;
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+        assert_eq!(
+            worker.lifecycle().await.admin,
+            crate::workers::AdminIntent::Active
+        );
+        let circuit = worker.circuit_stats().await;
+        assert_eq!(circuit.state(), CircuitState::Closed);
+        assert_eq!(circuit.consecutive_failures(), 0);
+        assert_eq!(circuit.consecutive_command_failures(), 0);
+        assert!(!worker.transport_is_down().await);
+        assert!(!worker.reserve_slots(1).await);
+        let attempts = || {
+            mock::global_ssh_invocations_snapshot()
+                .iter()
+                .filter(|call| call.worker_id == id && call.phase == mock::Phase::Connect)
+                .count()
+        };
+        assert_eq!(attempts(), 1);
+
+        tokio::time::advance(heartbeat - Duration::from_secs(1)).await;
+        yield_health_probe_tasks().await;
+        assert_eq!(
+            attempts(),
+            1,
+            "the normal heartbeat cadence must be retained"
+        );
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.status().await != WorkerStatus::Healthy {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the next heartbeat must restore plain unreachable eligibility without enable");
+        assert_eq!(attempts(), 2, "recovery must use a fresh health probe");
+        let circuit = worker.circuit_stats().await;
+        assert_eq!(circuit.consecutive_failures(), 0);
+        assert_eq!(circuit.consecutive_command_failures(), 0);
+        assert!(worker.lifecycle().await.is_schedulable());
+        assert!(worker.reserve_slots(1).await);
+        worker.release_slots(1).await;
+        monitor.stop().await;
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn offline_worker_extreme_intervals_do_not_overflow_into_reconnects() {
         let _lock = test_lock().lock().await;
         let _overrides = MockOverrideGuard::set_failure();
