@@ -40,10 +40,9 @@ pub fn main(arguments: &[OsString]) -> i32 {
     } {
         Ok(status) => status,
         Err(error) => {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "RCH_CONTROL_CAPTURE_REFUSED: {error}"
-            );
+            // Snapshot cleanup already consumed its deadline. A full log pipe
+            // must not strand its caller and the GC registry lock afterward.
+            crate::scoped_launch::diagnostic(&format!("RCH_CONTROL_CAPTURE_REFUSED: {error}"));
             REFUSED
         }
     }

@@ -441,3 +441,10 @@ mod unix {
         }
     }
 }
+
+/// Emit a best-effort control diagnostic without waiting for pipe capacity.
+/// Uses the launcher's existing one-shot write and original-flag restoration.
+#[cfg(unix)]
+pub(crate) fn diagnostic(message: &str) {
+    unix::diagnostic(message);
+}

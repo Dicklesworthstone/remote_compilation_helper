@@ -1253,3 +1253,95 @@ fn gc_shell_rejects_real_enospc_even_if_the_producer_succeeds() {
         assert!(output.status.success(), "{mode}: {output:?}");
     }
 }
+
+#[test]
+fn refused_operations_do_not_wait_for_inherited_diagnostic_pipe_capacity() {
+    use std::io::Read as _;
+
+    for cause in ["invalid", "deadline", "cancel", "producer"] {
+        let fixture = Fixture::new();
+        let pids = fixture.directory.path().join("pids");
+        let release = fixture.directory.path().join("release");
+        let mut command = if cause == "invalid" {
+            let mut command = fixture.command();
+            command.args(["0", "/bin/true"]);
+            command
+        } else {
+            let (_path, mut command) =
+                fixture.snapshot(if cause == "deadline" { 1000 } else { 5000 });
+            command
+                .args([
+                    "/bin/sh",
+                    "-c",
+                    "if [ \"$2\" = producer ]; then printf '%s\\n' $$ > \"$1\"; while [ ! -f \"$3\" ]; do /bin/sleep 0.01; done; exit 37; fi; trap '' TERM; /bin/sleep 30 & printf '%s %s\\n' $$ $! > \"$1\"; wait",
+                    "snapshot-diagnostic-backpressure",
+                ])
+                .arg(&pids)
+                .arg(cause)
+                .arg(&release);
+            command
+        };
+        let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+        let original_flags = rustix::fs::fcntl_getfl(&writer).unwrap();
+        rustix::fs::fcntl_setfl(&writer, original_flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+        let mut filled = 0;
+        // Fill to the last byte so even a short diagnostic has no capacity.
+        for bytes in [vec![b'x'; 4096], vec![b'x']] {
+            loop {
+                match rustix::io::write(&writer, &bytes) {
+                    Ok(count) => {
+                        assert!(count > 0);
+                        filled += count;
+                    }
+                    Err(rustix::io::Errno::AGAIN) => break,
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => panic!("could not fill diagnostic pipe: {error}"),
+                }
+            }
+        }
+        assert!(filled > 0);
+        rustix::fs::fcntl_setfl(&writer, original_flags).unwrap();
+        let process = command
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(writer.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let child = OwnedGroup {
+            pid: Pid::from_child(&process),
+            child: Some(process),
+        };
+        // Command can retain its configured stderr descriptor for another
+        // spawn. Close it now so it cannot hold the pipe open during readback.
+        drop(command);
+        if cause != "invalid" {
+            child.ready(&pids);
+        }
+        if cause == "cancel" {
+            rustix::process::kill_process(child.pid, Signal::TERM).unwrap();
+        } else if cause == "producer" {
+            // Keep the producer alive until readiness has been observed.
+            std::fs::write(&release, b"release").unwrap();
+        }
+        // Retain the unread pipe until the actual worker exits. The old
+        // blocking diagnostic hangs here after deadline/producer settlement.
+        let output = child.finish();
+        assert_eq!(output.status.code(), Some(125), "{cause}: {output:?}");
+        assert!(output.stdout.is_empty());
+        if cause != "invalid" {
+            assert_snapshot_producers_stopped(&pids);
+        }
+        assert_eq!(
+            rustix::fs::fcntl_getfl(&writer).unwrap(),
+            original_flags,
+            "{cause}: the caller's stderr flags were not restored"
+        );
+        drop(writer);
+        let mut preserved = Vec::new();
+        std::fs::File::from(reader)
+            .read_to_end(&mut preserved)
+            .unwrap();
+        assert_eq!(preserved, vec![b'x'; filled]);
+    }
+}
