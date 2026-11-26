@@ -582,6 +582,7 @@ impl SharedRuntime {
             .checked_add(budget)
             .ok_or_else(|| invalid("canonical root admission deadline overflow"))?;
         let mut obligations = ObligationSet::default();
+        let mut waiter = self.roots.queue();
         loop {
             if stopped.load(Ordering::Acquire) || !self.healthy() {
                 return Err(io::Error::new(
@@ -596,22 +597,22 @@ impl SharedRuntime {
                     "canonical Cargo root admission timed out",
                 ));
             }
-            if let Ok(permit) = self
-                .roots
-                .acquire_timeout(&mut obligations, remaining.min(Duration::from_millis(50)))
-            {
-                let admitted = RootAdmission {
-                    permit: Some(permit),
-                    obligations,
-                    _state: Arc::clone(&self.state),
-                };
-                if stopped.load(Ordering::Acquire) || !self.healthy() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "canonical Cargo root admission cancelled",
-                    ));
+            match waiter.wait_timeout(&mut obligations, remaining.min(Duration::from_millis(50))) {
+                Err(waiting) => waiter = waiting,
+                Ok(permit) => {
+                    let admitted = RootAdmission {
+                        permit: Some(permit),
+                        obligations,
+                        _state: Arc::clone(&self.state),
+                    };
+                    if stopped.load(Ordering::Acquire) || !self.healthy() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "canonical Cargo root admission cancelled",
+                        ));
+                    }
+                    return Ok(admitted);
                 }
-                return Ok(admitted);
             }
         }
     }

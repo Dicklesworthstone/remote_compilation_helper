@@ -24,7 +24,7 @@
 //! surfaces as an unresolved `CargoRootPermit` at region close instead
 //! of vanishing into a counter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -50,6 +50,19 @@ struct BrokerState {
     next_id: u64,
     /// Outstanding (granted, unreleased) permit ids.
     live: BTreeMap<u64, ()>,
+    /// Each registration has a private wakeup and retains its place across
+    /// cancellation/health polls. Only the head can take the next slot.
+    waiting: VecDeque<Arc<Condvar>>,
+}
+
+impl BrokerState {
+    fn wake_head(&self) {
+        if self.available > 0
+            && let Some(head) = self.waiting.front()
+        {
+            head.notify_one();
+        }
+    }
 }
 
 /// The coordinator-owned broker. Share as `Arc` across the coordinator's
@@ -58,8 +71,15 @@ struct BrokerState {
 pub struct RootPermitBroker {
     max_roots: usize,
     state: Mutex<BrokerState>,
-    /// Signaled whenever a permit returns to the pool.
-    slot_freed: Condvar,
+}
+
+/// FIFO registration for a Cargo root. Dropping it withdraws this caller
+/// without opening an obligation or consuming a root slot.
+#[derive(Debug)]
+pub struct RootPermitWaiter {
+    broker: Arc<RootPermitBroker>,
+    ready: Arc<Condvar>,
+    queued: bool,
 }
 
 /// One granted root permit (RAII: drop = release).
@@ -93,8 +113,8 @@ impl RootPermitBroker {
                 available: max_roots,
                 next_id: 0,
                 live: BTreeMap::new(),
+                waiting: VecDeque::new(),
             }),
-            slot_freed: Condvar::new(),
         })
     }
 
@@ -118,45 +138,17 @@ impl RootPermitBroker {
     ///
     /// Also opens the `CargoRootPermit` obligation in `set` so the
     /// owning attempt's region cannot close while the process lives.
-    /// If obligation opening fails (cannot, today — `open` is
-    /// idempotent — but typed for the future), the permit is returned
-    /// to the pool and `None` surfaces.
+    /// Queued callers have priority over a new nonblocking request.
     #[must_use]
     pub fn try_acquire(self: &Arc<Self>, set: &mut ObligationSet) -> Option<RootPermit> {
-        let id = {
-            let mut state = self.state.lock().ok()?;
-            if state.available == 0 {
-                return None;
-            }
-            state.available -= 1;
-            state.next_id += 1;
-            let id = state.next_id;
-            state.live.insert(id, ());
-            id
-        };
-        set.open(ObligationKind::CargoRootPermit);
-        Some(RootPermit {
-            id,
-            broker: Arc::clone(self),
-            released: false,
-        })
+        let mut state = self.state.lock().ok()?;
+        if state.available == 0 || !state.waiting.is_empty() {
+            return None;
+        }
+        Some(self.grant(&mut state, set))
     }
 
-    /// Take a root permit, blocking until one frees. Opens the
-    /// `CargoRootPermit` obligation in `set` (see [`Self::try_acquire`]).
-    ///
-    /// # Panics
-    /// If the broker's mutex is poisoned by a panicking holder — a
-    /// corrupted ledger must not silently over-grant.
-    #[must_use]
-    pub fn acquire(self: &Arc<Self>, set: &mut ObligationSet) -> RootPermit {
-        let mut state = self.state.lock().expect("root broker mutex poisoned");
-        while state.available == 0 {
-            state = self
-                .slot_freed
-                .wait(state)
-                .expect("root broker mutex poisoned");
-        }
+    fn grant(self: &Arc<Self>, state: &mut BrokerState, set: &mut ObligationSet) -> RootPermit {
         state.available -= 1;
         state.next_id += 1;
         let id = state.next_id;
@@ -169,6 +161,36 @@ impl RootPermitBroker {
         }
     }
 
+    /// Register once when waiting for a root, including callers that must
+    /// periodically leave their wait to check for cancellation or shutdown.
+    #[must_use]
+    pub fn queue(self: &Arc<Self>) -> RootPermitWaiter {
+        let ready = Arc::new(Condvar::new());
+        self.state
+            .lock()
+            .expect("root broker mutex poisoned")
+            .waiting
+            .push_back(Arc::clone(&ready));
+        RootPermitWaiter {
+            broker: Arc::clone(self),
+            ready,
+            queued: true,
+        }
+    }
+
+    /// Take a root permit, blocking until one frees. Opens the
+    /// `CargoRootPermit` obligation in `set` (see [`Self::try_acquire`]).
+    ///
+    /// # Panics
+    /// If the broker's mutex is poisoned by a panicking holder — a
+    /// corrupted ledger must not silently over-grant.
+    #[must_use]
+    pub fn acquire(self: &Arc<Self>, set: &mut ObligationSet) -> RootPermit {
+        self.queue()
+            .wait(set, None)
+            .expect("an unbounded wait cannot time out")
+    }
+
     /// Take a root permit with a wait budget.
     ///
     /// # Errors
@@ -178,32 +200,9 @@ impl RootPermitBroker {
         set: &mut ObligationSet,
         timeout: Duration,
     ) -> Result<RootPermit, PermitError> {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut state = self.state.lock().map_err(|_| PermitError::Timeout)?;
-        while state.available == 0 {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return Err(PermitError::Timeout);
-            }
-            let (guard, wait_result) = self
-                .slot_freed
-                .wait_timeout(state, deadline - now)
-                .map_err(|_| PermitError::Timeout)?;
-            state = guard;
-            if wait_result.timed_out() && state.available == 0 {
-                return Err(PermitError::Timeout);
-            }
-        }
-        state.available -= 1;
-        state.next_id += 1;
-        let id = state.next_id;
-        state.live.insert(id, ());
-        set.open(ObligationKind::CargoRootPermit);
-        Ok(RootPermit {
-            id,
-            broker: Arc::clone(self),
-            released: false,
-        })
+        self.queue()
+            .wait_timeout(set, timeout)
+            .map_err(|_| PermitError::Timeout)
     }
 
     /// Return permit `id` to the pool. Exactly-once: a second release
@@ -223,8 +222,7 @@ impl RootPermitBroker {
             };
         }
         state.available += 1;
-        drop(state);
-        self.slot_freed.notify_one();
+        state.wake_head();
         Ok(())
     }
 
@@ -238,6 +236,78 @@ impl RootPermitBroker {
     /// resolved — the latter IS the double-release signal upstream).
     pub fn resolve_obligation(set: &mut ObligationSet) -> Result<(), ObligationError> {
         set.resolve(ObligationKind::CargoRootPermit)
+    }
+}
+
+impl RootPermitWaiter {
+    /// Wait up to `timeout` for this registration. On expiry, returns the
+    /// same registration to poll again or drop to cancel.
+    ///
+    /// # Errors
+    /// Returns this still-queued waiter when no slot is available to it
+    /// before the wait expires.
+    pub fn wait_timeout(
+        self,
+        set: &mut ObligationSet,
+        timeout: Duration,
+    ) -> Result<RootPermit, Self> {
+        self.wait(set, Some(timeout))
+    }
+
+    fn wait(
+        mut self,
+        set: &mut ObligationSet,
+        timeout: Option<Duration>,
+    ) -> Result<RootPermit, Self> {
+        let state = self
+            .broker
+            .state
+            .lock()
+            .expect("root broker mutex poisoned");
+        let blocked = |state: &mut BrokerState| {
+            state.available == 0
+                || !state
+                    .waiting
+                    .front()
+                    .is_some_and(|head| Arc::ptr_eq(head, &self.ready))
+        };
+        let mut state = match timeout {
+            Some(timeout) => {
+                self.ready
+                    .wait_timeout_while(state, timeout, blocked)
+                    .expect("root broker mutex poisoned")
+                    .0
+            }
+            None => self
+                .ready
+                .wait_while(state, blocked)
+                .expect("root broker mutex poisoned"),
+        };
+        if blocked(&mut state) {
+            drop(state);
+            return Err(self);
+        }
+        state.waiting.pop_front();
+        self.queued = false;
+        let permit = self.broker.grant(&mut state, set);
+        state.wake_head();
+        Ok(permit)
+    }
+}
+
+impl Drop for RootPermitWaiter {
+    fn drop(&mut self) {
+        if self.queued {
+            let mut state = self
+                .broker
+                .state
+                .lock()
+                .expect("root broker mutex poisoned");
+            state
+                .waiting
+                .retain(|waiter| !Arc::ptr_eq(waiter, &self.ready));
+            state.wake_head();
+        }
     }
 }
 
@@ -373,6 +443,59 @@ mod tests {
             broker.acquire_timeout(&mut waiter, Duration::from_millis(80)),
             Err(PermitError::Timeout)
         ));
+    }
+
+    #[test]
+    fn health_polls_preserve_fifo_and_cancellation_passes_a_free_slot() {
+        let broker = RootPermitBroker::new(1);
+        let holder = broker.acquire(&mut set());
+        let oldest = broker.queue();
+        let cancelled = broker.queue();
+        let next = broker.queue();
+        let mut obligations = set();
+
+        // Canonical services repeatedly time out while checking authority
+        // and caller interest. A timeout must keep the original position.
+        let oldest = oldest
+            .wait_timeout(&mut obligations, Duration::ZERO)
+            .unwrap_err();
+        let oldest = oldest
+            .wait_timeout(&mut obligations, Duration::ZERO)
+            .unwrap_err();
+        assert!(obligations.may_close_region().is_ok());
+        drop(holder);
+        assert!(broker.try_acquire(&mut set()).is_none());
+        let next = next.wait_timeout(&mut set(), Duration::ZERO).unwrap_err();
+        let permit = oldest
+            .wait_timeout(&mut obligations, Duration::ZERO)
+            .unwrap();
+        assert!(obligations.may_close_region().is_err());
+        permit.release_into(&mut obligations).unwrap();
+
+        // A cancelled caller may be at the head with capacity available.
+        let next = next.wait_timeout(&mut set(), Duration::ZERO).unwrap_err();
+        drop(cancelled);
+        let permit = next.wait_timeout(&mut set(), Duration::ZERO).unwrap();
+        assert_eq!(broker.active(), 1);
+        drop(permit);
+        assert!(broker.try_acquire(&mut set()).is_some());
+    }
+
+    #[test]
+    fn cancelling_the_queue_head_wakes_a_sleeping_successor() {
+        let broker = RootPermitBroker::new(1);
+        let first = broker.queue();
+        let second = broker.queue();
+        let worker = std::thread::spawn(move || {
+            second
+                .wait_timeout(&mut set(), Duration::from_secs(2))
+                .unwrap()
+        });
+        drop(first);
+        let permit = worker.join().unwrap();
+        assert_eq!(broker.active(), 1);
+        drop(permit);
+        assert_eq!(broker.active(), 0);
     }
 
     #[test]
