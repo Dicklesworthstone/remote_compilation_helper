@@ -66,7 +66,9 @@ printf '%s\0' "$@" > "$RCH_TEST_CACHE_ROOT/cargo.argv"
 printf '%s\0' "${RCH_TEST_OPAQUE-unset}" "${RUSTC_WRAPPER-unset}" "${RABS_SOCKET_PATH-unset}" "${RCH_RABS_WORKER_ACTIVE-unset}" "${RABS_REUSE_CARGO_LAYOUT-unset}" "${CARGO_MAKEFLAGS-unset}" > "$RCH_TEST_CACHE_ROOT/cargo.env"
 /bin/cat > "$RCH_TEST_CACHE_ROOT/cargo.stdin"
 if [ -n "${RCH_TEST_JOB_READ-}" ]; then
-    IFS= read -r token <&"$RCH_TEST_JOB_READ" || exit 94
+    # dash (Ubuntu /bin/sh) accepts only single-digit descriptors in <&N, and the
+    # harness pipe is usually 10 or higher; reopen it through /dev/fd instead.
+    IFS= read -r token < "/dev/fd/$RCH_TEST_JOB_READ" || exit 94
     printf '%s' "$token" > "$RCH_TEST_CACHE_ROOT/cargo.token"
 fi
 printf 'cargo stdout\n'
