@@ -288,12 +288,7 @@ fn run_doctor() -> i32 {
 
     let state_dir = std::env::var("RABS_STATE_DIR")
         .unwrap_or_else(|_| default_under_home(".cache/rch/rabs-state"));
-    let state_dir_writable = {
-        let dir = std::path::Path::new(&state_dir);
-        prepare_state_directory(dir).is_ok()
-            && std::fs::write(dir.join(".doctor-probe"), b"ok").is_ok()
-            && std::fs::remove_file(dir.join(".doctor-probe")).is_ok()
-    };
+    let state_dir_writable = probe_state_directory(std::path::Path::new(&state_dir)).is_ok();
 
     let support = rabs_sandbox::canonical_namespace::HostIsolationSupport::probe();
     let missing_facets: Vec<String> = support
@@ -317,29 +312,118 @@ fn run_doctor() -> i32 {
     i32::from(overall(&checks) == Severity::Fail)
 }
 
-/// Liveness probe: hello + status over the socket. True iff a daemon
-/// answered a status frame.
+/// Test the configured filesystem without ever opening a caller-owned name.
+fn probe_state_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    prepare_state_directory(dir)?;
+    tempfile::tempfile_in(dir)?.write_all(b"ok")
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum DoctorReply {
+    HelloOk {
+        transport: u32,
+        application: u32,
+    },
+    CoordStatus {
+        v: u32,
+        // Both availability states prove that the daemon responded.
+        #[serde(rename = "available")]
+        _available: bool,
+    },
+}
+
+/// Bound both the complete exchange and each newline-delimited frame. A
+/// responsive peer may fragment its replies, but partial or incompatible
+/// replies cannot establish that the configured daemon responded.
 fn probe_daemon(socket_path: &str) -> bool {
-    use std::io::{BufRead, BufReader, Write};
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) else {
-        return false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    doctor_handshake(socket_path, deadline).unwrap_or(false)
+}
+
+fn doctor_handshake(socket_path: &str, deadline: Instant) -> std::io::Result<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "doctor probe timed out"))
     };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-    let hello = "{\"kind\":\"hello\",\
-        \"transport\":{\"minimum_compatible\":1,\"current\":1},\
-        \"application\":{\"minimum_compatible\":1,\"current\":1}}";
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(clone) => clone,
-        Err(_) => return false,
-    });
-    let mut line = String::new();
-    let ok = stream.write_all(hello.as_bytes()).is_ok()
-        && stream.write_all(b"\n").is_ok()
-        && reader.read_line(&mut line).is_ok()
-        && line.contains("hello-ok")
-        && stream.write_all(b"{\"kind\":\"status\"}\n").is_ok();
-    line.clear();
-    ok && reader.read_line(&mut line).is_ok() && line.contains("coord-status")
+    let stream = UnixStream::from(rustix::net::socket(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        None,
+    )?);
+    stream.set_nonblocking(true)?;
+    match rustix::net::connect(&stream, &SocketAddrUnix::new(socket_path)?) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::INPROGRESS) => loop {
+            let left = remaining()?;
+            let timeout = Timespec {
+                tv_sec: left.as_secs() as i64,
+                tv_nsec: left.subsec_nanos().into(),
+            };
+            let mut fds = [PollFd::new(&stream, PollFlags::OUT)];
+            match poll(&mut fds, Some(&timeout)) {
+                Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                Ok(_) => {
+                    rustix::net::sockopt::socket_error(&stream)??;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        },
+        Err(error) => return Err(error.into()),
+    }
+    stream.set_nonblocking(false)?;
+    let mut peer = BufReader::new(stream);
+    let mut exchange = |request: &[u8], maximum: usize| -> io::Result<DoctorReply> {
+        peer.get_ref().set_write_timeout(Some(remaining()?))?;
+        peer.get_mut().write_all(request)?;
+        let mut frame = Vec::new();
+        loop {
+            peer.get_ref().set_read_timeout(Some(remaining()?))?;
+            let bytes = peer.fill_buf()?;
+            if bytes.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete doctor reply",
+                ));
+            }
+            let newline = bytes.iter().position(|byte| *byte == b'\n');
+            let count = newline.unwrap_or(bytes.len());
+            if frame.len() + count >= maximum {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "doctor reply too large",
+                ));
+            }
+            frame.extend_from_slice(&bytes[..count]);
+            peer.consume(count + usize::from(newline.is_some()));
+            if newline.is_some() {
+                return serde_json::from_slice(&frame).map_err(io::Error::from);
+            }
+        }
+    };
+    let hello = b"{\"kind\":\"hello\",\"transport\":{\"minimum_compatible\":1,\"current\":1},\"application\":{\"minimum_compatible\":1,\"current\":1}}\n";
+    if !matches!(
+        exchange(hello, 64 * 1024)?,
+        DoctorReply::HelloOk {
+            transport: 1,
+            application: 1
+        }
+    ) {
+        return Ok(false);
+    }
+    Ok(matches!(
+        exchange(b"{\"kind\":\"status\"}\n", 128 * 1024)?,
+        DoctorReply::CoordStatus { v: 1, .. }
+    ))
 }
 
 const WORKER_PREPARE_USAGE: &str = "usage: rabsd --worker-prepare <absolute-source-root> <spec.json> <new-absolute-bundle-directory>";
@@ -958,5 +1042,94 @@ fn main() {
             report_canonical_error(format_args!("rabsd: {error}"));
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod doctor_probe_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::{fs::symlink, net::UnixListener};
+
+    #[test]
+    fn concurrent_probes_preserve_preexisting_file_and_symlink_target() {
+        let root = tempfile::tempdir().unwrap();
+        let old_probe = root.path().join(".doctor-probe");
+        let retained = root.path().join("retained");
+        std::fs::write(&retained, b"caller data").unwrap();
+        symlink(&retained, &old_probe).unwrap();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    probe_state_directory(root.path()).unwrap();
+                });
+            }
+        });
+        assert_eq!(std::fs::read_link(&old_probe).unwrap(), retained);
+        assert_eq!(std::fs::read(retained).unwrap(), b"caller data");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    fn probe_replies(hello: &[u8], status: Option<&[u8]>) -> bool {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let path = root.path().join("sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let mut peer = BufReader::new(listener.accept().unwrap().0);
+                peer.get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                peer.read_line(&mut request).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["kind"],
+                    "hello"
+                );
+                peer.get_mut().write_all(hello).unwrap();
+                if let Some(status) = status {
+                    request.clear();
+                    peer.read_line(&mut request).unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&request).unwrap()["kind"],
+                        "status"
+                    );
+                    // An oversized reply may be refused before its final bytes.
+                    let _ = peer.get_mut().write_all(status);
+                }
+            });
+            probe_daemon(path.to_str().unwrap())
+        })
+    }
+
+    #[test]
+    fn doctor_requires_complete_compatible_hello_and_status_frames() {
+        let hello = b"{\"kind\":\"hello-ok\",\"transport\":1,\"application\":1}\n";
+        let status = b"{\"kind\":\"coord-status\",\"v\":1,\"available\":true}\n";
+        assert!(probe_replies(hello, Some(status)));
+        assert!(probe_replies(
+            hello,
+            Some(b"{\"kind\":\"coord-status\",\"v\":1,\"available\":false}\n")
+        ));
+        for invalid in [
+            b"error: hello-ok\n".as_slice(),
+            b"{\"kind\":\"error\",\"message\":\"hello-ok\"}\n",
+            b"{\"kind\":\"hello-ok\",\"transport\":2,\"application\":1}\n",
+        ] {
+            assert!(!probe_replies(invalid, None));
+        }
+        for invalid in [
+            b"error: coord-status\n".as_slice(),
+            b"{\"kind\":\"coord-status\"}\n",
+            b"{\"kind\":\"coord-status\",\"v\":1,\"available\":\"true\"}\n",
+            b"{\"kind\":\"coord-status\",\"v\":1,\"available\":true}",
+        ] {
+            assert!(!probe_replies(hello, Some(invalid)));
+        }
+        let mut oversized = vec![b' '; 128 * 1024];
+        oversized.extend_from_slice(status);
+        assert!(!probe_replies(hello, Some(&oversized)));
     }
 }

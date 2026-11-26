@@ -856,9 +856,9 @@ fn accepted_install_reply(line: &str, install_deadline: Instant) -> Live {
 /// A path or a handshake field cannot establish who receives the compiler env.
 fn require_edge_owner(stream: &UnixStream, expected_uid: u32) -> io::Result<()> {
     let peer_uid: io::Result<u32> = std::cfg_select! {
-        any(target_os = "linux", target_os = "android") => {
-            Ok(nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)?.uid())
-        }
+        any(target_os = "linux", target_os = "android") => Ok(
+            nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)?.uid(),
+        ),
         any(
             target_vendor = "apple",
             target_os = "dragonfly",
