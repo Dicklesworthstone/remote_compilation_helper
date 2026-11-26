@@ -951,8 +951,8 @@ fn consult(
         .into_string()
         .map_err(|_| ())?;
     let live_frame = live_request_frame(args, &cwd);
-    let may_wait = live_frame.is_some();
-    let budget = Duration::from_millis(u64::from(if live_frame.is_some() {
+    let live_requested = live_frame.is_some();
+    let budget = Duration::from_millis(u64::from(if live_requested {
         live_decision_timeout_ms(decision_timeout_ms)
     } else {
         decision_timeout_ms
@@ -992,30 +992,24 @@ fn consult(
         reader,
         &frame,
         budget,
-        may_wait,
+        live_requested,
         socket,
         Duration::from_millis(u64::from(connect_timeout_ms)),
         owned,
     )
 }
 
-/// Did the daemon actually answer this consult, or only admit that it
-/// could not?
-///
-/// The breaker exists to notice a daemon that is not serving us. A
-/// `decision` frame in `shadow-error` mode is the daemon reporting its
-/// OWN failure — counting that as a healthy attempt keeps the breaker
-/// closed against a daemon that is answering nothing useful, so the
-/// wrapper pays the consult latency on every single rustc invocation for
-/// as long as the fault lasts. It is a failed attempt.
-///
-/// Deliberately string-shaped, not serde: the wrapper's whole budget is
-/// p95 <10 ms and it hand-rolls its JSON by design.
-fn consult_succeeded(reply: &str) -> bool {
-    if !reply.contains("\"kind\":\"decision\"") {
-        return false; // refusal, garbage, or a truncated line
-    }
-    !reply.contains("\"mode\":\"shadow-error\"")
+/// A shadow reply can confirm a healthy observation, including a degraded
+/// coordinator, but can only return the invocation to the local compiler.
+fn shadow_pass_through(reply: &reply_json::Value) -> bool {
+    use reply_json::Value;
+
+    reply.get("kind").and_then(Value::as_str) == Some("decision")
+        && reply.get("decision").and_then(Value::as_str) == Some("pass-through")
+        && matches!(
+            reply.get("mode").and_then(Value::as_str),
+            Some("shadow" | "shadow-coord-degraded" | "unshadowed")
+        )
 }
 
 /// Opt-in diagnostics for observations that never reached a cache action.
@@ -2567,6 +2561,9 @@ mod tests {
 
     #[test]
     fn a_daemon_reporting_its_own_failure_is_a_failed_attempt() {
+        let consult_succeeded = |line: &str| {
+            reply_json::parse(line).is_some_and(|reply| shadow_pass_through(&reply))
+        };
         // A real answer.
         assert!(consult_succeeded(
             "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow\",\
@@ -2586,6 +2583,15 @@ mod tests {
         // Refusals and noise are failures.
         assert!(!consult_succeeded(
             "{\"kind\":\"refusal\",\"reason\":\"unknown-frame\",\"detail\":\"consult\"}"
+        ));
+        assert!(consult_succeeded(
+            r#"{ "kind": "decision", "decision": "pass-through", "mode": "unshadowed" }"#
+        ));
+        assert!(!consult_succeeded(
+            r#"{"kind":"refusal","detail":{"kind":"decision","decision":"pass-through","mode":"shadow"}}"#
+        ));
+        assert!(!consult_succeeded(
+            r#"{"kind":"decision","decision":"pass-through","mode":"shadow","mode":"shadow-error"}"#
         ));
         assert!(!consult_succeeded(""));
         assert!(!consult_succeeded("{\"kind\":\"hello-ok\"}"));

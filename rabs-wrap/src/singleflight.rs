@@ -22,7 +22,7 @@ mod policy;
 use super::reply_json::{self, Value};
 use super::{
     ConsultStream, HELLO, Live, MAX_LIVE_REPLY_BYTES, MAX_REPLY_BYTES, PanicFence, connect_owned,
-    consult_succeeded, live_outcome,
+    live_outcome, shadow_pass_through,
 };
 use policy::WaitPolicy;
 use std::io::{self, BufRead, BufReader, Write};
@@ -160,7 +160,7 @@ pub(super) fn read_decision(
     reader: BufReader<ConsultStream>,
     frame: &str,
     decision_budget: Duration,
-    may_wait: bool,
+    live_requested: bool,
     socket: &str,
     connect_timeout: Duration,
     owned: &impl Fn() -> bool,
@@ -169,7 +169,7 @@ pub(super) fn read_decision(
         reader,
         frame,
         decision_budget,
-        may_wait,
+        live_requested,
         WaitPolicy::from_environment(),
         Some((socket, connect_timeout)),
         owned,
@@ -296,7 +296,7 @@ fn read_with_policy(
     mut reader: BufReader<ConsultStream>,
     frame: &str,
     decision_budget: Duration,
-    may_wait: bool,
+    live_requested: bool,
     mut policy: WaitPolicy,
     rollover: Option<(&str, Duration)>,
     owned: &impl Fn() -> bool,
@@ -311,13 +311,20 @@ fn read_with_policy(
     // Count reconnects separately from retries: a malicious or broken peer
     // cannot turn the per-connection quota into unlimited socket attempts.
     let mut rollovers = 0_u32;
+    let reply_limit = if live_requested {
+        MAX_LIVE_REPLY_BYTES
+    } else {
+        MAX_REPLY_BYTES
+    };
     loop {
         let response_deadline = reader.get_ref().deadline;
-        let line = read_owned_reply(&mut reader, MAX_LIVE_REPLY_BYTES, response_deadline, owned)
+        let line = read_owned_reply(&mut reader, reply_limit, response_deadline, owned)
             .map_err(|_| ())?;
         let reply = reply_json::parse(&line).ok_or(())?;
-        if reply.get("kind").and_then(Value::as_str) != Some("rustc-decision") {
-            return if consult_succeeded(&line) {
+        // A names-only observation omitted compiler inputs. Its reply cannot
+        // grant execution, installation, or another request on this connection.
+        if !live_requested || reply.get("kind").and_then(Value::as_str) != Some("rustc-decision") {
+            return if shadow_pass_through(&reply) {
                 Ok(Live::PassThrough)
             } else {
                 Err(())
@@ -329,7 +336,7 @@ fn read_with_policy(
         // duplicate hint fields as present here so wait_for rejects ambiguity.
         let capacity_hint = decision == Some("pass-through")
             && matches!(&reply, Value::Object(fields) if fields.iter().any(|(name, _)| name == "retry"));
-        if !matches!(decision, Some("wait" | "preparing")) && !(may_wait && capacity_hint) {
+        if !matches!(decision, Some("wait" | "preparing")) && !capacity_hint {
             // A changing action identity is not the flight we followed. Drop
             // before accepting a hit or executing an admitted attempt. Any
             // reserved attempt is released by the daemon's connection guard.
@@ -343,9 +350,6 @@ fn read_with_policy(
                 }
             }
             return live_outcome(&reply, reader, owned);
-        }
-        if !may_wait {
-            return Err(());
         }
         match wait_for(&reply).ok_or(())? {
             WaitFor::Capacity => {

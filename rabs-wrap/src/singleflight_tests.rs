@@ -60,6 +60,34 @@ fn exchange(replies: Vec<String>, settings: WaitPolicy) -> (Result<Live, ()>, Ve
 }
 
 #[test]
+fn names_only_observation_cannot_grant_live_work() {
+    for reply in [
+        EXECUTE,
+        "{\"kind\":\"rustc-decision\",\"decision\":\"hit\",\"capture_protocol\":1}\n",
+        "{\"kind\":\"rustc-decision\",\"decision\":\"remote\",\"action_key\":\"key\",\"remote_protocol\":1,\"capture_protocol\":1,\"compiler_skip_authorized\":false}\n",
+        WAIT,
+        PREPARING,
+    ] {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(reply.as_bytes()).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let outcome = read_with_policy(
+            reader(stream),
+            "names-only observation",
+            Duration::from_secs(1),
+            false,
+            policy(3),
+            None,
+            &|| true,
+        );
+        assert!(outcome.is_err(), "unexpected live reply to a shadow consult");
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).unwrap();
+        assert!(sent.is_empty(), "shadow consult sent a follow-up frame");
+    }
+}
+
+#[test]
 fn cold_facts_join_a_keyed_flight_then_one_admitted_execution() {
     let (result, requests) = exchange(
         vec![
