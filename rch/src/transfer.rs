@@ -5501,7 +5501,17 @@ mkdir -p {source}
         // rest are injected fresh. This is what forces wrapper/unclassified
         // builds — which may never forward CARGO_TARGET_DIR/GOCACHE/etc. — to
         // still drop artifacts inside the managed `/data/tmp` zone.
-        for &key in FORCED_MANAGED_ENV_KEYS {
+        // The admitted Go guard owns every temporary-directory alias. Its
+        // outer command must establish that same environment even when the
+        // dispatcher forwards nothing: otherwise a worker's TMP/TEMP can
+        // route native helpers back into ungranted source or host storage.
+        let go_temp_aliases: &[&str] =
+            if self.uses_external_go_runtime() && self.remote_cargo_target_dir_override.is_some() {
+                &["TMP", "TEMP"]
+            } else {
+                &[]
+            };
+        for &key in FORCED_MANAGED_ENV_KEYS.iter().chain(go_temp_aliases) {
             if applied.iter().any(|k| k == key) {
                 continue;
             }
@@ -21242,6 +21252,127 @@ cargo --version\n\"$RCH_TEST_TOOLCHAIN_CARGO\" --version\ncargo test --locked\n"
                     .is_none()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admitted_go_remote_commands_override_worker_temporary_aliases() {
+        let retained = tempfile::tempdir().unwrap();
+        for (case, (kind, compile_only, source_closure)) in [
+            (CompilationKind::GoBuild, false, false),
+            (CompilationKind::GoTest, true, false),
+            (CompilationKind::GoTest, false, true),
+            (CompilationKind::GoVet, false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = retained.path().join(format!("source {case}"));
+            let target = retained.path().join(format!("granted output {case}"));
+            std::fs::create_dir(&source).unwrap();
+            let pipeline = TransferPipeline::new(
+                source.clone(),
+                "go-runtime-aliases".into(),
+                format!("case-{case}"),
+                TransferConfig::default(),
+            )
+            .with_compilation_kind(Some(kind))
+            .with_go_test_output(compile_only)
+            .with_go_source_closure(source_closure)
+            .with_remote_path_override(source.to_str().unwrap())
+            .with_remote_cargo_target_dir_override(target.to_str().unwrap())
+            .with_env_allowlist(Vec::new())
+            .with_env_overrides(HashMap::new())
+            .with_compilation_config(rch_common::CompilationConfig {
+                external_timeout_enabled: false,
+                remote_build_jobs: RemoteBuildJobs::Off,
+                ..Default::default()
+            });
+            // Exercise the actual generated remote command with a native
+            // subprocess consuming all three common temporary aliases.
+            // No compiler or protocol double establishes the environment.
+            let command = pipeline.build_remote_command(
+                "sh -c '[ \"$TMP\" = \"$TMPDIR\" ] && \
+                 [ \"$TEMP\" = \"$TMPDIR\" ] && \
+                 printf tmp > \"$TMP/tmp-consumer\" && \
+                 printf temp > \"$TEMP/temp-consumer\"'",
+                None,
+            );
+            for inherited in [false, true] {
+                let mut process = Command::new("sh");
+                process
+                    .args(["-c", &command])
+                    .stdin(Stdio::null())
+                    .env_remove("TMP")
+                    .env_remove("TEMP")
+                    .kill_on_drop(true);
+                if inherited {
+                    process
+                        .env("TMP", source.join("ungranted-worker-tmp"))
+                        .env("TEMP", source.join("ungranted-worker-temp"));
+                }
+                let output = tokio::time::timeout(Duration::from_secs(30), process.output())
+                    .await
+                    .expect("remote temporary-alias command exceeded its deadline")
+                    .expect("execute generated remote command");
+                assert!(
+                    output.status.success(),
+                    "{kind:?}/inherited={inherited}: {output:?}"
+                );
+                assert_eq!(
+                    std::fs::read(target.join(".rch-tmp/tmp-consumer")).unwrap(),
+                    b"tmp"
+                );
+                assert_eq!(
+                    std::fs::read(target.join(".rch-tmp/temp-consumer")).unwrap(),
+                    b"temp"
+                );
+                assert_eq!(std::fs::read_dir(&source).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn temporary_aliases_are_not_forced_without_an_external_go_grant() {
+        for kind in [
+            None,
+            Some(CompilationKind::CargoBuild),
+            Some(CompilationKind::GoTest),
+            Some(CompilationKind::GoVet),
+        ] {
+            let pipeline = TransferPipeline::new(
+                PathBuf::from("/source/project"),
+                "project".into(),
+                "source-hash".into(),
+                TransferConfig::default(),
+            )
+            .with_compilation_kind(kind)
+            .with_remote_cargo_target_dir_override("/managed/target");
+            let plan = pipeline
+                .build_remote_env_plan_with_environment("/source/project", std::iter::empty());
+            for key in ["TMP", "TEMP"] {
+                assert!(
+                    !plan.env_prefix.applied.iter().any(|applied| applied == key),
+                    "{kind:?}/{key}"
+                );
+            }
+        }
+        let ungranted_go = TransferPipeline::new(
+            PathBuf::from("/source/project"),
+            "project".into(),
+            "source-hash".into(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::GoBuild));
+        let plan = ungranted_go
+            .build_remote_env_plan_with_environment("/source/project", std::iter::empty());
+        assert!(
+            !plan
+                .env_prefix
+                .applied
+                .iter()
+                .any(|key| matches!(key.as_str(), "TMP" | "TEMP"))
+        );
     }
 
     #[cfg(unix)]
