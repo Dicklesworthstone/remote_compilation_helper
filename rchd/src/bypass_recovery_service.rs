@@ -1049,22 +1049,33 @@ async fn record_worker_bypass(
     // Store -> endpoint -> lifecycle is also the recovery publication order.
     let mut store = store.lock().await;
     let config = worker.config.read().await;
-    record_worker_bypass_locked(
-        &mut store,
-        worker,
-        &config,
-        class,
-        diagnostic.into(),
-        now_ms,
-    )
-    .await;
+    let provenance = worker.network_revision_guard();
+    let _publication = worker.lock_network_publication(&provenance).await.unwrap();
+    worker
+        .with_recovery_state_before(
+            Instant::now() + Duration::from_secs(30),
+            &provenance,
+            |lifecycle, _, _| {
+                record_worker_bypass_locked(
+                    &mut store,
+                    lifecycle,
+                    &config,
+                    class,
+                    diagnostic.into(),
+                    now_ms,
+                );
+            },
+        )
+        .await
+        .expect("test bypass publication must acquire its live destinations");
 }
 
 /// Caller retains the bypass store and current endpoint guards throughout the
-/// eligibility transition and its durable publication.
-async fn record_worker_bypass_locked(
+/// eligibility transition and its durable publication, with the lifecycle
+/// destination already locked so the commit cannot suspend partway through.
+fn record_worker_bypass_locked(
     store: &mut BypassRecordStore,
-    worker: &WorkerState,
+    lifecycle: &mut crate::workers::WorkerLifecycle,
     config: &WorkerConfig,
     class: BypassFailureClass,
     diagnostic: String,
@@ -1078,7 +1089,7 @@ async fn record_worker_bypass_locked(
     // Serialize the live transition and its record with recovery's final
     // comparison. A failure arriving while an SSH probe/canary is in flight
     // must invalidate that old recovery result before it can reopen admission.
-    if worker.lifecycle().await.admin == AdminIntent::Disabled {
+    if lifecycle.admin == AdminIntent::Disabled {
         return;
     }
     let class = if store
@@ -1089,7 +1100,7 @@ async fn record_worker_bypass_locked(
     } else {
         class
     };
-    worker.enter_bypass(class).await;
+    lifecycle.enter_bypass(class);
     // Remediation observability (bead 14.5): a worker just entered temporary
     // bypass — record the lifecycle transition and the ineligibility reason.
     remediation::record_bypass_transition(BypassTransition::Bypassed);
@@ -1766,43 +1777,28 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             // A transport outage has one cheap, bounded recovery owner in the
             // health monitor. Turning it into a second persisted recovery
             // workflow would restart SSH independently of that owner's clock.
-            let Some(admission) = worker.background_probe().await else {
-                continue;
-            };
-            // The detection and publication must inspect the same endpoint.
-            // In particular, a reload resets its circuit and marks it awaiting
-            // a first health probe; that is not evidence of a new incident.
+            // Busy local publications must not hold this shared store while
+            // waiting for a single worker. Retry detection on the next scan.
             let mut store = self.store.lock().await;
-            let config = worker.config.read().await;
-            let Some(_publication) = worker.lock_network_publication(&admission).await else {
-                continue;
-            };
-            let lifecycle = worker.lifecycle().await;
-            if lifecycle.admin != AdminIntent::Active
-                || lifecycle.eligibility != EligibilityState::Unreachable
-            {
-                continue;
-            }
-            let id = config.id.to_string();
-            if store.contains(&id) {
-                continue;
-            }
-            let circuit = worker.circuit_stats().await;
-            if circuit.state() == rch_common::CircuitState::Closed
-                && circuit.consecutive_failures() == 0
-                && circuit.consecutive_command_failures() == 0
-            {
-                continue;
-            }
-            let last_error = worker.last_error().await;
-            let class = last_error
-                .as_deref()
-                .and_then(classify_disable_reason)
-                .unwrap_or(BypassFailureClass::Ssh);
-            let diagnostic = last_error.unwrap_or_else(|| "worker unreachable".to_string());
-            info!(worker = %id, ?class, "quarantining unreachable worker into temporary bypass");
-            record_worker_bypass_locked(&mut store, &worker, &config, class, diagnostic, now_ms)
-                .await;
+            let _ = worker.try_with_unreachable_bypass(|config, lifecycle, last_error| {
+                let id = config.id.as_str();
+                if store.contains(id) {
+                    return;
+                }
+                let class = last_error
+                    .and_then(classify_disable_reason)
+                    .unwrap_or(BypassFailureClass::Ssh);
+                let diagnostic = last_error.unwrap_or("worker unreachable").to_owned();
+                info!(worker = %id, ?class, "quarantining unreachable worker into temporary bypass");
+                record_worker_bypass_locked(
+                    &mut store,
+                    lifecycle,
+                    config,
+                    class,
+                    diagnostic,
+                    now_ms,
+                );
+            });
         }
     }
 
@@ -5701,6 +5697,83 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             CanaryOutcome::Passed
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_confirmation_skips_busy_detection_and_retries_its_current_evidence() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let bound = Duration::from_secs(5);
+        let pool = pool_with(&["blocked", "healthy"]).await;
+        let store = store();
+        let blocked = pool.get(&WorkerId::new("blocked")).await.unwrap();
+        blocked
+            .set_status(rch_common::WorkerStatus::Unreachable)
+            .await;
+        blocked.open_circuit().await;
+        let healthy = pool.get(&WorkerId::new("healthy")).await.unwrap();
+        assert!(healthy.reserve_slots(1).await);
+        record_worker_bypass(&store, &healthy, BypassFailureClass::Ssh, "down", T0).await;
+        {
+            let records = store.lock().await;
+            let record = records.get("healthy").unwrap();
+            assert_eq!(record.auto_rejoin.required_consecutive_passes, 2);
+            assert!(record.auto_rejoin.canary_required);
+            assert!(!records.contains("blocked"));
+        }
+        let service = BypassRecoveryService::new(
+            pool,
+            store.clone(),
+            ConfirmationWhileBlockedProber {
+                started: Notify::new(),
+                canceled: Arc::new(AtomicBool::new(false)),
+                blocked_probes: AtomicUsize::new(0),
+                healthy_probes: AtomicUsize::new(0),
+                healthy_canaries: AtomicUsize::new(0),
+            },
+            BypassRecoveryConfig {
+                check_interval: Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        // Reload owns this same write lock while updating pooled connections
+        // and the worker's other state. This worker has no persisted bypass,
+        // so startup restoration completes before periodic detection sees it.
+        let held_config = blocked.config.write().await;
+        let task = service.clone().start();
+        tokio::time::timeout(bound, async {
+            while !healthy.lifecycle().await.is_schedulable() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("an unrelated reload must not block both healthy confirmations and the canary");
+        assert_eq!(service.prober.healthy_probes.load(Ordering::SeqCst), 2);
+        assert_eq!(service.prober.healthy_canaries.load(Ordering::SeqCst), 1);
+        assert_eq!(service.prober.blocked_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(healthy.used_slots(), 1);
+        assert!(!store.lock().await.contains("healthy"));
+        assert!(!store.lock().await.contains("blocked"));
+        assert_eq!(blocked.eligibility().await, EligibilityState::Unreachable);
+
+        drop(held_config);
+        tokio::time::timeout(bound, async {
+            while !store.lock().await.contains("blocked") {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the next periodic scan must quarantine the previously busy worker");
+        let record = store.lock().await.get("blocked").cloned().unwrap();
+        assert_eq!(record.failure_class, BypassFailureClass::Ssh);
+        assert_eq!(record.consecutive_failures, 1);
+        assert_eq!(record.consecutive_passes, 0);
+        assert_eq!(
+            blocked.eligibility().await,
+            EligibilityState::TemporaryBypass
+        );
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

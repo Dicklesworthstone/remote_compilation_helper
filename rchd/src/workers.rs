@@ -1287,6 +1287,35 @@ impl WorkerState {
         (self.background_network_allowed().await && permit.is_current()).then_some(permit)
     }
 
+    /// Admit one newly unreachable worker without queueing the fleet's recovery
+    /// scan behind its reload or another publication. The caller holds the
+    /// bypass store; every worker guard is acquired before the synchronous
+    /// callback can change either durable quarantine or live eligibility.
+    pub(crate) fn try_with_unreachable_bypass<T>(
+        &self,
+        publish: impl FnOnce(&WorkerConfig, &mut WorkerLifecycle, Option<&str>) -> T,
+    ) -> Option<T> {
+        let config = self.config.try_read().ok()?;
+        let provenance = self.network_revision_guard();
+        let _publication = self.network_transition.try_lock().ok()?;
+        let circuit = self.circuit.try_read().ok()?;
+        let last_error = self.last_error_msg.try_read().ok()?;
+        let mut lifecycle = self.lifecycle.try_write().ok()?;
+        let drain = self.drain_completion.try_read().ok()?;
+        if !self.connection_is_ready()
+            || self.is_endpoint_retired()
+            || lifecycle.admin != AdminIntent::Active
+            || lifecycle.eligibility != EligibilityState::Unreachable
+            || matches!(*drain, DrainCompletionAction::Disable { .. })
+            || (circuit.state() == CircuitState::Closed
+                && circuit.consecutive_failures() == 0
+                && circuit.consecutive_command_failures() == 0)
+        {
+            return None;
+        }
+        provenance.with_current(|| publish(&config, &mut lifecycle, last_error.as_deref()))
+    }
+
     /// Publish or clear the latest exact registry-storage result while the
     /// health monitor holds its endpoint and network-publication guards.
     /// Every non-pressure result, including an inconclusive/failed transport,
@@ -3238,7 +3267,9 @@ impl WorkerPool {
         let Some(admin_store) = &self.admin_disable_store else {
             return 0;
         };
-        let mut administrative = admin_store.lock().await;
+        let Ok(mut administrative) = admin_store.try_lock() else {
+            return 0;
+        };
         let due: Vec<_> = administrative
             .all()
             .into_iter()
@@ -3253,13 +3284,18 @@ impl WorkerPool {
                 continue;
             }
             // Match administrative handlers: store -> registry -> bypass ->
-            // endpoint -> network publication. Never wait on network I/O here.
-            let workers = self.workers.read().await;
+            // endpoint -> network publication. A busy worker or store is
+            // retried on the next scan without holding up unrelated recovery.
+            let Ok(workers) = self.workers.try_read() else {
+                continue;
+            };
             let Some(worker) = workers.get(&WorkerId::new(&record.worker_id)) else {
                 // Admission saved this quarantine while its endpoint was
                 // known. Retiring expired intent permits only exact-owned
                 // historical recovery; it does not recreate worker inventory.
-                let mut bypass = bypass_store.lock().await;
+                let Ok(mut bypass) = bypass_store.try_lock() else {
+                    continue;
+                };
                 let Some(recovery) = bypass.get(&record.worker_id).cloned() else {
                     tracing::warn!(worker = %record.worker_id, "timed disable remains active: absent worker has no durable recovery quarantine");
                     continue;
@@ -3275,15 +3311,27 @@ impl WorkerPool {
                 expired += 1;
                 continue;
             };
-            let mut bypass = bypass_store.lock().await;
-            let config = worker.config.read().await;
-            let _publication = worker.network_transition.lock().await;
+            let Ok(mut bypass) = bypass_store.try_lock() else {
+                continue;
+            };
+            let Ok(config) = worker.config.try_read() else {
+                continue;
+            };
+            let Ok(_publication) = worker.network_transition.try_lock() else {
+                continue;
+            };
             if worker.is_endpoint_retired() {
                 continue;
             }
-            let mut lifecycle = worker.lifecycle.write().await;
-            let mut drain = worker.drain_completion.write().await;
-            let mut reason = worker.disabled_reason.write().await;
+            let Ok(mut lifecycle) = worker.lifecycle.try_write() else {
+                continue;
+            };
+            let Ok(mut drain) = worker.drain_completion.try_write() else {
+                continue;
+            };
+            let Ok(mut reason) = worker.disabled_reason.try_write() else {
+                continue;
+            };
             if lifecycle.admin != AdminIntent::Disabled
                 && !(lifecycle.admin == AdminIntent::Draining
                     && matches!(*drain, DrainCompletionAction::Disable { .. }))
@@ -7516,6 +7564,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_disable_expiry_skips_busy_publication_without_retiring_intent() {
+        async fn expire_while_held<T>(
+            held: T,
+            pool: &WorkerPool,
+            bypass: &Mutex<rch_common::bypass_record::BypassRecordStore>,
+            deadline: u64,
+        ) -> usize {
+            let expiry = pool.expire_admin_disables(bypass, deadline);
+            tokio::pin!(expiry);
+            let expired =
+                std::future::poll_fn(|cx| match std::future::Future::poll(expiry.as_mut(), cx) {
+                    std::task::Poll::Ready(expired) => std::task::Poll::Ready(expired),
+                    std::task::Poll::Pending => {
+                        panic!("a busy expiry must not queue the recovery scan")
+                    }
+                })
+                .await;
+            drop(held);
+            expired
+        }
+
+        for busy in ["administrative", "config", "network", "reason"] {
+            let (directory, context, id) = timed_disable_fixture().await;
+            let worker = context.pool.get(&id).await.unwrap();
+            assert!(worker.reserve_slots(2).await);
+            let response =
+                handle_worker_disable(&context, &id, Some("maintenance".into()), false, Some(1))
+                    .await;
+            assert_eq!(response.status, "ok", "{response:?}");
+            let deadline = response.expires_unix_ms.unwrap();
+            let administrative = context.admin_disable_store.as_ref().unwrap();
+            let bypass = context.bypass_store.as_ref().unwrap();
+            let old_admin = administrative.lock().await.get(id.as_str()).cloned();
+            let old_bypass = bypass.lock().await.get(id.as_str()).cloned();
+            let old_lifecycle = worker.lifecycle().await;
+            let old_reason = worker.disabled_reason.read().await.clone();
+            let old_admin_bytes = std::fs::read(directory.path().join("admin.json")).unwrap();
+            let old_bypass_bytes = std::fs::read(directory.path().join("bypass.json")).unwrap();
+            let network = worker.network_revision_guard();
+
+            let expired = match busy {
+                "administrative" => {
+                    expire_while_held(administrative.lock().await, &context.pool, bypass, deadline)
+                        .await
+                }
+                "config" => {
+                    expire_while_held(worker.config.write().await, &context.pool, bypass, deadline)
+                        .await
+                }
+                "network" => {
+                    expire_while_held(
+                        worker.network_transition.lock().await,
+                        &context.pool,
+                        bypass,
+                        deadline,
+                    )
+                    .await
+                }
+                "reason" => {
+                    expire_while_held(
+                        worker.disabled_reason.write().await,
+                        &context.pool,
+                        bypass,
+                        deadline,
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(expired, 0, "{busy}");
+            assert_eq!(
+                administrative.lock().await.get(id.as_str()),
+                old_admin.as_ref(),
+                "{busy}"
+            );
+            assert_eq!(
+                bypass.lock().await.get(id.as_str()),
+                old_bypass.as_ref(),
+                "{busy}"
+            );
+            assert_eq!(worker.lifecycle().await, old_lifecycle, "{busy}");
+            assert_eq!(*worker.disabled_reason.read().await, old_reason, "{busy}");
+            assert_eq!(
+                std::fs::read(directory.path().join("admin.json")).unwrap(),
+                old_admin_bytes,
+                "{busy}"
+            );
+            assert_eq!(
+                std::fs::read(directory.path().join("bypass.json")).unwrap(),
+                old_bypass_bytes,
+                "{busy}"
+            );
+            assert!(
+                network.is_current(),
+                "a skipped expiry must not revoke admission: {busy}"
+            );
+            assert_eq!(worker.used_slots(), 2, "{busy}");
+
+            assert_eq!(
+                context.pool.expire_admin_disables(bypass, deadline).await,
+                1,
+                "{busy}"
+            );
+            assert!(
+                administrative.lock().await.get(id.as_str()).is_none(),
+                "{busy}"
+            );
+            assert!(bypass.lock().await.get(id.as_str()).is_some(), "{busy}");
+            assert_eq!(
+                worker.lifecycle().await.admin,
+                AdminIntent::Active,
+                "{busy}"
+            );
+            assert_eq!(
+                worker.eligibility().await,
+                EligibilityState::TemporaryBypass,
+                "{busy}"
+            );
+            assert_eq!(worker.used_slots(), 2, "{busy}");
+            assert!(
+                !worker.reserve_slots(1).await,
+                "expiry requires fresh recovery: {busy}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn timed_disable_expiry_racing_redisable_keeps_the_newest_permanent_intent() {
         let (_directory, context, id) = timed_disable_fixture().await;
         let response = handle_worker_disable(&context, &id, None, false, Some(1)).await;
@@ -7523,13 +7698,10 @@ mod tests {
         let worker = context.pool.get(&id).await.unwrap();
         let publication = worker.network_transition.lock().await;
         let bypass = context.bypass_store.as_ref().unwrap();
-        let expiry = context.pool.expire_admin_disables(bypass, deadline);
-        tokio::pin!(expiry);
-        std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(expiry.as_mut(), cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
+        assert_eq!(
+            context.pool.expire_admin_disables(bypass, deadline).await,
+            0
+        );
         let newer =
             handle_worker_disable(&context, &id, Some("remain offline".into()), false, None);
         tokio::pin!(newer);
@@ -7539,8 +7711,11 @@ mod tests {
         })
         .await;
         drop(publication);
-        assert_eq!(expiry.await, 1);
         assert_eq!(newer.await.status, "ok");
+        assert_eq!(
+            context.pool.expire_admin_disables(bypass, deadline).await,
+            0
+        );
         assert!(worker.is_disabled().await);
         let mut administrative = context.admin_disable_store.as_ref().unwrap().lock().await;
         let record = administrative.effective_disable(id.as_str()).unwrap();
