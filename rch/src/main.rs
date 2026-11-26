@@ -4928,7 +4928,7 @@ fn print_gc_root_discovery_warning(report: &serde_json::Value) {
 }
 
 /// POSIX roots share one traversal, temp scan and liveness snapshot. Windows
-/// retains its existing read-only per-root commands.
+/// keeps independent read-only root results and scans worker temp once.
 fn gc_scan_commands(
     bases: &[String],
     windows: bool,
@@ -4936,10 +4936,7 @@ fn gc_scan_commands(
     use rch_common::stale_target_reap as reap;
 
     if windows {
-        bases
-            .iter()
-            .map(|base| (base.clone(), reap::enumerate_windows_targets_command(base)))
-            .collect()
+        reap::enumerate_windows_target_scans(bases)
     } else {
         vec![(
             if bases.len() == 1 {
@@ -6183,10 +6180,13 @@ fn cache_status_worker_report(
 ) -> serde_json::Value {
     use rch_common::stale_target_reap as reap;
 
-    let scanned_roots: Vec<_> = scan
+    let reports: Vec<_> = scan
         .completed_roots
         .iter()
         .flat_map(|(base, stdout)| gc_scan_root_reports(base, stdout))
+        .collect();
+    let scanned_roots: Vec<_> = reports
+        .iter()
         .map(|seen| {
             serde_json::json!({
                 "requested": seen.requested, "resolved": seen.resolved,
@@ -6194,43 +6194,35 @@ fn cache_status_worker_report(
             })
         })
         .collect();
+    // Attribute physical paths across all completed roots. A later configured
+    // root may own an entry already discovered via an overlapping temp tree.
+    let configured = reports.iter().filter_map(|report| {
+        Some((report.resolved.as_deref()?, report.requested.as_deref()?))
+    });
+    let temp = reports.iter().filter_map(|report| {
+        let path = report.temp_base.as_deref()?;
+        Some((path, path))
+    });
+    let attribution: Vec<_> = configured.chain(temp).collect();
     let mut seen = std::collections::HashSet::new();
     let entries: Vec<_> = scan
         .completed_roots
         .iter()
         .flat_map(|(base, stdout)| {
-            let reports = gc_scan_root_reports(base, stdout);
             reap::parse_target_entries(stdout)
                 .into_iter()
-                .map(move |entry| {
-                    let root = reports
-                        .iter()
-                        // max_by_key keeps its last tie; reverse so aliases
-                        // retain the first requested label, as gc does.
-                        .rev()
-                        .filter_map(|report| {
-                            let resolved = report.resolved.as_deref()?;
-                            rch_common::gc_roots::path_is_under(&entry.path, resolved)
-                                .then_some((resolved.len(), report.requested.as_deref()?))
-                        })
-                        .max_by_key(|(length, _)| *length)
-                        .map(|(_, requested)| requested.to_string())
-                        .or_else(|| {
-                            if windows {
-                                return None;
-                            }
-                            reports.iter().find_map(|report| {
-                                let temp = report.temp_base.as_deref()?;
-                                rch_common::gc_roots::path_is_under(&entry.path, temp)
-                                    .then(|| temp.to_string())
-                            })
-                        })
-                        .unwrap_or_else(|| base.clone());
-                    (root, entry)
-                })
+                .map(move |entry| (base, entry))
         })
         .filter(|(_, entry)| seen.insert(entry.path.clone()))
-        .map(|(base, entry)| {
+        .map(|(fallback, entry)| {
+            // max_by_key keeps the last tie. Prefer the first configured
+            // label over an alias or an equally specific temp path.
+            let base = attribution
+                .iter()
+                .rev()
+                .filter(|(path, _)| rch_common::gc_roots::path_is_under(&entry.path, path))
+                .max_by_key(|(path, _)| path.len())
+                .map_or(fallback.as_str(), |(_, label)| *label);
             // Share the GC verdict, including Windows' fail-closed ownership
             // rule. A partial inventory must never relax deletion eligibility.
             let verdict = if windows {
@@ -8008,13 +8000,15 @@ mod tests {
         );
         let evidence = "RCH_GC_ROOT resolved C:/rch\n\
                         RCH_GC_ROOT tmp C:/Users/builder/AppData/Local/Temp\n\
-                        RCH_TARGET_ENTRY 1 1024 free free C:/Users/builder/AppData/Local/Temp/rch-cargo-cache-win\n";
+                        RCH_TARGET_ENTRY 1 1024 free free C:/Users/builder/AppData/Local/Temp/rch-cargo-cache-win\n\
+                        RCH_TARGET_ENTRY 1 2048 unknown unknown C:/Users/builder/AppData/Local/Temp/nested/.rch-target-worker-job-2\n";
         let scan = CacheStatusScan {
             completed_roots: vec![
                 ("C:/rch".into(), evidence.into()),
                 (
                     "D:/rch-cache".into(),
-                    evidence.replace("resolved C:/rch", "resolved D:/rch-cache"),
+                    "RCH_GC_ROOT resolved C:/Users/builder/AppData/Local/Temp/nested\n\
+                     RCH_TARGET_ENTRY 1 2048 unknown unknown C:/Users/builder/AppData/Local/Temp/nested/.rch-target-worker-job-2\n".into(),
                 ),
             ],
             failed_root: Some("E:/rch-cache".into()),
@@ -8041,12 +8035,16 @@ mod tests {
         assert_eq!(report["inventory_only"], true);
         assert_eq!(
             report["entries"].as_array().unwrap().len(),
-            1,
-            "temp cache is deduplicated across roots"
+            2,
+            "the nested target is deduplicated across roots"
         );
-        assert_eq!(report["total_kb"], 1024);
+        assert_eq!(report["total_kb"], 3072);
+        assert_eq!(report["entries"][1]["enumeration_root"], "D:/rch-cache");
         assert_eq!(report["reapable_kb"], 0);
-        assert_eq!(report["entries"][0]["enumeration_root"], "C:/rch");
+        assert_eq!(
+            report["entries"][0]["enumeration_root"],
+            "C:/Users/builder/AppData/Local/Temp"
+        );
         assert_eq!(report["entries"][0]["reapable"], false);
         assert!(
             report["entries"][0]["kept_because"]
@@ -8067,7 +8065,7 @@ mod tests {
         assert_eq!(value["command"], "cache status");
         assert_eq!(value["error"]["code"], "RCH-E104");
         assert_eq!(value["data"]["workers"][0]["ok"], true);
-        assert_eq!(value["data"]["workers"][1]["total_kb"], 1024);
+        assert_eq!(value["data"]["workers"][1]["total_kb"], 3072);
     }
 
     // ── `rch gc` surface (scope-gap fix) ───────────────────────────────────

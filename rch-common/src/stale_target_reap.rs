@@ -1691,6 +1691,21 @@ fn enumerate_targets_script(bases: &[&str]) -> String {
 /// Every discovery/metadata traversal is checked; partial scans fail instead
 /// of being reported as an empty or completely measured worker.
 pub fn enumerate_windows_targets_command(base: &str) -> Result<String, String> {
+    enumerate_windows_root(base, true)
+}
+
+/// Each command independently inventories one configured root. Only the first
+/// includes the worker's shared temp tree, even when that configured root is
+/// missing. Keeping root-sized commands preserves earlier results on timeout.
+pub fn enumerate_windows_target_scans(bases: &[String]) -> Vec<(String, Result<String, String>)> {
+    bases
+        .iter()
+        .enumerate()
+        .map(|(index, base)| (base.clone(), enumerate_windows_root(base, index == 0)))
+        .collect()
+}
+
+fn enumerate_windows_root(base: &str, include_worker_temp: bool) -> Result<String, String> {
     if !crate::gc_roots::is_safe_windows_gc_base(base) {
         return Err("unsafe Windows inventory root".to_string());
     }
@@ -1719,13 +1734,16 @@ if [ -d "$base" ]; then
 else
     printf 'RCH_GC_ROOT_SKIPPED %s missing\n' "$base"
 fi
-{temp_base}
-__tmpbase="${{{temp_var}}}"
-__tmpscan=$(cd "$__tmpbase" && pwd -P && printf '.') || exit 1
-__tmpscan=${{__tmpscan%.}}
-__tmpscan=${{__tmpscan%"$__lf"}}
-case "$__tmpscan" in ''|/|[a-zA-Z]:/|/[a-zA-Z]|/cygdrive/[a-zA-Z]|*"$__lf"*|*"$__cr"*) exit 1;; esac
-printf 'RCH_GC_ROOT tmp %s\n' "$__tmpscan"
+__tmpscan=""
+if [ {scan_temp} -eq 1 ]; then
+    {temp_base}
+    __tmpbase="${{{temp_var}}}"
+    __tmpscan=$(cd "$__tmpbase" && pwd -P && printf '.') || exit 1
+    __tmpscan=${{__tmpscan%.}}
+    __tmpscan=${{__tmpscan%"$__lf"}}
+    case "$__tmpscan" in ''|/|[a-zA-Z]:/|/[a-zA-Z]|/cygdrive/[a-zA-Z]|*"$__lf"*|*"$__cr"*) exit 1;; esac
+    printf 'RCH_GC_ROOT tmp %s\n' "$__tmpscan"
+fi
 printf 'RCH_GC_GATES handles=0 handles_source=unsupported procs=0\n'
 __all=$(mktemp) || exit 1
 __unique=$(mktemp) || {{ rm -f "$__all"; exit 1; }}
@@ -1738,7 +1756,7 @@ if [ -n "$__rt" ]; then
         exit 1
     fi
 fi
-if [ "$__tmpscan" != "$__rt" ]; then
+if [ -n "$__tmpscan" ] && [ "$__tmpscan" != "$__rt" ]; then
     if ! find "$__tmpscan" -maxdepth {TMPBASE_MAXDEPTH} -type d \( {names} \) -prune -exec sh -c "$__discover" RCH_WINDOWS_INVENTORY_INVALID_PATH {{}} + >> "$__all"; then
         printf 'RCH_WINDOWS_INVENTORY_INCOMPLETE %s\n' "$__tmpscan" >&2
         exit 1
@@ -1760,6 +1778,7 @@ while IFS= read -r d; do
     printf 'RCH_TARGET_ENTRY %s %s unknown unknown %s\n' "$1" "$2" "$d"
 done < "$__unique"
 "#,
+        scan_temp = u8::from(include_worker_temp),
         temp_base = crate::gc_roots::remote_cargo_home_base_prelude(),
         temp_var = crate::gc_roots::RCH_CARGO_HOME_BASE_VAR,
         discovery = DISCOVERY_PATH_RECORDS,
@@ -3004,6 +3023,45 @@ mod tests {
             std::fs::canonicalize(cache).unwrap().to_str().unwrap()
         );
         assert!(!evaluate_windows_gc_candidate(&entries[0]).is_collect());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_inventory_walks_shared_temp_only_once_across_configured_roots() {
+        let fixture = tempfile::tempdir().unwrap();
+        let temp = fixture.path().join("worker-temp");
+        std::fs::create_dir_all(temp.join("rch-cargo-cache-worker")).unwrap();
+        let bases = vec!["C:/missing".into(), "D:/rch".into(), "E:/cache".into()];
+        for base in &bases[1..] {
+            std::fs::create_dir_all(fixture.path().join(base).join(".rch-target-worker-job-9"))
+                .unwrap();
+        }
+        for (index, (base, command)) in enumerate_windows_target_scans(&bases).into_iter().enumerate()
+        {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command.unwrap()])
+                .current_dir(fixture.path())
+                .env("TMPDIR", &temp)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{base}: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let entries = parse_target_entries(&stdout);
+            assert_eq!(entries.len(), 1, "{base}: {stdout}");
+            if index == 0 {
+                assert!(stdout.contains("RCH_GC_ROOT_SKIPPED C:/missing missing"));
+                assert!(stdout.contains("RCH_GC_ROOT tmp "));
+                assert!(entries[0].path.ends_with("/rch-cargo-cache-worker"));
+            } else {
+                assert!(!stdout.contains("RCH_GC_ROOT tmp "));
+                assert!(
+                    entries[0]
+                        .path
+                        .ends_with(&format!("/{base}/.rch-target-worker-job-9"))
+                );
+            }
+            assert!(!evaluate_windows_gc_candidate(&entries[0]).is_collect());
+        }
     }
 
     #[cfg(target_os = "linux")]
