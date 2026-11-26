@@ -2454,8 +2454,16 @@ refs=$(rch_gc_mktemp) && args=$(rch_gc_mktemp) || exit 1;
 trap 'rm -f -- "$refs" "$args"' EXIT;
 # A nonempty prefix is not a complete inventory. Avoid pipelines that mask
 # producer errors and refuse retirement if either capture could be partial.
-if ! __gc_capture "$refs" find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 -printf '%l\n' \
-  || [ ! -s "$refs" ]; then printf 'RCH_GC_CLAIMS incomplete-handles\n'; exit 0; fi;
+if rch_wkr_locate && __proc_version=$("$RCH_WKR" control-capture proc-references-probe 8>&- 2>/dev/null) \
+  && [ "$__proc_version" = 'rch-wkr proc-references v1' ]; then
+  __gc_capture "$refs" "$RCH_WKR" control-capture proc-references && __refs_ok=1 || __refs_ok=0;
+else
+  # Older workers retain the checked producer. Never downgrade a failed native
+  # census or interpret a partial lsof listing as absence of other users' fds.
+  __gc_capture "$refs" find /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd -maxdepth 1 -printf '%l\n' \
+    && __refs_ok=1 || __refs_ok=0;
+fi;
+if [ "$__refs_ok" != 1 ] || [ ! -s "$refs" ]; then printf 'RCH_GC_CLAIMS incomplete-handles\n'; exit 0; fi;
 if __gc_capture "$args" ps -ww -eo pid=,args= && [ -s "$args" ]; then :;
 else printf 'RCH_GC_CLAIMS incomplete-processes\n'; exit 0; fi;
 printf 'RCH_GC_CLAIMS ok\n';
@@ -5890,6 +5898,81 @@ flock -n "$__gc_source_registry/metadata.lock" true;
                 "metadata lock was not released after deletion"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abandoned_claims_use_legacy_capture_only_without_native_census_support() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("claims");
+        std::fs::create_dir(&registry).unwrap();
+        let worker = tmp.path().join("rch-wkr");
+        let calls = tmp.path().join("calls");
+        // Model the snapshot producer and checked writer together. A failed
+        // writer deliberately leaves a nonempty prefix at its destination.
+        std::fs::write(
+            &worker,
+            r#"#!/bin/sh
+case "$2" in
+proc-references-probe)
+    [ "$RCH_TEST_CAPTURE_MODE" != legacy ] || exit 125
+    printf 'rch-wkr proc-references v1\n' ;;
+snapshot-probe) printf 'rch-wkr control-capture snapshot v1\n' ;;
+snapshot)
+    case "$5" in
+    "$0") printf 'native\n' >> "$RCH_TEST_CAPTURE_LOG"
+          printf '/unrelated\n' > "$4"; exit 125 ;;
+    find) printf 'legacy\n' >> "$RCH_TEST_CAPTURE_LOG"
+          printf '/unrelated\n' > "$4" ;;
+    ps)   printf 'args\n' >> "$RCH_TEST_CAPTURE_LOG"
+          printf '123 sleep\n' > "$4" ;;
+    *) exit 125 ;;
+    esac ;;
+*) exit 125 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = tmp.path().join("record");
+        std::fs::write(&record, b"/fixture-owned-target\n").unwrap();
+        let digest = Command::new("sha256sum").arg(&record).output().unwrap();
+        assert!(digest.status.success());
+        let digest = std::str::from_utf8(&digest.stdout).unwrap().split_whitespace().next().unwrap();
+        let name = format!("fc-00000000-0000-4000-8000-000000000001.{digest}.claim");
+        let claim = registry.join(&name);
+        std::fs::rename(record, &claim).unwrap();
+        let command = abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0);
+        let run = |mode: &str| {
+            std::fs::write(&calls, "").unwrap();
+            let output = Command::new("sh")
+                .args(["-c", &command])
+                .env("RCH_WKR_BIN", &worker)
+                .env("RCH_GC_SCRATCH", tmp.path())
+                .env("TMPDIR", tmp.path())
+                .env_remove("RCH_RECOVERY_GC_CLAIM")
+                .env("RCH_TEST_CAPTURE_MODE", mode)
+                .env("RCH_TEST_CAPTURE_LOG", &calls)
+                .output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            parse_gc_claim_reports(&String::from_utf8(output.stdout).unwrap())
+        };
+
+        let (status, reports) = run("native-failure");
+        assert_eq!(status.as_deref(), Some("incomplete-handles"));
+        assert!(reports.is_empty());
+        assert!(claim.is_file());
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "native\n");
+
+        let (status, reports) = run("legacy");
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].verdict, "released");
+        assert!(registry.join("released").join(name).is_file());
+        assert_eq!(std::fs::read_to_string(calls).unwrap(), "legacy\nargs\n");
     }
 
     #[cfg(target_os = "linux")]

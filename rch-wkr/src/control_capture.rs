@@ -10,6 +10,9 @@
 //! deadline. A separately owned writer group and private lifetime pipe keep a
 //! blocked write or abruptly killed observer from stranding inventory commands.
 
+#[cfg(target_os = "linux")]
+mod proc_references;
+
 use std::ffi::OsString;
 
 const REFUSED: i32 = 125;
@@ -32,8 +35,18 @@ pub fn main(arguments: &[OsString]) -> i32 {
             REFUSED
         };
     }
+    #[cfg(target_os = "linux")]
+    if arguments.len() == 1 && arguments[0] == "proc-references-probe" {
+        return if std::io::stdout().lock().write_all(b"rch-wkr proc-references v1\n").is_ok() {
+            0
+        } else {
+            REFUSED
+        };
+    }
     #[cfg(unix)]
     match match arguments.first().and_then(|value| value.to_str()) {
+        #[cfg(target_os = "linux")]
+        Some("proc-references") if arguments.len() == 1 => proc_references::capture(),
         Some("snapshot") => snapshot(&arguments[1..]),
         Some("snapshot-write") => snapshot_writer(&arguments[1..]),
         _ => capture(arguments),
