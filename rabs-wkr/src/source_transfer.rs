@@ -223,8 +223,8 @@ struct DependencyOutputInput {
 
 /// Holds the complete generated-input inventory across compiler execution and
 /// capture. Files are rehashed against the source seal before this guard is
-/// returned; held descriptors and exact directory membership fence later
-/// replacement, mutation and newly introduced files.
+/// returned; a retained root, per-file generation witnesses and exact directory
+/// membership fence later replacement, mutation and newly introduced files.
 #[derive(Debug)]
 pub(crate) struct DependencyGeneratedInputs {
     backing: std::path::PathBuf,
@@ -243,7 +243,7 @@ struct PrivateDependencyInputs {
     directory: std::fs::File,
     directory_metadata: std::fs::Metadata,
     directories: std::collections::BTreeMap<String, std::fs::Metadata>,
-    files: std::collections::BTreeMap<String, (std::fs::File, std::fs::Metadata)>,
+    files: std::collections::BTreeMap<String, std::fs::Metadata>,
 }
 
 fn dependency_same_directory(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
@@ -390,7 +390,8 @@ impl PrivateDependencyInputs {
             if std::fs::canonicalize(&path)? != path {
                 return Err(refuse());
             }
-            let mut file = rabs_sandbox::regular_input::open(&path)?;
+            let mut file =
+                rabs_sandbox::source_transfer::open_staging_file(&guard.directory, name)?;
             let metadata = file.metadata()?;
             if metadata.len() != expected.len
                 || !dependency_same_file(&metadata, &std::fs::symlink_metadata(&path)?)
@@ -420,7 +421,12 @@ impl PrivateDependencyInputs {
             {
                 return Err(refuse());
             }
-            guard.files.insert(name.to_owned(), (file, metadata));
+            // The private directory retains the tree. As with reusable source
+            // projections, keep the generation witnessed by the hash read,
+            // then reacquire one member at a time during verification. Keeping
+            // every file open would exhaust the worker's descriptor limit for
+            // valid source manifests long before their 4,096-file bound.
+            guard.files.insert(name.to_owned(), metadata);
         }
         guard.verify()?;
         projection_checkpoint(stopped)?;
@@ -469,14 +475,34 @@ impl PrivateDependencyInputs {
         if found.len() != self.files.len() + self.directories.len() {
             return Err(refuse());
         }
-        for (name, (file, metadata)) in &self.files {
+        for (name, metadata) in &self.files {
             let path = self.backing.join(name);
+            let file = rabs_sandbox::source_transfer::open_staging_file(&self.directory, name)?;
             if std::fs::canonicalize(&path)? != path
                 || !dependency_same_file(metadata, &file.metadata()?)
                 || !dependency_same_file(metadata, &std::fs::symlink_metadata(path)?)
             {
                 return Err(refuse());
             }
+        }
+        // Reacquisition must not accept a mixed generation if a directory was
+        // replaced or its membership changed during the complete file pass.
+        for (name, metadata) in self.directories.iter().rev() {
+            let path = self.backing.join(name);
+            if std::fs::canonicalize(&path)? != path
+                || !dependency_same_directory(metadata, &std::fs::symlink_metadata(path)?)
+            {
+                return Err(refuse());
+            }
+        }
+        if std::fs::canonicalize(&self.backing)? != self.backing
+            || !dependency_same_directory(&self.directory_metadata, &self.directory.metadata()?)
+            || !dependency_same_directory(
+                &self.directory_metadata,
+                &std::fs::symlink_metadata(&self.backing)?,
+            )
+        {
+            return Err(refuse());
         }
         Ok(())
     }
@@ -3473,6 +3499,82 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_input_trees_prepare_under_a_low_descriptor_limit() {
+        const CHILD: &str = "RABS_TEST_PRIVATE_INPUT_DESCRIPTOR_LIMIT";
+        const FILES_PER_TREE: usize = 192;
+        const CONTENT: &[u8] = b"independent sealed input\0\xff";
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "source_transfer::tests::private_input_trees_prepare_under_a_low_descriptor_limit",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success()
+                    && String::from_utf8_lossy(&child.stdout)
+                        .contains("prepared both private input trees under the descriptor limit"),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        // Isolate the process-wide limit from every other harness test. Each
+        // actual source tree contains three times as many files as this limit.
+        let resource = rustix::process::Resource::Nofile;
+        let mut limit = rustix::process::getrlimit(resource);
+        limit.current = Some(limit.current.unwrap_or(64).min(64));
+        rustix::process::setrlimit(resource, limit).unwrap();
+        let paths = ["package/member/src", "generated/nested"]
+            .into_iter()
+            .flat_map(|prefix| {
+                (0..FILES_PER_TREE).map(move |index| format!("{prefix}/input-{index:04}"))
+            })
+            .collect::<Vec<_>>();
+        let files = paths
+            .iter()
+            .map(|path| (path.as_str(), CONTENT, false))
+            .collect::<Vec<_>>();
+        let (owner, context, mut spec, _runtime) =
+            workspace_dependency_fixture(&files, vec!["nested".into(), "nested/empty".into()]);
+        assert!(!owner.allow_cached_files);
+        assert!(owner.cache_protection.is_none());
+        let source = owner
+            .prepare_dependency_source(91, &context, &mut spec)
+            .unwrap()
+            .unwrap();
+        let generated = owner
+            .prepare_dependency_generated(91, &context, &mut spec)
+            .unwrap()
+            .unwrap();
+        // Retain both execution guards and the independently checked original
+        // upload at once, as execution does, without an FD per input file.
+        let original = retained_transfer_guard(&owner);
+        owner.protect_dependency(91, &context, &spec).unwrap();
+        for (guard, prefix) in [(&source, "member/src"), (&generated, "nested")] {
+            assert!(matches!(&guard.proof, DependencyInputProof::Private(_)));
+            assert_eq!(guard.file_count(), FILES_PER_TREE);
+            guard.verify().unwrap();
+            for index in 0..FILES_PER_TREE {
+                assert_eq!(
+                    std::fs::read(guard.backing.join(format!("{prefix}/input-{index:04}")))
+                        .unwrap(),
+                    CONTENT
+                );
+            }
+        }
+        assert!(source.backing.join("shared/empty").is_dir());
+        assert!(generated.backing.join("nested/empty").is_dir());
+        original.verify().unwrap();
+        println!("prepared both private input trees under the descriptor limit");
+    }
+
     #[test]
     fn generated_directory_only_and_mixed_trees_preserve_exact_private_topology() {
         use rabs_sandbox::dependency_context::DependencyExecutionMode;
@@ -3630,7 +3732,9 @@ mod tests {
         ];
         for mutation in [
             "bytes",
+            "restored_metadata",
             "file",
+            "symlink",
             "hardlink",
             "mode",
             "extra",
@@ -3650,9 +3754,27 @@ mod tests {
                         .unwrap();
                     std::fs::write(&input, b"different generated data").unwrap();
                 }
+                "restored_metadata" => {
+                    let before = std::fs::metadata(&input).unwrap();
+                    std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                    std::fs::write(&input, vec![b'x'; files[1].1.len()]).unwrap();
+                    std::fs::set_permissions(&input, before.permissions()).unwrap();
+                    std::fs::File::open(&input)
+                        .unwrap()
+                        .set_times(
+                            std::fs::FileTimes::new().set_modified(before.modified().unwrap()),
+                        )
+                        .unwrap();
+                }
                 "file" => {
                     std::fs::rename(&input, runtime.path().join("saved-input")).unwrap();
                     std::fs::write(&input, files[1].1).unwrap();
+                }
+                "symlink" => {
+                    let saved = runtime.path().join("saved-input");
+                    std::fs::rename(&input, &saved).unwrap();
+                    symlink(saved, &input).unwrap();
                 }
                 "hardlink" => std::fs::hard_link(&input, runtime.path().join("alias")).unwrap(),
                 "mode" => std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o400))

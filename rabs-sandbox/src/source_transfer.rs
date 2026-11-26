@@ -407,6 +407,57 @@ pub fn create_staging_file(
     }
 }
 
+/// Reopen one regular input beneath its retained private staging directory.
+/// The path is validated here, and each component is acquired without following
+/// symlinks or waiting for a FIFO writer. Only a bounded number of descriptors
+/// is held, independently of the tree's file count. Callers must still compare
+/// the returned file's generation and recheck the root's public-name identity.
+pub fn open_staging_file(root: &File, relative: &str) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        if relative.is_empty()
+            || relative.len() > 1024
+            || relative.contains(['\\', ':'])
+            || relative.chars().any(char::is_control)
+            || relative.split('/').count() > 32
+            || relative
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        {
+            return Err(invalid("unsafe staging file path"));
+        }
+        check_staging_directory(root, root)?;
+        let mut directory = root.try_clone()?;
+        let mut parent = String::new();
+        let mut parts = relative.split('/').peekable();
+        while let Some(part) = parts.next() {
+            let is_directory = parts.peek().is_some();
+            let member = open_staging_member(&directory, OsStr::new(part), is_directory, false)?;
+            if !is_directory {
+                let metadata = member.metadata()?;
+                ordinary_file(&metadata, metadata.len())?;
+                verify_staging_parent(root, &parent, &directory)?;
+                return Ok(member);
+            }
+            check_staging_directory(root, &member)?;
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(part);
+            directory = member;
+        }
+        Err(invalid("staging file path has no filename"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, relative);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "staging requires Unix",
+        ))
+    }
+}
+
 #[cfg(unix)]
 fn check_staging_directory(root: &File, directory: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -434,6 +485,7 @@ fn open_staging_member(
     let flags = OFlags::CLOEXEC
         | OFlags::NOFOLLOW
         | OFlags::NONBLOCK
+        | OFlags::NOCTTY
         | if is_directory {
             OFlags::RDONLY | OFlags::DIRECTORY
         } else if create {
@@ -1675,6 +1727,75 @@ mod tests {
         for path in ["../escape", "/absolute", "bad//path"] {
             assert!(create_staging_file(&held, path, &|| false).is_err());
         }
+    }
+
+    #[test]
+    fn staging_input_reopen_keeps_relative_paths_and_exact_regular_files() {
+        use std::os::unix::fs::symlink;
+        let owner = private();
+        let held = File::open(owner.path()).unwrap();
+        let mut written = create_staging_file(&held, "nested/deep/input", &|| false).unwrap();
+        written.write_all(b"retained\0input\xff").unwrap();
+        drop(written);
+        let mut actual = Vec::new();
+        open_staging_file(&held, "nested/deep/input")
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, b"retained\0input\xff");
+        for invalid in [
+            "",
+            "../escape",
+            "/absolute",
+            "bad//path",
+            "nested/../input",
+            "bad\0name",
+        ] {
+            assert!(open_staging_file(&held, invalid).is_err());
+        }
+        symlink("nested", owner.path().join("linked-parent")).unwrap();
+        symlink("input", owner.path().join("nested/deep/linked-input")).unwrap();
+        for invalid in [
+            "nested",
+            "linked-parent/deep/input",
+            "nested/deep/linked-input",
+        ] {
+            assert!(open_staging_file(&held, invalid).is_err());
+        }
+        std::fs::hard_link(
+            owner.path().join("nested/deep/input"),
+            owner.path().join("aliased-input"),
+        )
+        .unwrap();
+        assert!(open_staging_file(&held, "nested/deep/input").is_err());
+        assert!(open_staging_file(&held, "aliased-input").is_err());
+    }
+
+    #[test]
+    fn staging_input_reopen_refuses_fifo_without_waiting_for_a_writer() {
+        use rustix::fs::{Mode, OFlags};
+        use std::time::Duration;
+        let owner = private();
+        let held = File::open(owner.path()).unwrap();
+        rustix::fs::mkfifoat(&held, "fifo", Mode::RUSR | Mode::WUSR).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(open_staging_file(&held, "fifo").is_err())
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(1));
+        let rescue = result.is_err().then(|| {
+            rustix::fs::open(
+                owner.path().join("fifo"),
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .unwrap()
+        });
+        reader.join().unwrap();
+        drop(rescue);
+        assert_eq!(result, Ok(true), "staging input waited for a FIFO writer");
     }
 
     fn private() -> tempfile::TempDir {
