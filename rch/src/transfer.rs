@@ -16118,6 +16118,10 @@ Number of files transferred: 42
             .env("HOME", directory)
             .env("LC_ALL", "C")
             .env("NO_COLOR", "1")
+            // The generated supervisor locates rch-wkr itself. Without this it
+            // falls back to the host's installed worker, which on a fleet host
+            // is the previous release (no disk-supervise / scoped-launch).
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .stdin(Stdio::null())
             .kill_on_drop(true);
         let output = tokio::time::timeout(std::time::Duration::from_secs(6), child.output())
@@ -20471,6 +20475,7 @@ Number of files transferred: 42
                         .env_clear()
                         .env("PATH", "/usr/bin:/bin")
                         .env("HOME", &home)
+                        .env("RCH_WKR_BIN", native_control_worker_for_test())
                         .output()
                         .unwrap();
                     assert_eq!(
@@ -20586,6 +20591,7 @@ cargo --version\n\"$RCH_TEST_TOOLCHAIN_CARGO\" --version\ncargo test --locked\n"
                 .env("RCH_REQUIRE_REMOTE", "1")
                 .env("RCH_CARGO_WRAPPER_BYPASS", "1")
                 .env("RCH_CARGO_WRAPPER_ORIGIN", "caller")
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
                 .output()
                 .unwrap();
             assert_eq!(
