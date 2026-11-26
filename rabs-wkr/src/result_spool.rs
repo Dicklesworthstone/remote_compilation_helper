@@ -150,6 +150,16 @@ fn open_payload(path: &Path, len: u64) -> io::Result<File> {
     Ok(file)
 }
 
+// The per-item readers are length-limited, so their EOF checks cannot see a
+// suffix appended after the packed file's initial metadata check.
+fn verify_packed_eof(mut file: &File) -> io::Result<()> {
+    match file.read_exact(&mut [0; 1]) {
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
+        Err(error) => Err(error),
+        Ok(()) => Err(invalid("trailing retained payload bytes")),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Item {
     name: String,
@@ -533,6 +543,9 @@ pub fn load(
             Some(bundle)
         }
     };
+    if let Some(file) = &packed {
+        verify_packed_eof(file)?;
+    }
     Ok(RecoveredResult {
         recipient,
         completion: ExecutionCompletion {
@@ -715,6 +728,25 @@ mod tests {
         assert!(artifacts.file_identity("nested/a").unwrap().2);
         assert!(load(root.path(), 2, &fingerprint, &digest).is_err());
         assert!(load(root.path(), 1, &"0".repeat(64), &digest).is_err());
+    }
+
+    #[test]
+    fn packed_payload_growth_during_bounded_reads_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(PAYLOAD);
+        let mut writer = create_file(&path).unwrap();
+        writer.write_all(b"ab").unwrap();
+        let reader = open_payload(&path, 2).unwrap();
+        let mut item = [0; 1];
+        (&reader).take(1).read_exact(&mut item).unwrap();
+        assert_eq!(item, *b"a");
+        writer.write_all(b"unexpected suffix").unwrap();
+        (&reader).take(1).read_exact(&mut item).unwrap();
+        assert_eq!(item, *b"b");
+        assert_eq!(
+            verify_packed_eof(&reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
