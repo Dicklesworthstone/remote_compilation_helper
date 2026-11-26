@@ -54,7 +54,7 @@ impl RecoveryOwnership {
         expected: &DurableJobLease,
     ) -> anyhow::Result<PathBuf> {
         self.custody
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state != CUSTODY_RELEASE_RESERVED).then_some(CUSTODY_PROTECTED)
             })
             .map_err(|_| {
