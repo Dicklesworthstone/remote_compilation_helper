@@ -22,34 +22,37 @@ pub const MAX_RETAINED_STREAM_BYTES: u64 = 1024 * 1024 * 1024;
 #[derive(Debug)]
 pub struct CapturedStream {
     file: File,
+    bytes: CapturedRange,
+}
+
+/// One immutable extent in a private snapshot. Artifact bundles append multiple
+/// extents to a single anonymous file, then expose only per-extent reads.
+#[derive(Debug)]
+pub(crate) struct CapturedRange {
+    start: u64,
     len: u64,
     sha256: String,
 }
 
-impl CapturedStream {
-    /// Copy exactly `len` bytes and refuse early EOF, surplus bytes or an
-    /// excessive claim. Memory use is one fixed-size copy buffer. Call from
-    /// the blocking execution owner, never the async control reactor.
-    pub fn from_reader(reader: impl Read, len: u64) -> io::Result<Self> {
-        Self::from_reader_in(reader, len, &std::env::temp_dir())
+pub(crate) fn snapshot_file(directory: &Path) -> io::Result<File> {
+    let file = tempfile::tempfile_in(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    Ok(file)
+}
 
-    /// Retain a private anonymous copy on the owner's selected storage. The
-    /// directory must already exist; a failed allocation never falls back to
-    /// ambient temporary storage. Closing the snapshot releases its bytes.
-    pub fn from_reader_in(mut reader: impl Read, len: u64, directory: &Path) -> io::Result<Self> {
+impl CapturedRange {
+    pub(crate) fn append(file: &mut File, mut reader: impl Read, len: u64) -> io::Result<Self> {
         if len > MAX_RETAINED_STREAM_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "output retention limit exceeded",
             ));
         }
-        let mut file = tempfile::tempfile_in(directory)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        let start = file.seek(SeekFrom::End(0))?;
         let mut hasher = Sha256::new();
         let mut remaining = len;
         let mut buffer = [0_u8; MAX_OUTPUT_CHUNK_BYTES];
@@ -79,7 +82,57 @@ impl CapturedStream {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        Ok(Self { file, len, sha256 })
+        Ok(Self { start, len, sha256 })
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn read_chunk(
+        &self,
+        file: &mut File,
+        offset: u64,
+        max_bytes: usize,
+    ) -> io::Result<Vec<u8>> {
+        if offset > self.len || max_bytes == 0 || max_bytes > MAX_OUTPUT_CHUNK_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid output range",
+            ));
+        }
+        let count = usize::try_from((self.len - offset).min(max_bytes as u64))
+            .map_err(|_| io::Error::other("output range does not fit a chunk"))?;
+        let position = self
+            .start
+            .checked_add(offset)
+            .ok_or_else(|| io::Error::other("output range position overflow"))?;
+        file.seek(SeekFrom::Start(position))?;
+        let mut bytes = vec![0; count];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+impl CapturedStream {
+    /// Copy exactly `len` bytes and refuse early EOF, surplus bytes or an
+    /// excessive claim. Memory use is one fixed-size copy buffer. Call from
+    /// the blocking execution owner, never the async control reactor.
+    pub fn from_reader(reader: impl Read, len: u64) -> io::Result<Self> {
+        Self::from_reader_in(reader, len, &std::env::temp_dir())
+    }
+
+    /// Retain a private anonymous copy on the owner's selected storage. The
+    /// directory must already exist; a failed allocation never falls back to
+    /// ambient temporary storage. Closing the snapshot releases its bytes.
+    pub fn from_reader_in(reader: impl Read, len: u64, directory: &Path) -> io::Result<Self> {
+        let mut file = snapshot_file(directory)?;
+        let bytes = CapturedRange::append(&mut file, reader, len)?;
+        Ok(Self { file, bytes })
     }
 
     /// Snapshot the actual resident prefix followed by the entire spill tail.
@@ -108,37 +161,26 @@ impl CapturedStream {
     /// Exact original stream length, including both drain tiers.
     #[must_use]
     pub fn len(&self) -> u64 {
-        self.len
+        self.bytes.len()
     }
 
     /// Whether the compiler wrote no bytes on this stream.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     /// SHA-256 of the immutable snapshot, not of a later reopened spill file.
     #[must_use]
     pub fn sha256(&self) -> &str {
-        &self.sha256
+        self.bytes.sha256()
     }
 
     /// Read a replayable range. Offset at EOF is a valid empty final chunk;
     /// offset beyond EOF, zero size and oversize requests are refusals. No
     /// offset-plus-length arithmetic can wrap and no read allocates past the cap.
     pub fn read_chunk(&mut self, offset: u64, max_bytes: usize) -> io::Result<Vec<u8>> {
-        if offset > self.len || max_bytes == 0 || max_bytes > MAX_OUTPUT_CHUNK_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid output range",
-            ));
-        }
-        let count = usize::try_from((self.len - offset).min(max_bytes as u64))
-            .map_err(|_| io::Error::other("output range does not fit a chunk"))?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut bytes = vec![0; count];
-        self.file.read_exact(&mut bytes)?;
-        Ok(bytes)
+        self.bytes.read_chunk(&mut self.file, offset, max_bytes)
     }
 }
 

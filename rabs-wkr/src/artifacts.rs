@@ -7,7 +7,9 @@
 //! a caller-selected host directory. Every file is copied into immutable bounded
 //! diagnostic-range storage. This is a transport offer, not a CAS publication.
 
-use crate::output::{CapturedStream, MAX_OUTPUT_CHUNK_BYTES, MAX_RETAINED_STREAM_BYTES};
+use crate::output::{
+    CapturedRange, MAX_OUTPUT_CHUNK_BYTES, MAX_RETAINED_STREAM_BYTES, snapshot_file,
+};
 use crate::source_transfer::DependencyOutputInputs;
 use rabs_sandbox::artifact_tree::{
     MAX_TREE_ENTRIES, MAX_TREE_FILES, MAX_TREE_MANIFEST_BYTES, TREE_FILES_VERSION,
@@ -488,6 +490,7 @@ impl PreparedArtifacts {
         if found != self.plan.files {
             return Err(invalid("compiler did not produce every declared artifact"));
         }
+        let mut data = snapshot_file(self.snapshot_directory.path())?;
         let mut files = BTreeMap::new();
         let mut total_bytes = 0_u64;
         for name in &self.plan.files {
@@ -508,13 +511,13 @@ impl PreparedArtifacts {
             };
             #[cfg(not(unix))]
             let executable = false;
-            let bytes = CapturedStream::from_reader_in(
+            let bytes = CapturedRange::append(
+                &mut data,
                 CaptureReader {
                     file,
                     stopped: &stopped,
                 },
                 metadata.len(),
-                self.snapshot_directory.path(),
             )?;
             files.insert(name.clone(), CapturedArtifact { executable, bytes });
         }
@@ -524,7 +527,7 @@ impl PreparedArtifacts {
                 "artifact capture interrupted",
             ));
         }
-        let captured = finish_capture(self.plan.clone(), files)?;
+        let captured = finish_capture(self.plan.clone(), data, files)?;
         if let Some(inputs) = dependency_inputs {
             inputs.verify(self.backing())?;
         }
@@ -580,6 +583,7 @@ impl PreparedArtifacts {
         if exported_entries > MAX_TREE_ENTRIES {
             return Err(invalid("artifact tree directory entry limit exceeded"));
         }
+        let mut data = snapshot_file(self.snapshot_directory.path())?;
         let mut files = BTreeMap::new();
         let mut exported_bytes = 0_u64;
         for name in exported.iter().map(String::as_str) {
@@ -595,13 +599,13 @@ impl PreparedArtifacts {
             // Retain the same inode for the post-read check even though the
             // copying reader owns its descriptor. No original output is linked.
             let witness = file.try_clone()?;
-            let bytes = CapturedStream::from_reader_in(
+            let bytes = CapturedRange::append(
+                &mut data,
                 CaptureReader {
                     file,
                     stopped: &stopped,
                 },
                 metadata.len(),
-                self.snapshot_directory.path(),
             )?;
             inventory.verify_file(name, &witness)?;
             files.insert(
@@ -613,7 +617,7 @@ impl PreparedArtifacts {
             );
         }
         inventory.verify(&stopped)?;
-        let bundle = finish_capture(plan.clone(), files)?;
+        let bundle = finish_capture(plan.clone(), data, files)?;
         if bundle.total_bytes != exported_bytes {
             return Err(invalid("artifact tree changed length during capture"));
         }
@@ -663,7 +667,7 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
 #[derive(Debug)]
 struct CapturedArtifact {
     executable: bool,
-    bytes: CapturedStream,
+    bytes: CapturedRange,
 }
 
 /// Complete immutable artifact bundle. Fields are private so a successful
@@ -671,6 +675,7 @@ struct CapturedArtifact {
 #[derive(Debug)]
 pub struct CapturedArtifacts {
     plan: ArtifactPlan,
+    data: File,
     files: BTreeMap<String, CapturedArtifact>,
     total_bytes: u64,
     manifest_sha256: String,
@@ -678,6 +683,7 @@ pub struct CapturedArtifacts {
 
 fn finish_capture(
     plan: ArtifactPlan,
+    data: File,
     files: BTreeMap<String, CapturedArtifact>,
 ) -> io::Result<CapturedArtifacts> {
     let mut total_bytes = 0_u64;
@@ -702,6 +708,7 @@ fn finish_capture(
         .collect();
     let bundle = CapturedArtifacts {
         plan,
+        data,
         files,
         total_bytes,
         manifest_sha256,
@@ -736,10 +743,10 @@ impl CapturedArtifacts {
     /// Read ONLY a previously declared and captured name; this never opens a path.
     pub fn read_chunk(&mut self, name: &str, offset: u64, size: usize) -> io::Result<Vec<u8>> {
         self.files
-            .get_mut(name)
+            .get(name)
             .ok_or_else(|| invalid("unknown artifact"))?
             .bytes
-            .read_chunk(offset, size)
+            .read_chunk(&mut self.data, offset, size)
     }
 
     /// Stable COMPLETE descriptors for negotiation/ACK; no physical backing is
@@ -776,7 +783,7 @@ impl CapturedArtifacts {
     /// Populate only disposable input-byte storage, never an action result.
     /// A following dependency request can then negotiate these exact bytes
     /// without uploading the worker's own output back to it. Readers retain
-    /// the captured anonymous files; mutable compiler paths are never reopened.
+    /// the captured anonymous file; mutable compiler paths are never reopened.
     pub(crate) fn seed_source_cache(
         &mut self,
         cache: &crate::source_transfer::SourceCache,
@@ -1502,6 +1509,42 @@ mod tests {
         fs::write(&file, b"owned").unwrap();
         for directory in [file, root.path().join("missing")] {
             assert!(PreparedArtifacts::new_in(plan(&["a"]), &directory).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn many_tree_files_share_one_descriptor_and_ranges_stop_at_each_file() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = ArtifactPlan::new_tree("doc".into(), vec!["empty".into()]).unwrap();
+        let prepared = PreparedArtifacts::new_in(plan, root.path()).unwrap();
+        fs::write(prepared.backing().join("empty"), []).unwrap();
+        for index in 0_u16..256 {
+            fs::write(
+                prepared.backing().join(format!("page-{index}")),
+                index.to_be_bytes(),
+            )
+            .unwrap();
+        }
+        let snapshot_directory = prepared.snapshot_directory.path().to_owned();
+        let mut captured = prepared.capture(|| false).unwrap();
+        // Count only our anonymous snapshots; other libtest threads may open
+        // and close unrelated files concurrently.
+        let descriptors = fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+            .filter(|path| path.starts_with(&snapshot_directory))
+            .count();
+        assert_eq!(descriptors, 1);
+        assert!(captured.read_chunk("empty", 0, 8).unwrap().is_empty());
+        for index in (0_u16..256).rev() {
+            let name = format!("page-{index}");
+            assert_eq!(
+                captured.read_chunk(&name, 0, 8).unwrap(),
+                index.to_be_bytes()
+            );
+            assert!(captured.read_chunk(&name, 2, 8).unwrap().is_empty());
+            assert!(captured.read_chunk(&name, 3, 1).is_err());
         }
     }
 
