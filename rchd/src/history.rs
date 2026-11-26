@@ -5076,8 +5076,15 @@ mod tests {
             warm_test_admit(&history, &endpoint, &small, budget(&small), "first", 220.0).unwrap();
         let second =
             warm_test_admit(&history, &endpoint, &large, budget(&large), "second", 220.0).unwrap();
-        let third =
-            warm_test_admit(&history, &endpoint, &masked, budget(&masked), "third", 220.0).unwrap();
+        let third = warm_test_admit(
+            &history,
+            &endpoint,
+            &masked,
+            budget(&masked),
+            "third",
+            220.0,
+        )
+        .unwrap();
         for (active, output_gib, free_drop_gib) in
             [(&first, 2, 80), (&second, 78, 80), (&third, 2, 0)]
         {

@@ -10,7 +10,11 @@ use tracing::{debug, info, warn};
 /// A transfer's top-directory age filter only proposes candidates. Run the
 /// same whole-tree age, process, handle, retention and claim checks as GC.
 #[cfg(unix)]
-pub(crate) fn collect_idle_caches(per_job: bool, idle_minutes: u64, paths: &[String]) -> Result<()> {
+pub(crate) fn collect_idle_caches(
+    per_job: bool,
+    idle_minutes: u64,
+    paths: &[String],
+) -> Result<()> {
     use anyhow::{Context as _, ensure};
     use rch_common::stale_target_reap::{
         GcClass, GcCollectTarget, MIN_CARGO_CACHE_IDLE_MINUTES, MIN_POOLED_IDLE_MINUTES,

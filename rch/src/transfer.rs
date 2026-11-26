@@ -18564,7 +18564,13 @@ Number of files transferred: 42
             }
         }
         let calls = std::fs::read_to_string(calls).unwrap();
-        assert_eq!(calls.lines().filter(|s| *s == "collect-idle-caches").count(), 4);
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|s| *s == "collect-idle-caches")
+                .count(),
+            4
+        );
         assert_eq!(calls.lines().filter(|s| *s == "--per-job").count(), 1);
         for path in &paths[..4] {
             assert_eq!(

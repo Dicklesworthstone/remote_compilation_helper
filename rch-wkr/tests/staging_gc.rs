@@ -59,7 +59,10 @@ fn transfer_cache_gc_preserves_active_descendants_through_a_project_alias() {
             stdout.contains(&format!("RCH_GC_SKIP {trigger} active {}", path.display())),
             "{stdout}"
         );
-        assert_eq!(fs::read(path.join("deps/artifact")).unwrap(), b"current build");
+        assert_eq!(
+            fs::read(path.join("deps/artifact")).unwrap(),
+            b"current build"
+        );
     }
     assert!(!run(&["1"], &[pool]).status.success());
     assert!(!run(&["1440"], &["src"]).status.success());

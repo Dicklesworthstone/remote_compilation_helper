@@ -466,8 +466,7 @@ wait "$descendant"
                 descendant: open(identities[1]),
             };
             let leader = tokio::io::unix::AsyncFd::new(processes.leader.as_fd()).unwrap();
-            let descendant =
-                tokio::io::unix::AsyncFd::new(processes.descendant.as_fd()).unwrap();
+            let descendant = tokio::io::unix::AsyncFd::new(processes.descendant.as_fd()).unwrap();
             assert!(
                 rustix::process::waitid(
                     WaitId::PidFd(processes.leader.as_fd()),
