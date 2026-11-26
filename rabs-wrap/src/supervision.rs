@@ -367,20 +367,10 @@ impl Owner {
     }
 }
 
-fn spawn_with_etxtbsy_retry(command: &mut Command) -> io::Result<Child> {
-    let deadline = Instant::now() + Duration::from_millis(250);
-    loop {
-        match command.spawn() {
-            Err(error)
-                if (error.kind() == io::ErrorKind::ExecutableFileBusy
-                    || error.raw_os_error() == Some(26))
-                    && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            result => return result,
-        }
-    }
+fn spawn_with_etxtbsy_retry(command: &mut Command, owned: impl Fn() -> bool) -> io::Result<Child> {
+    // No child has started on cancellation. Even a diagnostic on inherited
+    // stderr could block indefinitely after the original caller disappeared.
+    super::start_while_owned(owned, || command.spawn()).unwrap_or_else(|| std::process::exit(1))
 }
 
 /// No compiler has started when this returns Err. The caller may abandon the
@@ -403,11 +393,8 @@ pub(super) fn spawn(
                 .envs(env.iter().map(|(key, value)| (key, value)))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
+            || owner.can_acknowledge_capture(),
         );
-    }
-    if owner.pid != std::process::id() || !owner.alive() {
-        eprintln!("rabs-wrap: compiler caller disappeared before execution");
-        std::process::exit(1);
     }
     kill_program()?;
     spawn_with_etxtbsy_retry(
@@ -427,6 +414,7 @@ pub(super) fn spawn(
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
+        || owner.can_acknowledge_capture(),
     )
 }
 
@@ -504,6 +492,7 @@ pub(super) fn run_if_guard() {
                 .arg0(argv0)
                 .args(args)
                 .process_group(0),
+            || owner.alive(),
         )?;
         let mut owned = OwnedCompiler {
             child,

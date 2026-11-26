@@ -307,6 +307,7 @@ fn busy_breaker_in_another_process_does_not_block_compiler_exec() {
         .args(["--crate-name", "fx"])
         .envs(wrap_env(dir.path()))
         .env("RABS_TEST_COMPILER_MARKER", &marker)
+        .stdin(Stdio::null())
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(42));
@@ -332,7 +333,10 @@ fn daemon_dead_fails_open_fast_and_breaker_opens_per_model() {
     // test owns the breaker-model semantics.)
     for _ in 0..3 {
         let mut command = Command::new(wrap());
-        command.arg(&fake).args(["--crate-name", "fx"]);
+        command
+            .arg(&fake)
+            .args(["--crate-name", "fx"])
+            .stdin(Stdio::null());
         for (key, value) in &envs {
             command.env(key, value);
         }
@@ -349,7 +353,10 @@ fn daemon_dead_fails_open_fast_and_breaker_opens_per_model() {
     );
     // Open breaker: still fail-open, still success, state stays open.
     let mut command = Command::new(wrap());
-    command.arg(&fake).args(["--crate-name", "fx"]);
+    command
+        .arg(&fake)
+        .args(["--crate-name", "fx"])
+        .stdin(Stdio::null());
     for (key, value) in &envs {
         command.env(key, value);
     }

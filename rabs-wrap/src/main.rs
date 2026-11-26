@@ -1314,20 +1314,40 @@ fn is_executable_file_busy(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::ExecutableFileBusy || error.raw_os_error() == Some(26)
 }
 
-fn exec_compiler(real_rustc: &OsStr, argv0: &OsStr, args: &[OsString]) -> ! {
+/// ETXTBSY means the compiler did not start. Before every new attempt,
+/// recheck the same caller. None is terminal cancellation and must stay silent.
+fn start_while_owned<T>(
+    owned: impl Fn() -> bool,
+    mut start: impl FnMut() -> io::Result<T>,
+) -> Option<io::Result<T>> {
     let deadline = Instant::now() + Duration::from_millis(250);
-    loop {
-        let error = std::process::Command::new(real_rustc)
-            .arg0(argv0)
-            .args(args)
-            .exec();
-        if is_executable_file_busy(&error) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-            continue;
+    while owned() {
+        match start() {
+            Err(_) if !owned() => return None,
+            Err(error) if is_executable_file_busy(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result => return Some(result),
         }
-        eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
-        std::process::exit(127);
     }
+    None
+}
+
+fn exec_compiler(
+    real_rustc: &OsStr,
+    argv0: &OsStr,
+    args: &[OsString],
+    owner: Option<supervision::Owner>,
+) -> ! {
+    let mut command = std::process::Command::new(real_rustc);
+    command.arg0(argv0).args(args);
+    // A successful Unix exec never returns to the wrapper.
+    let start = || -> io::Result<()> { Err(command.exec()) };
+    let Some(Err(error)) = start_while_owned(|| caller_still_owned(owner), start) else {
+        std::process::exit(1);
+    };
+    eprintln!("rabs-wrap: exec {}: {error}", real_rustc.to_string_lossy());
+    std::process::exit(127);
 }
 
 /// Run the admitted compiler with exact environment and live streams, then
@@ -1353,8 +1373,7 @@ fn run_attempt(
             // No compiler started. Abandon admission and become the original
             // compiler, rather than leave an unsupervised observed child.
             drop(session);
-            stop_if_caller_lost(Some(owner));
-            exec_compiler(real_rustc, argv0, args);
+            exec_compiler(real_rustc, argv0, args, Some(owner));
         }
     };
     let stdout = child.stdout.take();
@@ -1456,7 +1475,7 @@ fn main() {
 /// instead exits silently, including when a relay still holds stderr's lock.
 fn run_wrapper(real_rustc: &OsStr, args: &[OsString]) -> ! {
     if is_probe(args) {
-        exec_compiler(real_rustc, real_rustc, args);
+        exec_compiler(real_rustc, real_rustc, args, None);
     }
     let panic_fence = PanicFence::default();
     panic_fence.install_recording_hook();
@@ -1474,7 +1493,7 @@ fn run_wrapper(real_rustc: &OsStr, args: &[OsString]) -> ! {
         // otherwise bypass that compiler before run_attempt checks ownership.
         match owner {
             Some(owner) => run_wrapper_inner(real_rustc, args, owner, &panic_fence),
-            None => exec_compiler(real_rustc, real_rustc, args),
+            None => exec_compiler(real_rustc, real_rustc, args, None),
         }
     }));
     let ownership = if outcome.is_err() && panic_fence.permits_panic_retry() {
@@ -1485,7 +1504,7 @@ fn run_wrapper(real_rustc: &OsStr, args: &[OsString]) -> ! {
         None
     };
     if matches!(ownership.as_ref(), Some(Ok(true))) {
-        exec_compiler(real_rustc, real_rustc, args);
+        exec_compiler(real_rustc, real_rustc, args, original_owner.get().flatten());
     }
     // Do not print, join relays, or drop an arbitrary panic payload here.
     // Process exit releases the socket and lets the existing compiler guard
@@ -1589,17 +1608,32 @@ fn run_wrapper_inner(
             }
             Live::FailClosedSilently => std::process::exit(1),
         }
-        stop_if_caller_lost(Some(owner));
     }
 
     // Become the compiler. On success this never returns; exit codes,
     // signals, and stdio semantics are the real chain's, exactly.
-    exec_compiler(real_rustc, real_rustc, args);
+    exec_compiler(real_rustc, real_rustc, args, Some(owner));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_busy_compiler_cannot_start_after_caller_loss() {
+        let owned = std::cell::Cell::new(true);
+        let mut attempts = 0;
+        let result = start_while_owned(
+            || owned.get(),
+            || {
+                attempts += 1;
+                owned.set(false);
+                Err::<(), _>(io::Error::from(io::ErrorKind::ExecutableFileBusy))
+            },
+        );
+        assert!(result.is_none());
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn edge_identity_comes_from_the_connected_socket() {
