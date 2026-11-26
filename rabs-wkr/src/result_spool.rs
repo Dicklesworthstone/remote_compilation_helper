@@ -24,6 +24,7 @@ pub const MAX_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const DIRECTORY: &str = "retained-result";
 const MANIFEST: &str = "manifest.json";
+const PAYLOAD: &str = "payload";
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -128,8 +129,25 @@ fn create_file(path: &Path) -> io::Result<File> {
     }
     options.open(path)
 }
-fn data_path(root: &Path, index: usize) -> PathBuf {
-    root.join(format!("file-{index:03}"))
+/// Version one sealed one numbered file per item. Both versions use the
+/// result's canonical order: stdout, stderr, then the sorted artifact names.
+fn payload_names(manifest: &Value, count: usize) -> BTreeSet<String> {
+    if manifest["version"] == 1 {
+        (0..count).map(|index| format!("file-{index:03}")).collect()
+    } else {
+        BTreeSet::from([PAYLOAD.to_owned()])
+    }
+}
+
+fn open_payload(path: &Path, len: u64) -> io::Result<File> {
+    private_path(path, false)?;
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    require(
+        metadata.is_file() && metadata.len() == len,
+        "retained file type/size mismatch",
+    )?;
+    Ok(file)
 }
 
 #[derive(Debug, Clone)]
@@ -314,8 +332,8 @@ impl RetentionTarget {
             builder.mode(0o700);
         }
         builder.create(&self.root)?;
+        let mut payload = io::BufWriter::new(create_file(&self.root.join(PAYLOAD))?);
         for (index, item) in items.iter().enumerate() {
-            let mut file = create_file(&data_path(&self.root, index))?;
             let mut hasher = Sha256::new();
             let mut offset = 0_u64;
             while offset < item.len {
@@ -332,7 +350,7 @@ impl RetentionTarget {
                     !bytes.is_empty() && bytes.len() as u64 <= item.len - offset,
                     "capture range length changed",
                 )?;
-                file.write_all(&bytes)?;
+                payload.write_all(&bytes)?;
                 hasher.update(&bytes);
                 offset += bytes.len() as u64;
             }
@@ -345,9 +363,10 @@ impl RetentionTarget {
                 actual == item.digest,
                 "retained bytes differ from capture digest",
             )?;
-            file.sync_all()?;
         }
-        let manifest = json!({"version":1,"request_id":self.request_id,
+        payload.flush()?;
+        payload.get_ref().sync_all()?;
+        let manifest = json!({"version":2,"request_id":self.request_id,
             "request_fingerprint":self.fingerprint,"recipient":self.recipient.encode(),"result":record});
         let bytes = serde_json::to_vec(&manifest)?;
         require(
@@ -380,7 +399,8 @@ fn read_manifest(root: &Path, expected_digest: &str) -> io::Result<Value> {
     )?;
     let manifest: Value = serde_json::from_slice(&bytes)?;
     require(
-        manifest["version"] == 1 && manifest.as_object().is_some_and(|map| map.len() == 5),
+        matches!(manifest["version"].as_u64(), Some(1 | 2))
+            && manifest.as_object().is_some_and(|map| map.len() == 5),
         "retained manifest schema",
     )?;
     Ok(manifest)
@@ -458,29 +478,32 @@ pub fn load(
         "retained result request mismatch",
     )?;
     let (items, plan, stop_reason) = describe(result)?;
-    let expected: BTreeSet<_> = std::iter::once(MANIFEST.to_owned())
-        .chain((0..items.len()).map(|index| format!("file-{index:03}")))
-        .collect();
+    let expected = payload_names(&manifest, items.len());
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
         require(
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| expected.contains(name)),
+                .is_some_and(|name| name == MANIFEST || expected.contains(name)),
             "unknown spool entry",
         )?;
     }
-    let open_item = |index: usize, item: &Item| -> io::Result<File> {
-        let path = data_path(&root, index);
-        private_path(&path, false)?;
-        let file = File::open(&path)?;
-        let metadata = file.metadata()?;
-        require(
-            metadata.is_file() && metadata.len() == item.len,
-            "retained file type/size mismatch",
-        )?;
-        Ok(file)
+    // describe() already bounds the sum. The shared descriptor advances in
+    // manifest order; take() prevents one item from consuming the next.
+    let packed = if manifest["version"] == 2 {
+        let len = items.iter().map(|item| item.len).sum();
+        Some(open_payload(&root.join(PAYLOAD), len)?)
+    } else {
+        None
+    };
+    let open_item = |index: usize, item: &Item| -> io::Result<Box<dyn Read + '_>> {
+        if let Some(file) = &packed {
+            Ok(Box::new(file.take(item.len)))
+        } else {
+            let path = root.join(format!("file-{index:03}"));
+            Ok(Box::new(open_payload(&path, item.len)?))
+        }
     };
     let diagnostic = |index: usize| -> io::Result<CapturedStream> {
         let item = &items[index];
@@ -501,7 +524,7 @@ pub fn load(
                 let index = index + 2; // stdout and stderr occupy the first two entries.
                 let item = &items[index];
                 require(item.name == name, "retained artifact name mismatch")?;
-                Ok((open_item(index, item)?, item.executable))
+                Ok((open_item(index, item)?, item.len, item.executable))
             })?;
             require(
                 bundle.manifest() == result["artifact_manifest"],
@@ -551,22 +574,20 @@ pub fn purge_accepted(journal_root: &Path, digest: &str) -> io::Result<()> {
     }
     let manifest = read_manifest(&root, digest)?;
     let (items, _, _) = describe(&manifest["result"])?;
-    let expected: BTreeSet<_> = std::iter::once(MANIFEST.to_owned())
-        .chain((0..items.len()).map(|index| format!("file-{index:03}")))
-        .collect();
+    let expected = payload_names(&manifest, items.len());
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
         require(
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| expected.contains(name)),
+                .is_some_and(|name| name == MANIFEST || expected.contains(name)),
             "unknown spool entry prevents cleanup",
         )?;
         private_path(&entry.path(), false)?;
     }
-    for index in 0..items.len() {
-        match fs::remove_file(data_path(&root, index)) {
+    for name in expected {
+        match fs::remove_file(root.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -697,6 +718,44 @@ mod tests {
     }
 
     #[test]
+    fn numbered_version_one_seal_reopens_and_reclaims_after_partial_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let (_journal, target, fingerprint) = target(root.path(), 1);
+        let mut original = completion(1, true);
+        let digest = target.seal(&mut original).unwrap();
+        let spool = root.path().join(DIRECTORY);
+        let mut manifest = read_manifest(&spool, &digest).unwrap();
+        assert_eq!(manifest["version"], 2);
+        assert_eq!(
+            fs::read(spool.join(PAYLOAD)).unwrap(),
+            b"A\0\xffBcompiled\0\xff"
+        );
+        fs::remove_file(spool.join(PAYLOAD)).unwrap();
+
+        // Reproduce the previous writer's three independent private files.
+        let files = [b"A\0\xffB".as_slice(), b"", b"compiled\0\xff"];
+        for (index, bytes) in files.into_iter().enumerate() {
+            create_file(&spool.join(format!("file-{index:03}")))
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
+        manifest["version"] = json!(1);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(spool.join(MANIFEST), &bytes).unwrap();
+        let digest = sha256_hex(&bytes);
+        let recovered = load(root.path(), 1, &fingerprint, &digest).unwrap();
+        assert_eq!(
+            recovered.completion.artifacts.unwrap().manifest(),
+            original.artifacts.unwrap().manifest()
+        );
+        fs::remove_file(spool.join("file-001")).unwrap();
+        assert!(load(root.path(), 1, &fingerprint, &digest).is_err());
+        purge_accepted(root.path(), &digest).unwrap();
+        assert!(!exists(root.path()).unwrap());
+    }
+
+    #[test]
     fn retained_result_recovers_without_ambient_temp_storage() {
         const CHILD_ROOT: &str = "RABS_RESULT_STORAGE_TEST_ROOT";
         const CHILD_DONE: &str = "rabs-result-storage-recovered";
@@ -728,8 +787,7 @@ mod tests {
             // Recovery still owns independent immutable copies, including the
             // artifact reconstructed after its sealed bytes were verified.
             let spool = root.join(DIRECTORY);
-            fs::write(data_path(&spool, 0), vec![0; bytes.len()]).unwrap();
-            fs::write(data_path(&spool, 2), vec![0; bytes.len()]).unwrap();
+            fs::write(spool.join(PAYLOAD), vec![0; bytes.len()]).unwrap();
             let outputs = recovered.outputs.as_mut().unwrap();
             let expected_digest = sha256_hex(&bytes);
             assert_eq!(outputs.stdout.sha256(), expected_digest);
@@ -875,21 +933,28 @@ mod tests {
 
     #[test]
     fn corruption_and_foreign_entries_never_become_recovered_results() {
-        for case in 0..5 {
+        for case in 0..7 {
             let root = tempfile::tempdir().unwrap();
             let (_journal, target, fingerprint) = target(root.path(), 1);
             let digest = target.seal(&mut completion(1, true)).unwrap();
             let spool = root.path().join(DIRECTORY);
             match case {
-                0 => fs::write(data_path(&spool, 0), b"bad!").unwrap(),
+                0 => fs::write(spool.join(PAYLOAD), b"bad!").unwrap(),
                 1 => fs::write(spool.join(MANIFEST), b"{}").unwrap(),
                 2 => {
                     let _ = create_file(&spool.join("unexpected")).unwrap();
                 }
-                3 => fs::rename(data_path(&spool, 0), spool.join("missing")).unwrap(),
+                3 => fs::rename(spool.join(PAYLOAD), spool.join("missing")).unwrap(),
+                4 => fs::remove_file(spool.join(PAYLOAD)).unwrap(),
+                5 => OpenOptions::new()
+                    .append(true)
+                    .open(spool.join(PAYLOAD))
+                    .unwrap()
+                    .write_all(b"trailing")
+                    .unwrap(),
                 _ => {
-                    fs::rename(data_path(&spool, 0), root.path().join("outside")).unwrap();
-                    std::os::unix::fs::symlink(root.path().join("outside"), data_path(&spool, 0))
+                    fs::rename(spool.join(PAYLOAD), root.path().join("outside")).unwrap();
+                    std::os::unix::fs::symlink(root.path().join("outside"), spool.join(PAYLOAD))
                         .unwrap();
                 }
             }
@@ -943,7 +1008,7 @@ mod tests {
         assert!(root.path().join(DIRECTORY).join(MANIFEST).exists());
         fs::rename(&unknown, root.path().join("saved-foreign")).unwrap();
         // A previous cleanup may have removed some data files before crashing.
-        fs::remove_file(data_path(&root.path().join(DIRECTORY), 0)).unwrap();
+        fs::remove_file(root.path().join(DIRECTORY).join(PAYLOAD)).unwrap();
         purge_accepted(root.path(), &digest).unwrap();
         purge_accepted(root.path(), &digest).unwrap();
         assert!(!root.path().join(DIRECTORY).exists());
@@ -1062,10 +1127,18 @@ mod tests {
         assert!(artifacts.file_identity("debug/app").unwrap().2);
         // Same-length corruption of a later file must invalidate the complete
         // restore, even though earlier private extents already verified.
-        let last_file = data_path(&root.path().join(DIRECTORY), 132);
-        fs::write(&last_file, b"payload-BAD").unwrap();
+        use std::io::{Seek, SeekFrom};
+        let spool = root.path().join(DIRECTORY);
+        assert_eq!(fs::read_dir(&spool).unwrap().count(), 2);
+        let mut payload = OpenOptions::new()
+            .write(true)
+            .open(spool.join(PAYLOAD))
+            .unwrap();
+        payload.seek(SeekFrom::End(-11)).unwrap();
+        payload.write_all(b"payload-BAD").unwrap();
         assert!(load(root.path(), 23, &fingerprint, &digest).is_err());
-        fs::write(last_file, b"payload-129").unwrap();
+        payload.seek(SeekFrom::End(-11)).unwrap();
+        payload.write_all(b"payload-129").unwrap();
         let mut changed = request;
         changed["artifacts"].as_object_mut().unwrap().remove("tree");
         assert!(

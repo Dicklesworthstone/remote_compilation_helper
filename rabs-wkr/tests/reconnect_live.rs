@@ -608,7 +608,7 @@ fn corrupt_spool_on_disconnect_stops_service_without_resetting_ownership() {
     // The current session holds a private verified copy. The next connection
     // must verify the durable seal again after that transfer owner is dropped.
     std::fs::write(
-        root.path().join("state/retained-result/file-000"),
+        root.path().join("state/retained-result/payload"),
         b"corrupt",
     )
     .unwrap();

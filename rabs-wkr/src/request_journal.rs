@@ -962,7 +962,7 @@ mod tests {
         let receipt = seal(&mut journal, 1);
         journal.finish(1, &receipt, true).unwrap();
         drop(journal);
-        std::fs::write(root.path().join("retained-result/file-000"), b"corrupted").unwrap();
+        std::fs::write(root.path().join("retained-result/payload"), b"corrupted").unwrap();
         assert!(WorkerJournal::open(root.path(), "worker", "coord:7000").is_err());
         let state: Value =
             serde_json::from_slice(&std::fs::read(root.path().join(STATE_FILE)).unwrap()).unwrap();
@@ -1070,7 +1070,7 @@ mod tests {
         let receipt = seal(&mut journal, 1);
         journal.finish(1, &receipt, true).unwrap();
         let before = std::fs::read(root.path().join(STATE_FILE)).unwrap();
-        std::fs::write(root.path().join("retained-result/file-000"), b"corrupt").unwrap();
+        std::fs::write(root.path().join("retained-result/payload"), b"corrupt").unwrap();
         assert!(journal.prepare_reconnect().is_err());
         assert_eq!(journal.high_water(), Some(1));
         assert_eq!(std::fs::read(root.path().join(STATE_FILE)).unwrap(), before);

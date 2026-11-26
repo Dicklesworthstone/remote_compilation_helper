@@ -723,19 +723,18 @@ fn finish_capture(
 
 impl CapturedArtifacts {
     /// Restore a sealed, complete exact set directly into private range storage.
-    /// The caller opens only its own numbered spool entries and verifies the
-    /// rebuilt manifest against the journal seal before exposing this bundle.
-    pub(crate) fn restore(
+    /// The caller supplies a bounded reader for each sealed item and verifies
+    /// the rebuilt manifest against the journal before exposing this bundle.
+    pub(crate) fn restore<R: Read>(
         plan: ArtifactPlan,
         directory: &Path,
-        mut open: impl FnMut(usize, &str) -> io::Result<(File, bool)>,
+        mut open: impl FnMut(usize, &str) -> io::Result<(R, u64, bool)>,
     ) -> io::Result<Self> {
         let mut data = snapshot_file(directory)?;
         let mut files = BTreeMap::new();
         let mut total = 0_u64;
         for (index, name) in plan.files().enumerate() {
-            let (file, executable) = open(index, name)?;
-            let len = file.metadata()?.len();
+            let (file, len, executable) = open(index, name)?;
             total = total
                 .checked_add(len)
                 .filter(|bytes| *bytes <= MAX_ARTIFACT_BYTES)
