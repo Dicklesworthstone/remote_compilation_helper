@@ -835,6 +835,9 @@ fn accepted_install_reply(line: &str, install_deadline: Instant) -> Live {
 /// Authenticate the connected descriptor, including on singleflight reconnect.
 /// A path or a handshake field cannot establish who receives the compiler env.
 fn require_edge_owner(stream: &UnixStream, expected_uid: u32) -> io::Result<()> {
+    // Keep unsupported platforms warning-free without adding statements to
+    // cfg_select's expression arms (whose enclosing braces are stripped).
+    let _ = stream;
     let peer_uid: io::Result<u32> = std::cfg_select! {
         any(target_os = "linux", target_os = "android") => Ok(
             nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)?.uid(),
@@ -846,13 +849,10 @@ fn require_edge_owner(stream: &UnixStream, expected_uid: u32) -> io::Result<()> 
             target_os = "netbsd",
             target_os = "openbsd"
         ) => Ok(nix::unistd::getpeereid(stream)?.0.as_raw()),
-        _ => {
-            let _ = stream;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "no Unix peer credential adapter on this platform",
-            ))
-        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no Unix peer credential adapter on this platform",
+        )),
     };
     if peer_uid? != expected_uid {
         return Err(io::Error::new(
@@ -1027,9 +1027,9 @@ fn observe_with_breaker(
     };
     // An invocation too large for even a names-only observation stays local.
     // It supplies no evidence of daemon health and consumes no probe window.
-    let request = std::env::current_dir().ok().and_then(|cwd| {
-        request_frame::prepare(args, cwd.to_str()?, std::env::vars_os)
-    });
+    let request = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| request_frame::prepare(args, cwd.to_str()?, std::env::vars_os));
     let Some(request) = request else {
         trace_bypass("request-unrepresentable", args);
         return Live::PassThrough;
@@ -1597,10 +1597,7 @@ mod tests {
 
     #[test]
     fn edge_identity_comes_from_the_connected_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("edge.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let stream = UnixStream::connect(path).unwrap();
+        let (stream, _peer) = UnixStream::pair().unwrap();
         let owner = nix::unistd::geteuid().as_raw();
         require_edge_owner(&stream, owner).unwrap();
         let wrong_owner = owner.wrapping_add(1);
@@ -2581,9 +2578,8 @@ mod tests {
 
     #[test]
     fn a_daemon_reporting_its_own_failure_is_a_failed_attempt() {
-        let consult_succeeded = |line: &str| {
-            reply_json::parse(line).is_some_and(|reply| shadow_pass_through(&reply))
-        };
+        let consult_succeeded =
+            |line: &str| reply_json::parse(line).is_some_and(|reply| shadow_pass_through(&reply));
         // A real answer.
         assert!(consult_succeeded(
             "{\"kind\":\"decision\",\"decision\":\"pass-through\",\"mode\":\"shadow\",\
