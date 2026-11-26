@@ -5520,6 +5520,7 @@ version = "2.1.36"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "chrono",
  "clap",
  "cron",
