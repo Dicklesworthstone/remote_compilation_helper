@@ -43,8 +43,8 @@ use std::path::{Path, PathBuf};
 use rabs_protocol::result_identity::TypedDigest;
 
 use crate::blob_store::{
-    BlobStoreLayout, DurabilityPolicy, PutError, PutLimits, PutOutcome, io_err, publish_staged,
-    recompute_file_digest, stream_to_staging,
+    BlobStoreLayout, DurabilityPolicy, PutError, PutLimits, PutOutcome, create_private_file,
+    io_err, publish_staged, recompute_file_digest, stream_to_staging,
 };
 use crate::metadata_store::{RabsMetadataStore, digest_key};
 
@@ -279,7 +279,10 @@ pub fn put_if_absent_journaled(
     let journal = StagingJournal::open(layout, op)?;
     let attempt_hex = u128_hex(attempt);
     let dir = journal.attempt_dir(attempt);
-    fs::create_dir_all(&dir).map_err(io_err("create-attempt-dir"))?;
+    fs::create_dir_all(op_staging_dir(layout, &journal.op_hex)).map_err(io_err("create-op-dir"))?;
+    // Recovery owns an existing attempt, including the interval after its
+    // object has been linked into CAS but before its journal is terminal.
+    fs::create_dir(&dir).map_err(io_err("create-attempt-dir"))?;
     // Write-ahead intent BEFORE any object bytes exist.
     journal.append(&JournalRecord::Begin {
         attempt_hex: attempt_hex.clone(),
@@ -316,7 +319,8 @@ fn stage_verify_publish(
     durability: DurabilityPolicy,
     staging: &Path,
 ) -> Result<PutOutcome, PutError> {
-    let digests = match stream_to_staging(staging, reader, limits) {
+    let file = create_private_file(staging).map_err(io_err("create-staging"))?;
+    let digests = match stream_to_staging(file, reader, limits) {
         Ok(digests) => digests,
         Err(e) => {
             let _ = fs::remove_file(staging);
@@ -497,6 +501,58 @@ mod tests {
         digest_set(bytes, DigestRequest::default(), None)
             .unwrap()
             .atp_content_id
+    }
+
+    #[test]
+    fn repeated_put_leaves_the_existing_attempt_for_recovery() {
+        let layout = fresh_layout("retry-linked");
+        let mut store = store();
+        let journal = StagingJournal::open(&layout, 17).unwrap();
+        let old = b"committed bytes";
+        let declared = id_of(old);
+        let dir = journal.attempt_dir(3);
+        fs::create_dir_all(&dir).unwrap();
+        journal
+            .append(&JournalRecord::Begin {
+                attempt_hex: u128_hex(3),
+                declared_key: digest_key(&declared),
+            })
+            .unwrap();
+        let staged = dir.join("object");
+        fs::write(&staged, old).unwrap();
+        let target = layout.published_path(&declared, crate::blob_store::RAW_PROFILE_V1, &declared);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::hard_link(&staged, &target).unwrap();
+
+        let replacement = b"different request";
+        let mut reader = replacement.as_slice();
+        let result = put_if_absent_journaled(
+            &layout,
+            &mut store,
+            17,
+            3,
+            &id_of(replacement),
+            &mut reader,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        );
+        assert!(matches!(
+            result,
+            Err(PutError::Io {
+                step: "create-attempt-dir",
+                ..
+            })
+        ));
+        assert_eq!(reader, replacement);
+        assert_eq!(fs::read(staged).unwrap(), old);
+        assert_eq!(journal.replay().unwrap().records.len(), 1);
+        let report = recover_operations(&layout, &mut store, DurabilityPolicy::FULL).unwrap();
+        assert!(matches!(
+            report.resolved.as_slice(),
+            [(_, _, RecoveryAction::Resumed { .. })]
+        ));
+        assert_eq!(fs::read(target).unwrap(), old);
+        assert!(store.object_located(&declared).unwrap());
     }
 
     #[test]

@@ -216,9 +216,8 @@ pub struct BlobStoreLayout {
     root: PathBuf,
 }
 
-/// Process-wide uniquifier for staging/quarantine names (combined with
-/// the pid, so concurrent puts — including across processes — never
-/// share a staging path).
+/// Name suggestions. A restarted process can reuse both a PID and a sequence
+/// number, so only exclusive filesystem creation establishes ownership.
 static PUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl BlobStoreLayout {
@@ -278,10 +277,18 @@ impl BlobStoreLayout {
             .join(format!("{logical_hex}.{profile}.{encoded_hex}"))
     }
 
-    fn fresh_staging_path(&self) -> PathBuf {
-        let n = PUT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        self.staging_dir()
-            .join(format!("put-{}-{n}.tmp", std::process::id()))
+    fn create_staging(&self, sequence: &AtomicU64) -> Result<(PathBuf, fs::File), PutError> {
+        loop {
+            let n = sequence.fetch_add(1, Ordering::Relaxed);
+            let path = self
+                .staging_dir()
+                .join(format!("put-{}-{n}.tmp", std::process::id()));
+            match create_private_file(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io_err("create-staging")(error)),
+            }
+        }
     }
 
     fn quarantine_path(&self, logical: &TypedDigest) -> PathBuf {
@@ -292,6 +299,19 @@ impl BlobStoreLayout {
             std::process::id()
         ))
     }
+}
+
+/// A staging name may still link to a published object after a crash.
+/// Never reopen an existing inode for a fresh writer.
+pub(crate) fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -386,11 +406,11 @@ pub fn put_if_absent_with_fault(
     durability: DurabilityPolicy,
     fault: Option<FaultPoint>,
 ) -> Result<PutOutcome, PutError> {
-    let staging = layout.fresh_staging_path();
+    let (staging, file) = layout.create_staging(&PUT_COUNTER)?;
 
     // 1. Stream to the private staging file, hashing while writing and
     // enforcing the logical cap as bytes arrive.
-    let result = stream_to_staging(&staging, reader, limits);
+    let result = stream_to_staging(file, reader, limits);
     let digests = match result {
         Ok(digests) => digests,
         Err(e) => {
@@ -637,13 +657,12 @@ pub fn put_encoded_representation(
     limits: PutLimits,
     durability: DurabilityPolicy,
 ) -> Result<(StoredRepresentationId, PutOutcome), PutError> {
-    let staging = layout.fresh_staging_path();
+    let (staging, mut file) = layout.create_staging(&PUT_COUNTER)?;
 
     // Stream encoded bytes to staging, hashing under the ENCODED
     // domain and counting encoded size.
     let stream = (|| -> Result<(TypedDigest, u64), PutError> {
         use sha2::{Digest as _, Sha256};
-        let mut file = fs::File::create(&staging).map_err(io_err("create-staging"))?;
         let mut hasher = Sha256::new();
         hasher.update((ENCODED_REPRESENTATION_DOMAIN.len() as u64).to_be_bytes());
         hasher.update(ENCODED_REPRESENTATION_DOMAIN.as_bytes());
@@ -676,6 +695,7 @@ pub fn put_encoded_representation(
             total,
         ))
     })();
+    drop(file);
     let (encoded_digest, encoded_size) = match stream {
         Ok(v) => v,
         Err(e) => {
@@ -744,11 +764,10 @@ pub fn put_encoded_representation(
 }
 
 pub(crate) fn stream_to_staging(
-    staging: &Path,
+    mut file: fs::File,
     reader: &mut dyn Read,
     limits: PutLimits,
 ) -> Result<crate::digest_set::DigestSet, PutError> {
-    let mut file = fs::File::create(staging).map_err(io_err("create-staging"))?;
     let mut writer = StreamingObjectWriter::new(DigestRequest::default(), limits.expected_size);
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -877,6 +896,30 @@ mod tests {
         digest_set(bytes, DigestRequest::default(), None)
             .unwrap()
             .atp_content_id
+    }
+
+    #[test]
+    fn restarting_stage_sequence_preserves_a_linked_object() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = BlobStoreLayout::open(root.path()).unwrap();
+        let old = b"first durable object";
+        let declared = id_of(old);
+        let (leftover, mut file) = layout.create_staging(&AtomicU64::new(0)).unwrap();
+        file.write_all(old).unwrap();
+        drop(file);
+        let published = layout.published_path(&declared, RAW_PROFILE_V1, &declared);
+        fs::create_dir_all(published.parent().unwrap()).unwrap();
+        fs::hard_link(&leftover, &published).unwrap();
+
+        // Same PID and counter after restart, with the post-link cleanup pending.
+        let (new_path, file) = layout.create_staging(&AtomicU64::new(0)).unwrap();
+        assert_ne!(new_path, leftover);
+        let new = b"another build result";
+        let digests = stream_to_staging(file, &mut new.as_slice(), PutLimits::default()).unwrap();
+        assert_eq!(digests.atp_content_id, id_of(new));
+        assert_eq!(fs::read(&new_path).unwrap(), new);
+        assert_eq!(fs::read(&leftover).unwrap(), old);
+        assert_eq!(fs::read(&published).unwrap(), old);
     }
 
     /// Everything under objects/ must be a COMPLETE object: any file
