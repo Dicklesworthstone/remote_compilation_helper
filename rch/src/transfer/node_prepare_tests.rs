@@ -32,7 +32,12 @@ fn dependency_preparation_is_inside_the_tracked_workload() {
             .expect("worker preparation");
         assert!(preparation > session);
         assert_eq!(command.matches("rch-wkr prepare --project").count(), 1);
-        assert!(command.contains(&format!("rch-prepare {runtime} sh -c")));
+        // With no prepared-dependency proof, preparation stays inside the
+        // synchronized source scope: the boundary precedes the workload.
+        assert!(command.contains(&format!(
+            "rch-prepare {runtime} --preparation-boundary {} sh -c",
+            pipeline.remote_path()
+        )));
         assert!(!command.contains("npm ci"));
         assert!(!command.contains("npm install"));
         assert!(!command.contains("bun install"));
@@ -108,7 +113,12 @@ fn dependency_runtime_comes_from_the_kind_not_words_in_the_payload() {
         let command = pipeline.wrap_with_dependency_preparation(
             "LABEL='node bun cargo' compiler 'literal ; payload'".to_owned(),
         );
-        assert!(command.contains(&format!("rch-prepare {runtime} sh -c")));
+        // With no prepared-dependency proof, preparation stays inside the
+        // synchronized source scope: the boundary precedes the workload.
+        assert!(command.contains(&format!(
+            "rch-prepare {runtime} --preparation-boundary {} sh -c",
+            pipeline.remote_path()
+        )));
     }
 }
 
@@ -164,11 +174,11 @@ fn check_generated_wrapper(
     write_tool(
         &tools.join("rch-wkr"),
         "#!/bin/sh\nset -eu\n\
-         [ \"$*\" = \"prepare --project . --runtime $EXPECTED_RUNTIME --execution-layout\" ] || exit 91\n\
+         [ \"$*\" = \"prepare --project . --runtime $EXPECTED_RUNTIME --execution-layout --workspace-root --preparation-boundary $EXPECTED_BOUNDARY\" ] || exit 91\n\
          printf 'prepared\\n' >> events\n\
          if IFS= read -r ignored; then exit 92; fi\n\
          printf 'preparation metadata\\n' >&2\n\
-         printf 'RCH_PREPARED_NODE_MODULES\\n'\n\
+         printf 'RCH_PREPARED_NODE_MODULES:0\\n'\n\
          exit \"$PREPARATION_STATUS\"\n",
     );
     write_tool(&tools.join(program), "#!/bin/sh\nexit 96\n");
@@ -188,6 +198,8 @@ fn check_generated_wrapper(
         .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
         .env("PREPARATION_STATUS", preparation_status)
         .env("EXPECTED_RUNTIME", runtime)
+        // Ordinary preparation is bounded to the synchronized source scope.
+        .env("EXPECTED_BOUNDARY", pipeline.remote_path())
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();

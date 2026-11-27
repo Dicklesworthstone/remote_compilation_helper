@@ -24090,13 +24090,18 @@ fn main() {
     fn remote_timeout_kill_script_shape_and_parse() {
         let script = remote_timeout_kill_script("/tmp/rch-run/proj-abc/42.pgid", 42);
         assert!(script.contains("/tmp/rch-run/proj-abc/42.pgid"));
+        // The identity protocol ships as one escaped double-quoted literal
+        // (rch_common::REMOTE_PROCESS_IDENTITY_SCRIPT), so its `"` and `$`
+        // appear backslash-escaped in the generated script.
         // Group kill with NO `--` (dash's kill builtin mishandles it).
-        assert!(script.contains("kill -\"$1\" -\"$rch_pgid\""));
+        assert!(script.contains(r#"kill -\"\$1\" -\"\$rch_pgid\""#));
         assert!(!script.contains("kill -KILL -- "));
         // Boot/start identity and a process-table observation guard group signals.
         assert!(script.contains("rch_remote_leader_matches || return 43"));
         assert!(script.contains("ps -e -o pid= -o lwp= -o pgid= -o s= -o nlwp="));
-        assert!(script.contains(r#"ps -L -q "$pids" -o pid= -o lwp= -o pgid= -o stat= -o nlwp="#));
+        assert!(
+            script.contains(r#"ps -L -q \"\$pids\" -o pid= -o lwp= -o pgid= -o stat= -o nlwp="#)
+        );
         assert!(script.contains("rch_remote_cancel \"$f\" 42 kill"));
         assert!(script.contains("RCH_E104_KILL=verified_dead"));
         assert!(script.contains("RCH_E104_KILL=still_alive"));
@@ -24329,6 +24334,7 @@ fn main() {
             let output = Command::new("sh") // ubs:ignore — production verifier over this test's owned record
                 .arg("-c")
                 .arg(remote_timeout_kill_script(pgf.to_str().unwrap(), 42))
+                .env("RCH_WKR_BIN", native_control_worker_for_test())
                 .output()
                 .unwrap();
             assert_eq!(
@@ -24344,7 +24350,14 @@ fn main() {
         std::fs::write(&pgf, &record).unwrap();
 
         let script = remote_timeout_kill_script(pgf.to_str().unwrap(), 42);
-        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap(); // ubs:ignore — production kill script with this test's owned PGID path
+        // Verify with the candidate rch-wkr: without RCH_WKR_BIN the script
+        // locates the host's installed release, which cannot prove the group dead.
+        let output = Command::new("sh") // ubs:ignore — production kill script with this test's owned PGID path
+            .arg("-c")
+            .arg(&script)
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
+            .output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         // Safety net regardless of assertions.
         let _ = Command::new("sh") // ubs:ignore — test-owned process group; PGID parsed as positive integer above
@@ -24362,6 +24375,7 @@ fn main() {
         let retry = Command::new("sh") // ubs:ignore — production retry over the test's recorded identity
             .arg("-c")
             .arg(&script)
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
             .output()
             .unwrap();
         assert_eq!(
@@ -24373,7 +24387,12 @@ fn main() {
         // Missing identity cannot prove the remote command never started.
         let missing = dir.join("never-started.pgid");
         let script = remote_timeout_kill_script(missing.to_str().unwrap(), 42);
-        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap(); // ubs:ignore — production missing-PGID script over this test's owned path
+        let output = Command::new("sh") // ubs:ignore — production missing-PGID script over this test's owned path
+            .arg("-c")
+            .arg(&script)
+            .env("RCH_WKR_BIN", native_control_worker_for_test())
+            .output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         assert_eq!(
             parse_remote_timeout_kill_output(&stdout),
