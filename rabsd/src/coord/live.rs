@@ -1718,7 +1718,7 @@ pub struct CargoRootBrokerTelemetry {
     pub per_root_capacity: u32,
     /// Currently active Cargo roots holding an open `RootGrant`.
     pub active_cargo_roots: u32,
-    /// High-water mark of active Cargo roots observed (`must be <= max_concurrent_cargo_roots`).
+    /// High-water mark across configurations, each bounded by its then-current limit.
     pub peak_active_cargo_roots: u32,
     /// Requests currently waiting in the weighted fair queue.
     pub queued_requests: u64,
@@ -2910,7 +2910,8 @@ impl CoordLive {
         }
     }
 
-    /// Configure the live Cargo root-permit broker and weighted fair queue (`bd-d4uqa` / `T016`).
+    /// Update admission policy for future grants. Existing token ledgers,
+    /// queued turns, tenant weights and historical telemetry are retained.
     pub fn configure_cargo_root_broker(
         &self,
         max_concurrent_cargo_roots: u32,
@@ -2927,20 +2928,66 @@ impl CoordLive {
             .cargo_root_broker
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)?;
+        if broker.active_grants.len() > max_concurrent_cargo_roots as usize {
+            return Err(SubmissionRefusal::Admission(
+                "new cargo root limit is below the number of active grants".to_owned(),
+            ));
+        }
         broker.max_concurrent_cargo_roots = max_concurrent_cargo_roots;
         broker.per_root_capacity = per_root_capacity;
-        broker.queue = FairQueue::new(starvation_bound, deadline_window);
-        broker.queued_count = 0;
-        broker.active_grants.clear();
-        broker.peak_active_cargo_roots = 0;
-        broker.total_enqueued = 0;
-        broker.total_granted = 0;
-        broker.total_completed = 0;
-        broker.total_root_cap_refusals = 0;
-        broker.worst_lag_by_agent.clear();
-        broker.starvation_violations = 0;
-        broker.granted_order.clear();
+        broker.queue.starvation_bound = starvation_bound;
+        broker.queue.deadline_window = deadline_window;
         Ok(())
+    }
+
+    // Called under the broker lock. A competing admission cannot take a fair
+    // turn or release its root while the corresponding receipt is persisted.
+    fn record_cargo_root_decision(
+        &self,
+        root_id: &str,
+        decision: &str,
+        reason: &str,
+    ) -> Result<u64, SubmissionRefusal> {
+        let cas = self.cas.as_ref().ok_or(SubmissionRefusal::Unavailable)?;
+        let mut store = cas
+            .store()
+            .lock()
+            .map_err(|_| SubmissionRefusal::Unavailable)?;
+        // A delayed completion names just the invocation ID. Use the existing
+        // (kind, subject, seq) index so retired IDs remain fenced across boots
+        // without retaining another in-memory history of every invocation.
+        if decision == "enqueued" {
+            let prior = store
+                .query(
+                    "SELECT 1 FROM decision_receipts \
+                     WHERE kind = ?1 AND subject = ?2 AND decision = 'enqueued' LIMIT 1",
+                    &[
+                        SqlValue::Text(CARGO_ROOT_BROKER_RECEIPT_KIND.to_owned()),
+                        SqlValue::Text(root_id.to_owned()),
+                    ],
+                )
+                .map_err(|error| {
+                    SubmissionRefusal::Admission(format!("broker invocation lookup: {error:?}"))
+                })?;
+            if !prior.is_empty() {
+                return Err(SubmissionRefusal::Admission(format!(
+                    "cargo root invocation ID already used: {root_id}"
+                )));
+            }
+        }
+        let seq = self.next_seq();
+        store
+            .record_decision_receipt(
+                CARGO_ROOT_BROKER_RECEIPT_KIND,
+                root_id,
+                seq,
+                decision,
+                reason,
+            )
+            .map_err(|error| {
+                SubmissionRefusal::Admission(format!("broker {decision} receipt: {error:?}"))
+            })?;
+        Ok(seq)
     }
 
     /// Set a tenant's scheduling weight in the live Cargo root-permit broker (`bd-d4uqa`).
@@ -2978,34 +3025,19 @@ impl CoordLive {
             .cargo_root_broker
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)?;
+        let receipt_seq = self.record_cargo_root_decision(
+            root_id,
+            "enqueued",
+            &format!(
+                "agent={} project={} ci={} cost={} tick={}",
+                tenant.agent, tenant.project, tenant.ci, cost, now_tick
+            ),
+        )?;
         broker
             .queue
             .enqueue(tenant.clone(), root_id, cost, now_tick, deadline);
         broker.queued_count = broker.queued_count.saturating_add(1);
         broker.total_enqueued = broker.total_enqueued.saturating_add(1);
-        drop(broker);
-
-        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        if let Some(cas) = self.cas.as_ref() {
-            let mut store = cas
-                .store()
-                .lock()
-                .map_err(|_| SubmissionRefusal::Unavailable)?;
-            store
-                .record_decision_receipt(
-                    CARGO_ROOT_BROKER_RECEIPT_KIND,
-                    root_id,
-                    receipt_seq,
-                    "enqueued",
-                    &format!(
-                        "agent={} project={} ci={} cost={} tick={}",
-                        tenant.agent, tenant.project, tenant.ci, cost, now_tick
-                    ),
-                )
-                .map_err(|error| {
-                    SubmissionRefusal::Admission(format!("broker enqueue receipt: {error:?}"))
-                })?;
-        }
         Ok(CargoRootEnqueueReceipt {
             tenant,
             root_id: root_id.to_owned(),
@@ -3030,51 +3062,44 @@ impl CoordLive {
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)?;
         let active_count = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
-        if active_count >= broker.max_concurrent_cargo_roots {
+        let max_roots = broker.max_concurrent_cargo_roots;
+        if active_count >= max_roots {
+            self.record_cargo_root_decision(
+                "broker_capacity_gate",
+                "root_cap_reached",
+                &format!(
+                    "active_cargo_roots={active_count} max_concurrent_cargo_roots={max_roots} tick={now_tick}"
+                ),
+            )?;
             broker.total_root_cap_refusals = broker.total_root_cap_refusals.saturating_add(1);
-            let max_roots = broker.max_concurrent_cargo_roots;
-            drop(broker);
-
-            let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            if let Some(cas) = self.cas.as_ref() {
-                let mut store = cas
-                    .store()
-                    .lock()
-                    .map_err(|_| SubmissionRefusal::Unavailable)?;
-                store
-                    .record_decision_receipt(
-                        CARGO_ROOT_BROKER_RECEIPT_KIND,
-                        "broker_capacity_gate",
-                        receipt_seq,
-                        "root_cap_reached",
-                        &format!(
-                            "active_cargo_roots={active_count} max_concurrent_cargo_roots={max_roots} tick={now_tick}"
-                        ),
-                    )
-                    .map_err(|error| {
-                        SubmissionRefusal::Admission(format!(
-                            "broker cap refusal receipt: {error:?}"
-                        ))
-                    })?;
-            }
             return Ok(None);
         }
 
-        let Some(item) = broker.queue.dequeue(now_tick) else {
+        let Some(item) = broker.queue.peek(now_tick) else {
             return Ok(None);
         };
-        broker.queued_count = broker.queued_count.saturating_sub(1);
         let capacity = broker.per_root_capacity;
         let grant = RootGrant::open(capacity).map_err(|error| {
             SubmissionRefusal::Admission(format!("root grant open failed: {error:?}"))
         })?;
-        let root_id = item.label.clone();
-        broker.active_grants.insert(root_id.clone(), grant);
-        let new_active = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
-        if new_active > broker.peak_active_cargo_roots {
-            broker.peak_active_cargo_roots = new_active;
-        }
+        let new_active = active_count + 1;
         let wait_ticks = now_tick.saturating_sub(item.enqueued_at);
+        let receipt_seq = self.record_cargo_root_decision(
+            &item.label,
+            "root_granted",
+            &format!(
+                "agent={} capacity={} wait_ticks={} active={}/{}",
+                item.tenant.agent, capacity, wait_ticks, new_active, max_roots
+            ),
+        )?;
+        let item = broker
+            .queue
+            .dequeue(now_tick)
+            .expect("turn inspected under broker lock");
+        let root_id = item.label;
+        broker.queued_count = broker.queued_count.saturating_sub(1);
+        broker.active_grants.insert(root_id.clone(), grant);
+        broker.peak_active_cargo_roots = broker.peak_active_cargo_roots.max(new_active);
         if wait_ticks > broker.queue.starvation_bound {
             broker.starvation_violations = broker.starvation_violations.saturating_add(1);
         }
@@ -3085,30 +3110,6 @@ impl CoordLive {
             .or_insert(wait_ticks);
         broker.total_granted = broker.total_granted.saturating_add(1);
         broker.granted_order.push(root_id.clone());
-        let max_roots = broker.max_concurrent_cargo_roots;
-        drop(broker);
-
-        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        if let Some(cas) = self.cas.as_ref() {
-            let mut store = cas
-                .store()
-                .lock()
-                .map_err(|_| SubmissionRefusal::Unavailable)?;
-            store
-                .record_decision_receipt(
-                    CARGO_ROOT_BROKER_RECEIPT_KIND,
-                    &root_id,
-                    receipt_seq,
-                    "root_granted",
-                    &format!(
-                        "agent={} capacity={} wait_ticks={} active={}/{}",
-                        item.tenant.agent, capacity, wait_ticks, new_active, max_roots
-                    ),
-                )
-                .map_err(|error| {
-                    SubmissionRefusal::Admission(format!("broker grant receipt: {error:?}"))
-                })?;
-        }
 
         Ok(Some(CargoRootGrantReceipt {
             tenant: item.tenant,
@@ -3152,7 +3153,8 @@ impl CoordLive {
         Ok(grant.release(token))
     }
 
-    /// Complete an active Cargo root, closing its `RootGrant` and freeing one root slot (`bd-d4uqa`).
+    /// Signal root exit, stopping new token issuance. If descendants still hold
+    /// tokens, release them and retry completion to free the root slot.
     pub fn complete_cargo_root(
         &self,
         root_id: &str,
@@ -3165,34 +3167,26 @@ impl CoordLive {
             .cargo_root_broker
             .lock()
             .map_err(|_| SubmissionRefusal::Unavailable)?;
-        let Some(mut grant) = broker.active_grants.remove(root_id) else {
+        let Some(grant) = broker.active_grants.get_mut(root_id) else {
             return Err(SubmissionRefusal::Admission(format!(
                 "unknown or already completed cargo root: {root_id}"
             )));
         };
         grant.close();
-        broker.total_completed = broker.total_completed.saturating_add(1);
-        let remaining = u32::try_from(broker.active_grants.len()).unwrap_or(u32::MAX);
-        drop(broker);
-
-        let receipt_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        if let Some(cas) = self.cas.as_ref() {
-            let mut store = cas
-                .store()
-                .lock()
-                .map_err(|_| SubmissionRefusal::Unavailable)?;
-            store
-                .record_decision_receipt(
-                    CARGO_ROOT_BROKER_RECEIPT_KIND,
-                    root_id,
-                    receipt_seq,
-                    "root_completed",
-                    &format!("remaining_active={remaining} tick={now_tick}"),
-                )
-                .map_err(|error| {
-                    SubmissionRefusal::Admission(format!("broker completion receipt: {error:?}"))
-                })?;
+        let outstanding = grant.transferable_outstanding();
+        if outstanding != 0 {
+            return Err(SubmissionRefusal::Admission(format!(
+                "cargo root {root_id} is draining {outstanding} transferable tokens"
+            )));
         }
+        let remaining = u32::try_from(broker.active_grants.len() - 1).unwrap_or(u32::MAX);
+        let receipt_seq = self.record_cargo_root_decision(
+            root_id,
+            "root_completed",
+            &format!("remaining_active={remaining} tick={now_tick}"),
+        )?;
+        broker.active_grants.remove(root_id);
+        broker.total_completed = broker.total_completed.saturating_add(1);
 
         Ok(CargoRootCompletionReceipt {
             root_id: root_id.to_owned(),
@@ -5457,6 +5451,117 @@ mod tests {
                 .has_publication(&offer.manifest.action_key)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn cargo_root_reconfiguration_and_duplicate_requests_preserve_owned_capacity() {
+        let (_state, coord) = submission_coordinator();
+        coord.configure_cargo_root_broker(2, 2, 64, 16).unwrap();
+        let enqueue = |agent: &str, root: &str| {
+            let tenant = TenantKey {
+                agent: agent.to_owned(),
+                project: "pkg".to_owned(),
+                ci: false,
+            };
+            coord.enqueue_cargo_root_request(tenant, root, 1, 0, None)
+        };
+        // Competing tenants must not obtain independent custody under one ID.
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| enqueue("a", "first"));
+            let b = scope.spawn(|| enqueue("b", "first"));
+            assert_ne!(a.join().unwrap().is_ok(), b.join().unwrap().is_ok());
+        });
+        let first = coord.admit_next_cargo_root(1).unwrap().unwrap();
+        assert_eq!(first.root_id, "first");
+        let token = coord.issue_cargo_jobserver_token("first").unwrap().unwrap();
+        assert!(enqueue("b", "first").is_err());
+        enqueue("b", "second").unwrap();
+        coord.admit_next_cargo_root(2).unwrap().unwrap();
+        enqueue("c", "waiting").unwrap();
+        let before = coord.cargo_root_broker_telemetry().unwrap();
+        assert!(coord.configure_cargo_root_broker(1, 1, 4, 0).is_err());
+        assert_eq!(coord.cargo_root_broker_telemetry().unwrap(), before);
+        coord.configure_cargo_root_broker(2, 1, 4, 0).unwrap();
+
+        // Exit stops issuance but the descendant's token still owns capacity.
+        assert!(coord.complete_cargo_root("first", 3).is_err());
+        assert_eq!(
+            coord.issue_cargo_jobserver_token("first").unwrap(),
+            Err(GrantRefusal::GrantClosed)
+        );
+        assert!(coord.admit_next_cargo_root(4).unwrap().is_none());
+        coord
+            .release_cargo_jobserver_token("first", &token)
+            .unwrap()
+            .unwrap();
+        coord.complete_cargo_root("first", 5).unwrap();
+        assert!(enqueue("a", "first").is_err());
+        let next = coord.admit_next_cargo_root(6).unwrap().unwrap();
+        assert_eq!(next.root_id, "waiting");
+        assert_eq!(next.capacity, 1);
+        let telemetry = coord.cargo_root_broker_telemetry().unwrap();
+        assert_eq!(telemetry.total_enqueued, 3);
+        assert_eq!(telemetry.total_granted, 3);
+        assert_eq!(telemetry.total_completed, 1);
+        assert_eq!(telemetry.active_cargo_roots, 2);
+    }
+
+    #[test]
+    fn cargo_root_receipt_conflicts_preserve_retryable_admission_and_release() {
+        let (_state, coord) = submission_coordinator();
+        // Seed an incompatible receipt at the next sequence. The real SQLite
+        // transaction must refuse it; a retry can use the next sequence.
+        let conflict = |subject| {
+            coord
+                .cas
+                .as_ref()
+                .unwrap()
+                .store()
+                .lock()
+                .unwrap()
+                .record_decision_receipt(
+                    CARGO_ROOT_BROKER_RECEIPT_KIND,
+                    subject,
+                    coord.next_seq.load(Ordering::Relaxed),
+                    "conflicting-decision",
+                    "test",
+                )
+                .unwrap();
+        };
+        coord.configure_cargo_root_broker(1, 2, 64, 16).unwrap();
+        let enqueue = || {
+            let tenant = TenantKey {
+                agent: "a".into(),
+                project: "pkg".into(),
+                ci: false,
+            };
+            coord.enqueue_cargo_root_request(tenant, "first", 1, 0, None)
+        };
+        let snapshot = || coord.cargo_root_broker_telemetry().unwrap();
+        let initial = snapshot();
+        conflict("first");
+        assert!(enqueue().is_err());
+        assert_eq!(snapshot(), initial);
+        enqueue().unwrap();
+
+        let queued = snapshot();
+        conflict("first");
+        assert!(coord.admit_next_cargo_root(1).is_err());
+        assert_eq!(snapshot(), queued);
+        let granted = coord.admit_next_cargo_root(1).unwrap().unwrap();
+        assert_eq!(granted.root_id, "first");
+
+        let active = snapshot();
+        conflict("broker_capacity_gate");
+        assert!(coord.admit_next_cargo_root(2).is_err());
+        assert_eq!(snapshot(), active);
+        conflict("first");
+        assert!(coord.complete_cargo_root("first", 3).is_err());
+        assert_eq!(snapshot(), active);
+        let completed = coord.complete_cargo_root("first", 4).unwrap();
+        assert_eq!(completed.active_cargo_roots, 0);
+        assert!(coord.complete_cargo_root("first", 5).is_err());
+        assert_eq!(snapshot().total_completed, 1);
     }
 
     #[test]
