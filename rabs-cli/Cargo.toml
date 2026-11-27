@@ -21,6 +21,14 @@ path = "src/cargo_main.rs"
 name = "cargo-rabs"
 path = "src/cargo_subcommand.rs"
 
+[[bin]]
+name = "rabs-install"
+path = "src/install_main.rs"
+required-features = ["installer"]
+
+[features]
+installer = ["dep:flate2", "dep:tar"]
+
 # Operator-only dependency cone. Selection uses shared sandbox validators;
 # execution and authenticated transport remain in the separate native driver.
 [dependencies]
@@ -28,6 +36,8 @@ rabs-protocol = { path = "../rabs-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+flate2 = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rabs-sandbox = { path = "../rabs-sandbox" }

@@ -72,12 +72,14 @@ const BUDGETS: &[(&str, usize, &str)] = &[
     ),
     (
         "rabs-cli",
-        7,
+        9,
         "protocol build identity + serde/serde_json for bounded recovery records \
          + sha2 for exact saved-request identity + rustix for retained descriptors \
          and sealed native handoff + rabs-sandbox for the canonical Cargo command, \
          selection and stdin contract + tempfile for private retained operation \
-         profiles; no daemon or async runtime dependency",
+         profiles + optional flate2/tar for the native installer feature's \
+         bounded flat release archives (absent from default launcher builds); \
+         no daemon or async runtime dependency",
     ),
     (
         "rabs-asupersync",

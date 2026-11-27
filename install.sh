@@ -70,6 +70,9 @@ TEMP_DIR=""
 # An upgrading client must not restart its daemon until the new sibling daemon
 # has been installed. The old client remains in place until that drain succeeds.
 DAEMON_BINARY_INSTALLED=false
+# A source installation keeps its freshly built native installer through the
+# final launch checks. Release archives still select their bundled installer.
+RABS_NATIVE_INSTALLER=""
 # Expand arrays that may be empty as ${a[@]+"${a[@]}"}: under `set -u`, macOS's
 # /bin/bash 3.2 treats an empty "${a[@]}" as an unbound variable and exits.
 PROXY_ARGS=()
@@ -494,8 +497,16 @@ check_prerequisites() {
     local errors=0
 
     if [[ "${WITH_RABS:-false}" == "true" ]]; then
-        if ! command_exists python3 || ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
-            die "--with-rabs requires Python 3.9 or later for the bundle installer"
+        local rabs_from_source=false
+        if [[ -z "${OFFLINE_TARBALL:-}" ]] && \
+           { [[ "${FROM_SOURCE:-false}" == "true" ]] || \
+             { [[ -f "Cargo.toml" ]] && grep -q "remote_compilation_helper" Cargo.toml; }; }; then
+            rabs_from_source=true
+        fi
+        if [[ "$rabs_from_source" != "true" ]]; then
+            if ! command_exists python3 || ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
+                die "--with-rabs requires Python 3.9 or later for the legacy release bundle installer; --from-source uses the native installer"
+            fi
         fi
         if [[ "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}" != /* ]]; then
             die "The RABS installation directory must be absolute (RCH_RABS_INSTALL_DIR or RCH_INSTALL_DIR)"
@@ -762,6 +773,14 @@ install_split_binary() {
 }
 
 check_rabs_launchers() {
+    if [[ -n "${RABS_NATIVE_INSTALLER:-}" ]]; then
+        # The native source installer has already validated and activated the
+        # complete generation. Revalidate the managed inventory before probing
+        # its public entrypoints; never silently select another checker.
+        [[ "${2:-}" == "--installed" ]] || return 1
+        "$RABS_NATIVE_INSTALLER" --probe-installed --bin-dir "$3"
+        return $?
+    fi
     # Use the bundle installer's existing file/ELF validation before executing
     # supplied tools. An empty validator selects already-installed public links
     # for --verify-only. Version/probe commands have a finite lifetime and never
@@ -815,6 +834,18 @@ install_rabs_toolset() {
     [[ "${WITH_RABS:-false}" == "true" ]] || return 0
     local installer="$1" source_option="$2" source_path="$3"
     local bin_dir="${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}"
+    if [[ "$source_option" == "--from-build" ]]; then
+        if [[ ! -f "$installer" || -L "$installer" || ! -x "$installer" ]]; then
+            die "Requested native RABS installer is missing or not an ordinary executable: $installer"
+        fi
+        info "Installing the complete native RABS toolset into $bin_dir..."
+        if ! "$installer" --from-build "$source_path" --bin-dir "$bin_dir" --probe; then
+            die "Native RABS installation failed; inspect the reported activation state before retrying."
+        fi
+        RABS_NATIVE_INSTALLER="$installer"
+        success "Installed cargo-rabs, rabs-cargo, rabs-wrap, rabsd, rabs-wkr, rabs-cargo-root, rabs-recover and rabs-delivery-cas"
+        return 0
+    fi
     if [[ ! -f "$installer" || -L "$installer" ]]; then
         die "Requested RABS toolset is incomplete: install-rabs is missing; use a Linux GNU release containing all RABS tools"
     fi
@@ -874,7 +905,8 @@ build_rabs_toolset() {
     local project_dir="$1"
     info "Building the requested RABS toolset..."
     if ! cargo build --locked --profile wrapper-release -p rabs-wrap -p rabs-cli \
-        --bin rabs-wrap --bin cargo-rabs --bin rabs-cargo --bin rabs-recover \
+        --bin rabs-wrap --bin cargo-rabs --bin rabs-cargo --bin rabs-recover --bin rabs-install \
+        --features rabs-cli/installer \
         --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS wrapper/operator build failed; installation stopped"
     fi
@@ -883,7 +915,7 @@ build_rabs_toolset() {
         --target-dir "$SOURCE_BUILD_TARGET_DIR" --target "$SOURCE_BUILD_HOST"; then
         die "Requested RABS daemon/worker build failed; installation stopped"
     fi
-    install_rabs_toolset "$project_dir/scripts/install-rabs" --from-build "$TARGET_DIR"
+    install_rabs_toolset "$TARGET_DIR/wrapper-release/rabs-install" --from-build "$TARGET_DIR"
 }
 
 build_from_source() {

@@ -5124,12 +5124,14 @@ dependencies = [
 name = "rabs-cli"
 version = "2.1.36"
 dependencies = [
+ "flate2",
  "rabs-protocol",
  "rabs-sandbox",
  "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tar",
  "tempfile",
 ]
 

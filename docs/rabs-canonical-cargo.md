@@ -121,14 +121,38 @@ input option before the Cargo command. Arguments after Cargo's program/test
 operation identity. It never submits another build. The standalone
 `rabs-recover` command continues to default to inspection.
 
-`install.sh --with-rabs` and `scripts/install-rabs` install the native
-`cargo-rabs` in the same atomic generation as the other RABS executables. Source
-builds select it from `wrapper-release`; bundles must contain a native executable
-matching the other tools' architecture. Source-verified packaging checks its
-compiled build identity alongside every other native tool. The bundle installer
-still requires its existing installation interpreter; running `cargo rabs` uses
-only the Rust frontend and native helpers. Installing the frontend does not
-establish a fleet rollout, compiler-cache hit or performance result.
+`install.sh --from-source --with-rabs` builds and uses the native `rabs-install`
+operator binary. It validates all eight tools, copies them into a private
+generation, checks that they launch, and activates them with one symlink switch.
+The previous generation remains available. Final installation checks use that
+same native installer; the source installation path requires no installation
+interpreter. The archive decoder is an explicit `rabs-cli/installer` feature,
+so ordinary launcher builds retain their existing dependency graph.
+
+The installer can also be used directly against a completed split-profile build
+or an authenticated, extracted bundle:
+
+```sh
+cargo build --locked --profile wrapper-release -p rabs-cli \
+  --features installer --bin rabs-install
+
+target/wrapper-release/rabs-install --from-build /absolute/target \
+  --bin-dir /absolute/bin --probe
+target/wrapper-release/rabs-install --from-bundle /absolute/bundle \
+  --bin-dir /absolute/bin --verify
+```
+
+`--verify` compares the selected expected toolset with the installed generation
+without executing tools or changing the installation. `--probe-installed --bin-dir ...`
+validates the managed generation and performs bounded launch checks. Unmanaged
+destination entries, incomplete toolsets, invalid executable headers, and unsafe
+archives are refused. Source builds select wrapper/operator tools from
+`wrapper-release` and daemon/worker tools from `daemon-release`.
+
+Release-archive installation through `install.sh --with-rabs`, source-verified
+packaging, and SSH fleet deployment still use the legacy `scripts/install-rabs`
+contract. Those paths remain a separate native-port task. Installing the frontend
+does not establish a fleet rollout, compiler-cache hit or performance result.
 
 ## Native canonical Cargo entry point
 
