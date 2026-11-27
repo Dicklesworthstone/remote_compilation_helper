@@ -182,6 +182,21 @@ struct SourceFence {
     created: Instant,
 }
 
+impl SourceFence {
+    fn from_record(record: &BuildRecord, wrapper: Option<&str>, created: Instant) -> Option<Self> {
+        if record.exit_code == 0 || record.location != BuildLocation::Remote {
+            return None;
+        }
+        Some(Self {
+            build_id: record.id,
+            project_id: record.project_id.clone(),
+            worker_id: record.worker_id.clone()?,
+            wrapper: wrapper.filter(|id| canonical_local_wrapper(id))?.to_owned(),
+            created,
+        })
+    }
+}
+
 /// A new source fence needs lease reconciliation before selection can retry.
 /// Distinguish that advisory refresh from ordinary admission rejection and
 /// from an I/O failure that may already have published durable ownership.
@@ -484,10 +499,10 @@ pub struct BuildHistory {
     /// never restores capacity observations from disk.
     disk_budget_completed_at: Mutex<HashMap<String, Instant>>,
     /// Failed remote builds whose client lease may still own worker source
-    /// (bd-jqhno). Transient: selection consults them for the same project.
+    /// (bd-jqhno). Rebuilt from recent terminal receipts after a restart.
     source_fences: Mutex<Vec<SourceFence>>,
     /// (project, worker) pairs whose live checkout refused a source sync, and
-    /// when (bd-fbtws). Transient, like `source_fences`.
+    /// when (bd-fbtws). Transient.
     live_checkout_fences: Mutex<HashMap<(String, String), Instant>>,
     /// (project, worker) pairs whose source another owner held past the
     /// admission wait, and when (bd-p3kuz). Transient.
@@ -3026,6 +3041,10 @@ impl BuildHistory {
         let initial_id = std::cmp::max(max_id.saturating_add(1), epoch_id);
         let queue_epoch = QUEUE_ID_NAMESPACE | epoch_id;
         let next_queue_id = next_queue_id.map_or(queue_epoch, |id| id.max(queue_epoch));
+        // The worker's source claim can outlive both its build and this daemon.
+        // Restore candidates before pruning receipts; selection still checks
+        // the wrapper's current lease before excluding a worker.
+        let source_fences = restore_source_fences(&active, &terminal);
         // After max_id counted them: a pruned receipt's id is never reissued.
         let queue_predecessors = queued
             .iter()
@@ -3037,7 +3056,7 @@ impl BuildHistory {
             records: RwLock::new(records),
             active: RwLock::new(active),
             disk_budget_completed_at: Mutex::new(HashMap::new()),
-            source_fences: Mutex::new(Vec::new()),
+            source_fences: Mutex::new(source_fences),
             live_checkout_fences: Mutex::new(HashMap::new()),
             source_busy_fences: Mutex::new(HashMap::new()),
             source_topology_fences: Mutex::new(source_topology_fences),
@@ -3465,25 +3484,13 @@ impl BuildHistory {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(state.worker_id.clone(), Instant::now());
         }
-        if exit_code != 0
-            && state.location == BuildLocation::Remote
-            && let Some(wrapper) = state
-                .local_wrapper_id
-                .as_deref()
-                .filter(|wrapper| canonical_local_wrapper(wrapper))
-        {
+        if let Some(fence) = SourceFence::from_record(&record, wrapper, Instant::now()) {
             let mut fences = self.source_fences.lock().unwrap_or_else(|e| e.into_inner());
             fences.retain(|fence| fence.created.elapsed() < SOURCE_FENCE_MAX_AGE);
             if fences.len() >= SOURCE_FENCE_LIMIT {
                 fences.remove(0);
             }
-            fences.push(SourceFence {
-                build_id,
-                project_id: state.project_id.clone(),
-                worker_id: state.worker_id.clone(),
-                wrapper: wrapper.to_owned(),
-                created: Instant::now(),
-            });
+            fences.push(fence);
         }
         let state = active.remove(&build_id).expect("locked ownership exists");
         self.learn_footprint(
@@ -3670,6 +3677,45 @@ fn queue_predecessor_matches(
         }
         _ => false,
     }
+}
+
+/// The wrapper journal describes one attempt. A retry that was admitted on
+/// a different worker must never revive its predecessor's fence on restart.
+fn restore_source_fences(
+    active: &HashMap<u64, ActiveBuildState>,
+    terminal: &HashMap<u64, TerminalOwnership>,
+) -> Vec<SourceFence> {
+    let mut seen: HashSet<&str> = active
+        .values()
+        .filter_map(|build| build.local_wrapper_id.as_deref())
+        .collect();
+    let mut receipts: Vec<_> = terminal.values().collect();
+    receipts.sort_unstable_by_key(|receipt| std::cmp::Reverse(receipt.record.id));
+
+    let now = Utc::now();
+    let mono = Instant::now();
+    let mut fences: Vec<_> = receipts
+        .into_iter()
+        .filter_map(|receipt| {
+            let wrapper = receipt.local_wrapper_id.as_deref()?;
+            if !seen.insert(wrapper) {
+                return None;
+            }
+            let completed = DateTime::parse_from_rfc3339(&receipt.record.completed_at).ok()?;
+            // Clock rollback cannot prove that an owned claim has expired.
+            let age = now
+                .signed_duration_since(completed)
+                .to_std()
+                .unwrap_or_default();
+            if age >= SOURCE_FENCE_MAX_AGE {
+                return None;
+            }
+            SourceFence::from_record(&receipt.record, Some(wrapper), mono.checked_sub(age)?)
+        })
+        .collect();
+    fences.sort_unstable_by_key(|fence| (fence.created, fence.build_id));
+    fences.drain(..fences.len().saturating_sub(SOURCE_FENCE_LIMIT));
+    fences
 }
 
 /// Drop receipts past retention, then the oldest beyond the cap. An
@@ -4250,6 +4296,60 @@ mod tests {
         history.source_fences.lock().unwrap()[0].created =
             Instant::now().checked_sub(SOURCE_FENCE_MAX_AGE).unwrap();
         assert!(history.source_fenced_workers("music", |_| true).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_fences_only_current_failed_attempts_within_the_original_window() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.jsonl");
+        let history = BuildHistory::new(10).with_persistence(path.clone());
+        let wrapper = rch_common::job_identity::new_local_wrapper_id;
+        let held = wrapper();
+        let failed = complete_retry_attempt(&history, "held-worker", &held);
+        let expired = complete_retry_attempt(&history, "expired-worker", &wrapper());
+        let retried = wrapper();
+        complete_retry_attempt(&history, "original-worker", &retried);
+        let start = |history: &BuildHistory, worker: &str, wrapper: String| {
+            history
+                .try_start_active_build_with_wrapper(
+                    "retry-project".into(),
+                    worker.into(),
+                    "cargo build".into(),
+                    0,
+                    Some(wrapper),
+                    1,
+                    BuildLocation::Remote,
+                )
+                .unwrap()
+        };
+        let success = start(&history, "replacement-worker", retried).unwrap();
+        {
+            let mut receipts = history.terminal.write().unwrap();
+            receipts.get_mut(&expired.id).unwrap().record.completed_at =
+                (Utc::now() - ChronoDuration::hours(1)).to_rfc3339();
+            receipts.get_mut(&failed.id).unwrap().record.completed_at =
+                (Utc::now() - ChronoDuration::minutes(20)).to_rfc3339();
+        }
+        finish_owned(&history, &success, 0);
+        let active = wrapper();
+        complete_retry_attempt(&history, "retried-worker", &active);
+        assert!(start(&history, "current-worker", active).is_some());
+        drop(history);
+
+        let loaded = BuildHistory::load_from_file(&path, 10).unwrap();
+        assert_eq!(
+            loaded.source_fenced_workers("retry-project", |_| true),
+            HashSet::from(["held-worker".to_owned()])
+        );
+        assert!(start(&loaded, "held-worker", wrapper()).is_none());
+        let age = loaded.source_fences.lock().unwrap()[0].created.elapsed();
+        assert!(age >= Duration::from_secs(20 * 60));
+        assert!(
+            loaded
+                .source_fenced_workers("retry-project", |owner| owner != held)
+                .is_empty()
+        );
+        assert!(start(&loaded, "held-worker", wrapper()).is_some());
     }
 
     fn source_fence_admission(history: &BuildHistory, wrapper: &str) -> ActiveBuildAdmission {
