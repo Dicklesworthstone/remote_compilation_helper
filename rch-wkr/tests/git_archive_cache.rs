@@ -39,6 +39,7 @@ impl Fixture {
         };
         let root = tempfile::Builder::new()
             .prefix("rch-native-archive-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(base)
             .unwrap()
             .keep();

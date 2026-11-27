@@ -11989,8 +11989,14 @@ mod tests {
     fn git_archive_cache_generated_script_executes_native_reuse_with_literal_roots() {
         use sha2::{Digest as _, Sha256};
         use std::os::unix::fs::PermissionsExt as _;
-        let retained = tempfile::tempdir().unwrap().keep();
-        let root = std::fs::canonicalize(&retained).unwrap();
+        // This success case needs a trusted ancestor chain. TMPDIR can be a
+        // shared build tree, and the default tempdir mode is 0777 & !umask.
+        let root = tempfile::Builder::new()
+            .prefix("rch-archive-script-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+            .unwrap()
+            .keep();
         let source = root.join("source ' $literal `name` α");
         let target = root.join("target ' $literal `name` β");
         let pipeline = TransferPipeline::new(

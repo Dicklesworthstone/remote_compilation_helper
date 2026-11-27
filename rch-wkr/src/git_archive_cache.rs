@@ -884,6 +884,7 @@ mod native {
             fn new() -> Self {
                 let root = tempfile::Builder::new()
                     .prefix("rch-archive-boundary-")
+                    .permissions(fs::Permissions::from_mode(0o700))
                     .tempdir_in(if cfg!(target_os = "macos") {
                         "/private/tmp"
                     } else {
