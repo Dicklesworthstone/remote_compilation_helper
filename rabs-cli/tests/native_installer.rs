@@ -3,13 +3,14 @@
 //! Real native CLI and live shell source-install integration. The tool fixtures
 //! are host ELF executables; PATH contains only native true and lock-cleanup rm.
 
+use flate2::{Compression, write::GzEncoder};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const TOOLS: [&str; 8] = [
+const TOOLS: [&str; 9] = [
     "cargo-rabs",
     "rabs-wrap",
     "rabsd",
@@ -18,6 +19,7 @@ const TOOLS: [&str; 8] = [
     "rabs-delivery-cas",
     "rabs-recover",
     "rabs-cargo",
+    "rabs-install",
 ];
 
 struct Fixture {
@@ -51,7 +53,11 @@ impl Fixture {
         for name in TOOLS {
             let path = Self::tool(&build, name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, &bytes).unwrap();
+            if name == "rabs-install" {
+                fs::copy(env!("CARGO_BIN_EXE_rabs-install"), &path).unwrap();
+            } else {
+                fs::write(&path, &bytes).unwrap();
+            }
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         fs::create_dir(temporary.path().join(".cargo")).unwrap();
@@ -74,7 +80,7 @@ impl Fixture {
             .join(
                 if matches!(
                     name,
-                    "cargo-rabs" | "rabs-cargo" | "rabs-recover" | "rabs-wrap"
+                    "cargo-rabs" | "rabs-cargo" | "rabs-recover" | "rabs-wrap" | "rabs-install"
                 ) {
                     "wrapper-release"
                 } else {
@@ -90,6 +96,19 @@ impl Fixture {
             .env("PATH", &self.native_only_path)
             .env("HOME", self.temporary.path());
         command
+    }
+
+    fn archive(&self) -> PathBuf {
+        let path = self.temporary.path().join("native-release.tar.gz");
+        let encoder = GzEncoder::new(fs::File::create(&path).unwrap(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for name in TOOLS {
+            archive
+                .append_path_with_name(Self::tool(&self.build, name), name)
+                .unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap();
+        path
     }
 
     fn shell(&self, program: &str) -> Command {
@@ -161,8 +180,96 @@ fn live_source_install_and_final_checks_use_the_native_helper_with_minimal_path(
         b"# existing user configuration\n"
     );
     for name in TOOLS {
-        assert_eq!(fs::read(fixture.root.join(name)).unwrap(), fixture.bytes);
+        assert_eq!(
+            fs::read(fixture.root.join(name)).unwrap(),
+            fs::read(Fixture::tool(&fixture.build, name)).unwrap()
+        );
     }
+}
+
+#[test]
+fn live_archive_install_and_standalone_final_probe_use_the_native_generation() {
+    let fixture = Fixture::new();
+    let archive = fixture.archive();
+    let output = fixture
+        .shell(
+            r#"
+        source "$1"
+        WITH_RABS=true
+        FROM_SOURCE=false
+        LOCK_FILE="$5.lock"
+        unexpected="$5"
+        command_not_found_handle() { printf '%s\n' "$*" > "$unexpected"; return 127; }
+        install_rabs_toolset "$2" --from-archive "$6"
+        [[ "$RABS_NATIVE_INSTALLER" == "$2" ]]
+        unset RABS_NATIVE_INSTALLER
+        check_rabs_launchers "" --installed "$4"
+        "#,
+        )
+        .arg(&archive)
+        .output()
+        .unwrap();
+    success(&output);
+    let receipts: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0]["kind"], "rabs-installed");
+    assert_eq!(receipts[1]["kind"], "rabs-launch-check");
+    assert_eq!(receipts[0]["generation"], receipts[1]["generation"]);
+    assert_eq!(receipts[0]["files"].as_object().unwrap().len(), 9);
+    assert!(!fixture.temporary.path().join("unexpected-command").exists());
+    assert_eq!(
+        fs::read_link(fixture.root.join("rabs-install")).unwrap(),
+        Path::new(".rabs-current/rabs-install")
+    );
+    assert_eq!(
+        fs::read(fixture.temporary.path().join(".cargo/config.toml")).unwrap(),
+        b"# existing user configuration\n"
+    );
+}
+
+#[test]
+fn archive_launch_failure_preserves_the_active_generation() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .native()
+        .arg("--from-build")
+        .arg(&fixture.build)
+        .arg("--bin-dir")
+        .arg(&fixture.root)
+        .arg("--probe")
+        .output()
+        .unwrap();
+    success(&output);
+    let previous = fs::read_link(fixture.root.join(".rabs-current")).unwrap();
+    fs::write(Fixture::tool(&fixture.build, "rabsd"), &fixture.bytes[..64]).unwrap();
+    let archive = fixture.archive();
+    let output = fixture
+        .shell(
+            r#"
+        source "$1"
+        WITH_RABS=true
+        FROM_SOURCE=false
+        LOCK_FILE="$5.lock"
+        unexpected="$5"
+        command_not_found_handle() { printf '%s\n' "$*" > "$unexpected"; return 127; }
+        install_rabs_toolset "$2" --from-archive "$6"
+        "#,
+        )
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_link(fixture.root.join(".rabs-current")).unwrap(),
+        previous
+    );
+    assert!(!fixture.temporary.path().join("unexpected-command").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("launch check failed"));
 }
 
 #[test]

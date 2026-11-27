@@ -288,6 +288,7 @@ where
             | "rabs-recover"
             | "rabs-cargo"
             | "cargo-rabs"
+            | "rabs-install"
     ) {
         return None;
     }
@@ -693,6 +694,10 @@ mod tests {
             .expect("native Cargo subcommand must identify its own compiled tool");
         assert!(subcommand.contains("\"tool\":\"cargo-rabs\""));
         assert!(build_info_for_args("cargo-rabs", ["--rabs-build-info", "run"]).is_none());
+        let installer = build_info_for_args("rabs-install", ["--rabs-build-info"])
+            .expect("native installer must identify its own compiled source");
+        assert!(installer.contains("\"tool\":\"rabs-install\""));
+        assert!(build_info_for_args("rabs-install", ["--rabs-build-info", "--verify"]).is_none());
         for args in [
             vec![],
             vec!["--version"],

@@ -19,7 +19,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const TOOLS: [&str; 8] = [
+const TOOLS: [&str; 9] = [
     "cargo-rabs",
     "rabs-wrap",
     "rabsd",
@@ -28,6 +28,7 @@ const TOOLS: [&str; 8] = [
     "rabs-delivery-cas",
     "rabs-recover",
     "rabs-cargo",
+    "rabs-install",
 ];
 const VERSIONS: &str = ".rabs-versions";
 const CURRENT: &str = ".rabs-current";
@@ -169,7 +170,7 @@ where
         type Value = BTreeMap<String, ToolIdentity>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("eight distinct RABS executable identities")
+            formatter.write_str("nine distinct RABS executable identities")
         }
 
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -388,7 +389,7 @@ fn source_paths(root: &Path, split: bool) -> BTreeMap<String, PathBuf> {
         .map(|name| {
             let profile = if matches!(
                 *name,
-                "cargo-rabs" | "rabs-cargo" | "rabs-recover" | "rabs-wrap"
+                "cargo-rabs" | "rabs-cargo" | "rabs-recover" | "rabs-wrap" | "rabs-install"
             ) {
                 "wrapper-release"
             } else {
@@ -990,7 +991,7 @@ fn install(sources: &mut Sources, root: &Path, probe: bool) -> io::Result<Value>
     )?;
     installation.directory.sync_all()?;
     Ok(json!({
-        "kind": "rabs-installed", "bin_dir": root, "generation": name,
+        "kind": "rabs-installed", "bin_dir": root, "generation": name, "machine": sources.expected.machine,
         "files": sources.expected.files, "services_started": false, "cargo_config_changed": false,
     }))
 }

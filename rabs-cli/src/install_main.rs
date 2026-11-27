@@ -28,9 +28,10 @@ Options:
 
 Verify publisher signatures/checksums before supplying a bundle or archive.
 Content hashes detect corruption; they do not authenticate a publisher.
-All eight tools activate together. Existing generations and failed installation
-stages are retained. Unmanaged entries are never replaced. No service is started
-and no Cargo configuration is changed. --verify never executes installed tools.
+All nine native tools, including rabs-install, activate together.
+Existing generations and failed installation stages are retained. Unmanaged
+entries are never replaced. No service is started and no Cargo configuration
+is changed. --verify never executes installed tools.
 Launch checks have a ten-second deadline per tool and clean up their owned
 process groups. Package production, retained SSH images and fleet transport are
 not implemented by this local installer; unsupported options fail explicitly.

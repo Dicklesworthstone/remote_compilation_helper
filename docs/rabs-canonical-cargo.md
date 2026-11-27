@@ -121,11 +121,12 @@ input option before the Cargo command. Arguments after Cargo's program/test
 operation identity. It never submits another build. The standalone
 `rabs-recover` command continues to default to inspection.
 
-`install.sh --from-source --with-rabs` builds and uses the native `rabs-install`
-operator binary. It validates all eight tools, copies them into a private
+`install.sh --with-rabs` uses the native `rabs-install` operator for source,
+downloaded release, and offline archive installations. It validates all nine
+native tools, including the installer, and copies them into a private
 generation, checks that they launch, and activates them with one symlink switch.
 The previous generation remains available. Final installation checks use that
-same native installer; the source installation path requires no installation
+same native installer. All installation paths require no installation
 interpreter. The archive decoder is an explicit `rabs-cli/installer` feature,
 so ordinary launcher builds retain their existing dependency graph.
 
@@ -149,10 +150,17 @@ destination entries, incomplete toolsets, invalid executable headers, and unsafe
 archives are refused. Source builds select wrapper/operator tools from
 `wrapper-release` and daemon/worker tools from `daemon-release`.
 
-Release-archive installation through `install.sh --with-rabs`, source-verified
-packaging, and SSH fleet deployment still use the legacy `scripts/install-rabs`
-contract. Those paths remain a separate native-port task. Installing the frontend
-does not establish a fleet rollout, compiler-cache hit or performance result.
+Release archives used with `install.sh --with-rabs` must contain the complete
+nine-tool native inventory, including `rabs-install`. Build the installer with
+`--features rabs-cli/installer` in the wrapper profile. Existing eight-tool
+bundles are refused before activation. The installed generation contains its own
+native validator, so `install.sh --verify-only --with-rabs` works without a
+source checkout or the original archive.
+
+Source-verified packaging, retained images, and SSH fleet deployment still use
+the legacy `scripts/install-rabs` contract pending their native port. Installing
+the frontend does not establish a fleet rollout, compiler-cache hit or
+performance result.
 
 ## Native canonical Cargo entry point
 

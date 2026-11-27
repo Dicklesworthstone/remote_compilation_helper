@@ -497,17 +497,6 @@ check_prerequisites() {
     local errors=0
 
     if [[ "${WITH_RABS:-false}" == "true" ]]; then
-        local rabs_from_source=false
-        if [[ -z "${OFFLINE_TARBALL:-}" ]] && \
-           { [[ "${FROM_SOURCE:-false}" == "true" ]] || \
-             { [[ -f "Cargo.toml" ]] && grep -q "remote_compilation_helper" Cargo.toml; }; }; then
-            rabs_from_source=true
-        fi
-        if [[ "$rabs_from_source" != "true" ]]; then
-            if ! command_exists python3 || ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
-                die "--with-rabs requires Python 3.9 or later for the legacy release bundle installer; --from-source uses the native installer"
-            fi
-        fi
         if [[ "${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}" != /* ]]; then
             die "The RABS installation directory must be absolute (RCH_RABS_INSTALL_DIR or RCH_INSTALL_DIR)"
         fi
@@ -773,100 +762,32 @@ install_split_binary() {
 }
 
 check_rabs_launchers() {
-    if [[ -n "${RABS_NATIVE_INSTALLER:-}" ]]; then
-        # The native source installer has already validated and activated the
-        # complete generation. Revalidate the managed inventory before probing
-        # its public entrypoints; never silently select another checker.
-        [[ "${2:-}" == "--installed" ]] || return 1
-        "$RABS_NATIVE_INSTALLER" --probe-installed --bin-dir "$3"
-        return $?
+    # Install/probe validates the captured generation before activation. Final
+    # checks use either that same native helper or the installed native tool.
+    [[ "${2:-}" == "--installed" ]] || return 1
+    local installer="${RABS_NATIVE_INSTALLER:-$3/rabs-install}"
+    if [[ ! -f "$installer" || ! -x "$installer" ]]; then
+        error "Native RABS installer is unavailable for launch checks: $installer"
+        return 1
     fi
-    # Use the bundle installer's existing file/ELF validation before executing
-    # supplied tools. An empty validator selects already-installed public links
-    # for --verify-only. Version/probe commands have a finite lifetime and never
-    # enroll workers, consult the daemon, or start a RABS service.
-    python3 -I - "$@" <<'PY'
-import os
-from pathlib import Path
-import runpy
-import shutil
-import subprocess
-import sys
-
-validator, source_kind, source_path = sys.argv[1:]
-try:
-    if validator:
-        api = runpy.run_path(validator)
-        paths = (api["source_files"](None, source_path) if source_kind == "--from-build"
-                 else api["source_files"](source_path, None))
-        machine = api["host_machine"]()
-        for name in api["NATIVE_TOOLS"]:
-            with paths[name].open("rb") as reader:
-                api["require_native_elf"](name, reader.read(64), machine)
-    else:
-        paths = {name: Path(source_path) / name
-                 for name in ("cargo-rabs", "rabs-cargo", "rabs-recover", "rabs-wrap", "rabsd", "rabs-wkr",
-                              "rabs-cargo-root", "rabs-delivery-cas")}
-    probe_tool = shutil.which("true")
-    if probe_tool is None:
-        raise RuntimeError("wrapper verification requires an external true executable")
-    for name, arguments in (("cargo-rabs", ["--help"]), ("rabs-cargo", ["--help"]),
-                            ("rabs-recover", ["--help"]),
-                            ("rabs-delivery-cas", ["--help"]), ("rabsd", ["--version"]),
-                            ("rabs-wkr", ["--version"]), ("rabs-cargo-root", ["--version"]),
-                            ("rabs-wrap", [probe_tool, "-vV"])):
-        if not paths[name].is_file() or not os.access(paths[name], os.X_OK):
-            raise RuntimeError(name + " is missing or not executable")
-        try:
-            result = subprocess.run([str(paths[name]), *arguments], timeout=10,
-                                    stdout=subprocess.DEVNULL if "--help" in arguments else None)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise RuntimeError(name + " cannot execute on this host: " + str(error)) from error
-        if result.returncode:
-            raise RuntimeError(name + " launch check failed with exit " + str(result.returncode))
-except Exception as error:
-    print("RABS launch check: " + str(error), file=sys.stderr)
-    sys.exit(1)
-PY
+    "$installer" --probe-installed --bin-dir "$3"
 }
 
 install_rabs_toolset() {
     [[ "${WITH_RABS:-false}" == "true" ]] || return 0
     local installer="$1" source_option="$2" source_path="$3"
     local bin_dir="${RCH_RABS_INSTALL_DIR:-$INSTALL_DIR}"
-    if [[ "$source_option" == "--from-build" ]]; then
-        if [[ ! -f "$installer" || -L "$installer" || ! -x "$installer" ]]; then
-            die "Requested native RABS installer is missing or not an ordinary executable: $installer"
-        fi
-        info "Installing the complete native RABS toolset into $bin_dir..."
-        if ! "$installer" --from-build "$source_path" --bin-dir "$bin_dir" --probe; then
-            die "Native RABS installation failed; inspect the reported activation state before retrying."
-        fi
-        RABS_NATIVE_INSTALLER="$installer"
-        success "Installed cargo-rabs, rabs-cargo, rabs-wrap, rabsd, rabs-wkr, rabs-cargo-root, rabs-recover and rabs-delivery-cas"
-        return 0
+    if [[ ! -f "$installer" || -L "$installer" || ! -x "$installer" ]]; then
+        die "Requested native RABS installer is missing or not an ordinary executable: $installer; use a Linux GNU release containing rabs-install"
     fi
-    if [[ ! -f "$installer" || -L "$installer" ]]; then
-        die "Requested RABS toolset is incomplete: install-rabs is missing; use a Linux GNU release containing all RABS tools"
+    info "Installing the complete native RABS toolset into $bin_dir..."
+    # The native owner captures and verifies archive/build bytes, probes the
+    # staged executables, then activates the complete generation atomically.
+    if ! "$installer" "$source_option" "$source_path" --bin-dir "$bin_dir" --probe; then
+        die "Native RABS installation failed; inspect the reported activation state before retrying. For an unmanaged installation, choose a separate RCH_RABS_INSTALL_DIR."
     fi
-    local probe_source="$source_path" probe_kind="$source_option"
-    if [[ "$source_option" == "--from-archive" ]]; then
-        # Both archive paths have already extracted this exact trusted bundle.
-        # The installer validates the original archive again during staging.
-        probe_source="${installer%/*}"
-        probe_kind="--from-bundle"
-    fi
-    if ! check_rabs_launchers "$installer" "$probe_kind" "$probe_source"; then
-        die "Requested RABS executables failed launch checks; generation activation was not attempted"
-    fi
-    info "Installing the complete RABS toolset into $bin_dir..."
-    # Use the supplied bundle/build's installer and its atomic generation
-    # switch. It verifies the complete toolset before activating any of it and
-    # refuses to overwrite unmanaged files from an older loose installation.
-    if ! python3 -I "$installer" "$source_option" "$source_path" --bin-dir "$bin_dir"; then
-        die "Requested RABS installation failed; inspect the reported error before retrying. For an existing unmanaged installation, choose a separate RCH_RABS_INSTALL_DIR."
-    fi
-    success "Installed cargo-rabs, rabs-cargo, rabs-wrap, rabsd, rabs-wkr, rabs-cargo-root, rabs-recover and rabs-delivery-cas"
+    RABS_NATIVE_INSTALLER="$installer"
+    success "Installed cargo-rabs, rabs-cargo, rabs-wrap, rabsd, rabs-wkr, rabs-cargo-root, rabs-recover, rabs-delivery-cas and rabs-install"
 }
 
 # Bind native source builds and installation to the same output layout. Cargo
@@ -1146,7 +1067,7 @@ download_binaries() {
     fi
 
     validate_archive_binaries "$TEMP_DIR" || return 1
-    install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$TEMP_DIR/$asset_name"
+    install_rabs_toolset "$TEMP_DIR/rabs-install" --from-archive "$TEMP_DIR/$asset_name"
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
@@ -1966,7 +1887,7 @@ install_from_tarball() {
     fi
 
     validate_archive_binaries "$TEMP_DIR" || return 1
-    install_rabs_toolset "$TEMP_DIR/install-rabs" --from-archive "$tarball"
+    install_rabs_toolset "$TEMP_DIR/rabs-install" --from-archive "$tarball"
 
     # Install binaries from tarball
     if [[ "$MODE" == "worker" ]]; then
