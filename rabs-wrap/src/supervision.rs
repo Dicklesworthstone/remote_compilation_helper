@@ -308,6 +308,15 @@ pub(super) struct Owner {
 
 impl Owner {
     pub(super) fn capture() -> io::Result<Self> {
+        // Admitted compilers see output pipes and cache hits replay bytes.
+        // Preserve the original chain for programs that can observe a terminal
+        // on any stream, including diagnostics with redirected stdin.
+        if io::stdin().is_terminal() || io::stdout().is_terminal() || io::stderr().is_terminal() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "terminal-dependent compiler invocation",
+            ));
+        }
         if !cfg!(target_os = "linux") {
             // Preserve the existing non-Linux lane; no Linux supervision claim.
             return Ok(Self {
@@ -321,14 +330,6 @@ impl Owner {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "unqualified supervisor architecture",
-            ));
-        }
-        // A detached process group must not change terminal input semantics.
-        // Interactive callers retain the original direct-exec path instead.
-        if io::stdin().is_terminal() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "interactive compiler input",
             ));
         }
         // /proc/self must agree with the process-visible namespace too. Reading

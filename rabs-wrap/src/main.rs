@@ -1448,7 +1448,7 @@ fn run_wrapper(real_rustc: &OsStr, args: &[OsString]) -> ! {
         panic_fixture("owner-capture");
         let owner = supervision::Owner::capture().ok();
         original_owner.set(Some(owner));
-        // Interactive stdin, unsupported supervision, and unavailable procfs
+        // Terminal I/O, unsupported supervision, and unavailable procfs
         // require the original compiler. A cache hit or remote offer would
         // otherwise bypass that compiler before run_attempt checks ownership.
         match owner {

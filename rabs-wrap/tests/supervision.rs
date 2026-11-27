@@ -361,6 +361,47 @@ fn zombie_compiler_leader_is_not_whole_process_completion() {
 }
 
 #[test]
+fn terminal_descriptors_keep_the_original_compiler_and_skip_edge_consultation() {
+    use std::io::IsTerminal;
+
+    for descriptor in 0..=2 {
+        let fixture = Fixture::new(
+            r#"for fd in 0 1 2; do
+                if test -t "$fd"; then printf '%s' "$fd" >> terminal.fds; fi
+            done
+            exit 37"#,
+        );
+        let edge = UnixListener::bind(&fixture.socket).unwrap();
+        edge.set_nonblocking(true).unwrap();
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/ptmx")
+            .unwrap();
+        assert!(terminal.is_terminal());
+        let mut command = fixture.command();
+        match descriptor {
+            0 => command.stdin(terminal),
+            1 => command.stdout(terminal),
+            _ => command.stderr(terminal),
+        };
+        let mut child = Owned(command.spawn().unwrap());
+        let pid = child.0.id();
+        assert_eq!(wait(&mut child).code(), Some(37));
+        assert_eq!(fixture.pid("compiler.pid"), pid);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.path().join("terminal.fds")).unwrap(),
+            descriptor.to_string(),
+        );
+        assert_eq!(
+            edge.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "consulted the edge with a terminal on fd {descriptor}",
+        );
+    }
+}
+
+#[test]
 fn bare_compiler_is_bound_before_the_admitted_environment_changes_path() {
     let fixture = Fixture::new("printf 'selected compiler'; exit 7");
     let selected = fixture.root.path().join("selected");
