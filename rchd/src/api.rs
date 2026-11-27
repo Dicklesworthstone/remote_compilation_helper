@@ -3941,6 +3941,31 @@ pub(crate) async fn recover_restart_admission(ctx: &DaemonContext) {
     }
 }
 
+/// Retire explicitly released client evidence even when no operator asks for
+/// restart readiness. The same single scanner and journal gates serve both
+/// paths; background maintenance grants no additional deletion authority.
+pub(crate) fn start_client_lease_maintenance(ctx: DaemonContext) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(maintain_client_leases(ctx, Duration::from_secs(60)))
+}
+
+async fn maintain_client_leases(ctx: DaemonContext, interval: Duration) {
+    // Run once at startup, then skip missed ticks rather than catching up with
+    // repeated full censuses after a stalled filesystem or suspended daemon.
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        // Let restart/shutdown own their readiness scan. A concurrent request
+        // still competes through the same semaphore, including after timeout.
+        if ctx.admission_barrier.read().await.is_closed() {
+            continue;
+        }
+        if let Err(error) = bounded_client_lease_scan(&ctx).await {
+            debug!(%error, "Client lease maintenance deferred; retaining evidence");
+        }
+    }
+}
+
 async fn bounded_client_lease_scan(ctx: &DaemonContext) -> Result<Vec<String>> {
     // Retain the permit inside the blocking task even if a caller times out.
     // A stuck filesystem therefore cannot create an unbounded pile of scans.
@@ -9372,6 +9397,127 @@ mod tests {
             assert_eq!(std::fs::read(unrelated).unwrap(), b"caller-owned output");
             assert!(fresh_path.is_file(), "{case}: cleanup lost a live blocker");
         }
+    }
+
+    #[tokio::test]
+    async fn background_lease_maintenance_reaps_released_evidence_without_api_requests() {
+        use rch_common::job_identity::{JobLeaseCustodyRelease, JobLeasePayload};
+
+        let ctx = make_test_context(WorkerPool::new());
+        let unrelated_ctx = make_test_context(WorkerPool::new());
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let stale = now - LEASE_REAP_RETENTION_MS - 1;
+        let mut released = make_test_lease(stale, std::process::id());
+        released.acknowledge_terminal(stale);
+        released.exit_code = Some(0);
+        released.recovery = Some(serde_json::json!({"completed-hook-proof": true}));
+        let payload_name = format!(
+            "{}.cargo-stdout-{}",
+            released.identity.local_wrapper_id,
+            Uuid::new_v4()
+        );
+        let payload_bytes = b"successful compiler output";
+        let payload_path = ctx.client_lease_dir.join(&payload_name);
+        write_private_test_journal(&payload_path, payload_bytes);
+        released.custody_release = Some(JobLeaseCustodyRelease {
+            version: 1,
+            recovery_blake3: blake3::hash(
+                &serde_json::to_vec(released.recovery.as_ref().unwrap()).unwrap(),
+            )
+            .to_hex()
+            .to_string(),
+            payloads: vec![JobLeasePayload {
+                name: payload_name,
+                bytes: payload_bytes.len() as u64,
+                blake3: blake3::hash(payload_bytes).to_hex().to_string(),
+            }],
+        });
+        let write = |dir: &std::path::Path, lease: &DurableJobLease| {
+            let path = dir.join(format!("{}.json", lease.identity.local_wrapper_id));
+            write_private_test_journal(&path, &serde_json::to_vec(lease).unwrap());
+            path
+        };
+        let released_path = write(&ctx.client_lease_dir, &released);
+        let foreign_path = write(&unrelated_ctx.client_lease_dir, &released);
+        let active = make_test_lease(now, std::process::id());
+        let active_path = write(&ctx.client_lease_dir, &active);
+        let mut recent = make_test_lease(now, std::process::id());
+        recent.acknowledge_terminal(now);
+        let recent_path = write(&ctx.client_lease_dir, &recent);
+        let mut retained = make_test_lease(stale, std::process::id());
+        retained.acknowledge_terminal(stale);
+        retained.recovery = Some(serde_json::json!({"retired": true}));
+        let retained_path = write(&ctx.client_lease_dir, &retained);
+
+        let task = start_client_lease_maintenance(ctx.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while released_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the background task must reap without a restart/status request");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // Joining the async owner stops new scans. The shared permit also
+        // fences any already-running blocking scan through its completion.
+        let _completed = ctx.client_lease_scans.acquire().await.unwrap();
+
+        assert!(!payload_path.exists());
+        assert!(released_path.with_extension("recovery.lock").is_file());
+        for path in [active_path, recent_path, retained_path, foreign_path] {
+            assert!(path.is_file(), "maintenance removed {}", path.display());
+        }
+        assert!(!ctx.admission_barrier.read().await.is_closed());
+        assert!(ctx.history.active_builds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_lease_maintenance_shares_scan_budget_and_stops_on_shutdown() {
+        let ctx = make_test_context(WorkerPool::new());
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let stale = now - LEASE_REAP_RETENTION_MS - 1;
+        let write = || {
+            let mut lease = make_test_lease(stale, std::process::id());
+            lease.acknowledge_terminal(stale);
+            let path = ctx
+                .client_lease_dir
+                .join(format!("{}.json", lease.identity.local_wrapper_id));
+            write_private_test_journal(&path, &serde_json::to_vec(&lease).unwrap());
+            path
+        };
+        let first = write();
+        let permit = ctx.client_lease_scans.clone().try_acquire_owned().unwrap();
+        let task = tokio::spawn(maintain_client_leases(
+            ctx.clone(),
+            Duration::from_millis(10),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            first.exists(),
+            "an existing census must retain its scan budget"
+        );
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while first.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a later maintenance tick must retry the skipped census");
+        let completed = ctx.client_lease_scans.acquire().await.unwrap();
+        ctx.admission_barrier.write().await.begin_shutdown();
+        let retained = write();
+        drop(completed);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            retained.exists(),
+            "shutdown must stop new maintenance scans"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(ctx.client_lease_scans.available_permits(), 1);
+        assert!(retained.exists());
     }
 
     #[test]

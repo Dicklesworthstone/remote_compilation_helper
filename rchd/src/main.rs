@@ -1996,15 +1996,19 @@ async fn async_main() -> Result<()> {
     // only once startup is complete: the immediate scan must not race an IPC
     // listener that is bound but not yet serving and back off for ten minutes.
     // An isolated test pool must not reconcile the operator's real leases.
-    if !isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket) {
-        let _lease_recovery = lease_recovery::start(
-            context.events.clone(),
-            cli.socket.clone(),
-            admin_disable_store.clone(),
-            context.pool.clone(),
-            context.history.clone(),
-        );
-    }
+    let lease_maintenance_handle =
+        if !isolated_worker_pool(&cli.socket, cli.workers_config.as_deref(), &shared_socket) {
+            let _lease_recovery = lease_recovery::start(
+                context.events.clone(),
+                cli.socket.clone(),
+                admin_disable_store.clone(),
+                context.pool.clone(),
+                context.history.clone(),
+            );
+            Some(api::start_client_lease_maintenance(context.clone()))
+        } else {
+            None
+        };
 
     // The guardian prevents new orphaned SSH masters, but upgrading from an
     // older daemon must also drain foreground connections whose owner died.
@@ -2160,6 +2164,10 @@ async fn async_main() -> Result<()> {
     // after a signal or internal shutdown has committed process exit.
     context.admission_barrier.write().await.begin_shutdown();
     maintenance_recovery_handle.abort();
+    if let Some(handle) = lease_maintenance_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
     #[cfg(unix)]
     if let Some(handle) = ssh_orphan_recovery {
         handle.abort();
