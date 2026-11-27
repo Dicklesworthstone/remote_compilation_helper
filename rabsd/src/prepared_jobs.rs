@@ -426,6 +426,34 @@ async fn read_frame(stream: &mut UnixStream, until: Instant) -> io::Result<Value
     }
 }
 
+/// Single owned client-CLI Asupersync runtime shared across all `--job-*`
+/// UDS subcommands (`submit`, `status`, `wait`, `follow`, `live`), so none of
+/// the subcommand modules build ad-hoc runtimes of their own.
+pub(super) struct ClientSession {
+    runtime: asupersync::runtime::Runtime,
+}
+
+impl ClientSession {
+    pub(super) fn new(label: &str) -> io::Result<Self> {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|error| io::Error::other(format!("{label} runtime: {error:?}")))?;
+        Ok(Self { runtime })
+    }
+
+    pub(super) fn exchange(
+        &self,
+        socket: &str,
+        request: &Value,
+        until: Instant,
+    ) -> io::Result<Value> {
+        rabs_asupersync::daemon_runtime::block_on_top_level(
+            &self.runtime,
+            exchange_until(UnixStream::connect(socket), request, until),
+        )
+    }
+}
+
 fn exchange(socket: &str, request: &Value) -> io::Result<Value> {
     // Local verification/installation can read a complete delivery twice. A
     // client timeout does not cancel the joined filesystem owner or retry it.
@@ -435,13 +463,7 @@ fn exchange(socket: &str, request: &Value) -> io::Result<Value> {
         CLIENT_BUDGET
     };
     let until = Instant::now() + budget;
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .build()
-        .map_err(|error| io::Error::other(format!("job client runtime: {error:?}")))?;
-    rabs_asupersync::daemon_runtime::block_on_top_level(
-        &runtime,
-        exchange_until(UnixStream::connect(socket), request, until),
-    )
+    ClientSession::new("job client")?.exchange(socket, request, until)
 }
 
 async fn exchange_until(

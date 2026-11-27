@@ -31,6 +31,17 @@
 //! - Domain crates (`rabs-protocol`, `rabs-action`, `rabs-key`,
 //!   `rabs-scheduler`, core `rabs-cas`) must never depend on this crate.
 
+//! ## Live runtime vs deferred model inventory
+//!
+//! - **Live daemon/worker runtime modules** (wired into `rabsd` / `rabs-wkr`):
+//!   `daemon_runtime`, `obligations`, `obligation_dashboard`, `crashpack`,
+//!   `region_tree`, `worker_transport`, `process_groups`, `stream_drain`,
+//!   `jobserver`, `root_permits`.
+//! - **Deferred model/policy libraries** (unit-tested contracts awaiting
+//!   later-milestone direct runtime wiring — never claim live integration):
+//!   `attempt_outcome`, `cargo_launch`, `delivery_obligations`, `supervision`,
+//!   `termination`.
+
 pub mod crashpack;
 pub mod daemon_runtime;
 pub mod delivery_obligations;

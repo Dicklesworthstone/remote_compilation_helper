@@ -24,7 +24,9 @@
 //! `RABS_SOCKET_PATH`/`RABS_LOG_LEVEL`/`RABS_PREPARED_CONCURRENCY`. UNKNOWN `[rabs]` keys are a
 //! typed refusal, not a silent ignore (config drift must be loud).
 
-use rabs_asupersync::daemon_runtime::{DaemonRunOptions, run_daemon};
+use rabs_asupersync::daemon_runtime::{
+    DaemonRunOptions, LiveObligationTracker, SubsystemWork, run_daemon,
+};
 use rabsd::coord::prepared_operation::PreparedConcurrency;
 use std::time::{Duration, Instant};
 
@@ -547,6 +549,46 @@ fn run_prepare(args: &[String]) -> i32 {
     }
 }
 
+fn telemetry_work(
+    coord: std::sync::Arc<rabsd::coord::live::CoordLive>,
+    tracker: std::sync::Arc<LiveObligationTracker>,
+) -> SubsystemWork {
+    Box::new(move |_cx, mut shutdown| {
+        Box::pin(async move {
+            let live_obligations = tracker.outstanding_count().to_string();
+            log_line(
+                "rabsd-telemetry-ready",
+                &[
+                    ("subsystems", "4"),
+                    ("outstanding_obligations", &live_obligations),
+                ],
+            );
+            shutdown.wait().await;
+            let stats = coord.l1_stats();
+            let remaining_obligations = tracker.outstanding_count().to_string();
+            let l1_hits = stats.hits.to_string();
+            let l1_misses = stats.misses.to_string();
+            let l1_evictions = stats.evictions.to_string();
+            let authority = if coord.authority().is_some() {
+                "active"
+            } else {
+                "none"
+            };
+            log_line(
+                "rabsd-telemetry-drain",
+                &[
+                    ("authority", authority),
+                    ("l1_hits", &l1_hits),
+                    ("l1_misses", &l1_misses),
+                    ("l1_evictions", &l1_evictions),
+                    ("outstanding_obligations", &remaining_obligations),
+                ],
+            );
+            Ok(())
+        })
+    })
+}
+
 fn main() {
     if let Some(info) = rabs_protocol::release_authorization::build_info_for_args(
         "rabsd",
@@ -990,6 +1032,7 @@ fn main() {
     } else {
         None
     };
+    let obligation_tracker = std::sync::Arc::new(LiveObligationTracker::new());
     let coord_work =
         prepared_jobs::coord_work(std::sync::Arc::clone(&coord), prepared_operations.clone());
     let options = DaemonRunOptions {
@@ -1010,6 +1053,10 @@ fn main() {
             },
         )),
         coord_work: Some(coord_work),
+        telemetry_work: Some(telemetry_work(
+            std::sync::Arc::clone(&coord),
+            std::sync::Arc::clone(&obligation_tracker),
+        )),
         // W1 (bd-hfhq2): the janitor region owns the mounted, fail-closed
         // reconciled store for the daemon lifetime — INCLUDING the GC
         // sweep + quota evidence (advisory; escalation belongs to the
@@ -1020,6 +1067,7 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok()),
         )),
+        obligation_tracker: Some(obligation_tracker),
         ..DaemonRunOptions::default()
     };
     match run_daemon(options) {

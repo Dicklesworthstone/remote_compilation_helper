@@ -6,10 +6,9 @@
 //! verified final streams before any stdout or remaining stderr is emitted.
 
 use super::{
-    CLIENT_BUDGET, ClientDeadline, exchange_until, follow, invalid, remaining, report_client_error,
+    CLIENT_BUDGET, ClientDeadline, ClientSession, follow, invalid, remaining, report_client_error,
     with_client_console,
 };
-use asupersync::net::unix::UnixStream;
 use rabs_asupersync::stream_drain::preview::MAX_PREVIEW_BYTES;
 use rabsd::coord::prepared_operation::{CARGO_STDERR_PREVIEW_VERSION, DiagnosticStream};
 use serde_json::{Value, json};
@@ -209,21 +208,14 @@ pub(super) fn run(id: &str, budget: Duration, socket: &str) -> i32 {
     let deadline = ClientDeadline::new(Instant::now() + budget);
     let mut prefix = StderrPrefix::default();
     let result = with_client_console(&deadline, |mut stdout, mut stderr| {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|error| io::Error::other(format!("live stderr runtime: {error:?}")))?;
+        let client = ClientSession::new("live stderr")?;
         // Console writes run on this waiting client, never the daemon's
         // transport reactor or execution owner. A stalled reader cannot stop
         // worker pipe drains, lease renewals or cancellation handling.
         deliver(
             id,
             &deadline,
-            |request, deadline| {
-                rabs_asupersync::daemon_runtime::block_on_top_level(
-                    &runtime,
-                    exchange_until(UnixStream::connect(socket), request, deadline),
-                )
-            },
+            |request, deadline| client.exchange(socket, request, deadline),
             std::thread::sleep,
             &mut prefix,
             &mut stdout,

@@ -4,10 +4,9 @@
 
 use super::follow::Completion;
 use super::{
-    CLIENT_BUDGET, COMPLETION_BUDGET, ClientDeadline, exchange_until, invalid, remaining,
+    CLIENT_BUDGET, COMPLETION_BUDGET, ClientDeadline, ClientSession, invalid, remaining,
     report_client_error, with_client_console,
 };
-use asupersync::net::unix::UnixStream;
 use rabsd::coord::prepared_operation::PreparedCompletion;
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -271,18 +270,11 @@ pub(super) fn run(args: &[String], socket: &str) -> i32 {
     let deadline = ClientDeadline::new(Instant::now() + budget);
     let mut exposed = false;
     let result = with_client_console(&deadline, |mut stdout, mut stderr| {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|error| io::Error::other(format!("job wait runtime: {error:?}")))?;
+        let client = ClientSession::new("job wait")?;
         deliver(
             id,
             &deadline,
-            |request, request_deadline| {
-                rabs_asupersync::daemon_runtime::block_on_top_level(
-                    &runtime,
-                    exchange_until(UnixStream::connect(socket), request, request_deadline),
-                )
-            },
+            |request, request_deadline| client.exchange(socket, request, request_deadline),
             std::thread::sleep,
             &mut stdout,
             &mut stderr,

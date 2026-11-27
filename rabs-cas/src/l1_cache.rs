@@ -462,12 +462,19 @@ mod tests {
             cache.insert(digest(1), updated);
         }
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.order.len(), 1, "FIFO bookkeeping must also be bounded");
+        assert_eq!(
+            cache.order.len(),
+            1,
+            "FIFO bookkeeping must also be bounded"
+        );
         assert_eq!(cache.evictions, 0);
         let snapshot = cache.snapshot();
         assert_eq!(snapshot.len(), 1, "inventory must not duplicate a live key");
         assert_eq!(snapshot[0].projection_epoch, 19_999);
-        assert_eq!(cache.try_get_hit(&digest(1)).unwrap().projection_epoch, 19_999);
+        assert_eq!(
+            cache.try_get_hit(&digest(1)).unwrap().projection_epoch,
+            19_999
+        );
     }
 
     #[test]
@@ -488,7 +495,11 @@ mod tests {
         assert_eq!(cache.try_get_hit(&digest(2)), Some(row(2)));
         assert_eq!(cache.try_get_hit(&digest(3)), Some(row(3)));
         assert_eq!(
-            cache.snapshot().iter().map(|entry| entry.key.clone()).collect::<Vec<_>>(),
+            cache
+                .snapshot()
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect::<Vec<_>>(),
             vec![digest_key(&digest(2)), digest_key(&digest(3))]
         );
     }
@@ -522,10 +533,12 @@ mod tests {
         let mut backend_calls = 0;
         for _ in 0..10_000 {
             assert_eq!(
-                cache.lookup_through(&digest(1), |_| {
-                    backend_calls += 1;
-                    Ok::<_, StoreError>(Some(row(1)))
-                }).unwrap(),
+                cache
+                    .lookup_through(&digest(1), |_| {
+                        backend_calls += 1;
+                        Ok::<_, StoreError>(Some(row(1)))
+                    })
+                    .unwrap(),
                 Some(row(1))
             );
             assert_eq!(cache.order.len(), 1);

@@ -12,15 +12,17 @@
 //! - Cx is the only capability channel. Subsystem bodies receive
 //!   their Cx from the runtime; nothing reaches for ambient state.
 //! - Obligations are typed completions. Each subsystem holds an
-//!   ObligationSet; an owner that exits without reporting completion is
-//!   attributed by name, never silently dropped. The region-tree model
-//!   is asserted against the live spawn ledger at boot.
+//!   ObligationSet and reports into a live [`ObligationDashboard`] via
+//!   [`LiveObligationTracker`]; an owner that exits without reporting
+//!   completion is attributed by name, never silently dropped. The
+//!   region-tree model is asserted against the live spawn ledger at boot.
 //! - Crash evidence survives. A boot marker prevents the evidence-loss
 //!   mode "kill -9 erases what was running". Named subsystem crashpacks
 //!   accompany nonclean shutdown receipts. A marker found at boot means
 //!   the prior incarnation died unclean.
 
 use crate::crashpack::{Crashpack, RedactedContext};
+use crate::obligation_dashboard::{ObligationDashboard, QuiescenceStatus};
 use crate::obligations::{ObligationKind, ObligationSet};
 use crate::region_tree::{Attribution, RegionSpec};
 use asupersync::cx::Cx;
@@ -29,9 +31,85 @@ use asupersync::signal::ShutdownController;
 use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
+
+/// Thread-safe live [`ObligationDashboard`] tracker shared between the daemon
+/// root region and the `telemetry` subsystem.
+#[derive(Debug, Default)]
+pub struct LiveObligationTracker {
+    dashboard: Mutex<ObligationDashboard>,
+    tick: AtomicU64,
+}
+
+impl LiveObligationTracker {
+    /// Create a fresh tracker with zero outstanding obligations.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn next_tick(&self) -> u64 {
+        self.tick.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Record an obligation opening under `region` and return its causal tick.
+    pub fn record_open(&self, region: &str, kind: ObligationKind) -> u64 {
+        let tick = self.next_tick();
+        let mut guard = self
+            .dashboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.opened(region, kind, tick);
+        tick
+    }
+
+    /// Record clean resolution of an obligation under `region`.
+    pub fn record_resolved(&self, region: &str, kind: ObligationKind) {
+        let mut guard = self
+            .dashboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.resolved(region, kind);
+    }
+
+    /// Current number of unresolved obligations tracked across all regions.
+    #[must_use]
+    pub fn outstanding_count(&self) -> usize {
+        let guard = self
+            .dashboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.outstanding_by_age().len()
+    }
+
+    /// Current quiescence status of one region path at the latest causal tick.
+    #[must_use]
+    pub fn quiescence(&self, region: &str) -> QuiescenceStatus {
+        let now = self.tick.load(Ordering::Relaxed);
+        let guard = self
+            .dashboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.quiescence(region, now)
+    }
+
+    /// Snapshot of currently unresolved obligations, oldest first.
+    #[must_use]
+    pub fn snapshot_outstanding(&self) -> Vec<(String, ObligationKind, u64)> {
+        let guard = self
+            .dashboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .outstanding_by_age()
+            .into_iter()
+            .map(|row| (row.region.clone(), row.kind, row.opened_at_tick))
+            .collect()
+    }
+}
 
 /// The daemon's subsystem regions, in spawn order (plan §12).
 pub const DAEMON_SUBSYSTEMS: [&str; 4] = ["edge", "coord", "telemetry", "janitor"];
@@ -80,13 +158,16 @@ pub struct ShutdownReceipt {
     pub shutdown_ms: u128,
     /// Whether a prior incarnation died unclean (boot marker found).
     pub recovered_from_unclean: bool,
+    /// Unresolved obligations still recorded in [`ObligationDashboard`] at close.
+    pub leaked_obligations: usize,
 }
 
 impl ShutdownReceipt {
-    /// Every subsystem exited with its obligations resolved.
+    /// Every subsystem exited with its obligations resolved and the live
+    /// obligation dashboard reached quiescence.
     #[must_use]
     pub fn clean(&self) -> bool {
-        self.subsystems.iter().all(|s| s.obligations_clean)
+        self.subsystems.iter().all(|s| s.obligations_clean) && self.leaked_obligations == 0
     }
 
     /// One JSON line for logs/stdout (hand-rolled; daemon logging must
@@ -113,11 +194,12 @@ impl ShutdownReceipt {
             })
             .collect();
         format!(
-            "{{\"v\":1,\"kind\":\"rabsd-shutdown-receipt\",\"clean\":{},\"boot_ms\":{},\"shutdown_ms\":{},\"recovered_from_unclean\":{},\"subsystems\":[{}]}}",
+            "{{\"v\":1,\"kind\":\"rabsd-shutdown-receipt\",\"clean\":{},\"boot_ms\":{},\"shutdown_ms\":{},\"recovered_from_unclean\":{},\"leaked_obligations\":{},\"subsystems\":[{}]}}",
             self.clean(),
             self.boot_ms,
             self.shutdown_ms,
             self.recovered_from_unclean,
+            self.leaked_obligations,
             subsystems.join(",")
         )
     }
@@ -204,9 +286,15 @@ pub struct DaemonRunOptions {
     /// Real work for the coord region (S6+: the live coordinator).
     /// None = idle skeleton.
     pub coord_work: Option<SubsystemWork>,
+    /// Real work for the telemetry region: live obligation/L1 telemetry
+    /// reporting and clean drain on shutdown. None = idle skeleton.
+    pub telemetry_work: Option<SubsystemWork>,
     /// Real work for the janitor region (W1/Phase 1: the on-disk
     /// rabs-cas byte store + quota/GC owner). None = idle skeleton.
     pub janitor_work: Option<SubsystemWork>,
+    /// Optional caller-owned live [`ObligationDashboard`] tracker shared with
+    /// `telemetry_work`. When `None`, the daemon allocates a fresh tracker.
+    pub obligation_tracker: Option<Arc<LiveObligationTracker>>,
 }
 
 impl std::fmt::Debug for DaemonRunOptions {
@@ -218,7 +306,9 @@ impl std::fmt::Debug for DaemonRunOptions {
             .field("behavior", &self.behavior)
             .field("edge_work", &self.edge_work.is_some())
             .field("coord_work", &self.coord_work.is_some())
+            .field("telemetry_work", &self.telemetry_work.is_some())
             .field("janitor_work", &self.janitor_work.is_some())
+            .field("obligation_tracker", &self.obligation_tracker.is_some())
             .finish()
     }
 }
@@ -232,7 +322,9 @@ impl Default for DaemonRunOptions {
             behavior: [SubsystemBehavior::Clean; 4],
             edge_work: None,
             coord_work: None,
+            telemetry_work: None,
             janitor_work: None,
+            obligation_tracker: None,
         }
     }
 }
@@ -254,13 +346,19 @@ fn json_string(value: &str) -> String {
 
 fn crashpack_json(pack: &Crashpack) -> String {
     let attribution = [
-        ("coordinator_authority", &pack.attribution.coordinator_authority),
+        (
+            "coordinator_authority",
+            &pack.attribution.coordinator_authority,
+        ),
         ("build_operation", &pack.attribution.build_operation),
         ("action_key", &pack.attribution.action_key),
         ("action_generation", &pack.attribution.action_generation),
         ("attempt", &pack.attribution.attempt),
         ("lease", &pack.attribution.lease),
-        ("worker_boot_generation", &pack.attribution.worker_boot_generation),
+        (
+            "worker_boot_generation",
+            &pack.attribution.worker_boot_generation,
+        ),
     ]
     .into_iter()
     .map(|(name, value)| {
@@ -345,10 +443,14 @@ async fn subsystem_body(
     behavior: SubsystemBehavior,
     work: Option<SubsystemWork>,
     controller: Arc<ShutdownController>,
+    tracker: Arc<LiveObligationTracker>,
 ) -> SubsystemOutcome {
     cx.trace(&format!("rabsd subsystem {name} ready"));
+    let region_path = format!("rabsd/{name}");
+    let obligation = lifetime_obligation(name);
     let mut obligations = ObligationSet::default();
-    obligations.open(lifetime_obligation(name));
+    obligations.open(obligation);
+    tracker.record_open(&region_path, obligation);
 
     // Record early return at the owner boundary, before another subsystem or
     // an external signal can race with the parent's observation of this join.
@@ -373,18 +475,18 @@ async fn subsystem_body(
 
     let _ = cx.checkpoint();
     let (obligations_clean, abandoned) = match (behavior, work_result) {
-        (SubsystemBehavior::Clean, Ok(())) => {
-            match obligations.resolve(lifetime_obligation(name)) {
-                Ok(()) => (true, vec![]),
-                Err(e) => (false, vec![format!("resolve failed: {e:?}")]),
+        (SubsystemBehavior::Clean, Ok(())) => match obligations.resolve(obligation) {
+            Ok(()) => {
+                tracker.record_resolved(&region_path, obligation);
+                (true, vec![])
             }
-        }
+            Err(e) => (false, vec![format!("resolve failed: {e:?}")]),
+        },
         (SubsystemBehavior::Clean, Err(reason)) => (false, vec![format!("work failed: {reason}")]),
         (SubsystemBehavior::HoldObligationOpen, _) => (
             false,
             vec![format!(
-                "abandoned {:?}: subsystem held it open past shutdown (lab)",
-                lifetime_obligation(name)
+                "abandoned {obligation:?}: subsystem held it open past shutdown (lab)"
             )],
         ),
     };
@@ -401,6 +503,7 @@ fn joined_subsystem(
     name: &'static str,
     joined: Result<SubsystemOutcome, asupersync::runtime::JoinError>,
     controller: &ShutdownController,
+    tracker: &LiveObligationTracker,
 ) -> SubsystemOutcome {
     match joined {
         Ok(outcome) => outcome,
@@ -410,10 +513,18 @@ fn joined_subsystem(
             // Stop new work and retain every sibling owner until its join.
             controller.shutdown();
             let reason = format!("subsystem join failed: {error}");
+            let obligation = lifetime_obligation(name);
             let mut obligations = ObligationSet::default();
             // This owner never reported its lifetime obligation complete.
             // The evidence does not infer which child effects are still live.
-            obligations.open(lifetime_obligation(name));
+            obligations.open(obligation);
+            let region_path = format!("rabsd/{name}");
+            if matches!(
+                tracker.quiescence(&region_path),
+                QuiescenceStatus::Quiescent
+            ) {
+                tracker.record_open(&region_path, obligation);
+            }
             let _ = writeln!(std::io::stderr().lock(), "{}", failure_line(name, &reason));
             SubsystemOutcome {
                 name: name.into(),
@@ -485,7 +596,11 @@ pub fn run_daemon_controlled(
     let behavior = options.behavior;
     let mut edge_work = options.edge_work;
     let mut coord_work = options.coord_work;
+    let mut telemetry_work = options.telemetry_work;
     let mut janitor_work = options.janitor_work;
+    let tracker = options
+        .obligation_tracker
+        .unwrap_or_else(|| Arc::new(LiveObligationTracker::new()));
     let root_controller = Arc::clone(&controller);
     let handle = runtime.handle();
     let result: Result<ShutdownReceipt, DaemonError> = runtime.block_on(async move {
@@ -497,10 +612,7 @@ pub fn run_daemon_controlled(
                 // early failure or external shutdown. Dropping the root drops
                 // its timer registration as well.
                 let mut auto_shutdown = run_for.map(|delay| {
-                    Box::pin(asupersync::time::sleep(
-                        asupersync::time::wall_now(),
-                        delay,
-                    ))
+                    Box::pin(asupersync::time::sleep(asupersync::time::wall_now(), delay))
                 });
 
                 let mut handles = Vec::new();
@@ -512,12 +624,22 @@ pub fn run_daemon_controlled(
                     let work = match name {
                         "edge" => edge_work.take(),
                         "coord" => coord_work.take(),
+                        "telemetry" => telemetry_work.take(),
                         "janitor" => janitor_work.take(),
                         _ => None,
                     };
                     let controller = Arc::clone(&root_controller);
+                    let subsystem_tracker = Arc::clone(&tracker);
                     match cx.spawn(move |cx| {
-                        subsystem_body(name, cx, shutdown, subsystem_behavior, work, controller)
+                        subsystem_body(
+                            name,
+                            cx,
+                            shutdown,
+                            subsystem_behavior,
+                            work,
+                            controller,
+                            subsystem_tracker,
+                        )
                     }) {
                         Ok(handle) => {
                             spawned.push(name.to_string());
@@ -580,7 +702,8 @@ pub fn run_daemon_controlled(
                         }
                         match handle.poll_join(task) {
                             Poll::Ready(joined) => {
-                                let terminal = joined_subsystem(name, joined, &root_controller);
+                                let terminal =
+                                    joined_subsystem(name, joined, &root_controller, &tracker);
                                 if !terminal.obligations_clean {
                                     root_controller.shutdown();
                                     shutdown_start.get_or_insert_with(Instant::now);
@@ -607,6 +730,7 @@ pub fn run_daemon_controlled(
                 if let Some(error) = boot_error {
                     return Err(error);
                 }
+                let leaked_obligations = tracker.outstanding_count();
                 Ok(ShutdownReceipt {
                     subsystems: outcomes
                         .into_iter()
@@ -615,6 +739,7 @@ pub fn run_daemon_controlled(
                     boot_ms,
                     shutdown_ms: shutdown_start.map_or(0, |started| started.elapsed().as_millis()),
                     recovered_from_unclean,
+                    leaked_obligations,
                 })
             })
             .await
@@ -648,7 +773,9 @@ mod tests {
             behavior: [SubsystemBehavior::Clean; 4],
             edge_work: None,
             coord_work: None,
+            telemetry_work: None,
             janitor_work: None,
+            obligation_tracker: None,
         }
     }
 
@@ -665,7 +792,9 @@ mod tests {
             // test still owns and joins the runtime before failing.
             controller.shutdown();
         }
-        owner.join().expect("daemon owner returns without panicking");
+        owner
+            .join()
+            .expect("daemon owner returns without panicking");
         result
             .expect("subsystem failure must stop the daemon without an external signal")
             .expect("daemon runs")
@@ -675,11 +804,8 @@ mod tests {
         Box::new(move |_cx, mut shutdown| {
             Box::pin(async move {
                 shutdown.wait().await;
-                asupersync::time::sleep(
-                    asupersync::time::wall_now(),
-                    Duration::from_millis(30),
-                )
-                .await;
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(30))
+                    .await;
                 drained.store(true, Ordering::Release);
                 Ok(())
             })
@@ -706,6 +832,7 @@ mod tests {
         let receipt = run_daemon(options(30)).expect("daemon runs");
         assert!(receipt.clean(), "{receipt:?}");
         assert_eq!(receipt.subsystems.len(), 4);
+        assert_eq!(receipt.leaked_obligations, 0);
         assert!(receipt.boot_ms < 100, "boot took {}ms", receipt.boot_ms);
         assert!(
             receipt.shutdown_ms < 100,
@@ -728,6 +855,7 @@ mod tests {
         }));
         let receipt = failure_run(opts);
         assert!(!receipt.clean());
+        assert_eq!(receipt.leaked_obligations, 1);
         let edge = &receipt.subsystems[0];
         assert_eq!(edge.name, "edge");
         assert!(edge.abandoned[0].contains("unsafe"), "{edge:?}");
@@ -751,18 +879,19 @@ mod tests {
         opts.boot_marker = Some(marker.clone());
         opts.edge_work = Some(Box::new(|_cx, _shutdown| {
             Box::pin(async {
-                asupersync::time::sleep(
-                    asupersync::time::wall_now(),
-                    Duration::from_millis(10),
-                )
-                .await;
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10))
+                    .await;
                 panic!("deliberate subsystem panic");
             })
         }));
         opts.coord_work = Some(draining_work(Arc::clone(&drained)));
         let receipt = failure_run(opts);
-        assert!(drained.load(Ordering::Acquire), "sibling still owns its work");
+        assert!(
+            drained.load(Ordering::Acquire),
+            "sibling still owns its work"
+        );
         assert!(!receipt.clean(), "{receipt:?}");
+        assert_eq!(receipt.leaked_obligations, 1);
         assert!(marker.exists(), "panic must preserve crash-recovery marker");
         assert_eq!(receipt.subsystems.len(), DAEMON_SUBSYSTEMS.len());
         let edge = &receipt.subsystems[0];
@@ -797,6 +926,7 @@ mod tests {
         let receipt = failure_run(opts);
         assert!(drained.load(Ordering::Acquire));
         assert!(!receipt.clean());
+        assert_eq!(receipt.leaked_obligations, 1);
         let coord = &receipt.subsystems[1];
         assert_eq!(coord.name, "coord");
         assert!(coord.abandoned[0].contains("work factory failed"));
@@ -860,6 +990,7 @@ mod tests {
         let receipt = failure_run(opts);
         assert!(drained.load(Ordering::Acquire));
         assert!(!receipt.clean());
+        assert_eq!(receipt.leaked_obligations, 2);
         assert!(!receipt.subsystems[0].obligations_clean);
         assert!(!receipt.subsystems[1].obligations_clean);
         assert!(receipt.subsystems[0].abandoned[0].contains("edge drain failed"));
@@ -875,8 +1006,7 @@ mod tests {
         opts.edge_work = Some(Box::new(|_cx, _shutdown| {
             Box::pin(async { Err("startup failed".into()) })
         }));
-        let receipt =
-            run_daemon_controlled(opts, Arc::clone(&controller)).expect("daemon returns");
+        let receipt = run_daemon_controlled(opts, Arc::clone(&controller)).expect("daemon returns");
         assert!(!receipt.clean());
         drop(controller);
         assert!(
@@ -903,6 +1033,7 @@ mod tests {
         opts.behavior[1] = SubsystemBehavior::HoldObligationOpen; // coord
         let receipt = run_daemon(opts).expect("daemon runs");
         assert!(!receipt.clean());
+        assert_eq!(receipt.leaked_obligations, 1);
         let coord = &receipt.subsystems[1];
         assert_eq!(coord.name, "coord");
         assert!(!coord.obligations_clean);
@@ -968,7 +1099,9 @@ mod tests {
         let receipt = failure_run(opts);
         let line = receipt.to_json_line();
         assert_eq!(line.lines().count(), 1, "failure must stay one JSON record");
-        assert!(line.contains(r#""abandoned":["work failed: failure \"detail\" \\ path\u000anext"]"#));
+        assert!(
+            line.contains(r#""abandoned":["work failed: failure \"detail\" \\ path\u000anext"]"#)
+        );
         assert!(line.contains(r#""failure":"work failed: failure \"detail\" \\ path\u000anext""#));
         assert!(line.contains(r#""context":[{"key":"region","value":"rabsd/edge"}]"#));
     }
@@ -979,5 +1112,73 @@ mod tests {
         assert_eq!(spec.name, "rabsd");
         let model: Vec<&str> = spec.children.iter().map(|c| c.name).collect();
         assert_eq!(model, DAEMON_SUBSYSTEMS.to_vec());
+    }
+
+    #[test]
+    fn telemetry_region_runs_real_work_and_drains_with_zero_leaked_obligations() {
+        let tracker = Arc::new(LiveObligationTracker::new());
+        let observed_live = Arc::new(AtomicU64::new(0));
+        let observed_for_work = Arc::clone(&observed_live);
+        let tracker_for_work = Arc::clone(&tracker);
+        let mut opts = options(30);
+        opts.obligation_tracker = Some(Arc::clone(&tracker));
+        opts.telemetry_work = Some(Box::new(move |_cx, mut shutdown| {
+            Box::pin(async move {
+                let live = tracker_for_work.outstanding_count() as u64;
+                observed_for_work.store(live, Ordering::Release);
+                shutdown.wait().await;
+                Ok(())
+            })
+        }));
+
+        let receipt = run_daemon(opts).expect("daemon runs with live telemetry");
+        assert!(receipt.clean(), "{receipt:?}");
+        assert_eq!(receipt.leaked_obligations, 0);
+        assert!(receipt.subsystems.iter().all(|s| s.crashpack.is_none()));
+        assert!(
+            observed_live.load(Ordering::Acquire) >= 1,
+            "telemetry work must observe live open obligations while running"
+        );
+        for name in DAEMON_SUBSYSTEMS {
+            assert_eq!(
+                tracker.quiescence(&format!("rabsd/{name}")),
+                QuiescenceStatus::Quiescent,
+                "subsystem {name} must reach quiescence at close"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_failure_surfaces_crashpack_and_leaked_obligation_in_dashboard() {
+        let tracker = Arc::new(LiveObligationTracker::new());
+        let mut opts = options(0);
+        opts.run_for = None;
+        opts.obligation_tracker = Some(Arc::clone(&tracker));
+        opts.telemetry_work = Some(Box::new(|_cx, _shutdown| {
+            Box::pin(async { Err("telemetry sink \"broken\"\nline2".to_owned()) })
+        }));
+        let receipt = failure_run(opts);
+        assert!(!receipt.clean());
+        assert_eq!(receipt.leaked_obligations, 1);
+        let telemetry = &receipt.subsystems[2];
+        assert_eq!(telemetry.name, "telemetry");
+        assert!(!telemetry.obligations_clean);
+        assert!(telemetry.crashpack.is_some());
+        assert!(matches!(
+            tracker.quiescence("rabsd/telemetry"),
+            QuiescenceStatus::Draining { .. }
+        ));
+        assert_eq!(
+            tracker.snapshot_outstanding().len(),
+            1,
+            "leaked telemetry obligation must remain visible on the dashboard"
+        );
+        let line = receipt.to_json_line();
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "escaped receipt must stay one line"
+        );
+        assert!(line.contains("\"leaked_obligations\":1"));
     }
 }

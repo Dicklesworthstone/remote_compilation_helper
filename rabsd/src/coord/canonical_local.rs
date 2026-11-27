@@ -3084,6 +3084,9 @@ fn merge_shutdown_receipts(
     edge.boot_ms = edge.boot_ms.saturating_add(coordinator.boot_ms);
     edge.shutdown_ms = edge.shutdown_ms.saturating_add(coordinator.shutdown_ms);
     edge.recovered_from_unclean |= coordinator.recovered_from_unclean;
+    edge.leaked_obligations = edge
+        .leaked_obligations
+        .saturating_add(coordinator.leaked_obligations);
     edge
 }
 
