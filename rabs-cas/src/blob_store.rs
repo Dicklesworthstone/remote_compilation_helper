@@ -291,13 +291,25 @@ impl BlobStoreLayout {
         }
     }
 
-    fn quarantine_path(&self, logical: &TypedDigest) -> PathBuf {
-        let n = PUT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        self.quarantine_dir().join(format!(
-            "incoming-{}-{}-{n}",
-            hex(&logical.bytes),
-            std::process::id()
-        ))
+    fn preserve_incoming(
+        &self,
+        staging: &Path,
+        logical: &TypedDigest,
+        sequence: &AtomicU64,
+    ) -> Result<PathBuf, PutError> {
+        loop {
+            let n = sequence.fetch_add(1, Ordering::Relaxed);
+            let candidate = self.quarantine_dir().join(format!(
+                "incoming-{}-{}-{n}",
+                hex(&logical.bytes),
+                std::process::id()
+            ));
+            match fs::hard_link(staging, &candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io_err("preserve-incoming")(error)),
+            }
+        }
     }
 }
 
@@ -851,12 +863,16 @@ fn handle_existing(
 
     // Existing digest, different bytes: incident. Preserve BOTH
     // candidates — the existing file stays exactly where it is; the
-    // incoming staging file moves to quarantine (rename, same fs).
+    // incoming bytes get a new, exclusive link beside older incident evidence.
     if let Some(observation) = observation {
         observation.validate(target, file_digest)?;
     }
-    let preserved = layout.quarantine_path(declared);
-    fs::rename(staging, &preserved).map_err(io_err("preserve-incoming"))?;
+    let preserved = layout.preserve_incoming(staging, declared, &PUT_COUNTER)?;
+    if durability.fsync_directory {
+        fs::File::open(layout.quarantine_dir())
+            .and_then(|directory| directory.sync_all())
+            .map_err(io_err("fsync-quarantine-dir"))?;
+    }
     store.add_quarantine(
         QuarantineScope::LogicalObject,
         &digest_key(declared),
@@ -865,6 +881,7 @@ fn handle_existing(
     // Flag every implicated location row (the published copy is now
     // suspect evidence, not identity).
     store.set_location_quarantined(declared, &target.to_string_lossy(), true)?;
+    let _ = fs::remove_file(staging);
     Err(PutError::CollisionIncident {
         digest: digest_key(declared),
         existing_path: target.to_string_lossy().into_owned(),
@@ -896,6 +913,28 @@ mod tests {
         digest_set(bytes, DigestRequest::default(), None)
             .unwrap()
             .atp_content_id
+    }
+
+    #[test]
+    fn a_restarted_writer_preserves_both_collision_records() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = BlobStoreLayout::open(root.path()).unwrap();
+        let declared = id_of(b"contested");
+        let preserve = |bytes: &[u8]| {
+            let (stage, mut file) = layout.create_staging(&AtomicU64::new(0)).unwrap();
+            file.write_all(bytes).unwrap();
+            drop(file);
+            let evidence = layout
+                .preserve_incoming(&stage, &declared, &AtomicU64::new(0))
+                .unwrap();
+            fs::remove_file(stage).unwrap();
+            evidence
+        };
+        let first = preserve(b"earlier observation");
+        let second = preserve(b"later observation");
+        assert_ne!(first, second);
+        assert_eq!(fs::read(first).unwrap(), b"earlier observation");
+        assert_eq!(fs::read(second).unwrap(), b"later observation");
     }
 
     #[test]
