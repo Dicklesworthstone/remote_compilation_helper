@@ -219,6 +219,22 @@ impl StagingJournal {
         op_staging_dir(&self.layout, &self.op_hex).join(u128_hex(attempt))
     }
 
+    fn reserve_attempt(&self, attempt: u128) -> Result<PathBuf, PutError> {
+        // Startup recovery enumerates journals. Even a process killed before
+        // its first Begin must leave a discoverable operation for its empty
+        // reservation; an existing journal must keep all previous frames.
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal_path(&self.layout, &self.op_hex))
+            .map_err(io_err("open-journal"))?;
+        fs::create_dir_all(op_staging_dir(&self.layout, &self.op_hex))
+            .map_err(io_err("create-op-dir"))?;
+        let dir = self.attempt_dir(attempt);
+        fs::create_dir(&dir).map_err(io_err("create-attempt-dir"))?;
+        Ok(dir)
+    }
+
     /// Append one record and fsync the journal file.
     ///
     /// # Errors
@@ -278,11 +294,7 @@ pub fn put_if_absent_journaled(
 ) -> Result<PutOutcome, PutError> {
     let journal = StagingJournal::open(layout, op)?;
     let attempt_hex = u128_hex(attempt);
-    let dir = journal.attempt_dir(attempt);
-    fs::create_dir_all(op_staging_dir(layout, &journal.op_hex)).map_err(io_err("create-op-dir"))?;
-    // Recovery owns an existing attempt, including the interval after its
-    // object has been linked into CAS but before its journal is terminal.
-    fs::create_dir(&dir).map_err(io_err("create-attempt-dir"))?;
+    let dir = journal.reserve_attempt(attempt)?;
     // Write-ahead intent BEFORE any object bytes exist.
     journal.append(&JournalRecord::Begin {
         attempt_hex: attempt_hex.clone(),
@@ -381,11 +393,10 @@ pub fn recover_operations(
     fs::create_dir_all(&journals).map_err(io_err("create-journals-dir"))?;
     let mut journal_files: Vec<PathBuf> = fs::read_dir(&journals)
         .map_err(io_err("read-journals-dir"))?
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension().is_some_and(|e| e == "journal")).then_some(path)
-        })
-        .collect();
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()
+        .map_err(io_err("read-journal-entry"))?;
+    journal_files.retain(|path| path.extension().is_some_and(|e| e == "journal"));
     journal_files.sort();
 
     for path in journal_files {
@@ -406,7 +417,18 @@ pub fn recover_operations(
                     attempt_hex,
                     declared_key,
                 } => {
-                    if !attempts.iter().any(|(a, _, _)| a == attempt_hex) {
+                    if let Some((_, previous, terminal)) =
+                        attempts.iter_mut().find(|(a, _, _)| a == attempt_hex)
+                    {
+                        // A completed put releases its attempt directory. A
+                        // subsequent Begin can own it again before this
+                        // operation journal is retired. Only the latest open
+                        // epoch describes the bytes now staged there.
+                        if *terminal {
+                            *previous = Some(declared_key.clone());
+                            *terminal = false;
+                        }
+                    } else {
                         attempts.push((attempt_hex.clone(), Some(declared_key.clone()), false));
                     }
                 }
@@ -423,12 +445,12 @@ pub fn recover_operations(
             let attempt_dir = op_staging_dir(layout, &op_hex).join(attempt_hex);
             if *terminal {
                 // Dead writer's leftovers (H003's deferred orphans).
-                let _ = fs::remove_dir_all(&attempt_dir);
+                remove_recovered_staging(&attempt_dir)?;
                 continue;
             }
             let staged = attempt_dir.join("object");
             let action = resolve_open_attempt(layout, store, declared_key, &staged, durability)?;
-            let _ = fs::remove_dir_all(&attempt_dir);
+            remove_recovered_staging(&attempt_dir)?;
             report
                 .resolved
                 .push((op_hex.clone(), attempt_hex.clone(), action));
@@ -437,11 +459,19 @@ pub fn recover_operations(
         // Every attempt is now terminal: retire the journal and the
         // operation's staging directory. (Rewrite is unnecessary — the
         // resolved state is fully reflected in durable reality.)
-        let _ = fs::remove_dir_all(op_staging_dir(layout, &op_hex));
+        remove_recovered_staging(&op_staging_dir(layout, &op_hex))?;
         fs::remove_file(&path).map_err(io_err("retire-journal"))?;
         report.retired_journals.push(op_hex);
     }
     Ok(report)
+}
+
+fn remove_recovered_staging(path: &Path) -> Result<(), PutError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_err("remove-recovery-staging")(error)),
+    }
 }
 
 /// Resolve one open attempt: resume iff the staged bytes verify
@@ -458,13 +488,12 @@ fn resolve_open_attempt(
     let Some(declared_key) = declared_key else {
         return Ok(RecoveryAction::Cleaned);
     };
-    if !staged.exists() {
+    if !staged.try_exists().map_err(io_err("stat-recovery-stage"))? {
         return Ok(RecoveryAction::Cleaned);
     }
-    let recomputed = match recompute_file_digest(staged) {
-        Ok(digest) => digest,
-        Err(_) => return Ok(RecoveryAction::Cleaned),
-    };
+    // An unreadable stage has an unknown identity. Leave both it and the
+    // journal for a later pass instead of retiring the only copy.
+    let recomputed = recompute_file_digest(staged)?;
     if digest_key(&recomputed) != *declared_key {
         return Ok(RecoveryAction::Cleaned);
     }
@@ -501,6 +530,78 @@ mod tests {
         digest_set(bytes, DigestRequest::default(), None)
             .unwrap()
             .atp_content_id
+    }
+
+    #[test]
+    fn recovery_can_retry_a_pre_begin_reservation_and_an_unreadable_stage() {
+        let layout = fresh_layout("retry-recovery");
+        let mut store = store();
+        let journal = StagingJournal::open(&layout, 73).unwrap();
+        let first = journal.reserve_attempt(1).unwrap();
+        // Process exit after reservation but before its first Begin.
+        let report = recover_operations(&layout, &mut store, DurabilityPolicy::FULL).unwrap();
+        assert_eq!(report.retired_journals, [u128_hex(73)]);
+        assert!(!first.exists());
+
+        let bytes = b"bytes restored to readability";
+        let declared = id_of(bytes);
+        let stage = journal.reserve_attempt(1).unwrap().join("object");
+        journal
+            .append(&JournalRecord::Begin {
+                attempt_hex: u128_hex(1),
+                declared_key: digest_key(&declared),
+            })
+            .unwrap();
+        // A directory produces a real read/open error even for a privileged
+        // test runner. It must not be classified as a mismatched digest.
+        fs::create_dir(&stage).unwrap();
+        assert!(recover_operations(&layout, &mut store, DurabilityPolicy::FULL).is_err());
+        assert!(stage.is_dir());
+        assert_eq!(journal.replay().unwrap().records.len(), 1);
+        fs::rename(&stage, layout.root().join("unreadable-fixture")).unwrap();
+        fs::write(&stage, bytes).unwrap();
+        let retried = recover_operations(&layout, &mut store, DurabilityPolicy::FULL).unwrap();
+        assert!(matches!(
+            retried.resolved.as_slice(),
+            [(_, _, RecoveryAction::Resumed { .. })]
+        ));
+        assert!(store.object_located(&declared).unwrap());
+    }
+
+    #[test]
+    fn completed_attempt_does_not_hide_a_later_interrupted_put() {
+        let layout = fresh_layout("reuse-after-terminal");
+        let mut store = store();
+        let first = b"first result";
+        put_if_absent_journaled(
+            &layout,
+            &mut store,
+            29,
+            7,
+            &id_of(first),
+            &mut first.as_slice(),
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        let second = b"second result";
+        let declared = id_of(second);
+        let journal = StagingJournal::open(&layout, 29).unwrap();
+        let dir = journal.reserve_attempt(7).unwrap();
+        journal
+            .append(&JournalRecord::Begin {
+                attempt_hex: u128_hex(7),
+                declared_key: digest_key(&declared),
+            })
+            .unwrap();
+        fs::write(dir.join("object"), second).unwrap();
+        let report = recover_operations(&layout, &mut store, DurabilityPolicy::FULL).unwrap();
+        let [(_, _, RecoveryAction::Resumed { path })] = report.resolved.as_slice() else {
+            panic!("the later verified put should resume: {report:?}");
+        };
+        assert_eq!(fs::read(path).unwrap(), second);
+        assert!(store.object_located(&id_of(first)).unwrap());
+        assert!(store.object_located(&declared).unwrap());
     }
 
     #[test]
