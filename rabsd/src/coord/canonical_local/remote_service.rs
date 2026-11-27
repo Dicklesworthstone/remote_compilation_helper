@@ -1455,12 +1455,8 @@ async fn deliver_result<S: AsyncRead + AsyncWrite + Unpin>(
     }
     outcome.verify_before_delivery(cancelled)?;
     checkpoint(stopped, deadline)?;
-    wire.send(
-        &Message::complete(outcome.termination)?,
-        stopped,
-        deadline,
-    )
-    .await?;
+    wire.send(&Message::complete(outcome.termination)?, stopped, deadline)
+        .await?;
     // The client can recover a lost Complete while this owner still exists.
     // A lost Delivered only retains bounded custody; it never reruns Cargo.
     require(

@@ -54,12 +54,7 @@ fn quoted(frame: &mut String, value: &str) -> Option<()> {
     }
 }
 
-fn encode<I>(
-    args: &[String],
-    cwd: &str,
-    environment: &impl Fn() -> I,
-    live: bool,
-) -> Option<String>
+fn encode<I>(args: &[String], cwd: &str, environment: &impl Fn() -> I, live: bool) -> Option<String>
 where
     I: Iterator<Item = (OsString, OsString)>,
 {
@@ -76,16 +71,21 @@ where
     }
     push(&mut frame, "],\"cwd\":")?;
     quoted(&mut frame, cwd)?;
-    let env_field = if live { ",\"env\":[" } else { ",\"env_names\":[" };
+    let env_field = if live {
+        ",\"env\":["
+    } else {
+        ",\"env_names\":["
+    };
     push(&mut frame, env_field)?;
     let mut first = true;
     for (name, value) in environment() {
         let name = if live {
             name.to_str()?
         } else {
-            let Some(name) = name.to_str().filter(|name| {
-                name.starts_with("CARGO") || name.starts_with("RUSTC")
-            }) else {
+            let Some(name) = name
+                .to_str()
+                .filter(|name| name.starts_with("CARGO") || name.starts_with("RUSTC"))
+            else {
                 continue;
             };
             name

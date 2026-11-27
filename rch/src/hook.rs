@@ -5784,10 +5784,8 @@ pub async fn run_exec(
                         .any(|code| code == "project.source_fenced")
                 })
             }) {
-                reporter.summary_critical(&format!(
-                    "[RCH] {}: {}",
-                    hold.worker_id, hold.final_reason
-                ));
+                reporter
+                    .summary_critical(&format!("[RCH] {}: {}", hold.worker_id, hold.final_reason));
             }
             let requested_refusal = requested_worker_refusal(&preferred_workers, &response);
             // A pin that could not be honored is the exact failure the allow-set fix

@@ -91,20 +91,21 @@ pub fn evaluate_break_even(inputs: &BreakEvenInputs) -> BreakEvenReceipt {
     let transfer_ms = (missing_bytes / throughput + inputs.path_rtt_ms) / sharing;
     let output_return_ms = inputs.output_bytes / throughput + inputs.path_rtt_ms;
 
-    let remote_completion_ms = inputs.remote_queue_ms
-        + transfer_ms
-        + inputs.toolchain_materialization_ms
-        + inputs.remote_exec_ms
-        + output_return_ms
-        + inputs.reliability_penalty_ms
-        + inputs.pressure_penalty_ms;
-    let local_completion_ms = inputs.local_queue_ms + inputs.local_exec_ms;
+    let remote_completion_ms = inputs
+        .remote_queue_ms
+        .saturating_add(transfer_ms)
+        .saturating_add(inputs.toolchain_materialization_ms)
+        .saturating_add(inputs.remote_exec_ms)
+        .saturating_add(output_return_ms)
+        .saturating_add(inputs.reliability_penalty_ms)
+        .saturating_add(inputs.pressure_penalty_ms);
+    let local_completion_ms = inputs.local_queue_ms.saturating_add(inputs.local_exec_ms);
 
     // Uncertain remote estimates must beat local by MORE: margin =
     // remote * uncertainty / 1000.
     let margin_ms =
         remote_completion_ms.saturating_mul(u64::from(inputs.uncertainty_permille)) / 1000;
-    let decision = if remote_completion_ms + margin_ms < local_completion_ms {
+    let decision = if remote_completion_ms.saturating_add(margin_ms) < local_completion_ms {
         BreakEvenDecision::ExecuteRemote
     } else {
         BreakEvenDecision::ExecuteLocal

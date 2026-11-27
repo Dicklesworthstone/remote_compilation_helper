@@ -2685,8 +2685,7 @@ fn inherited_rule_hides_cargo_outputs(
         let Some(profile) = entry.strip_suffix("/**") else {
             return false;
         };
-        if artifact_pattern_exclude(entry).is_some() || artifact_pattern_priority(entry).is_some()
-        {
+        if artifact_pattern_exclude(entry).is_some() || artifact_pattern_priority(entry).is_some() {
             return false;
         }
         if !profile.split('/').any(|part| part == "*") {

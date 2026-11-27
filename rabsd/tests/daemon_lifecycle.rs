@@ -298,7 +298,6 @@ fn kill_nine_leaves_evidence_and_next_boot_reports_recovery() {
     );
 }
 
-
 /// The actual daemon must finish even when its caller stops consuming either
 /// event stream. The child receives a blocking descriptor; the test never
 /// drains it to make progress and checks that its flags remain unchanged.

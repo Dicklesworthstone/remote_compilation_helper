@@ -5964,8 +5964,8 @@ esac
         let claim = registry.join(&name);
         std::fs::rename(record, &claim).unwrap();
         let helper = tmp.path().join("system-reader");
-        let command = abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0)
-            .replace(
+        let command =
+            abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0).replace(
                 "/usr/local/libexec/rch/gc-proc-references-v1",
                 &shell_escape::escape(helper.to_str().unwrap().into()),
             );

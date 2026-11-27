@@ -1233,9 +1233,9 @@ impl Message {
         validate_termination(termination)?;
         Ok(match termination {
             ChildTermination::Exited(exit_code) => Self::Complete { exit_code },
-            ChildTermination::Signaled { signal_number } => Self::CompleteSignaled {
-                signal_number,
-            },
+            ChildTermination::Signaled { signal_number } => {
+                Self::CompleteSignaled { signal_number }
+            }
         })
     }
 }

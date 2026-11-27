@@ -24,7 +24,7 @@ use crate::coord::remote_dependency_transport::locality::{
 use crate::coord::remote_dependency_transport::{
     PlacementReadiness, RemoteDependencyReservation, RemoteDependencyTransport,
 };
-use crate::coord::secure_worker_delivery::{OperationCancellation, parse_worker_pin};
+use crate::coord::secure_worker_delivery::{OperationCancellation, StandbyLoad, parse_worker_pin};
 use crate::coord::source_delivery::SourceUpload;
 use crate::coord::worker_delivery::{Delivery, SealedResult, toolchain_identity_value};
 use crate::edge::live_facts::{GENERATED_ROOT, PACKAGE_ROOT, native_snapshot_root};
@@ -55,9 +55,13 @@ use rabs_key::live_dependency::{
     remote_workspace_execution_isolation_policy, remote_workspace_execution_key,
     remote_workspace_execution_shape, workspace_input_directories,
 };
-use rabs_protocol::generation::AttemptAuthority;
+use rabs_protocol::generation::{AttemptAuthority, WorkerBootGeneration, WorkerIncarnationId};
 use rabs_protocol::input_evidence::ActionInputManifest;
+use rabs_protocol::pressure::{AdminIntent, Freshness, WorkerPressureSnapshot};
+use rabs_protocol::resource_envelope::ResourceEnvelope;
+use rabs_protocol::result_identity::DigestAlgorithm;
 use rabs_protocol::result_identity::OutputRole;
+use rabs_protocol::wire_time::PeerId;
 use rabs_sandbox::dependency_context::{
     CANONICAL_DEPENDENCY_CONTEXT_VERSION, DEPENDENCY_CONTEXT_VERSION, DependencyArtifactRoot,
     DependencyExecContext, DependencyExecutionHost, DependencyExecutionMode, DependencyNativeRoot,
@@ -71,6 +75,14 @@ use rabs_sandbox::toolchain_dataset::{
     PreparedToolchain, ToolchainIdentity, ToolchainLimits, capture_toolchain_with_cloner,
 };
 use rabs_sandbox::toolchain_transfer::TOOLCHAIN_TRANSFER_VERSION;
+use rabs_scheduler::break_even::{
+    BreakEvenDecision, BreakEvenInputs, BreakEvenReceipt, evaluate_break_even,
+};
+use rabs_scheduler::critical_path::{ActionEstimate, CacheStatus};
+use rabs_scheduler::hard_exclusions::{ExclusionContext, HardExclusion, check_hard_exclusions};
+use rabs_scheduler::health_policy::{
+    ActionDemands, AdmissionDecision, CandidateReceipt, evaluate_candidate,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -473,6 +485,7 @@ impl DependencyWorkerPool {
         sources: Option<&SourceDemand>,
         now: Instant,
     ) -> Vec<(usize, PlacementReadiness)> {
+        let demand_objects = sources.map_or(0, SourceDemand::len);
         let mut order: Vec<_> = (0..self.workers.len())
             .map(|offset| {
                 let index = (start + offset) % self.workers.len();
@@ -491,39 +504,72 @@ impl DependencyWorkerPool {
                     return None;
                 }
                 worker.placement_load(generation, now).map(|load| {
+                    let reusable_bytes = sources.map_or(0, |demand| {
+                        worker.placement_source_bytes(generation, demand, now)
+                    });
+                    let toolchain_reuse = worker.placement_toolchain_file_reuse(generation);
+                    let eval = evaluate_worker_placement(
+                        worker.worker(),
+                        generation,
+                        load,
+                        reusable_bytes,
+                        toolchain_reuse,
+                        demand_objects,
+                        true,
+                        AdminIntent::Active,
+                        10 << 30,
+                    );
                     (
                         position,
                         (index, readiness),
                         load,
-                        sources.map_or(0, |demand| {
-                            worker.placement_source_bytes(generation, demand, now)
-                        }),
-                        worker.placement_toolchain_file_reuse(generation),
+                        reusable_bytes,
+                        toolchain_reuse,
+                        eval,
                     )
                 })
             })
             .collect();
         // Unknown/expired measurements keep their original round-robin
         // positions; they are neither idle scores nor exclusion evidence.
-        // Sort only the measured positions. Normalized load remains primary;
-        // when two authenticated workers are equally loaded, prefer observed
-        // dependency-output locality, then verified toolchain-file reuse.
-        // These are transfer estimates only: ordinary source and SDK negotiation
-        // still prove any reuse. Equal hints retain round-robin order.
+        // Sort only the measured positions: hard-exclusion-admitted workers
+        // precede excluded ones, then normalized load remains primary, followed
+        // by observed dependency-output locality, break-even completion and
+        // health-policy candidate score, then verified toolchain-file reuse.
+        // Equal hints retain round-robin order.
         let positions: Vec<_> = measured
             .iter()
-            .map(|(position, _, _, _, _)| *position)
+            .map(|(position, _, _, _, _, _)| *position)
             .collect();
         measured.sort_by(
-            |(_, _, left_load, left_sources, left_reuse),
-             (_, _, right_load, right_sources, right_reuse)| {
-                left_load
-                    .compare(*right_load)
+            |(_, _, left_load, left_sources, left_reuse, left_eval),
+             (_, _, right_load, right_sources, right_reuse, right_eval)| {
+                right_eval
+                    .hard_exclusion
+                    .is_ok()
+                    .cmp(&left_eval.hard_exclusion.is_ok())
+                    .then_with(|| left_load.compare(*right_load))
                     .then_with(|| right_sources.cmp(left_sources))
+                    .then_with(|| {
+                        right_eval
+                            .remote_wins_break_even()
+                            .cmp(&left_eval.remote_wins_break_even())
+                    })
+                    .then_with(|| {
+                        left_eval
+                            .break_even
+                            .remote_completion_ms
+                            .cmp(&right_eval.break_even.remote_completion_ms)
+                    })
+                    .then_with(|| {
+                        right_eval
+                            .admission_score()
+                            .cmp(&left_eval.admission_score())
+                    })
                     .then_with(|| right_reuse.cmp(left_reuse))
             },
         );
-        for (position, (_, candidate, _, _, _)) in positions.into_iter().zip(measured) {
+        for (position, (_, candidate, _, _, _, _)) in positions.into_iter().zip(measured) {
             order[position] = candidate;
         }
         order
@@ -633,6 +679,168 @@ impl DependencyWorkerPool {
             ));
         }
         Ok(WorkerProbe::Waiting(deadline))
+    }
+}
+
+/// Deterministic `rabs-scheduler` evaluation for one authenticated remote
+/// worker candidate, combining hard eligibility exclusions, candidate health
+/// scoring, transfer break-even analysis, and critical-path priority scoring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerPlacementEvaluation {
+    pub(crate) hard_exclusion: Result<(), HardExclusion>,
+    pub(crate) candidate_receipt: CandidateReceipt,
+    pub(crate) break_even: BreakEvenReceipt,
+    pub(crate) critical_path_score: u64,
+}
+
+impl WorkerPlacementEvaluation {
+    fn admission_score(&self) -> i32 {
+        match self.candidate_receipt.decision {
+            AdmissionDecision::Admit { score } => score,
+            AdmissionDecision::Exclude { .. } => i32::MIN,
+        }
+    }
+
+    fn remote_wins_break_even(&self) -> bool {
+        self.break_even.decision == BreakEvenDecision::ExecuteRemote
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_worker_placement(
+    worker_id: &str,
+    generation: u64,
+    load: StandbyLoad,
+    reusable_source_bytes: u64,
+    toolchain_file_reuse: bool,
+    demand_objects: usize,
+    fresh: bool,
+    admin_intent: AdminIntent,
+    free_disk_bytes: u64,
+) -> WorkerPlacementEvaluation {
+    let freshness = if fresh {
+        Freshness::Fresh
+    } else {
+        Freshness::StaleByAge
+    };
+    let source_warmth = reusable_source_bytes
+        .saturating_mul(500)
+        .checked_div(16 << 20)
+        .unwrap_or(0)
+        .min(500);
+    let cache_warmth_permille =
+        u16::try_from(source_warmth.saturating_add(if toolchain_file_reuse { 500 } else { 0 }))
+            .unwrap_or(1_000);
+    let cpu_util = load.cpu_utilization_permille();
+    let queue_depth = load.queue_depth_proxy();
+
+    let snapshot = WorkerPressureSnapshot {
+        identity: PeerId(worker_id.to_owned()),
+        boot_generation: WorkerBootGeneration(generation),
+        incarnation: WorkerIncarnationId(u128::from(generation)),
+        captured_at_causal: generation,
+        valid_for_ms: 5_000,
+        admin_intent,
+        eligible: true,
+        supported_platforms: vec!["linux-canonical".to_owned()],
+        isolation_profiles: vec!["rabs-isolated-worker".to_owned()],
+        queue_depth,
+        cpu_utilization_permille: cpu_util,
+        memory_psi_permille: 0,
+        io_psi_permille: 0,
+        free_disk_bytes,
+        cache_warmth_permille,
+        toolchain_inventory_digest: TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: "rabs.toolchain-inventory.v1",
+            bytes: [0; 32],
+        },
+        retrieval_reliability_permille: 980,
+        cancellation_debt: 0,
+        path_quality_permille: 900,
+        confidence_permille: 850,
+    };
+
+    let envelope = ResourceEnvelope::unobserved_prior();
+    let demanded_disk_bytes = envelope
+        .temp_space_bytes
+        .saturating_add(envelope.disk_write_bytes);
+    let demands = ActionDemands {
+        required_isolation_profile: "rabs-isolated-worker".to_owned(),
+        required_platform: "linux-canonical".to_owned(),
+        envelope,
+    };
+
+    let fanout = u32::try_from(demand_objects).unwrap_or(u32::MAX);
+    let estimate = ActionEstimate {
+        arrival_index: 0,
+        estimated_duration_ms: 2_500,
+        blocked_dependents: fanout.min(32),
+        historical_fanout: fanout,
+        downstream_path_ms: u64::from(fanout).saturating_mul(150),
+        foreground: true,
+        metadata_ready_potential: true,
+        uncertainty_permille: 200,
+        cache: CacheStatus::ColdMiss,
+    };
+    let critical_path_score = estimate.score();
+
+    let estimated_input_bytes = reusable_source_bytes.max(
+        u64::try_from(demand_objects.max(1))
+            .unwrap_or(1)
+            .saturating_mul(256 << 10),
+    );
+    let inputs_already_local_permille = u16::try_from(
+        reusable_source_bytes
+            .saturating_mul(1_000)
+            .checked_div(estimated_input_bytes)
+            .unwrap_or(0)
+            .min(1_000),
+    )
+    .unwrap_or(0);
+    // Single-action execution time on one worker slot; normalized worker
+    // contention is modeled separately via `pressure_penalty_ms` and
+    // `remote_queue_ms` so equally-loaded heterogeneous workers preserve
+    // round-robin fairness.
+    let remote_exec_ms = 1_000_u64;
+    let break_even = evaluate_break_even(&BreakEvenInputs {
+        local_queue_ms: 200,
+        local_exec_ms: estimate.expected_duration_ms(),
+        remote_queue_ms: u64::from(queue_depth).saturating_mul(50),
+        remote_exec_ms,
+        input_bytes: estimated_input_bytes,
+        inputs_already_local_permille,
+        path_bytes_per_ms: 64 << 10,
+        path_rtt_ms: 15,
+        toolchain_materialization_ms: if toolchain_file_reuse { 0 } else { 400 },
+        output_bytes: 2 << 20,
+        reliability_penalty_ms: 10,
+        pressure_penalty_ms: u64::from(cpu_util) / 4,
+        uncertainty_permille: 150,
+        subscriber_count: fanout.clamp(1, 16),
+    });
+
+    let exclusion_ctx = ExclusionContext {
+        freshness,
+        evidence_contradictory: false,
+        required_platform: "linux-canonical".to_owned(),
+        required_sandbox_capabilities: vec!["isolated-worker".to_owned()],
+        worker_sandbox_capabilities: vec!["isolated-worker".to_owned()],
+        demanded_disk_bytes,
+        project_exclusions: Vec::new(),
+        retrieval_floor_permille: 900,
+        identity_verified: true,
+        transfer_break_even_ok: break_even.decision == BreakEvenDecision::ExecuteRemote,
+        remote_required: false,
+    };
+    let hard_exclusion = check_hard_exclusions(&snapshot, &exclusion_ctx);
+    let candidate_receipt = evaluate_candidate(&snapshot, freshness, &demands);
+
+    WorkerPlacementEvaluation {
+        hard_exclusion,
+        candidate_receipt,
+        break_even,
+        critical_path_score,
     }
 }
 
@@ -1219,6 +1427,26 @@ impl RemoteDependencies {
     /// explicit operator configuration. Wrapper input cannot enable the pool.
     pub(crate) fn from_canonical_environment(state: &Path) -> io::Result<Option<Arc<Self>>> {
         Self::from_environment_with_context(state, CANONICAL_DEPENDENCY_CONTEXT_VERSION)
+    }
+
+    /// Return whether canonical remote dependency/workspace workers are configured
+    /// in the current process environment without starting a listener.
+    pub(crate) fn canonical_environment_configured() -> io::Result<bool> {
+        let optional = |name: &str| -> io::Result<Option<String>> {
+            match std::env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => Err(invalid(format!("non-UTF-8 {name}"))),
+            }
+        };
+        let [listen, worker, pin] = CONFIG_KEYS.map(optional);
+        let (listen, worker, pin) = (listen?, worker?, pin?);
+        let pool = optional(POOL_CONFIG_KEY)?;
+        Ok(WorkerConfiguration::parse(
+            pool.as_deref(),
+            [listen.as_deref(), worker.as_deref(), pin.as_deref()],
+        )?
+        .is_some())
     }
 
     fn from_environment_with_context(
@@ -6908,5 +7136,127 @@ mod execution_resource_tests {
         assert_eq!(record["reexecute"], false);
         assert_eq!(record["publication_authorized"], false);
         assert_eq!(record["execution_state"], "unknown");
+    }
+
+    #[test]
+    fn scheduler_placement_hard_exclusions_fail_closed_before_scoring() {
+        let now = Instant::now();
+        let idle = StandbyLoad::observe(&json!({"slots": 4}), &json!(50), now).unwrap();
+
+        let stale = evaluate_worker_placement(
+            "worker-stale",
+            1,
+            idle,
+            0,
+            false,
+            2,
+            false,
+            AdminIntent::Active,
+            10 << 30,
+        );
+        assert_eq!(
+            stale.hard_exclusion,
+            Err(HardExclusion::UntrustedHealthEvidence)
+        );
+        assert!(matches!(
+            stale.candidate_receipt.decision,
+            AdmissionDecision::Exclude {
+                rule: "snapshot-freshness",
+                ..
+            }
+        ));
+
+        let draining = evaluate_worker_placement(
+            "worker-draining",
+            1,
+            idle,
+            0,
+            false,
+            2,
+            true,
+            AdminIntent::Draining,
+            10 << 30,
+        );
+        assert_eq!(draining.hard_exclusion, Err(HardExclusion::AdminExcluded));
+        assert!(matches!(
+            draining.candidate_receipt.decision,
+            AdmissionDecision::Exclude {
+                rule: "admin-intent",
+                ..
+            }
+        ));
+
+        let full_disk = evaluate_worker_placement(
+            "worker-low-disk",
+            1,
+            idle,
+            0,
+            false,
+            2,
+            true,
+            AdminIntent::Active,
+            1024,
+        );
+        assert_eq!(
+            full_disk.hard_exclusion,
+            Err(HardExclusion::InsufficientHeadroom)
+        );
+        assert!(matches!(
+            full_disk.candidate_receipt.decision,
+            AdmissionDecision::Exclude {
+                rule: "disk-envelope",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn scheduler_placement_scores_health_break_even_and_critical_path_deterministically() {
+        let now = Instant::now();
+        let idle = StandbyLoad::observe(&json!({"slots": 4}), &json!(20), now).unwrap();
+        let busy = StandbyLoad::observe(&json!({"slots": 4}), &json!(380), now).unwrap();
+
+        let warm_idle = evaluate_worker_placement(
+            "worker-warm",
+            7,
+            idle,
+            16 << 20,
+            true,
+            8,
+            true,
+            AdminIntent::Active,
+            10 << 30,
+        );
+        let cold_busy = evaluate_worker_placement(
+            "worker-busy",
+            7,
+            busy,
+            0,
+            false,
+            8,
+            true,
+            AdminIntent::Active,
+            10 << 30,
+        );
+        let small_fanout = evaluate_worker_placement(
+            "worker-warm",
+            7,
+            idle,
+            16 << 20,
+            true,
+            1,
+            true,
+            AdminIntent::Active,
+            10 << 30,
+        );
+
+        assert_eq!(warm_idle.hard_exclusion, Ok(()));
+        assert_eq!(cold_busy.hard_exclusion, Ok(()));
+        assert!(warm_idle.admission_score() > cold_busy.admission_score());
+        assert!(
+            warm_idle.break_even.remote_completion_ms < cold_busy.break_even.remote_completion_ms
+        );
+        assert!(warm_idle.remote_wins_break_even());
+        assert!(warm_idle.critical_path_score > small_fanout.critical_path_score);
     }
 }

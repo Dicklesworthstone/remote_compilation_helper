@@ -47,7 +47,7 @@ rabs-key = { path = "../rabs-key", version = "2.1.0" }
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 # H017: safe FICLONE and anonymous probe files; atomic no-clobber output
 # directory publication on Linux/macOS. No unsafe code in RABS.
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs"] }
 
 [lints.rust]
 unsafe_code = "forbid"

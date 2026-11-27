@@ -11,10 +11,11 @@ categories.workspace = true
 description = "RABS tiny RUSTC_WRAPPER binary: breaker-gated daemon consult, exec passthrough (bridge plan S2)"
 publish = false
 
-# Tiny-wrapper profile discipline (A021): the workspace release profile
-# is already opt-level=z + LTO + panic=abort + strip. Dependency budget
-# is deliberately minimal — protocol + safe executable lookup; no async runtime, no
-# serde (hand-rolled frames): the p95 <10ms budget is the design.
+# Tiny-wrapper profile discipline (A021): built with `--profile wrapper-release`
+# (opt-level=z + strip + panic=unwind + lto=false; panic=unwind is required by
+# I49 containment). Dependency budget is deliberately minimal — protocol + safe
+# Unix peer/signal handling (nix, signal-hook); no async runtime, no serde
+# (hand-rolled frames): the p95 <10ms budget is the design.
 [dependencies]
 rabs-protocol = { path = "../rabs-protocol" }
 

@@ -98,7 +98,7 @@ pub fn evaluate_candidate(
             *exclusion = Some((rule, reason));
         }
         if let RuleOutcome::Score { delta } = &outcome {
-            *score += delta;
+            *score = score.saturating_add(*delta);
         }
         findings.push(RuleFinding { rule, outcome });
     };
@@ -196,7 +196,9 @@ pub fn evaluate_candidate(
         &mut score,
         "queue-pressure",
         RuleOutcome::Score {
-            delta: -(i32::try_from(snapshot.queue_depth).unwrap_or(i32::MAX) * 10),
+            delta: -(i32::try_from(snapshot.queue_depth)
+                .unwrap_or(i32::MAX)
+                .saturating_mul(10)),
         },
     );
     push(
@@ -399,5 +401,13 @@ mod tests {
             .find(|f| f.rule == "queue-pressure")
             .unwrap();
         assert_eq!(queue_finding.outcome, RuleOutcome::Score { delta: -200 });
+    }
+
+    #[test]
+    fn extreme_queue_depth_saturates_without_overflow() {
+        let mut extreme = snapshot();
+        extreme.queue_depth = u32::MAX;
+        let receipt = evaluate_candidate(&extreme, Freshness::Fresh, &demands());
+        assert!(matches!(receipt.decision, AdmissionDecision::Admit { .. }));
     }
 }

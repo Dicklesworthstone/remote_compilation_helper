@@ -2535,8 +2535,7 @@ fn installed_cargo_multiple_targets_prepare_and_replay_host_and_target_dependenc
         }));
     }
     assert!(units.iter().any(|unit| {
-        unit["pkg_id"].as_str().unwrap().contains("host-helper")
-            && unit["platform"].is_null()
+        unit["pkg_id"].as_str().unwrap().contains("host-helper") && unit["platform"].is_null()
     }));
     let delivered = fixture.path().join("delivered");
     retained.materialize_into(&delivered).unwrap();

@@ -31,7 +31,7 @@ tempfile = "3.25.0"
 [target.'cfg(unix)'.dependencies]
 # Descriptor-relative source/endpoint ownership and effective-UID checks
 # without unsafe code in this crate. The package/version is unchanged.
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 
 [lints.rust]
 unsafe_code = "forbid"

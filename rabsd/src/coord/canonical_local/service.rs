@@ -1005,13 +1005,16 @@ pub fn run_service_profile(
     let mut sessions = Sessions::default();
     let admissions = OperationAdmissions::new(config.max_roots, config.max_queued_roots);
     let mut sequence = 0_u64;
+    let workspace_library_cache = runtime.remote_workers_configured();
     report_status(json!({
         "kind":"canonical-service-listening", "version":SERVICE_VERSION,
         "socket":config.socket, "max_roots":config.max_roots,
         "max_queued_roots":config.max_queued_roots,
         "jobs_per_root":config.jobs_per_root, "build_identity":build_identity,
         "required_release":release_mode == ReleaseAuthorizationMode::Required,
-        "workspace_cache":false
+        "workspace_cache":workspace_library_cache,
+        "workspace_library_cache":workspace_library_cache,
+        "workspace_binary_cache":false
     }));
     let result = loop {
         sessions.reap();
@@ -1151,8 +1154,7 @@ pub(super) fn run_client_profile(
             early_refusal,
             deadline,
             stopped,
-            &mut stdout,
-            &mut stderr,
+            (&mut stdout, &mut stderr),
         )
     })();
     if result.is_ok() {
@@ -1207,8 +1209,7 @@ fn receive_result(
     mut early_refusal: Option<(Header, Vec<u8>)>,
     deadline: Instant,
     stopped: &AtomicBool,
-    stdout: &mut impl Write,
-    stderr: &mut impl Write,
+    (stdout, stderr): (&mut impl Write, &mut impl Write),
 ) -> io::Result<ChildTermination> {
     let mut result = None;
     while !state.is_finished() {
@@ -1534,8 +1535,10 @@ mod tests {
             None,
             deadline,
             &stopped,
-            &mut ControlledOutput::new(&stdout, &stopped, deadline).unwrap(),
-            &mut ControlledOutput::new(&stderr, &stopped, deadline).unwrap(),
+            (
+                &mut ControlledOutput::new(&stdout, &stopped, deadline).unwrap(),
+                &mut ControlledOutput::new(&stderr, &stopped, deadline).unwrap(),
+            ),
         )
         .unwrap();
         assert_eq!(code, ChildTermination::Exited(7));
@@ -1608,8 +1611,7 @@ mod tests {
                 None,
                 Instant::now() + Duration::from_secs(5),
                 &AtomicBool::new(false),
-                &mut stdout,
-                &mut stderr,
+                (&mut stdout, &mut stderr),
             )
             .unwrap();
             assert_eq!(actual, expected);
@@ -1834,8 +1836,7 @@ mod tests {
                         None,
                         deadline,
                         &client_stopped,
-                        &mut stdout,
-                        &mut stderr,
+                        (&mut stdout, &mut stderr),
                     );
                     finished.send(outcome).unwrap();
                 });

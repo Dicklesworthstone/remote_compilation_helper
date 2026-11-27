@@ -712,9 +712,9 @@ impl VendoredSources {
                 continue;
             }
             let selector = if source.starts_with("git+") {
-                let (selector, _) = source
-                    .rsplit_once('#')
-                    .ok_or_else(|| invalid("selected vendor Git source lacks its locked revision"))?;
+                let (selector, _) = source.rsplit_once('#').ok_or_else(|| {
+                    invalid("selected vendor Git source lacks its locked revision")
+                })?;
                 require(
                     GitSource::parse(source)? == GitSource::parse_encoded(source)?,
                     "selected vendor Git source uses an ambiguous encoded selector",
@@ -724,12 +724,16 @@ impl VendoredSources {
                 source.as_str()
             };
             if super::selection::package_id_matches(id, selector, name, version) {
-                require(owner.is_none(), "selected vendor unit has ambiguous locked owners")?;
+                require(
+                    owner.is_none(),
+                    "selected vendor unit has ambiguous locked owners",
+                )?;
                 owner = Some(source);
             }
         }
-        let source = owner
-            .ok_or_else(|| invalid("selected vendor unit differs from its locked package source"))?;
+        let source = owner.ok_or_else(|| {
+            invalid("selected vendor unit differs from its locked package source")
+        })?;
         // Every target entrypoint must be an actual retained ordinary file,
         // including host build scripts and proc macros. check_package below
         // additionally binds all of them to this same verified package root.

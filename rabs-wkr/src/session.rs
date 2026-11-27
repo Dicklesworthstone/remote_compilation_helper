@@ -961,7 +961,9 @@ fn execution_grants(
         }
         let build_grant = worker_build_grant(request.jobserver_grant, resources.slots)
             .map_err(|error| error.to_string())?;
-        let execution_slots = contract.execution_slots().map_err(|error| error.to_string())?;
+        let execution_slots = contract
+            .execution_slots()
+            .map_err(|error| error.to_string())?;
         if execution_slots > resources.slots {
             return Err(format!(
                 "nextest execution requires {execution_slots} slots but worker capacity is {}",
@@ -1588,21 +1590,34 @@ fn execute_canonical_inner(
             ));
             return exec_error(request.request_id);
         };
-        let prepared =
-            crate::target_cache::target_key(scope, request, inputs, &spec, support, plan, build_grant)
-                .and_then(|key| {
-                    let compatible = crate::target_cache::target_compatibility_key(
-                        scope, request, inputs, &spec, support, plan, build_grant,
-                    )?;
-                    cache.acquire(
-                        key,
-                        compatible,
-                        inputs.clone(),
-                        || PreparedArtifacts::new_in(plan.clone(), capture_directory.path()),
-                        request.request_id,
-                        &|| control.reason().is_some(),
-                    )
-                });
+        let prepared = crate::target_cache::target_key(
+            scope,
+            request,
+            inputs,
+            &spec,
+            support,
+            plan,
+            build_grant,
+        )
+        .and_then(|key| {
+            let compatible = crate::target_cache::target_compatibility_key(
+                scope,
+                request,
+                inputs,
+                &spec,
+                support,
+                plan,
+                build_grant,
+            )?;
+            cache.acquire(
+                key,
+                compatible,
+                inputs.clone(),
+                || PreparedArtifacts::new_in(plan.clone(), capture_directory.path()),
+                request.request_id,
+                &|| control.reason().is_some(),
+            )
+        });
         match prepared {
             Ok((attempt, restored)) => {
                 if let Some(restored) = restored {
@@ -2430,7 +2445,10 @@ mod tests {
             workspace_backing: "/absent-workspace".into(),
             jobserver_grant: Some(build_jobs),
         };
-        (request, crate::artifacts::parse_plan(&value).unwrap().unwrap())
+        (
+            request,
+            crate::artifacts::parse_plan(&value).unwrap().unwrap(),
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -2438,19 +2456,16 @@ mod tests {
     fn nextest_host_reservation_and_compiler_jobserver_use_their_separate_grants() {
         for (build_jobs, test_threads) in [(2, 8), (8, 1)] {
             let root = tempfile::tempdir().unwrap();
-            let budget = crate::host_budget::HostBudget::open(&root.path().join("budget"), 8)
-                .unwrap();
+            let budget =
+                crate::host_budget::HostBudget::open(&root.path().join("budget"), 8).unwrap();
             let (request, plan) = nextest_fixture(build_jobs, Some(test_threads), false);
             let mut resources = ExecutionResources::new(8);
             resources.host_budget = Some(&budget);
             let grants = execution_grants(&request, Some(&plan), resources).unwrap();
             assert_eq!(grants.build_grant, build_jobs);
             assert_eq!(grants.execution_slots, 8);
-            let bridge = crate::jobserver::JobserverBridge::mint(
-                grants.build_grant,
-                root.path(),
-            )
-            .unwrap();
+            let bridge =
+                crate::jobserver::JobserverBridge::mint(grants.build_grant, root.path()).unwrap();
             let mut env = Vec::new();
             crate::jobserver::JobserverBridge::apply(&mut env, &bridge);
             assert!(env.contains(&("NUM_JOBS".to_owned(), build_jobs.to_string())));
@@ -2463,7 +2478,10 @@ mod tests {
                 polls.set(count + 1);
                 count > 0
             });
-            assert_eq!(blocked.err().unwrap().kind(), std::io::ErrorKind::Interrupted);
+            assert_eq!(
+                blocked.err().unwrap().kind(),
+                std::io::ErrorKind::Interrupted
+            );
             drop(lease);
             assert!(budget.acquire(8, || false).is_ok());
         }
@@ -2636,8 +2654,7 @@ mod tests {
         assert!(execution_grants(&request, None, ExecutionResources::new(8)).is_err());
         assert!(execution_grants(&request, Some(&plan), ExecutionResources::new(4)).is_err());
         let root = tempfile::tempdir().unwrap();
-        let budget = crate::host_budget::HostBudget::open(&root.path().join("budget"), 4)
-            .unwrap();
+        let budget = crate::host_budget::HostBudget::open(&root.path().join("budget"), 4).unwrap();
         let mut resources = ExecutionResources::new(8);
         resources.host_budget = Some(&budget);
         assert!(execution_grants(&request, Some(&plan), resources).is_err());
@@ -2650,13 +2667,15 @@ mod tests {
         assert!(execution_grants(&changed, Some(&plan), ExecutionResources::new(16)).is_err());
 
         let (legacy, legacy_plan) = nextest_fixture(2, None, false);
-        assert!(
-            execution_grants(&legacy, Some(&legacy_plan), ExecutionResources::new(8)).is_err()
-        );
+        assert!(execution_grants(&legacy, Some(&legacy_plan), ExecutionResources::new(8)).is_err());
         let (compile_only, compile_plan) = nextest_fixture(2, None, true);
         assert_eq!(
-            execution_grants(&compile_only, Some(&compile_plan), ExecutionResources::new(8))
-                .unwrap(),
+            execution_grants(
+                &compile_only,
+                Some(&compile_plan),
+                ExecutionResources::new(8)
+            )
+            .unwrap(),
             ExecutionGrants {
                 build_grant: 2,
                 execution_slots: 2,

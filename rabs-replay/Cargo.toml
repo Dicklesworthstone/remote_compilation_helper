@@ -14,6 +14,10 @@ publish = false
 [lib]
 doctest = false
 
+[[bin]]
+name = "rabs-replay"
+path = "src/main.rs"
+
 # The trust-ladder engine (bead B005): reads the B002 corpus, replays
 # under pluggable execution paths (the stock path REALLY executes), and
 # compares. Process effects are this crate's PURPOSE; no Tokio, no

@@ -1517,9 +1517,215 @@ pub async fn run_quarantine(action: QuarantineAction, ctx: &OutputContext) -> an
     }
 }
 
+/// One grouped telemetry counter pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct TelemetryCountDto {
+    /// Grouped label recorded in CAS metadata.
+    pub label: String,
+    /// Recorded row count for this label.
+    pub count: u64,
+}
+
+/// Read-only CAS telemetry receipt for `rch rabs telemetry` (M15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct CasTelemetryReceipt {
+    /// Receipt schema tag.
+    pub schema: &'static str,
+    /// Existing metadata database path read by the command.
+    pub metadata_path: String,
+    /// Observed SQLite schema version.
+    pub schema_version: u32,
+    /// Always `recorded_cas_snapshot_only`: reflects persisted CAS rows, not live request counters.
+    pub telemetry_scope: &'static str,
+    /// Always false: live coordinator clock/authority serving gates are not evaluated here.
+    pub serving_authorization_evaluated: bool,
+    /// Total rows in `action_entries`.
+    pub action_entries: u64,
+    /// Total rows in `action_key_headers` (None on schema 25).
+    pub action_key_headers: Option<u64>,
+    /// Distinct action keys with recorded component breakdowns.
+    pub actions_with_breakdowns: u64,
+    /// Total committed publications across all result kinds.
+    pub publications_total: u64,
+    /// Committed publications grouped by `result_kind`.
+    pub publications_by_result_kind: Vec<TelemetryCountDto>,
+    /// Serving-state rows grouped by `disposition`.
+    pub serving_states_by_disposition: Vec<TelemetryCountDto>,
+    /// Recorded `servable` disposition share of committed publications (permille), when publications exist.
+    pub recorded_servable_fraction_permille: Option<u32>,
+    /// Active quarantines grouped by `scope`.
+    pub quarantines_by_scope: Vec<TelemetryCountDto>,
+    /// Total unresolved divergence incidents.
+    pub unresolved_divergence_incidents: u64,
+    /// Total logical CAS objects.
+    pub objects_total: u64,
+    /// Sum of logical byte sizes across `objects`.
+    pub objects_logical_bytes: u64,
+    /// Non-quarantined physical object locations.
+    pub object_locations_healthy: u64,
+    /// Quarantined physical object locations.
+    pub object_locations_quarantined: u64,
+    /// Physical object locations marked durable.
+    pub object_locations_durable: u64,
+    /// Unreleased reachability pins.
+    pub active_pins: u64,
+    /// Released reachability pins.
+    pub released_pins: u64,
+    /// Total persisted GC receipts.
+    pub gc_receipts_total: u64,
+    /// Cumulative reclaimed locations recorded in `gc_receipts`.
+    pub gc_total_reclaimed: u64,
+    /// Admitted actions grouped by `rabs-live-action-class-v1` decision receipt.
+    pub runtime_classes: Vec<TelemetryCountDto>,
+    /// Persisted decision receipts grouped by `kind`.
+    pub decision_receipts_by_kind: Vec<TelemetryCountDto>,
+    /// Persisted release-gate verdict rows.
+    pub release_verdicts_total: u64,
+    /// Distinct workers with recorded capabilities.
+    pub worker_capabilities_workers: u64,
+}
+
+const TELEMETRY_SCHEMA: &str = "rch.rabs-telemetry.v1";
+
+/// Read durable CAS telemetry from an existing `meta.sqlite` without creating
+/// or migrating the store.
+///
+/// # Errors
+/// Missing/incompatible store or corrupt metadata rows.
+pub fn telemetry_receipt(cas_root: &Path) -> anyhow::Result<CasTelemetryReceipt> {
+    let database = cas_root.join("meta.sqlite");
+    let raw = rabs_cas::action_inspection::inspect_cas_telemetry(&database)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", database.display()))?;
+    let servable_count = raw
+        .serving_states_by_disposition
+        .iter()
+        .find(|row| row.label == "servable")
+        .map_or(0, |row| row.count);
+    let recorded_servable_fraction_permille = (raw.publications_total > 0).then(|| {
+        let permille = servable_count
+            .saturating_mul(1_000)
+            .checked_div(raw.publications_total)
+            .unwrap_or(0)
+            .min(1_000);
+        u32::try_from(permille).unwrap_or(1_000)
+    });
+    let map_counts = |rows: Vec<rabs_cas::action_inspection::LabelCount>| {
+        rows.into_iter()
+            .map(|row| TelemetryCountDto {
+                label: row.label,
+                count: row.count,
+            })
+            .collect()
+    };
+    Ok(CasTelemetryReceipt {
+        schema: TELEMETRY_SCHEMA,
+        metadata_path: database.display().to_string(),
+        schema_version: raw.schema_version,
+        telemetry_scope: "recorded_cas_snapshot_only",
+        serving_authorization_evaluated: false,
+        action_entries: raw.action_entries,
+        action_key_headers: raw.action_key_headers,
+        actions_with_breakdowns: raw.actions_with_breakdowns,
+        publications_total: raw.publications_total,
+        publications_by_result_kind: map_counts(raw.publications_by_result_kind),
+        serving_states_by_disposition: map_counts(raw.serving_states_by_disposition),
+        recorded_servable_fraction_permille,
+        quarantines_by_scope: map_counts(raw.quarantines_by_scope),
+        unresolved_divergence_incidents: raw.unresolved_divergence_incidents,
+        objects_total: raw.objects_total,
+        objects_logical_bytes: raw.objects_logical_bytes,
+        object_locations_healthy: raw.object_locations_healthy,
+        object_locations_quarantined: raw.object_locations_quarantined,
+        object_locations_durable: raw.object_locations_durable,
+        active_pins: raw.active_pins,
+        released_pins: raw.released_pins,
+        gc_receipts_total: raw.gc_receipts_total,
+        gc_total_reclaimed: raw.gc_total_reclaimed,
+        runtime_classes: map_counts(raw.runtime_classes),
+        decision_receipts_by_kind: map_counts(raw.decision_receipts_by_kind),
+        release_verdicts_total: raw.release_verdicts_total,
+        worker_capabilities_workers: raw.worker_capabilities_workers,
+    })
+}
+
+fn print_telemetry(receipt: &CasTelemetryReceipt) {
+    println!(
+        "rabs telemetry [{}] (schema {}, {})",
+        receipt.metadata_path, receipt.schema_version, receipt.telemetry_scope
+    );
+    println!(
+        "  actions: {} entries, {} with breakdowns, headers={}",
+        receipt.action_entries,
+        receipt.actions_with_breakdowns,
+        receipt
+            .action_key_headers
+            .map_or_else(|| "n/a (schema 25)".to_owned(), |n| n.to_string())
+    );
+    println!(
+        "  publications: {} total (recorded servable share: {})",
+        receipt.publications_total,
+        receipt
+            .recorded_servable_fraction_permille
+            .map_or_else(|| "n/a".to_owned(), |p| format!("{p}‰"))
+    );
+    for row in &receipt.publications_by_result_kind {
+        println!("    result_kind {}: {}", row.label, row.count);
+    }
+    for row in &receipt.serving_states_by_disposition {
+        println!("    serving_state {}: {}", row.label, row.count);
+    }
+    println!(
+        "  objects: {} ({} logical bytes), locations healthy={} quarantined={} durable={}",
+        receipt.objects_total,
+        receipt.objects_logical_bytes,
+        receipt.object_locations_healthy,
+        receipt.object_locations_quarantined,
+        receipt.object_locations_durable
+    );
+    println!(
+        "  pins: active={} released={}, gc_receipts={} (reclaimed={})",
+        receipt.active_pins,
+        receipt.released_pins,
+        receipt.gc_receipts_total,
+        receipt.gc_total_reclaimed
+    );
+    println!(
+        "  incidents: unresolved_divergence={}, quarantines={}, release_verdicts={}, workers={}",
+        receipt.unresolved_divergence_incidents,
+        receipt
+            .quarantines_by_scope
+            .iter()
+            .map(|r| r.count)
+            .sum::<u64>(),
+        receipt.release_verdicts_total,
+        receipt.worker_capabilities_workers
+    );
+    for row in &receipt.runtime_classes {
+        println!("  runtime_class {}: {}", row.label, row.count);
+    }
+    println!(
+        "  note: recorded snapshot only; live coordinator authorization and request hit rates are not inferred"
+    );
+}
+
+/// Entry point for `rch rabs telemetry` (M15).
+///
+/// # Errors
+/// Propagates store open/inspection failures under the caller's exit-code convention.
+pub async fn run_telemetry(cas_root: Option<PathBuf>, ctx: &OutputContext) -> anyhow::Result<()> {
+    let root = resolve_cas_root(cas_root.as_deref())?;
+    let receipt = telemetry_receipt(&root)?;
+    if ctx.is_json() || ctx.is_toon() {
+        ctx.json(&ApiResponse::ok("rabs telemetry", &receipt))?;
+    } else {
+        print_telemetry(&receipt);
+    }
+    Ok(())
+}
+
 /// `rch rabs <group>` command groups (R004 lands `verify`, `locate`,
 /// `quarantine`; R005 lands `gc`; R006 lands `worker` + `doctor`;
-/// `bd-dockb` lands `release-verdict`).
+/// `bd-dockb` lands `release-verdict`; M15 lands `telemetry`).
 #[derive(Debug, Subcommand)]
 pub enum RabsCommand {
     /// Content-addressed store garbage collection (H014 engine)
@@ -1594,6 +1800,15 @@ pub enum RabsCommand {
         /// Release-verdict operation
         #[command(subcommand)]
         action: ReleaseVerdictAction,
+    },
+    /// Read-only durable CAS telemetry snapshot: publications, serving states, quarantines, objects, pins, and receipts (M15)
+    #[command(
+        after_help = "EXAMPLES:\n    rch rabs telemetry\n    rch --json rabs telemetry --cas-root /path/to/rabs-state/cas"
+    )]
+    Telemetry {
+        /// CAS root directory (default: rabsd's state dir)
+        #[arg(long, value_name = "DIR")]
+        cas_root: Option<PathBuf>,
     },
 }
 
@@ -2210,5 +2425,67 @@ mod tests {
         assert_eq!(after_verify.scanned_locations, 1);
         assert_eq!(after_verify.healthy_locations, 1);
         assert!(after_verify.quarantined_locations.is_empty());
+    }
+
+    #[test]
+    fn telemetry_receipt_reads_real_store_and_refuses_missing_cas_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing-cas");
+        assert!(telemetry_receipt(&missing).is_err());
+        assert!(!missing.exists());
+
+        let cas_root = dir.path().join("cas");
+        std::fs::create_dir_all(&cas_root).expect("mkdir");
+        let mut store = open_or_init_store(&cas_root).expect("open store");
+        let authority = rabs_cas::metadata_store::AuthorityRow {
+            digest: rabs_key::typed_digest::compute("rabs.telemetry-auth.v1", b"active"),
+            cluster_id: "telemetry-test".to_owned(),
+            incarnation: 1,
+            term: 1,
+            acquired_seq: 1,
+        };
+        store.acquire_authority(&authority).expect("authority");
+        let base = rabs_key::typed_digest::compute("rabs.telemetry-base.v1", b"item");
+        let descriptor = rabs_protocol::descriptor::ActionDescriptor {
+            key_epoch: 1,
+            projection_epoch: 1,
+            action_class: rabs_protocol::descriptor::ActionClass::RustcDependencyCompile,
+            normalized_invocation: base.clone(),
+            virtual_working_directory: base.clone(),
+            action_inputs: base.clone(),
+            negative_dependencies: base.clone(),
+            dependency_inputs: base.clone(),
+            toolchain: base.clone(),
+            output_platform: base.clone(),
+            environment: base.clone(),
+            sandbox_semantic_policy: base.clone(),
+            build_path_semantic_policy: base.clone(),
+            execution_semantics: base.clone(),
+            output_declarations: base,
+        };
+        store
+            .record_action_key_provenance(
+                &authority.digest,
+                &descriptor,
+                "rustc-dependency-compile",
+            )
+            .expect("provenance");
+        drop(store);
+
+        let before = std::fs::read(cas_root.join("meta.sqlite")).expect("read before");
+        let receipt = telemetry_receipt(&cas_root).expect("telemetry receipt");
+        assert_eq!(receipt.schema, TELEMETRY_SCHEMA);
+        assert_eq!(receipt.telemetry_scope, "recorded_cas_snapshot_only");
+        assert!(!receipt.serving_authorization_evaluated);
+        assert_eq!(receipt.action_key_headers, Some(1));
+        assert_eq!(receipt.actions_with_breakdowns, 1);
+        assert_eq!(receipt.publications_total, 0);
+        assert!(receipt.recorded_servable_fraction_permille.is_none());
+        assert_eq!(receipt.runtime_classes.len(), 1);
+        assert_eq!(receipt.runtime_classes[0].label, "rustc-dependency-compile");
+        assert_eq!(
+            before,
+            std::fs::read(cas_root.join("meta.sqlite")).expect("read after")
+        );
     }
 }

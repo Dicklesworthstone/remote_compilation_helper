@@ -452,9 +452,18 @@ mod tests {
     #[test]
     fn source_fix_and_browser_launch_cannot_be_served() {
         for (args, family) in [
-            (vec!["cargo", "clippy", "--fix", "--allow-dirty"], CargoCommandFamily::Mutating),
-            (vec!["cargo", "doc", "--open"], CargoCommandFamily::Interactive),
-            (vec!["cargo", "rustdoc", "--open"], CargoCommandFamily::Interactive),
+            (
+                vec!["cargo", "clippy", "--fix", "--allow-dirty"],
+                CargoCommandFamily::Mutating,
+            ),
+            (
+                vec!["cargo", "doc", "--open"],
+                CargoCommandFamily::Interactive,
+            ),
+            (
+                vec!["cargo", "rustdoc", "--open"],
+                CargoCommandFamily::Interactive,
+            ),
         ] {
             let decision = enforce(&inv(&args));
             assert_eq!(decision.family, family);

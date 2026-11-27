@@ -9566,7 +9566,7 @@ fn canonical_cargo_check_replays_propagated_native_workspace_metadata() {
     profile["selection"] = json!({"workspace":true,"lib":true,"features":["remote_workspace"]});
     let names = ["canonical_app", "propagated_consumer"];
     let stock = stock_native_workspace_metadata(owner.path(), 0, &profile, &names);
-    let (mut worker, environment) = NativeWorker::start(owner.path());
+    let (worker, environment) = NativeWorker::start(owner.path());
     let mut targets = BTreeSet::new();
     let mut original_keys = None;
     for number in 1..=4 {
@@ -9730,7 +9730,7 @@ fn canonical_cargo_build_replays_propagated_native_workspace_archives() {
     };
     let mut expected = stock(0, &profile, 43);
     let initial_provider_archive = expected.0["native_provider"].clone();
-    let (mut worker, environment) = NativeWorker::start(owner.path());
+    let (worker, environment) = NativeWorker::start(owner.path());
     let mut targets = BTreeSet::new();
     let mut original_keys: Option<BTreeMap<String, String>> = None;
     let mut changed_keys: Option<BTreeMap<String, String>> = None;

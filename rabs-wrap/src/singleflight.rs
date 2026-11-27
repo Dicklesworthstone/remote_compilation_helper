@@ -318,8 +318,8 @@ fn read_with_policy(
     };
     loop {
         let response_deadline = reader.get_ref().deadline;
-        let line = read_owned_reply(&mut reader, reply_limit, response_deadline, owned)
-            .map_err(|_| ())?;
+        let line =
+            read_owned_reply(&mut reader, reply_limit, response_deadline, owned).map_err(|_| ())?;
         let reply = reply_json::parse(&line).ok_or(())?;
         // A names-only observation omitted compiler inputs. Its reply cannot
         // grant execution, installation, or another request on this connection.

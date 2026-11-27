@@ -43,15 +43,25 @@ const BUDGETS: &[(&str, usize, &str)] = &[
          workspace-reviewed, structurally excluded from TypedDigest) + \
          rabs-key (H039: publication admission reuses F035's one \
          bundle-root implementation; pure sibling, protocol-only deps) + \
-         filetime (K004: preserve stock Cargo mtime semantics on \
-         materialized outputs so downstream fingerprints match stock)",
+         rustix (H017: safe FICLONE, anonymous probes, and atomic no-clobber \
+         output publication on Linux/macOS without unsafe code)",
     ),
-    ("rabs-sandbox", 4, "protocol + reviewed namespace/fs crates"),
+    (
+        "rabs-sandbox",
+        8,
+        "protocol + memchr (bounded output/path scanning) + object (bounded \
+         native archive/ELF payload validation) + serde/serde_json (canonical \
+         sandbox and request-profile serialization) + sha2 (snapshot and input \
+         digests) + tempfile (sandbox staging scratch) + rustix (Unix \
+         descriptor-relative ownership and EUID checks without unsafe code)",
+    ),
     (
         "rabs-wrap",
         3,
-        "protocol + tempfile (wrapper-local staging scratch) + serde_json \
-         (wrapper control-plane frames)",
+        "protocol + nix (Unix peer credentials, effective-user executable \
+         checks, and PGID-0-safe process-group observation) + signal-hook \
+         (restore terminal signal defaults including SIGPIPE without unsafe \
+         code); no serde or async runtime",
     ),
     (
         "rabs-replay",
@@ -69,26 +79,32 @@ const BUDGETS: &[(&str, usize, &str)] = &[
          selection and stdin contract + tempfile for private retained operation \
          profiles; no daemon or async runtime dependency",
     ),
-    ("rabs-asupersync", 3, "asupersync + protocol (+1 headroom)"),
+    (
+        "rabs-asupersync",
+        5,
+        "asupersync + rabs-protocol + rabs-action (adapter over action state \
+         machines) + rustls (explicit ring/std crypto provider selection for \
+         mTLS when workspace features unify aws-lc-rs) + rustix (Unix process \
+         signaling/identity without unsafe code)",
+    ),
     (
         "rabsd",
-        13,
-        "composes the domain crates (rabs-action/rabs-key/rabs-cas/\
-         rabs-sandbox/rabs-scheduler) + the asupersync runtime adapter \
-         (rabs-asupersync + asupersync) + configuration surfaces (serde, \
-         serde_json, toml) + tempfile (daemon-owned staging scratch) + \
-         sha2 (the coordinator's wire-level SHA-256 digests over delivery \
-         archives, recovery, acks and prepared requests, which are protocol \
-         values rather than rabs-key cache keys; used in 21 modules since \
-         1c57edb3, bd-csbxg)",
+        17,
+        "composes the domain crates (rabs-protocol, rabs-action, rabs-key, \
+         rabs-cas, rabs-sandbox, rabs-scheduler) + the asupersync runtime \
+         adapter (rabs-asupersync + asupersync) + configuration/wire surfaces \
+         (serde, serde_json, toml, sha2) + source/artifact delivery archives \
+         (flate2, tar, tempfile) + Unix signal/descriptor handling \
+         (signal-hook, rustix)",
     ),
     (
         "rabs-wkr",
-        9,
-        "composes execution-relevant domain crates + tempfile (anonymous, \
-         session-owned diagnostic and transfer snapshots in source_transfer, \
-         execution, session and request_journal; added by 860c872e without \
-         the budget change)",
+        12,
+        "composes execution-relevant domain crates (rabs-protocol, rabs-key, \
+         rabs-cas, rabs-sandbox) + runtime (rabs-asupersync + asupersync) + \
+         wire/config/staging (sha2, serde_json, toml, tempfile) + Linux \
+         Cargo-root helper process/cgroup/signal control (rustix, signal-hook); \
+         unused rabs-action removed",
     ),
 ];
 

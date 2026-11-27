@@ -15,7 +15,8 @@
 //! commit, and no entry is ever added or raised. See AGENTS.md
 //! "RULE 0.75 - RUST ONLY: NO PYTHON, EVER".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Mentions that never execute Python (classifier fixtures, tags, values).
@@ -31,6 +32,14 @@ const NAMED_ONLY: &[(&str, usize)] = &[
 
 /// `.py` files left in the workspace. Shrink only.
 const PY_FILES_DEBT: usize = 91;
+
+/// Extensionless scripts whose shebang still invokes Python. Shrink only;
+/// never add an entry.
+const EXTENSIONLESS_PY_DEBT: &[&str] = &[
+    "scripts/cargo-rabs",
+    "scripts/install-rabs",
+    "scripts/rabs-recover",
+];
 
 /// Sources that still run Python. Shrink only; never add or raise an entry.
 const PORT_DEBT: &[(&str, usize)] = &[
@@ -82,7 +91,6 @@ const PORT_DEBT: &[(&str, usize)] = &[
     ("scripts/e2e_remediation_views.sh", 7),
     ("scripts/e2e_self_test_full.sh", 1),
     ("scripts/e2e_storm_control.sh", 5),
-    ("scripts/rabs_layer0_bench.sh", 1),
     ("scripts/test_dependabot_automerge_workflow.sh", 6),
     ("scripts/test_update_signature_verification.sh", 2),
     ("scripts/test_verbose_flag.sh", 1),
@@ -102,6 +110,38 @@ struct Scan {
     /// `.rs` and `.sh` files, relative to the workspace root.
     sources: Vec<PathBuf>,
     py_files: Vec<PathBuf>,
+    /// Extensionless files whose `#!` shebang invokes Python.
+    extensionless_py_scripts: Vec<PathBuf>,
+}
+
+fn is_python_shebang_line(first_line: &str) -> bool {
+    let trimmed = first_line.trim_end_matches(['\r', '\n']);
+    let Some(rest) = trimmed.strip_prefix("#!") else {
+        return false;
+    };
+    rest.split_whitespace().any(|token| {
+        let base = token.rsplit('/').next().unwrap_or(token);
+        base.to_ascii_lowercase().starts_with("python")
+    })
+}
+
+fn has_python_shebang(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 256];
+    let Ok(read) = file.read(&mut buf) else {
+        return false;
+    };
+    let prefix = &buf[..read];
+    let line_end = prefix
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .unwrap_or(prefix.len());
+    let Ok(first_line) = std::str::from_utf8(&prefix[..line_end]) else {
+        return false;
+    };
+    is_python_shebang_line(first_line)
 }
 
 fn scan(dir: &Path, root: &Path, found: &mut Scan) {
@@ -127,6 +167,8 @@ fn scan(dir: &Path, root: &Path, found: &mut Scan) {
                 found.sources.push(relative());
             } else if name.ends_with(".py") {
                 found.py_files.push(relative());
+            } else if !name.contains('.') && has_python_shebang(&path) {
+                found.extensionless_py_scripts.push(relative());
             }
         }
     }
@@ -212,11 +254,51 @@ fn rust_sources_never_gain_python() {
             "{py_files} .py files, limit {PY_FILES_DEBT}. Ratchet: lower PY_FILES_DEBT to {py_files}."
         ));
     }
+
+    let actual_extless: BTreeSet<String> = found
+        .extensionless_py_scripts
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let allowed_extless: BTreeSet<&str> = EXTENSIONLESS_PY_DEBT.iter().copied().collect();
+    assert_eq!(
+        allowed_extless.len(),
+        EXTENSIONLESS_PY_DEBT.len(),
+        "an extensionless Python script is listed twice"
+    );
+    for script in &actual_extless {
+        if !allowed_extless.contains(script.as_str()) {
+            violations.push(format!(
+                "{script}: new extensionless Python script detected by shebang. RCH is Rust-only: \
+                 write it in Rust or POSIX sh."
+            ));
+        }
+    }
+    for script in &allowed_extless {
+        if !actual_extless.contains(*script) {
+            violations.push(format!(
+                "{script}: extensionless Python script removed or ported. Ratchet: remove it from \
+                 EXTENSIONLESS_PY_DEBT in tests/no_python_guard.rs."
+            ));
+        }
+    }
+
     assert!(
         violations.is_empty(),
         "Rust-only guard failed:\n  {}",
         violations.join("\n  ")
     );
+}
+
+#[test]
+fn extensionless_python_shebang_detector_catches_python_and_ignores_sh() {
+    assert!(is_python_shebang_line("#!/usr/bin/env python3"));
+    assert!(is_python_shebang_line("#!/usr/bin/env -S python3 -u\n"));
+    assert!(is_python_shebang_line("#!/usr/bin/python3.11\r\n"));
+    assert!(is_python_shebang_line("#!/bin/python"));
+    assert!(!is_python_shebang_line("#!/usr/bin/env bash"));
+    assert!(!is_python_shebang_line("#!/bin/sh"));
+    assert!(!is_python_shebang_line("not a shebang python3"));
 }
 
 #[test]
@@ -236,6 +318,13 @@ fn guard_sees_the_workspace() {
             .iter()
             .any(|path| path.ends_with("rch-common/src/remote_process.sh")),
         "the workspace scan did not find the embedded shell scripts"
+    );
+    assert!(
+        found
+            .extensionless_py_scripts
+            .iter()
+            .any(|path| path.ends_with("scripts/install-rabs")),
+        "the workspace scan did not find extensionless Python scripts (scripts/install-rabs)"
     );
     assert!(
         found.sources.len() > 100,

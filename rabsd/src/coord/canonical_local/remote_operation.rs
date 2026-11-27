@@ -454,9 +454,13 @@ mod tests {
                 .unwrap();
             assert!(request.get("artifacts").is_none());
             assert_eq!(request["program"], "/__rabs/toolchain/bin/cargo-nextest");
-            assert!(request["args"].as_array().unwrap().windows(2).any(|pair| {
-                pair == [json!("--build-jobs"), json!("2")]
-            }));
+            assert!(
+                request["args"]
+                    .as_array()
+                    .unwrap()
+                    .windows(2)
+                    .any(|pair| { pair == [json!("--build-jobs"), json!("2")] })
+            );
         }
     }
 

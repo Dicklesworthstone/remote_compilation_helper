@@ -15,8 +15,13 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
-use rabs_cas::action_inspection::{self, ActionInspection};
+use rabs_cas::action_inspection::{
+    self, ActionInspection, BreakdownHeaderInspection, BreakdownInspection,
+    FRAGMENTATION_WINDOW_MAX_LIMIT, InspectionRows,
+};
 use rabs_key::action_key::{ActionKeyHeader, BorrowedKeyComponent, recompute_action_key};
+use rabs_key::fragmentation::{aggregate_borrowed, top_fragmenters_owned};
+use rabs_key::fragmentation_analyzer::FragmentationCategory;
 use rabs_key::key_diff::{LookupOutcome, diff_key_inputs};
 use rabs_key::typed_digest::DOMAIN_ACTION_KEY;
 use rabs_protocol::descriptor::ACTION_KEY_COMPONENT_NAMES;
@@ -71,6 +76,18 @@ pub enum WhyAction {
         /// trust-refused | materialization-unavailable)
         #[arg(long)]
         outcome: String,
+    },
+    /// Rank action-key components fragmenting a CAS store (privacy-safe digests only)
+    #[command(
+        after_help = "EXAMPLES:\n    rch why fragmentation\n    rch --json why fragmentation --cas-root /path/to/rabs-state/cas --limit 500"
+    )]
+    Fragmentation {
+        /// Existing CAS root; defaults to RABS_STATE_DIR/cas or ~/.cache/rch/rabs-state/cas
+        #[arg(long)]
+        cas_root: Option<PathBuf>,
+        /// Maximum recorded actions with key breakdowns to sample (1..=4096)
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
     },
 }
 
@@ -167,6 +184,63 @@ pub struct RefusalExplanation {
     pub code: &'static str,
     /// Human-readable one-line explanation.
     pub explanation: &'static str,
+}
+
+/// One opaque component-digest bucket in a fragmentation report.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct FragmentationBucketDto {
+    /// Semantic digest domain recorded in CAS metadata.
+    pub domain: String,
+    /// Opaque lowercase SHA-256 digest hex (never raw paths, flags, or env values).
+    pub digest_hex: String,
+    /// Number of verified actions in the sample carrying this component digest.
+    pub count: u64,
+}
+
+/// One canonical action-key component observed taking multiple distinct values.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct FragmentingComponentReport {
+    /// Canonical action-key component name (A014).
+    pub component: &'static str,
+    /// Distinct digest values observed in the verified sample.
+    pub distinct_values: usize,
+    /// Total verified actions contributing to this component histogram.
+    pub observations: u64,
+    /// Mapped Q011 fragmentation category code.
+    pub category: &'static str,
+    /// Convergence remediation guidance from the Q011 analyzer.
+    pub remediation: &'static str,
+    /// Up to five most frequent opaque digest buckets.
+    pub top_buckets: Vec<FragmentationBucketDto>,
+}
+
+/// Live-backed key-fragmentation report from one read-only CAS metadata snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct FragmentationReport {
+    /// Metadata database read by the command.
+    pub metadata_path: String,
+    /// Observed database schema version.
+    pub schema_version: u32,
+    /// Always `opaque-digests-only`: raw env values, paths, and argv never enter this report.
+    pub privacy_mode: &'static str,
+    /// Total rows in `action_entries`.
+    pub total_action_entries: u64,
+    /// Total distinct actions present in `key_breakdowns`.
+    pub total_actions_with_breakdowns: u64,
+    /// Distinct actions sampled from `key_breakdowns` within the requested limit.
+    pub sampled_actions: usize,
+    /// Sampled actions whose complete 12-component breakdown cryptographically recomputed to their key.
+    pub verified_actions: usize,
+    /// Sampled actions excluded because of missing schema-26 headers or incomplete components.
+    pub incomplete_actions: usize,
+    /// True when more actions with breakdowns exist than `sampled_actions`.
+    pub truncated: bool,
+    /// Components with more than one distinct digest value, ranked descending.
+    pub fragmenters: Vec<FragmentingComponentReport>,
+    /// Canonical components observed with at most one distinct value.
+    pub converged_components: Vec<&'static str>,
+    /// Explicit evidence boundaries and non-claims for this snapshot.
+    pub notes: Vec<String>,
 }
 
 /// Bounded recorded rows; truncation must remain visible to callers.
@@ -894,6 +968,215 @@ pub fn explain_stored_miss(
     compare_stored(&database, &prior, &current)
 }
 
+fn verify_recorded_breakdown(
+    action_key: &str,
+    breakdown_header: Option<&BreakdownHeaderInspection>,
+    breakdown: &InspectionRows<BreakdownInspection>,
+) -> Result<Option<VerifiedBreakdown>, String> {
+    if breakdown.truncated {
+        return Err(format!(
+            "action {action_key} has truncated component evidence"
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for component in &breakdown.items {
+        if !ACTION_KEY_COMPONENT_NAMES.contains(&component.component.as_str())
+            || !names.insert(component.component.as_str())
+        {
+            return Err(format!(
+                "action {action_key} has unknown or duplicate component names"
+            ));
+        }
+        if component.algorithm != "sha256-v1" {
+            return Err(format!(
+                "action {action_key} has an unsupported component algorithm"
+            ));
+        }
+    }
+    let Some(header) = breakdown_header else {
+        return Ok(None);
+    };
+    if names.len() != ACTION_KEY_COMPONENT_NAMES.len() {
+        return Ok(None);
+    }
+    let hex = action_key
+        .strip_prefix(DOMAIN_ACTION_KEY)
+        .and_then(|tail| tail.strip_prefix(':'))
+        .ok_or_else(|| format!("action {action_key} has an invalid action-key domain"))?;
+    let dto = BreakdownDto {
+        key_epoch: header.key_epoch,
+        projection_epoch: header.projection_epoch,
+        action_class_tag: header.action_class_tag,
+        components: breakdown
+            .items
+            .iter()
+            .map(|component| ComponentDto {
+                name: component.component.clone(),
+                digest: DigestDto {
+                    domain: component.domain.clone(),
+                    hex: component.digest_hex.clone(),
+                },
+            })
+            .collect(),
+        final_key: DigestDto {
+            domain: DOMAIN_ACTION_KEY.to_owned(),
+            hex: hex.to_owned(),
+        },
+    };
+    dto.into_breakdown()
+        .map(Some)
+        .map_err(|error| format!("action {action_key} key provenance: {error}"))
+}
+
+/// Inspect a bounded window of persisted action-key breakdowns and rank the
+/// components fragmenting the CAS store using opaque digests only (M15).
+///
+/// # Errors
+/// Missing/incompatible CAS stores, invalid limit, or corrupt key provenance.
+pub fn explain_fragmentation(cas_root: &Path, limit: usize) -> anyhow::Result<FragmentationReport> {
+    anyhow::ensure!(
+        (1..=FRAGMENTATION_WINDOW_MAX_LIMIT).contains(&limit),
+        "--limit must be between 1 and {FRAGMENTATION_WINDOW_MAX_LIMIT}"
+    );
+    let database = cas_root.join("meta.sqlite");
+    let window = action_inspection::inspect_fragmentation_window(&database, limit)
+        .map_err(|error| anyhow::anyhow!("{}: {error}", database.display()))?;
+
+    let mut verified = Vec::new();
+    let mut incomplete_actions = 0_usize;
+    for record in &window.sampled_actions {
+        match verify_recorded_breakdown(
+            &record.action_key,
+            record.breakdown_header.as_ref(),
+            &record.breakdown,
+        )
+        .map_err(anyhow::Error::msg)?
+        {
+            Some(breakdown) => verified.push(breakdown),
+            None => incomplete_actions += 1,
+        }
+    }
+
+    let borrowed: Vec<Vec<BorrowedKeyComponent<'_>>> =
+        verified.iter().map(VerifiedBreakdown::borrowed).collect();
+    let histograms = aggregate_borrowed(&borrowed);
+    let ranked = top_fragmenters_owned(&histograms);
+
+    let mut fragmenters = Vec::with_capacity(ranked.len());
+    for (component, distinct_values) in ranked {
+        let hist = histograms
+            .iter()
+            .find(|h| h.component == component)
+            .expect("ranked component came from histograms");
+        let category = FragmentationCategory::for_action_key_component(component)
+            .unwrap_or(FragmentationCategory::CommandPaletteDrift);
+        fragmenters.push(FragmentingComponentReport {
+            component,
+            distinct_values,
+            observations: hist.total(),
+            category: category.code(),
+            remediation: category.remediation(),
+            top_buckets: hist
+                .buckets
+                .iter()
+                .take(5)
+                .map(|bucket| FragmentationBucketDto {
+                    domain: bucket.domain.clone(),
+                    digest_hex: bucket.digest_hex.clone(),
+                    count: bucket.count,
+                })
+                .collect(),
+        });
+    }
+
+    let converged_components: Vec<&'static str> = histograms
+        .iter()
+        .filter(|hist| hist.distinct_values() <= 1)
+        .map(|hist| hist.component)
+        .collect();
+
+    let mut notes = Vec::new();
+    if window.schema_version < 26 {
+        notes.push(
+            "schema 25 stores lack action_key_headers; historical breakdowns cannot be cryptographically verified and are counted under incomplete_actions".to_owned(),
+        );
+    }
+    if incomplete_actions > 0 {
+        notes.push(format!(
+            "{incomplete_actions} sampled action(s) had missing key headers or incomplete component breakdowns and were excluded from verified histograms"
+        ));
+    }
+    if verified.len() < 2 {
+        notes.push(
+            "fewer than two verified key breakdowns were present; fragmentation requires at least two distinct verified actions".to_owned(),
+        );
+    }
+    notes.push(
+        "privacy: only opaque component digest buckets are inspected; compiler-ms waste is not fabricated without build timings".to_owned(),
+    );
+
+    Ok(FragmentationReport {
+        metadata_path: database.display().to_string(),
+        schema_version: window.schema_version,
+        privacy_mode: "opaque-digests-only",
+        total_action_entries: window.total_action_entries,
+        total_actions_with_breakdowns: window.total_actions_with_breakdowns,
+        sampled_actions: window.sampled_actions.len(),
+        verified_actions: verified.len(),
+        incomplete_actions,
+        truncated: window.truncated,
+        fragmenters,
+        converged_components,
+        notes,
+    })
+}
+
+fn format_fragmentation(report: &FragmentationReport) -> String {
+    let mut lines = vec![
+        format!("metadata: {:?}", report.metadata_path),
+        format!(
+            "actions: {} entries, {} with breakdowns, {} sampled ({} verified, {} incomplete{})",
+            report.total_action_entries,
+            report.total_actions_with_breakdowns,
+            report.sampled_actions,
+            report.verified_actions,
+            report.incomplete_actions,
+            if report.truncated { ", truncated" } else { "" }
+        ),
+    ];
+    if report.fragmenters.is_empty() {
+        lines.push("fragmenters: none observed across verified breakdowns".to_owned());
+    } else {
+        for (index, item) in report.fragmenters.iter().enumerate() {
+            lines.push(format!(
+                "{}. {} — {} distinct values across {} verified actions [{}]",
+                index + 1,
+                item.component,
+                item.distinct_values,
+                item.observations,
+                item.category
+            ));
+            lines.push(format!("   remediation: {}", item.remediation));
+            for bucket in &item.top_buckets {
+                lines.push(format!(
+                    "   bucket: {}:{} (count={})",
+                    bucket.domain, bucket.digest_hex, bucket.count
+                ));
+            }
+        }
+    }
+    if !report.converged_components.is_empty() {
+        lines.push(format!(
+            "converged components: {}",
+            report.converged_components.join(", ")
+        ));
+    }
+    for note in &report.notes {
+        lines.push(format!("note: {note}"));
+    }
+    lines.join("\n")
+}
+
 /// Explain an index-level refusal from its stable code.
 ///
 /// # Errors
@@ -1063,6 +1346,15 @@ pub async fn run(action: WhyAction, ctx: &OutputContext) -> anyhow::Result<()> {
                 ctx.json(&ApiResponse::ok("why refusal", &explanation))?;
             } else {
                 println!("{}: {}", explanation.code, explanation.explanation);
+            }
+        }
+        WhyAction::Fragmentation { cas_root, limit } => {
+            let root = super::rabs_gc::resolve_cas_root(cas_root.as_deref())?;
+            let report = explain_fragmentation(&root, limit)?;
+            if ctx.is_json() {
+                ctx.json(&ApiResponse::ok("why fragmentation", &report))?;
+            } else {
+                println!("{}", format_fragmentation(&report));
             }
         }
     }
@@ -1768,6 +2060,90 @@ mod tests {
         assert_eq!(unknown.unavailable[0].side, "current");
         let absent = directory.path().join("absent");
         assert!(explain_stored_miss(&prior, &current, &absent).is_err());
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn fragmentation_ranks_live_store_components_without_leaking_secrets() {
+        use rabs_cas::metadata_store::{
+            AuthorityRow, RabsMetadataStore, RusqliteEngine, SqlMetadataStore,
+        };
+        use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("meta.sqlite");
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open(&database).unwrap()).unwrap();
+        let authority = AuthorityRow {
+            digest: rabs_key::typed_digest::compute("rabs.frag-authority.v1", b"active"),
+            cluster_id: "frag-test".to_owned(),
+            incarnation: 1,
+            term: 1,
+            acquired_seq: 1,
+        };
+        store.acquire_authority(&authority).unwrap();
+        let base = rabs_key::typed_digest::compute("rabs.frag-base.v1", b"stable");
+        let secret_env = "SECRET_TOKEN_NEVER_LEAK_12345";
+
+        for (tc_tag, env_tag) in [
+            ("tc-a", format!("{secret_env}-1")),
+            ("tc-a", format!("{secret_env}-2")),
+            ("tc-a", format!("{secret_env}-3")),
+            ("tc-b", format!("{secret_env}-4")),
+        ] {
+            let descriptor = ActionDescriptor {
+                key_epoch: 1,
+                projection_epoch: 1,
+                action_class: ActionClass::RustcDependencyCompile,
+                normalized_invocation: base.clone(),
+                virtual_working_directory: base.clone(),
+                action_inputs: base.clone(),
+                negative_dependencies: base.clone(),
+                dependency_inputs: base.clone(),
+                toolchain: rabs_key::typed_digest::compute(
+                    "rabs.toolchain-contract.v1",
+                    tc_tag.as_bytes(),
+                ),
+                output_platform: base.clone(),
+                environment: rabs_key::typed_digest::compute("rabs.env.v1", env_tag.as_bytes()),
+                sandbox_semantic_policy: base.clone(),
+                build_path_semantic_policy: base.clone(),
+                execution_semantics: base.clone(),
+                output_declarations: base.clone(),
+            };
+            store
+                .record_action_key_provenance(
+                    &authority.digest,
+                    &descriptor,
+                    "rustc-dependency-compile",
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        let report = explain_fragmentation(directory.path(), 100).unwrap();
+        assert_eq!(report.privacy_mode, "opaque-digests-only");
+        assert_eq!(report.verified_actions, 4);
+        assert_eq!(report.incomplete_actions, 0);
+        assert!(!report.truncated);
+        assert_eq!(report.fragmenters.len(), 2);
+        assert_eq!(report.fragmenters[0].component, "environment");
+        assert_eq!(report.fragmenters[0].distinct_values, 4);
+        assert_eq!(
+            report.fragmenters[0].category,
+            "rustflags_profile_divergence"
+        );
+        assert_eq!(report.fragmenters[1].component, "toolchain");
+        assert_eq!(report.fragmenters[1].distinct_values, 2);
+        assert_eq!(report.fragmenters[1].category, "toolchain_drift");
+        assert_eq!(report.converged_components.len(), 10);
+
+        let json_text = serde_json::to_string(&report).unwrap();
+        let human_text = format_fragmentation(&report);
+        assert!(!json_text.contains(secret_env));
+        assert!(!human_text.contains(secret_env));
+        assert!(explain_fragmentation(directory.path(), 0).is_err());
+        let absent = directory.path().join("absent-frag");
+        assert!(explain_fragmentation(&absent, 10).is_err());
         assert!(!absent.exists());
     }
 }

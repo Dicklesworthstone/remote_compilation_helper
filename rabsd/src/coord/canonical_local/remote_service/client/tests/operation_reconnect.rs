@@ -202,8 +202,7 @@ fn remote_reconnect_preserves_native_termination_without_shell_number_aliases() 
         ]);
         let resumed = RecoveryPeer::new(&[
             Message::Accepted {},
-            Message::build_finished(resumed_termination, retained.len() as u64, 0, None)
-                .unwrap(),
+            Message::build_finished(resumed_termination, retained.len() as u64, 0, None).unwrap(),
             Message::complete(resumed_termination).unwrap(),
         ]);
         let commands = resumed.output();
@@ -226,7 +225,10 @@ fn remote_reconnect_preserves_native_termination_without_shell_number_aliases() 
             assert!(stdout.is_empty());
             assert!(!client.delivery.stdout_published);
         }
-        assert_eq!(client.delivery.completion.as_ref().unwrap().termination, original);
+        assert_eq!(
+            client.delivery.completion.as_ref().unwrap().termination,
+            original
+        );
         assert_resume(&commands, retained.len() as u64, 0);
         assert!(peers.is_empty());
         assert!(!destination.exists());
@@ -320,7 +322,11 @@ fn remote_completion_rejects_invalid_native_statuses_and_failed_artifact_offers(
         ))
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("invalid remote native termination"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid remote native termination")
+        );
         assert!(delivery.completion.is_none());
         assert!(!delivery.stdout_published);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);

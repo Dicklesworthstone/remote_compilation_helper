@@ -48,6 +48,44 @@ pub const ALL_CATEGORIES: [FragmentationCategory; 11] = [
 ];
 
 impl FragmentationCategory {
+    /// Stable snake_case wire code for this category.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::DependencyVersionSpread => "dependency_version_spread",
+            Self::FeatureDrift => "feature_drift",
+            Self::LockfileInconsistency => "lockfile_inconsistency",
+            Self::ToolchainDrift => "toolchain_drift",
+            Self::RustflagsProfileDivergence => "rustflags_profile_divergence",
+            Self::TargetCpuDrift => "target_cpu_drift",
+            Self::PathPolicyDrift => "path_policy_drift",
+            Self::CommandPaletteDrift => "command_palette_drift",
+            Self::BuildScriptVolatility => "build_script_volatility",
+            Self::PlatformFragmentation => "platform_fragmentation",
+            Self::DuplicateSnapshots => "duplicate_snapshots",
+        }
+    }
+
+    /// Map a canonical action-key component name (A014) to its primary
+    /// convergence category.
+    #[must_use]
+    pub fn for_action_key_component(component: &str) -> Option<Self> {
+        match component {
+            "toolchain" => Some(Self::ToolchainDrift),
+            "environment" | "execution_semantics" => Some(Self::RustflagsProfileDivergence),
+            "dependency_inputs" => Some(Self::DependencyVersionSpread),
+            "output_platform" | "sandbox_semantic_policy" => Some(Self::PlatformFragmentation),
+            "build_path_semantic_policy" | "virtual_working_directory" => {
+                Some(Self::PathPolicyDrift)
+            }
+            "normalized_invocation" => Some(Self::CommandPaletteDrift),
+            "action_inputs" => Some(Self::DuplicateSnapshots),
+            "negative_dependencies" => Some(Self::BuildScriptVolatility),
+            "output_declarations" => Some(Self::FeatureDrift),
+            _ => None,
+        }
+    }
+
     /// The convergence remediation for this category.
     #[must_use]
     pub const fn remediation(self) -> &'static str {
@@ -200,12 +238,24 @@ mod tests {
     #[test]
     fn the_registry_is_closed_with_a_remediation_per_category() {
         assert_eq!(ALL_CATEGORIES.len(), 11, "eleven categories, pinned");
+        let mut codes = std::collections::BTreeSet::new();
         for category in ALL_CATEGORIES {
             assert!(
                 !category.remediation().is_empty(),
                 "{category:?} must name its convergence remediation"
             );
+            assert!(
+                !category.code().is_empty() && codes.insert(category.code()),
+                "{category:?} must have a unique non-empty code"
+            );
         }
+        for component in rabs_protocol::descriptor::ACTION_KEY_COMPONENT_NAMES {
+            assert!(
+                FragmentationCategory::for_action_key_component(component).is_some(),
+                "canonical component `{component}` must map to a fragmentation category"
+            );
+        }
+        assert!(FragmentationCategory::for_action_key_component("unknown").is_none());
     }
 
     #[test]

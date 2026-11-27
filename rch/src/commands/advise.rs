@@ -37,6 +37,12 @@ pub struct AdviseArgs {
     /// Maximum number of discovered timing reports to read, newest first
     #[arg(long, default_value_t = 20)]
     pub max_timings: usize,
+    /// Optional RABS CAS root to inspect recorded key fragmentation (read-only)
+    #[arg(long, value_name = "DIR")]
+    pub cas_root: Option<PathBuf>,
+    /// Optional B002 invocation corpus NDJSONL path to measure test wall-time dominance
+    #[arg(long, value_name = "PATH")]
+    pub corpus: Option<PathBuf>,
 }
 
 /// One advice row in its stable wire form.
@@ -67,6 +73,34 @@ pub struct SkippedReport {
     pub reason: String,
 }
 
+/// Summary of live CAS key-fragmentation diagnostics attached via `--cas-root`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct CasFragmentationSummary {
+    /// Metadata database inspected (read-only).
+    pub metadata_path: String,
+    /// Verified actions sampled.
+    pub verified_actions: usize,
+    /// Sampled actions with incomplete provenance.
+    pub incomplete_actions: usize,
+    /// Fragmenting canonical components with convergence remediations.
+    pub fragmenters: Vec<super::why::FragmentingComponentReport>,
+}
+
+/// Summary of B002 invocation corpus test dominance attached via `--corpus`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct CorpusTestSummary {
+    /// Corpus path inspected.
+    pub corpus_path: String,
+    /// Total non-empty lines parsed as valid invocation records.
+    pub records_parsed: usize,
+    /// Test invocations matched (`Nextest` or `cargo test` / `cargo nextest`).
+    pub test_invocations: usize,
+    /// Malformed lines skipped (counted honestly).
+    pub malformed_lines: usize,
+    /// Total observed test wall time across matched invocations (ms).
+    pub total_test_wall_ms: u64,
+}
+
 /// The complete `rch advise` report.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct AdviseReport {
@@ -84,6 +118,12 @@ pub struct AdviseReport {
     pub units_observed: usize,
     /// Advice sorted by expected saving (largest first).
     pub advice: Vec<AdviceRow>,
+    /// Optional CAS key-fragmentation diagnostics (present when `--cas-root` is given).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cas_fragmentation: Option<CasFragmentationSummary>,
+    /// Optional B002 corpus test-dominance summary (present when `--corpus` is given).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_tests: Option<CorpusTestSummary>,
     /// Advice kinds or facts this run could not measure.
     pub evidence_limits: Vec<String>,
 }
@@ -109,7 +149,13 @@ pub fn run(args: &AdviseArgs, ctx: &OutputContext) -> anyhow::Result<()> {
     } else {
         args.timings.clone()
     };
-    let report = build_report(&metadata, platform, &reports);
+    let report = build_report_with_sources(
+        &metadata,
+        platform,
+        &reports,
+        args.cas_root.as_deref(),
+        args.corpus.as_deref(),
+    )?;
     if ctx.is_json() {
         ctx.json(&ApiResponse::ok("advise", &report))?;
     } else {
@@ -664,11 +710,156 @@ fn critical_path<'a>(
     total
 }
 
+struct CorpusTestAnalysis {
+    summary: CorpusTestSummary,
+    dominance: Vec<(String, u32)>,
+    extra_evidence: BTreeMap<(AdviceKindCode, String), Vec<String>>,
+}
+
+fn is_test_invocation(tool: &str, command: &str) -> bool {
+    if tool == "Nextest" {
+        return true;
+    }
+    if tool != "CargoWholeCommand" {
+        return false;
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let Some(cargo_pos) = tokens.iter().position(|t| *t == "cargo") else {
+        return false;
+    };
+    for token in tokens.iter().skip(cargo_pos + 1) {
+        if token.starts_with('+') || token.starts_with('-') {
+            continue;
+        }
+        return matches!(*token, "test" | "t" | "nextest");
+    }
+    false
+}
+
+fn suite_label_from_record(cwd: &str, command: &str) -> String {
+    let repo = Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(cwd);
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut index = 0;
+    while index < tokens.len() {
+        if matches!(tokens[index], "-p" | "--package" | "--test")
+            && let Some(target) = tokens.get(index + 1)
+            && !target.starts_with('-')
+        {
+            return format!("{repo}::{target}");
+        }
+        index += 1;
+    }
+    repo.to_owned()
+}
+
+fn analyze_corpus_tests(path: &Path) -> anyhow::Result<CorpusTestAnalysis> {
+    use std::io::{BufRead as _, BufReader};
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open B002 corpus {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut records_parsed = 0_usize;
+    let mut test_invocations = 0_usize;
+    let mut malformed_lines = 0_usize;
+    let mut per_suite_ms: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+    let mut total_test_wall_ms = 0_u64;
+
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            malformed_lines += 1;
+            continue;
+        };
+        let (Some(tool), Some(cwd), Some(duration_ms), Some(argv)) = (
+            value.get("tool").and_then(serde_json::Value::as_str),
+            value
+                .get("cwd_redacted")
+                .and_then(serde_json::Value::as_str),
+            value.get("duration_ms").and_then(serde_json::Value::as_u64),
+            value
+                .get("argv_redacted")
+                .and_then(serde_json::Value::as_array),
+        ) else {
+            malformed_lines += 1;
+            continue;
+        };
+        records_parsed += 1;
+        let command = argv
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !is_test_invocation(tool, &command) {
+            continue;
+        }
+        test_invocations += 1;
+        total_test_wall_ms = total_test_wall_ms.saturating_add(duration_ms);
+        let suite = suite_label_from_record(cwd, &command);
+        let entry = per_suite_ms.entry(suite).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(duration_ms);
+        entry.1 += 1;
+    }
+
+    let mut dominance = Vec::new();
+    let mut extra_evidence = BTreeMap::new();
+    if total_test_wall_ms > 0 {
+        for (suite, (suite_ms, count)) in per_suite_ms {
+            let permille = u32::try_from(
+                suite_ms
+                    .saturating_mul(1_000)
+                    .checked_div(total_test_wall_ms)
+                    .unwrap_or(0)
+                    .min(1_000),
+            )
+            .unwrap_or(1_000);
+            extra_evidence.insert(
+                (kind_code(AdviceKind::DominatingTests), suite.clone()),
+                vec![format!(
+                    "measured from corpus: {count} test invocation(s) totaling {suite_ms}ms out of {total_test_wall_ms}ms test wall time"
+                )],
+            );
+            dominance.push((suite, permille));
+        }
+    }
+
+    Ok(CorpusTestAnalysis {
+        summary: CorpusTestSummary {
+            corpus_path: path.display().to_string(),
+            records_parsed,
+            test_invocations,
+            malformed_lines,
+            total_test_wall_ms,
+        },
+        dominance,
+        extra_evidence,
+    })
+}
+
+#[cfg(test)]
 fn build_report(
     metadata: &Metadata,
     platform: Option<String>,
     reports: &[PathBuf],
 ) -> AdviseReport {
+    build_report_with_sources(metadata, platform, reports, None, None)
+        .expect("build_report without external CAS/corpus sources is infallible")
+}
+
+fn build_report_with_sources(
+    metadata: &Metadata,
+    platform: Option<String>,
+    reports: &[PathBuf],
+    cas_root: Option<&Path>,
+    corpus_path: Option<&Path>,
+) -> anyhow::Result<AdviseReport> {
     let mut skipped = Vec::new();
     let mut parsed = Vec::new();
     for path in reports {
@@ -705,7 +896,49 @@ fn build_report(
         }
     }
     let times = UnitTimes::from_reports(&used);
-    let attribution = attribute(metadata, &times, !used.is_empty());
+    let mut attribution = attribute(metadata, &times, !used.is_empty());
+
+    let mut cas_fragmentation = None;
+    if let Some(root) = cas_root {
+        let frag = super::why::explain_fragmentation(root, 500)?;
+        if frag.verified_actions < 2 {
+            attribution.limits.push(format!(
+                "CAS fragmentation: {} verified breakdown(s) at {}; need >= 2 verified actions to rank key fragmenters",
+                frag.verified_actions, frag.metadata_path
+            ));
+        }
+        cas_fragmentation = Some(CasFragmentationSummary {
+            metadata_path: frag.metadata_path,
+            verified_actions: frag.verified_actions,
+            incomplete_actions: frag.incomplete_actions,
+            fragmenters: frag.fragmenters,
+        });
+    }
+
+    let mut corpus_tests = None;
+    if let Some(corpus) = corpus_path {
+        let analysis = analyze_corpus_tests(corpus)?;
+        if analysis.summary.test_invocations > 0 {
+            attribution
+                .limits
+                .retain(|limit| !limit.starts_with("test dominance:"));
+            attribution.inputs.test_dominance = analysis.dominance;
+            attribution.extra_evidence.extend(analysis.extra_evidence);
+            if analysis.summary.malformed_lines > 0 {
+                attribution.limits.push(format!(
+                    "corpus: skipped {} malformed line(s) while reading {}",
+                    analysis.summary.malformed_lines, analysis.summary.corpus_path
+                ));
+            }
+        } else {
+            attribution.limits.push(format!(
+                "corpus: {} had {} parsed record(s) but 0 test invocations",
+                analysis.summary.corpus_path, analysis.summary.records_parsed
+            ));
+        }
+        corpus_tests = Some(analysis.summary);
+    }
+
     let advice = advise(&attribution.inputs)
         .into_iter()
         .map(|advice| row(advice, &attribution.extra_evidence))
@@ -718,7 +951,7 @@ fn build_report(
                 .to_owned(),
         );
     }
-    AdviseReport {
+    Ok(AdviseReport {
         workspace_root: metadata.workspace_root.display().to_string(),
         platform,
         profile,
@@ -726,8 +959,10 @@ fn build_report(
         skipped_reports: skipped,
         units_observed: times.duration_ms.len(),
         advice,
+        cas_fragmentation,
+        corpus_tests,
         evidence_limits,
-    }
+    })
 }
 
 fn row(advice: Advice, extra: &BTreeMap<(AdviceKindCode, String), Vec<String>>) -> AdviceRow {
@@ -786,6 +1021,39 @@ fn format_report(report: &AdviseReport) -> String {
         for line in &row.evidence {
             let _ = writeln!(out, "   - {line}");
         }
+    }
+    if let Some(frag) = &report.cas_fragmentation {
+        let _ = writeln!(
+            out,
+            "\nCAS key fragmentation ({}, {} verified, {} incomplete):",
+            frag.metadata_path, frag.verified_actions, frag.incomplete_actions
+        );
+        if frag.fragmenters.is_empty() {
+            let _ = writeln!(out, "  - no fragmenting key components observed");
+        } else {
+            for item in &frag.fragmenters {
+                let _ = writeln!(
+                    out,
+                    "  - `{}`: {} distinct values across {} actions [{}] -> {}",
+                    item.component,
+                    item.distinct_values,
+                    item.observations,
+                    item.category,
+                    item.remediation
+                );
+            }
+        }
+    }
+    if let Some(corpus) = &report.corpus_tests {
+        let _ = writeln!(
+            out,
+            "\nCorpus test timing ({}): {} records parsed, {} test invocations ({}ms total, {} malformed)",
+            corpus.corpus_path,
+            corpus.records_parsed,
+            corpus.test_invocations,
+            corpus.total_test_wall_ms,
+            corpus.malformed_lines
+        );
     }
     if !report.evidence_limits.is_empty() {
         let _ = writeln!(out, "\nEvidence limits:");
@@ -1217,5 +1485,122 @@ const CONCURRENCY_DATA = [];
         );
         let json = serde_json::to_value(&report).unwrap();
         assert!(json["evidence_limits"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn corpus_and_cas_root_feed_test_dominance_and_fragmentation_diagnostics() {
+        use rabs_cas::metadata_store::{
+            AuthorityRow, RabsMetadataStore, RusqliteEngine, SqlMetadataStore,
+        };
+        use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let corpus = dir.path().join("invocations.ndjsonl");
+        let lines = [
+            serde_json::json!({
+                "schema": "rabs.invocation-record",
+                "tool": "CargoWholeCommand",
+                "argv_redacted": ["cargo test -p slow_suite"],
+                "cwd_redacted": "/work/app",
+                "duration_ms": 8_000_u64,
+            })
+            .to_string(),
+            serde_json::json!({
+                "schema": "rabs.invocation-record",
+                "tool": "Nextest",
+                "argv_redacted": ["cargo nextest run -p fast_suite"],
+                "cwd_redacted": "/work/app",
+                "duration_ms": 2_000_u64,
+            })
+            .to_string(),
+            serde_json::json!({
+                "schema": "rabs.invocation-record",
+                "tool": "CargoWholeCommand",
+                "argv_redacted": ["cargo check --workspace"],
+                "cwd_redacted": "/work/app",
+                "duration_ms": 50_000_u64,
+            })
+            .to_string(),
+            "{malformed json".to_owned(),
+        ];
+        std::fs::write(&corpus, lines.join("\n")).unwrap();
+
+        let cas_root = dir.path().join("cas");
+        std::fs::create_dir_all(&cas_root).unwrap();
+        let mut store =
+            SqlMetadataStore::open(RusqliteEngine::open(&cas_root.join("meta.sqlite")).unwrap())
+                .unwrap();
+        let authority = AuthorityRow {
+            digest: rabs_key::typed_digest::compute("rabs.advise-auth.v1", b"active"),
+            cluster_id: "advise-test".to_owned(),
+            incarnation: 1,
+            term: 1,
+            acquired_seq: 1,
+        };
+        store.acquire_authority(&authority).unwrap();
+        let base = rabs_key::typed_digest::compute("rabs.advise-base.v1", b"base");
+        for tc in ["nightly-a", "nightly-b"] {
+            let desc = ActionDescriptor {
+                key_epoch: 1,
+                projection_epoch: 1,
+                action_class: ActionClass::RustcDependencyCompile,
+                normalized_invocation: base.clone(),
+                virtual_working_directory: base.clone(),
+                action_inputs: base.clone(),
+                negative_dependencies: base.clone(),
+                dependency_inputs: base.clone(),
+                toolchain: rabs_key::typed_digest::compute("rabs.toolchain.v1", tc.as_bytes()),
+                output_platform: base.clone(),
+                environment: base.clone(),
+                sandbox_semantic_policy: base.clone(),
+                build_path_semantic_policy: base.clone(),
+                execution_semantics: base.clone(),
+                output_declarations: base.clone(),
+            };
+            store
+                .record_action_key_provenance(&authority.digest, &desc, "rustc-dependency-compile")
+                .unwrap();
+        }
+        drop(store);
+
+        let meta = metadata(serde_json::json!({
+            "packages": [package("app", "app", "0.1.0", "bin")],
+            "workspace_members": ["app"],
+            "resolve": {"nodes": [{"id": "app", "deps": []}]},
+            "target_directory": "/t",
+            "workspace_root": "/w",
+        }));
+        let report = build_report_with_sources(
+            &meta,
+            Some("x86_64-unknown-linux-gnu".to_owned()),
+            &[],
+            Some(&cas_root),
+            Some(&corpus),
+        )
+        .unwrap();
+
+        let dom = report
+            .advice
+            .iter()
+            .find(|row| row.kind == "dominating_tests")
+            .expect("dominating test suite from corpus");
+        assert_eq!(dom.subject, "app::slow_suite");
+        assert!(dom.evidence.iter().any(|e| e.contains("800 permille")));
+        assert!(
+            !report
+                .evidence_limits
+                .iter()
+                .any(|l| l.starts_with("test dominance:"))
+        );
+        let corpus_summary = report.corpus_tests.as_ref().unwrap();
+        assert_eq!(corpus_summary.records_parsed, 3);
+        assert_eq!(corpus_summary.test_invocations, 2);
+        assert_eq!(corpus_summary.malformed_lines, 1);
+        assert_eq!(corpus_summary.total_test_wall_ms, 10_000);
+
+        let cas_frag = report.cas_fragmentation.as_ref().unwrap();
+        assert_eq!(cas_frag.verified_actions, 2);
+        assert_eq!(cas_frag.fragmenters.len(), 1);
+        assert_eq!(cas_frag.fragmenters[0].component, "toolchain");
     }
 }

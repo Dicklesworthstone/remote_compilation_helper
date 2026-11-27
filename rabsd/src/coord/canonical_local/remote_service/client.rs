@@ -1431,9 +1431,7 @@ async fn receive_operation<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let completed = match wire.receive_until(stopped, delivery_deadline).await? {
         Message::Complete { exit_code } => ChildTermination::Exited(exit_code),
-        Message::CompleteSignaled { signal_number } => {
-            ChildTermination::Signaled { signal_number }
-        }
+        Message::CompleteSignaled { signal_number } => ChildTermination::Signaled { signal_number },
         _ => {
             return Err(invalid(
                 "remote operation ended without its terminal completion receipt",

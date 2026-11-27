@@ -80,7 +80,10 @@ fn names_only_observation_cannot_grant_live_work() {
             None,
             &|| true,
         );
-        assert!(outcome.is_err(), "unexpected live reply to a shadow consult");
+        assert!(
+            outcome.is_err(),
+            "unexpected live reply to a shadow consult"
+        );
         let mut sent = Vec::new();
         peer.read_to_end(&mut sent).unwrap();
         assert!(sent.is_empty(), "shadow consult sent a follow-up frame");

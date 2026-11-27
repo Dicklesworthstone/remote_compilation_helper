@@ -14,9 +14,11 @@
 //! breakdown carries. The leak-check test enumerates the output type's
 //! reachable data to prove no byte-level value can appear.
 
+use rabs_protocol::descriptor::ACTION_KEY_COMPONENT_NAMES;
+use rabs_protocol::raw_bytes::encode_hex;
 use rabs_protocol::result_identity::TypedDigest;
 
-use crate::action_key::ActionKeyBreakdown;
+use crate::action_key::{ActionKeyBreakdown, BorrowedKeyComponent};
 
 /// One value bucket: an opaque component digest and its occurrence count.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +103,117 @@ pub fn aggregate(breakdowns: &[ActionKeyBreakdown]) -> Vec<ComponentHistogram> {
 /// descending, keeping components with more than one observed value.
 #[must_use]
 pub fn top_fragmenters(histograms: &[ComponentHistogram]) -> Vec<(&'static str, usize)> {
+    let mut out: Vec<(&'static str, usize)> = histograms
+        .iter()
+        .filter(|h| h.distinct_values() > 1)
+        .map(|h| (h.component, h.distinct_values()))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    out
+}
+
+/// One value bucket read from durable storage: an opaque component digest
+/// with an owned semantic domain (so stored domains never need `Box::leak`)
+/// and its occurrence count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedValueBucket {
+    /// Semantic digest domain recorded in metadata.
+    pub domain: String,
+    /// Opaque lowercase hexadecimal SHA-256 digest (never the raw value).
+    pub digest_hex: String,
+    /// How many observed keys carried this digest.
+    pub count: u64,
+}
+
+/// Histogram for one canonical component across borrowed persisted breakdowns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedComponentHistogram {
+    /// Canonical component name (from `ACTION_KEY_COMPONENT_NAMES`).
+    pub component: &'static str,
+    /// Distinct observed values with counts, descending by count.
+    pub buckets: Vec<OwnedValueBucket>,
+}
+
+impl OwnedComponentHistogram {
+    /// Number of distinct values observed for this component.
+    #[must_use]
+    pub fn distinct_values(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Total observations across all buckets.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.buckets.iter().map(|b| b.count).sum()
+    }
+}
+
+/// Fold verified persisted breakdowns into per-component histograms without
+/// allocating `'static` domain strings. Only canonical component names from
+/// `ACTION_KEY_COMPONENT_NAMES` are aggregated, in canonical order.
+#[must_use]
+pub fn aggregate_borrowed(
+    breakdowns: &[Vec<BorrowedKeyComponent<'_>>],
+) -> Vec<OwnedComponentHistogram> {
+    let mut histograms: Vec<OwnedComponentHistogram> = Vec::new();
+    for breakdown in breakdowns {
+        for component in breakdown {
+            let Some(&canonical_name) = ACTION_KEY_COMPONENT_NAMES
+                .iter()
+                .find(|&&name| name == component.name)
+            else {
+                continue;
+            };
+            let hist = match histograms
+                .iter_mut()
+                .find(|h| h.component == canonical_name)
+            {
+                Some(h) => h,
+                None => {
+                    histograms.push(OwnedComponentHistogram {
+                        component: canonical_name,
+                        buckets: Vec::new(),
+                    });
+                    histograms.last_mut().expect("just pushed")
+                }
+            };
+            let digest_hex = encode_hex(component.bytes);
+            match hist
+                .buckets
+                .iter_mut()
+                .find(|b| b.domain == component.domain && b.digest_hex == digest_hex)
+            {
+                Some(bucket) => bucket.count += 1,
+                None => hist.buckets.push(OwnedValueBucket {
+                    domain: component.domain.to_owned(),
+                    digest_hex,
+                    count: 1,
+                }),
+            }
+        }
+    }
+    histograms.sort_by_key(|h| {
+        ACTION_KEY_COMPONENT_NAMES
+            .iter()
+            .position(|&name| name == h.component)
+            .unwrap_or(usize::MAX)
+    });
+    for hist in &mut histograms {
+        hist.buckets.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.domain.cmp(&b.domain))
+                .then_with(|| a.digest_hex.cmp(&b.digest_hex))
+        });
+    }
+    histograms
+}
+
+/// The top fragmenting components across owned histograms: sorted by
+/// distinct-value count descending, keeping components with more than one
+/// observed value.
+#[must_use]
+pub fn top_fragmenters_owned(histograms: &[OwnedComponentHistogram]) -> Vec<(&'static str, usize)> {
     let mut out: Vec<(&'static str, usize)> = histograms
         .iter()
         .filter(|h| h.distinct_values() > 1)
@@ -202,5 +315,40 @@ mod tests {
                 let _: u64 = count;
             }
         }
+    }
+
+    #[test]
+    fn aggregate_borrowed_matches_static_aggregation_without_leaking_domains() {
+        let breakdowns: Vec<_> = [
+            compute_action_key(&descriptor(1, 50)),
+            compute_action_key(&descriptor(2, 50)),
+            compute_action_key(&descriptor(2, 51)),
+            compute_action_key(&descriptor(2, 52)),
+        ]
+        .to_vec();
+        let borrowed: Vec<Vec<BorrowedKeyComponent<'_>>> = breakdowns
+            .iter()
+            .map(|b| {
+                b.components
+                    .iter()
+                    .map(|c| BorrowedKeyComponent {
+                        name: c.name,
+                        domain: c.digest.domain,
+                        bytes: &c.digest.bytes,
+                    })
+                    .collect()
+            })
+            .collect();
+        let owned = aggregate_borrowed(&borrowed);
+        assert_eq!(
+            top_fragmenters_owned(&owned),
+            vec![("environment", 3), ("toolchain", 2)]
+        );
+        let tc = owned.iter().find(|h| h.component == "toolchain").unwrap();
+        assert_eq!(tc.total(), 4);
+        assert_eq!(tc.buckets[0].count, 3);
+        assert_eq!(tc.buckets[0].digest_hex, "02".repeat(32));
+        assert_eq!(tc.buckets[1].count, 1);
+        assert_eq!(tc.buckets[1].digest_hex, "01".repeat(32));
     }
 }

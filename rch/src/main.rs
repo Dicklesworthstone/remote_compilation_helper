@@ -2598,6 +2598,9 @@ async fn dispatch_command(cli: Cli, ctx: Arc<OutputContext>) -> Result<()> {
             Commands::Rabs {
                 action: commands::rabs_gc::RabsCommand::ReleaseVerdict { action },
             } => commands::rabs_gc::run_release_verdict(action, &ctx).await,
+            Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::Telemetry { cas_root },
+            } => commands::rabs_gc::run_telemetry(cas_root, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
             Commands::Footprints { action } => commands::footprints::run(action, &ctx).await,
@@ -3078,6 +3081,22 @@ fn schema_json_for_command(command: &Option<Commands>) -> Result<String> {
             let schema = SchemaSettings::draft07()
                 .into_generator()
                 .into_root_schema_for::<commands::why::RefusalExplanation>();
+            serde_json::to_string_pretty(&schema)?
+        }
+        Some(Commands::Why {
+            action: commands::why::WhyAction::Fragmentation { .. },
+        }) => {
+            let schema = SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<commands::why::FragmentationReport>();
+            serde_json::to_string_pretty(&schema)?
+        }
+        Some(Commands::Rabs {
+            action: commands::rabs_gc::RabsCommand::Telemetry { .. },
+        }) => {
+            let schema = SchemaSettings::draft07()
+                .into_generator()
+                .into_root_schema_for::<commands::rabs_gc::CasTelemetryReceipt>();
             serde_json::to_string_pretty(&schema)?
         }
         Some(Commands::Advise(_)) => {
@@ -10448,6 +10467,43 @@ mod tests {
                 assert_eq!(outcome, "first-seen");
             }
             _ => fail_expected("Expected why refusal command"),
+        }
+        let cli = Cli::try_parse_from([
+            "rch",
+            "--json",
+            "why",
+            "fragmentation",
+            "--cas-root",
+            "/tmp/rabs-cas",
+            "--limit",
+            "250",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Why {
+                action: commands::why::WhyAction::Fragmentation { cas_root, limit },
+            }) => {
+                assert_eq!(cas_root, Some(std::path::PathBuf::from("/tmp/rabs-cas")));
+                assert_eq!(limit, 250);
+            }
+            _ => fail_expected("Expected why fragmentation command"),
+        }
+        let cli = Cli::try_parse_from([
+            "rch",
+            "--json",
+            "rabs",
+            "telemetry",
+            "--cas-root",
+            "/tmp/rabs-cas",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Rabs {
+                action: commands::rabs_gc::RabsCommand::Telemetry { cas_root },
+            }) => {
+                assert_eq!(cas_root, Some(std::path::PathBuf::from("/tmp/rabs-cas")));
+            }
+            _ => fail_expected("Expected rabs telemetry command"),
         }
     }
 

@@ -34,7 +34,21 @@ trap 'rm -rf "$SCRATCH"' EXIT
 TOUCH_FILE=$( (find "$REPO_DIR" -maxdepth 3 -name '*.rs' 2>/dev/null || true) | head -1)
 [ -n "$TOUCH_FILE" ] || { echo "no .rs file to touch in $REPO_DIR" >&2; exit 2; }
 
-now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+now_ms() {
+  local LC_ALL=C secs frac ms
+  if [[ -n "${EPOCHREALTIME:-}" && "$EPOCHREALTIME" == *.* ]]; then
+    secs=${EPOCHREALTIME%.*}
+    frac="${EPOCHREALTIME#*.}000"
+    printf '%s%s\n' "$secs" "${frac:0:3}"
+  else
+    ms=$(date +%s%3N 2>/dev/null || true)
+    if [[ "$ms" =~ ^[0-9]{13,}$ ]]; then
+      printf '%s\n' "$ms"
+    else
+      printf '%s000\n' "$(date +%s)"
+    fi
+  fi
+}
 
 emit() { # variant scenario iteration duration_ms exit_code
   printf '{"v":1,"kind":"layer0-baseline","repo":"%s","host":"%s","toolchain":"%s","variant":"%s","scenario":"%s","iteration":%s,"duration_ms":%s,"exit":%s}\n' \

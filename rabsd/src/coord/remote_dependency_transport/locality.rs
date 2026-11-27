@@ -54,6 +54,10 @@ impl SourceDemand {
     pub(crate) fn new<'a>(objects: impl IntoIterator<Item = &'a TypedDigest>) -> Self {
         Self(objects.into_iter().take(MAX_OBJECTS).cloned().collect())
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// Exact object identity from capture, paired with verified delivery length.

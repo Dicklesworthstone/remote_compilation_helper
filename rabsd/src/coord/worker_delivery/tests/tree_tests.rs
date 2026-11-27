@@ -582,8 +582,14 @@ fn historical_nextest_resume_keeps_omitted_threads_without_new_execution_capabil
     let mut peer = cargo_fixture(&destination, stdout);
     peer.replies[0]["canonical"] = json!(false);
     peer.replies[0]["slots"] = json!(1);
-    peer.replies[0].as_object_mut().unwrap().remove("command_contexts");
-    peer.replies[0].as_object_mut().unwrap().remove("nextest_admission_versions");
+    peer.replies[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("command_contexts");
+    peer.replies[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("nextest_admission_versions");
     peer.replies[0]["request_high_water"] = json!(7);
     peer.replies[0]["result_retentions"] = json!([RESULT_RETENTION]);
     peer.replies[1]["resumed"] = json!(true);
@@ -600,10 +606,17 @@ fn historical_nextest_resume_keeps_omitted_threads_without_new_execution_capabil
     assert!(peer.replies.is_empty());
     assert!(delivered.acknowledgments_confirmed);
     assert_eq!(peer.sent[1], DeliveryMode::Resume.frame(&request));
-    assert!(peer.sent.iter().all(|frame| frame["kind"] != "canonical-exec"));
+    assert!(
+        peer.sent
+            .iter()
+            .all(|frame| frame["kind"] != "canonical-exec")
+    );
     assert_eq!(delivered.receipt["reexecute"], false);
     assert_eq!(delivered.receipt["publication_authorized"], false);
-    assert_eq!(fs::read(destination.join("diagnostics/stdout")).unwrap(), stdout);
+    assert_eq!(
+        fs::read(destination.join("diagnostics/stdout")).unwrap(),
+        stdout
+    );
     let recovered =
         recover_existing_delivery(&request, "worker", &destination, DeliveryTrust::Loopback)
             .unwrap()

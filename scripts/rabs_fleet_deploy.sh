@@ -72,7 +72,7 @@ usage() {
 [[ $# -ge 2 && $# -le 3 ]] || usage
 WORKER=$1
 COORDINATOR=$2
-LOCAL_BIN=${3:-target/release/rabs-wkr}
+LOCAL_BIN=${3:-target/daemon-release/rabs-wkr}
 REMOTE_BIN=/usr/local/bin/rabs-wkr
 SSH_OPTS=(-o ConnectTimeout=20 -o BatchMode=yes)
 

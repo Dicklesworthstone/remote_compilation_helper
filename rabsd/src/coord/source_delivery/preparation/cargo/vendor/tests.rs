@@ -986,7 +986,6 @@ fn local_reclassification_of_vendor_packages_is_refused_before_metadata_can_read
     );
 }
 
-
 fn selected_vendor_source(command: &str) -> CargoSource {
     let request = json!({
         "program":"/__rabs/toolchain/bin/cargo",
@@ -1055,34 +1054,65 @@ fn selected_vendor_graph_binds_target_and_host_units_to_the_complete_captured_so
     let (metadata, graph) = selected_vendor_graph(planning);
     let control = PreparationControl::uncontrolled();
     let result = validate_selected_graph(
-        &retained, planning, selection, &metadata, &graph,
-        SelectedSources::Vendor(&vendor), &control,
+        &retained,
+        planning,
+        selection,
+        &metadata,
+        &graph,
+        SelectedSources::Vendor(&vendor),
+        &control,
     )
     .unwrap();
-    assert!(result.is_empty(), "vendor input adds no Cargo-home archive projection");
+    assert!(
+        result.is_empty(),
+        "vendor input adds no Cargo-home archive projection"
+    );
     let files = validate_capture(&retained, "app/Cargo.toml", Some(&vendor), false).unwrap();
     for file in [
-        "app/Cargo.lock", "app/.cargo/config.toml",
+        "app/Cargo.lock",
+        "app/.cargo/config.toml",
         "vendor/arbitrary-folder/.cargo-checksum.json",
-        "vendor/arbitrary-folder/data.txt", "unrelated/input.txt",
+        "vendor/arbitrary-folder/data.txt",
+        "unrelated/input.txt",
     ] {
         assert!(files.iter().any(|selected| selected == file), "{file}");
     }
     // A local-only graph cannot substitute for this external source owner.
-    assert!(validate_selected_graph(
-        &retained, planning, selection, &metadata, &graph,
-        SelectedSources::Local, &control,
-    ).is_err());
+    assert!(
+        validate_selected_graph(
+            &retained,
+            planning,
+            selection,
+            &metadata,
+            &graph,
+            SelectedSources::Local,
+            &control,
+        )
+        .is_err()
+    );
 
     for (field, value) in [
         ("pkg_id", json!(format!("{CRATES_IO}#other@1.0.0"))),
         ("pkg_id", json!(format!("{CRATES_IO}#fixture_dep@9.0.0"))),
         ("pkg_id", json!(format!("{CRATES_IO}#1.0.0"))),
-        ("pkg_id", json!("registry+https://foreign.invalid/index#fixture_dep@1.0.0")),
-        ("pkg_id", json!(format!("path+file://{}/{}#fixture_dep@1.0.0", planning.display(), DEP))),
+        (
+            "pkg_id",
+            json!("registry+https://foreign.invalid/index#fixture_dep@1.0.0"),
+        ),
+        (
+            "pkg_id",
+            json!(format!(
+                "path+file://{}/{}#fixture_dep@1.0.0",
+                planning.display(),
+                DEP
+            )),
+        ),
         ("src_path", json!(planning.join(DEP).join("missing.rs"))),
         ("src_path", json!(planning.join("app/src/main.rs"))),
-        ("src_path", json!("/outside/vendor/arbitrary-folder/src/lib.rs")),
+        (
+            "src_path",
+            json!("/outside/vendor/arbitrary-folder/src/lib.rs"),
+        ),
     ] {
         // Mutate only the host unit: checking target roots alone would miss it.
         let mut changed = graph.clone();
@@ -1091,17 +1121,34 @@ fn selected_vendor_graph_binds_target_and_host_units_to_the_complete_captured_so
         } else {
             changed["units"][2][field] = value;
         }
-        assert!(validate_selected_graph(
-            &retained, planning, selection, &metadata, &changed,
-            SelectedSources::Vendor(&vendor), &control,
-        ).is_err(), "{changed}");
+        assert!(
+            validate_selected_graph(
+                &retained,
+                planning,
+                selection,
+                &metadata,
+                &changed,
+                SelectedSources::Vendor(&vendor),
+                &control,
+            )
+            .is_err(),
+            "{changed}"
+        );
     }
     let mut neighbor = metadata;
     neighbor["workspace_root"] = json!(planning.join("neighbor"));
-    assert!(validate_selected_graph(
-        &retained, planning, selection, &neighbor, &graph,
-        SelectedSources::Vendor(&vendor), &control,
-    ).is_err());
+    assert!(
+        validate_selected_graph(
+            &retained,
+            planning,
+            selection,
+            &neighbor,
+            &graph,
+            SelectedSources::Vendor(&vendor),
+            &control,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1112,23 +1159,34 @@ fn selected_vendor_targets_cannot_cross_package_boundaries_or_path_prefixes() {
     package(root.path(), sibling, "sibling", "1.0.0");
     let retained = image(root.path());
     let vendor = verify(root.path()).unwrap();
-    let locked = vendor.bind_lock(&retained, Path::new("app/Cargo.lock")).unwrap();
+    let locked = vendor
+        .bind_lock(&retained, Path::new("app/Cargo.lock"))
+        .unwrap();
     let planning = Path::new("/private/planning");
     let own = planning.join(DEP).join("src/lib.rs");
     let other = planning.join(sibling).join("src/lib.rs");
     let id = format!("{CRATES_IO}#fixture_dep@1.0.0");
     let control = PreparationControl::uncontrolled();
-    vendor.check_selected_package(
-        &retained, planning, &id, &[own.to_str().unwrap()], &locked, &control,
-    ).unwrap();
+    vendor
+        .check_selected_package(
+            &retained,
+            planning,
+            &id,
+            &[own.to_str().unwrap()],
+            &locked,
+            &control,
+        )
+        .unwrap();
     for paths in [
         vec![other.to_str().unwrap()],
         vec![own.to_str().unwrap(), other.to_str().unwrap()],
         vec![other.to_str().unwrap(), own.to_str().unwrap()],
     ] {
-        assert!(vendor.check_selected_package(
-            &retained, planning, &id, &paths, &locked, &control,
-        ).is_err());
+        assert!(
+            vendor
+                .check_selected_package(&retained, planning, &id, &paths, &locked, &control,)
+                .is_err()
+        );
     }
 }
 
@@ -1136,7 +1194,12 @@ fn selected_vendor_targets_cannot_cross_package_boundaries_or_path_prefixes() {
 fn selected_vendor_mode_still_requires_all_locked_packages_and_matching_checksums() {
     use super::super::selection::{SelectedSources, validate_selected_graph};
 
-    for case in ["checksum", "source", "missing-unselected", "duplicate-owner"] {
+    for case in [
+        "checksum",
+        "source",
+        "missing-unselected",
+        "duplicate-owner",
+    ] {
         let root = tempfile::tempdir().unwrap();
         let checksum = fixture(root.path());
         let path = root.path().join("app/Cargo.lock");
@@ -1158,39 +1221,57 @@ fn selected_vendor_mode_still_requires_all_locked_packages_and_matching_checksum
         let source = selected_vendor_source("check");
         let planning = Path::new("/private/planning");
         let (metadata, graph) = selected_vendor_graph(planning);
-        assert!(validate_selected_graph(
-            &retained, planning, source.selection.as_ref().unwrap(), &metadata, &graph,
-            SelectedSources::Vendor(&vendor), &PreparationControl::uncontrolled(),
-        ).is_err(), "{case}");
+        assert!(
+            validate_selected_graph(
+                &retained,
+                planning,
+                source.selection.as_ref().unwrap(),
+                &metadata,
+                &graph,
+                SelectedSources::Vendor(&vendor),
+                &PreparationControl::uncontrolled(),
+            )
+            .is_err(),
+            "{case}"
+        );
     }
 }
 
 #[test]
 fn selected_vendor_git_units_use_the_exact_bound_lock_and_reject_selector_drift() {
     let planning = Path::new("/private/planning");
-    for selector in [None, Some(("branch", "stable")), Some(("rev", GIT_REVISION))] {
+    for selector in [
+        None,
+        Some(("branch", "stable")),
+        Some(("rev", GIT_REVISION)),
+    ] {
         let root = tempfile::tempdir().unwrap();
         let source = git_fixture(root.path(), selector);
         let retained = image(root.path());
         let vendor = verify(root.path()).unwrap();
-        let locked = vendor.bind_lock(&retained, Path::new("app/Cargo.lock")).unwrap();
+        let locked = vendor
+            .bind_lock(&retained, Path::new("app/Cargo.lock"))
+            .unwrap();
         let (selector, _) = source.rsplit_once('#').unwrap();
         let id = format!("{selector}#git_dep@2.0.0");
         let target = planning.join(GIT_DEP).join("src/lib.rs");
         let paths = [target.to_str().unwrap()];
         let control = PreparationControl::uncontrolled();
-        vendor.check_selected_package(
-            &retained, planning, &id, &paths, &locked, &control,
-        ).unwrap();
+        vendor
+            .check_selected_package(&retained, planning, &id, &paths, &locked, &control)
+            .unwrap();
         for wrong in [
             id.replace("immutable-source", "foreign-source"),
             id.replace("git_dep@2.0.0", "other@2.0.0"),
             format!("{selector}#{GIT_REVISION}"),
             format!("git+{GIT_URL}?branch=other#git_dep@2.0.0"),
         ] {
-            assert!(vendor.check_selected_package(
-                &retained, planning, &wrong, &paths, &locked, &control,
-            ).is_err(), "{wrong}");
+            assert!(
+                vendor
+                    .check_selected_package(&retained, planning, &wrong, &paths, &locked, &control,)
+                    .is_err(),
+                "{wrong}"
+            );
         }
     }
     // The unit ID has no precise revision. A full rev selector in the retained
@@ -1199,28 +1280,54 @@ fn selected_vendor_git_units_use_the_exact_bound_lock_and_reject_selector_drift(
     let source = git_fixture(root.path(), Some(("rev", GIT_REVISION)));
     let path = root.path().join("app/Cargo.lock");
     let lock = fs::read_to_string(&path).unwrap();
-    fs::write(path, lock.replace(&source, &format!("git+{GIT_URL}?rev={GIT_REVISION}#{}", "a".repeat(40)))).unwrap();
+    fs::write(
+        path,
+        lock.replace(
+            &source,
+            &format!("git+{GIT_URL}?rev={GIT_REVISION}#{}", "a".repeat(40)),
+        ),
+    )
+    .unwrap();
     let retained = image(root.path());
     let vendor = verify(root.path()).unwrap();
-    assert!(vendor.bind_lock(&retained, Path::new("app/Cargo.lock")).is_err());
+    assert!(
+        vendor
+            .bind_lock(&retained, Path::new("app/Cargo.lock"))
+            .is_err()
+    );
 
     // Literal and URL-encoded selectors cannot be guessed into one identity.
     let root = tempfile::tempdir().unwrap();
     let source = git_fixture(root.path(), Some(("branch", "feature%2Fbranch")));
     let retained = image(root.path());
     let vendor = verify(root.path()).unwrap();
-    let locked = vendor.bind_lock(&retained, Path::new("app/Cargo.lock")).unwrap();
+    let locked = vendor
+        .bind_lock(&retained, Path::new("app/Cargo.lock"))
+        .unwrap();
     let target = planning.join(GIT_DEP).join("src/lib.rs");
     let (selector, _) = source.rsplit_once('#').unwrap();
-    assert!(vendor.check_selected_package(
-        &retained, planning, &format!("{selector}#git_dep@2.0.0"),
-        &[target.to_str().unwrap()], &locked, &PreparationControl::uncontrolled(),
-    ).is_err());
+    assert!(
+        vendor
+            .check_selected_package(
+                &retained,
+                planning,
+                &format!("{selector}#git_dep@2.0.0"),
+                &[target.to_str().unwrap()],
+                &locked,
+                &PreparationControl::uncontrolled(),
+            )
+            .is_err()
+    );
 }
 
 #[test]
 fn selected_vendor_preflight_preserves_checksum_config_and_cpu_refusals() {
-    for case in ["checksum", "unselected-checksum", "config-layer", "native-cpu"] {
+    for case in [
+        "checksum",
+        "unselected-checksum",
+        "config-layer",
+        "native-cpu",
+    ] {
         let root = tempfile::tempdir().unwrap();
         fixture(root.path());
         match case {
@@ -1229,18 +1336,26 @@ fn selected_vendor_preflight_preserves_checksum_config_and_cpu_refusals() {
                 package(root.path(), "vendor/unselected", "unselected", "3.0.0");
                 write(root.path(), "vendor/unselected/data.txt", b"changed");
             }
-            "config-layer" => write(root.path(), ".cargo/config.toml", b"[build]\nrustflags=[]\n"),
+            "config-layer" => write(
+                root.path(),
+                ".cargo/config.toml",
+                b"[build]\nrustflags=[]\n",
+            ),
             "native-cpu" => write(
-                root.path(), "app/.cargo/config.toml",
+                root.path(),
+                "app/.cargo/config.toml",
                 format!("{CONFIG}\n[build]\nrustflags=['-Ctarget-cpu=native']\n"),
             ),
             _ => unreachable!(),
         }
         let source = selected_vendor_source("check");
         // An unavailable toolchain proves refusal precedes any Cargo launch.
-        let error = source.prepare(
-            std::sync::Arc::new(image(root.path())), Some(&root.path().join("missing-toolchain")),
-        ).unwrap_err();
+        let error = source
+            .prepare(
+                std::sync::Arc::new(image(root.path())),
+                Some(&root.path().join("missing-toolchain")),
+            )
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}: {error}");
         if case == "native-cpu" {
             assert!(error.to_string().contains("target-cpu=native"), "{error}");
@@ -1257,14 +1372,20 @@ fn installed_cargo_selected_vendor_preparation_preserves_all_bytes_without_runni
     fixture(&source_root);
     let manifest = fs::read_to_string(source_root.join("app/Cargo.toml")).unwrap();
     write(
-        &source_root, "app/Cargo.toml",
+        &source_root,
+        "app/Cargo.toml",
         format!("{manifest}\n[build-dependencies]\nfixture_dep='=1.0.0'\n"),
     );
     write(
-        &source_root, "app/build.rs",
+        &source_root,
+        "app/build.rs",
         b"fn main() { panic!(\"selected source planning must not run project code\"); }\n",
     );
-    write(&source_root, "unrelated/input.txt", b"complete source anchor");
+    write(
+        &source_root,
+        "unrelated/input.txt",
+        b"complete source anchor",
+    );
     let tools = root.path().join("tools");
     fs::create_dir(&tools).unwrap();
     let cargo = super::super::local_tool("cargo", &tools).unwrap();
@@ -1273,19 +1394,26 @@ fn installed_cargo_selected_vendor_preparation_preserves_all_bytes_without_runni
     let retained = std::sync::Arc::new(image(&source_root));
     for command in ["check", "build"] {
         let selected = selected_vendor_source(command);
-        let (prepared, files) = selected.prepare(
-            std::sync::Arc::clone(&retained), Some(toolchain),
-        ).unwrap();
+        let (prepared, files) = selected
+            .prepare(std::sync::Arc::clone(&retained), Some(toolchain))
+            .unwrap();
         assert!(std::sync::Arc::ptr_eq(&prepared, &retained));
         assert!(selected.cargo_home_projection().is_none());
         for file in [
-            "app/Cargo.toml", "app/Cargo.lock", "app/.cargo/config.toml",
-            "app/build.rs", "vendor/arbitrary-folder/Cargo.toml",
+            "app/Cargo.toml",
+            "app/Cargo.lock",
+            "app/.cargo/config.toml",
+            "app/build.rs",
+            "vendor/arbitrary-folder/Cargo.toml",
             "vendor/arbitrary-folder/src/lib.rs",
             "vendor/arbitrary-folder/.cargo-checksum.json",
-            "vendor/arbitrary-folder/data.txt", "unrelated/input.txt",
+            "vendor/arbitrary-folder/data.txt",
+            "unrelated/input.txt",
         ] {
-            assert!(files.iter().any(|selected| selected == file), "{command}: {file}");
+            assert!(
+                files.iter().any(|selected| selected == file),
+                "{command}: {file}"
+            );
             assert_eq!(
                 prepared.file_bytes("workspace", file),
                 Some(fs::read(source_root.join(file)).unwrap().as_slice()),

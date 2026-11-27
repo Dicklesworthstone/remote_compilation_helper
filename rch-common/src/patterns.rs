@@ -4242,15 +4242,26 @@ mod tests {
         ] {
             assert!(!classify_command(command).is_compilation, "{command}");
             assert!(
-                !classify_command_detailed(command).classification.is_compilation,
+                !classify_command_detailed(command)
+                    .classification
+                    .is_compilation,
                 "{command}"
             );
         }
         for (command, expected) in [
-            ("cargo clippy -- -Dwarnings --fix", CompilationKind::CargoClippy),
-            ("cargo clippy --config 'alias.fix = \"--fix\"'", CompilationKind::CargoClippy),
+            (
+                "cargo clippy -- -Dwarnings --fix",
+                CompilationKind::CargoClippy,
+            ),
+            (
+                "cargo clippy --config 'alias.fix = \"--fix\"'",
+                CompilationKind::CargoClippy,
+            ),
             ("cargo doc --no-deps", CompilationKind::CargoDoc),
-            ("cargo clippy >clippy.log 2>&1", CompilationKind::CargoClippy),
+            (
+                "cargo clippy >clippy.log 2>&1",
+                CompilationKind::CargoClippy,
+            ),
             ("cargo xwin clippy -- --fix", CompilationKind::CargoClippy),
         ] {
             assert_eq!(classify_command(command).kind, Some(expected), "{command}");

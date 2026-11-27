@@ -1349,8 +1349,12 @@ mod tests {
             );
             // The metadata is a legitimate ordinary Cargo compilation result.
             assert!(
-                CargoArtifactReport::read(bytes.as_slice(), OUTPUT_ROOT, CargoArtifactMode::Compilation)
-                    .is_ok()
+                CargoArtifactReport::read(
+                    bytes.as_slice(),
+                    OUTPUT_ROOT,
+                    CargoArtifactMode::Compilation
+                )
+                .is_ok()
             );
         }
         let mut binary = record(
@@ -1361,8 +1365,12 @@ mod tests {
         binary["target"]["name"] = json!("my-app");
         let bytes = stream(&[dependency, binary, finished]);
         assert!(
-            CargoArtifactReport::read(bytes.as_slice(), OUTPUT_ROOT, CargoArtifactMode::Documentation)
-                .is_ok()
+            CargoArtifactReport::read(
+                bytes.as_slice(),
+                OUTPUT_ROOT,
+                CargoArtifactMode::Documentation
+            )
+            .is_ok()
         );
     }
 

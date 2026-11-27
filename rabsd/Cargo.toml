@@ -44,7 +44,7 @@ asupersync = { version = "=0.5.0", git = "https://github.com/Dicklesworthstone/a
 signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
 # Selected registry cache files are opened relative to retained directory
 # descriptors; neither symlinked ancestors nor a substituted FIFO are inputs.
-rustix = { version = "1.1.4", features = ["fs", "process", "net", "event", "pty"] }
+rustix = { version = "1.1.5", features = ["fs", "process", "net", "event", "pty"] }
 
 [dev-dependencies]
 tempfile = "3.25.0"
@@ -60,7 +60,7 @@ rabs-replay = { path = "../rabs-replay" }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Exercise real terminal refusal and inherited pipe input at the CLI boundary.
-rustix = { version = "1.1.4", features = ["pty", "pipe"] }
+rustix = { version = "1.1.5", features = ["pty", "pipe"] }
 
 [lints.rust]
 unsafe_code = "forbid"

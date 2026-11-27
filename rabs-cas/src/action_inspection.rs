@@ -24,6 +24,9 @@ const HEADER_SCHEMA_VERSION: u32 = 26;
 /// Maximum number of rows returned in each per-action list.
 pub const INSPECTION_ROW_LIMIT: usize = 64;
 
+/// Maximum number of distinct actions sampled by [`inspect_fragmentation_window`].
+pub const FRAGMENTATION_WINDOW_MAX_LIMIT: usize = 4_096;
+
 /// A bounded list; truncation means that additional recorded rows exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectionRows<T> {
@@ -125,6 +128,63 @@ pub struct BreakdownInspection {
     pub digest_hex: String,
 }
 
+/// Recorded header and component breakdown rows for one action in a
+/// fragmentation-window snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentationActionRecord {
+    pub action_key: String,
+    pub breakdown_header: Option<BreakdownHeaderInspection>,
+    pub breakdown: InspectionRows<BreakdownInspection>,
+}
+
+/// Bounded read-only snapshot of recorded key breakdowns across the CAS store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentationWindowInspection {
+    pub schema_version: u32,
+    pub total_action_entries: u64,
+    pub total_actions_with_breakdowns: u64,
+    pub sampled_actions: Vec<FragmentationActionRecord>,
+    pub truncated: bool,
+}
+
+/// One grouped label/count pair from a read-only telemetry snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelCount {
+    pub label: String,
+    pub count: u64,
+}
+
+/// One consistent read-only snapshot of durable CAS metadata telemetry.
+///
+/// All values are recorded facts from `meta.sqlite` — never live coordinator
+/// authorization or synthetic hit-rate projections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CasTelemetryInspection {
+    pub schema_version: u32,
+    pub action_entries: u64,
+    /// Present on schema 26; `None` on schema 25 where `action_key_headers` does not exist.
+    pub action_key_headers: Option<u64>,
+    pub actions_with_breakdowns: u64,
+    pub publications_total: u64,
+    pub publications_by_result_kind: Vec<LabelCount>,
+    pub serving_states_by_disposition: Vec<LabelCount>,
+    pub quarantines_by_scope: Vec<LabelCount>,
+    pub unresolved_divergence_incidents: u64,
+    pub objects_total: u64,
+    pub objects_logical_bytes: u64,
+    pub object_locations_healthy: u64,
+    pub object_locations_quarantined: u64,
+    pub object_locations_durable: u64,
+    pub active_pins: u64,
+    pub released_pins: u64,
+    pub gc_receipts_total: u64,
+    pub gc_total_reclaimed: u64,
+    pub runtime_classes: Vec<LabelCount>,
+    pub decision_receipts_by_kind: Vec<LabelCount>,
+    pub release_verdicts_total: u64,
+    pub worker_capabilities_workers: u64,
+}
+
 #[derive(Debug)]
 pub enum InspectionError {
     InvalidActionKey,
@@ -201,6 +261,24 @@ pub fn inspect_action_pair(
     })
 }
 
+/// Inspect a bounded window of recorded action-key breakdowns in one read-only
+/// SQLite snapshot without creating or migrating `meta.sqlite`.
+pub fn inspect_fragmentation_window(
+    database: &Path,
+    limit: usize,
+) -> Result<FragmentationWindowInspection, InspectionError> {
+    let bounded_limit = limit.clamp(1, FRAGMENTATION_WINDOW_MAX_LIMIT);
+    with_snapshot(database, |transaction, version| {
+        inspect_fragmentation_snapshot(transaction, bounded_limit, version)
+    })
+}
+
+/// Inspect durable CAS metadata counters in one read-only SQLite snapshot
+/// without creating or migrating `meta.sqlite`.
+pub fn inspect_cas_telemetry(database: &Path) -> Result<CasTelemetryInspection, InspectionError> {
+    with_snapshot(database, inspect_telemetry_snapshot)
+}
+
 fn with_snapshot<T>(
     database: &Path,
     inspect: impl FnOnce(&Transaction<'_>, u32) -> Result<T, InspectionError>,
@@ -227,6 +305,266 @@ fn inspect_pair_snapshot(
         inspect_snapshot(transaction, prior, schema_version)?,
         inspect_snapshot(transaction, current, schema_version)?,
     ))
+}
+
+fn inspect_fragmentation_snapshot(
+    transaction: &Transaction<'_>,
+    limit: usize,
+    schema_version: u32,
+) -> Result<FragmentationWindowInspection, InspectionError> {
+    let total_action_entries = scalar_u64(
+        transaction,
+        "SELECT COUNT(*) FROM action_entries",
+        "action entry count",
+    )?;
+    let total_actions_with_breakdowns = scalar_u64(
+        transaction,
+        "SELECT COUNT(DISTINCT action_key) FROM key_breakdowns",
+        "actions with breakdowns count",
+    )?;
+    let query_limit = i64::try_from(limit.saturating_add(1))
+        .map_err(|_| invalid("fragmentation window limit overflow"))?;
+    let mut keys = Vec::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT action_key FROM key_breakdowns ORDER BY action_key LIMIT ?1",
+        )?;
+        let mut rows = statement.query([query_limit])?;
+        while let Some(row) = rows.next()? {
+            keys.push(text(row, 0, "breakdown action key")?);
+        }
+    }
+    let truncated = keys.len() > limit;
+    keys.truncate(limit);
+
+    let mut sampled_actions = Vec::with_capacity(keys.len());
+    for action_key in keys {
+        let breakdown_header = if schema_version == HEADER_SCHEMA_VERSION {
+            optional_row(
+                transaction,
+                "SELECT key_epoch, projection_epoch, action_class_tag FROM action_key_headers \
+                 WHERE action_key = ?1",
+                Some(&action_key),
+                |row| {
+                    Ok(BreakdownHeaderInspection {
+                        key_epoch: unsigned32(row, 0, "header key epoch")?,
+                        projection_epoch: unsigned32(row, 1, "header projection epoch")?,
+                        action_class_tag: unsigned32(row, 2, "header action class")?,
+                    })
+                },
+            )?
+        } else {
+            None
+        };
+        let breakdown = bounded_rows(
+            transaction,
+            "SELECT component, algo, domain, bytes FROM key_breakdowns \
+             WHERE action_key = ?1 ORDER BY component LIMIT 65",
+            &action_key,
+            |row| {
+                let digest = digest(row, 1)?;
+                Ok(BreakdownInspection {
+                    component: text(row, 0, "key component")?,
+                    algorithm: digest.algorithm,
+                    domain: digest.domain,
+                    digest_hex: digest.digest_hex,
+                })
+            },
+        )?;
+        sampled_actions.push(FragmentationActionRecord {
+            action_key,
+            breakdown_header,
+            breakdown,
+        });
+    }
+
+    Ok(FragmentationWindowInspection {
+        schema_version,
+        total_action_entries,
+        total_actions_with_breakdowns,
+        sampled_actions,
+        truncated,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn inspect_telemetry_snapshot(
+    transaction: &Transaction<'_>,
+    schema_version: u32,
+) -> Result<CasTelemetryInspection, InspectionError> {
+    let action_entries = scalar_u64(
+        transaction,
+        "SELECT COUNT(*) FROM action_entries",
+        "action entry count",
+    )?;
+    let action_key_headers = if schema_version == HEADER_SCHEMA_VERSION {
+        Some(scalar_u64(
+            transaction,
+            "SELECT COUNT(*) FROM action_key_headers",
+            "action key header count",
+        )?)
+    } else {
+        None
+    };
+    let actions_with_breakdowns = scalar_u64(
+        transaction,
+        "SELECT COUNT(DISTINCT action_key) FROM key_breakdowns",
+        "actions with breakdowns count",
+    )?;
+    let publications_by_result_kind = grouped_counts(
+        transaction,
+        "SELECT result_kind, COUNT(*) FROM action_publications GROUP BY result_kind ORDER BY result_kind",
+        "publication result kind",
+    )?;
+    let publications_total = publications_by_result_kind
+        .iter()
+        .map(|row| row.count)
+        .fold(0_u64, u64::saturating_add);
+    let serving_states_by_disposition = grouped_counts(
+        transaction,
+        "SELECT disposition, COUNT(*) FROM action_serving_states GROUP BY disposition ORDER BY disposition",
+        "serving disposition",
+    )?;
+    let quarantines_by_scope = grouped_counts(
+        transaction,
+        "SELECT scope, COUNT(*) FROM quarantines GROUP BY scope ORDER BY scope",
+        "quarantine scope",
+    )?;
+    let unresolved_divergence_incidents = scalar_u64(
+        transaction,
+        "SELECT COUNT(*) FROM divergence_incidents",
+        "divergence incident count",
+    )?;
+    let objects_total = scalar_u64(transaction, "SELECT COUNT(*) FROM objects", "object count")?;
+    let objects_logical_bytes = scalar_u64(
+        transaction,
+        "SELECT COALESCE(SUM(logical_size), 0) FROM objects",
+        "object logical size sum",
+    )?;
+    let mut object_locations_healthy = 0_u64;
+    let mut object_locations_quarantined = 0_u64;
+    let mut object_locations_durable = 0_u64;
+    {
+        let mut statement = transaction.prepare(
+            "SELECT quarantined, durable, COUNT(*) FROM object_locations GROUP BY quarantined, durable",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let quarantined = integer(row, 0, "location quarantined flag")?;
+            let durable = integer(row, 1, "location durable flag")?;
+            let count = unsigned(row, 2, "location group count")?;
+            if quarantined != 0 {
+                object_locations_quarantined = object_locations_quarantined.saturating_add(count);
+            } else {
+                object_locations_healthy = object_locations_healthy.saturating_add(count);
+            }
+            if durable != 0 {
+                object_locations_durable = object_locations_durable.saturating_add(count);
+            }
+        }
+    }
+    let mut active_pins = 0_u64;
+    let mut released_pins = 0_u64;
+    {
+        let mut statement =
+            transaction.prepare("SELECT released, COUNT(*) FROM pins GROUP BY released")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let released = integer(row, 0, "pin released flag")?;
+            let count = unsigned(row, 1, "pin group count")?;
+            if released != 0 {
+                released_pins = released_pins.saturating_add(count);
+            } else {
+                active_pins = active_pins.saturating_add(count);
+            }
+        }
+    }
+    let gc_receipts_total = scalar_u64(
+        transaction,
+        "SELECT COUNT(*) FROM gc_receipts",
+        "gc receipt count",
+    )?;
+    let gc_total_reclaimed = scalar_u64(
+        transaction,
+        "SELECT COALESCE(SUM(reclaimed), 0) FROM gc_receipts",
+        "gc reclaimed sum",
+    )?;
+    let runtime_classes = grouped_counts(
+        transaction,
+        "SELECT decision, COUNT(*) FROM decision_receipts \
+         WHERE kind = 'rabs-live-action-class-v1' GROUP BY decision ORDER BY decision",
+        "runtime action class",
+    )?;
+    let decision_receipts_by_kind = grouped_counts(
+        transaction,
+        "SELECT kind, COUNT(*) FROM decision_receipts GROUP BY kind ORDER BY kind",
+        "decision receipt kind",
+    )?;
+    let release_verdicts_total = scalar_u64(
+        transaction,
+        "SELECT COUNT(*) FROM release_verdicts",
+        "release verdict count",
+    )?;
+    let worker_capabilities_workers = scalar_u64(
+        transaction,
+        "SELECT COUNT(DISTINCT worker) FROM worker_capabilities",
+        "worker capabilities worker count",
+    )?;
+
+    Ok(CasTelemetryInspection {
+        schema_version,
+        action_entries,
+        action_key_headers,
+        actions_with_breakdowns,
+        publications_total,
+        publications_by_result_kind,
+        serving_states_by_disposition,
+        quarantines_by_scope,
+        unresolved_divergence_incidents,
+        objects_total,
+        objects_logical_bytes,
+        object_locations_healthy,
+        object_locations_quarantined,
+        object_locations_durable,
+        active_pins,
+        released_pins,
+        gc_receipts_total,
+        gc_total_reclaimed,
+        runtime_classes,
+        decision_receipts_by_kind,
+        release_verdicts_total,
+        worker_capabilities_workers,
+    })
+}
+
+fn scalar_u64(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    field: &str,
+) -> Result<u64, InspectionError> {
+    let mut statement = transaction.prepare(sql)?;
+    let mut rows = statement.query([])?;
+    let Some(row) = rows.next()? else {
+        return Err(invalid(format!("{field} query returned no row")));
+    };
+    unsigned(row, 0, field)
+}
+
+fn grouped_counts(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    field: &str,
+) -> Result<Vec<LabelCount>, InspectionError> {
+    let mut statement = transaction.prepare(sql)?;
+    let mut rows = statement.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(LabelCount {
+            label: text(row, 0, field)?,
+            count: unsigned(row, 1, field)?,
+        });
+    }
+    Ok(out)
 }
 
 fn normalize_key(key: &str) -> Result<String, InspectionError> {
@@ -1234,5 +1572,187 @@ mod tests {
             assert_eq!(action.breakdown_header.as_ref().unwrap().key_epoch, 9);
             assert_eq!(action.breakdown.items[0].digest_hex, "09".repeat(32));
         }
+    }
+
+    #[test]
+    fn fragmentation_window_and_telemetry_never_create_or_migrate_missing_or_legacy_dbs() {
+        let missing_dir = tempfile::tempdir().unwrap();
+        let missing = missing_dir.path().join("absent.sqlite");
+        assert!(matches!(
+            inspect_fragmentation_window(&missing, 10),
+            Err(InspectionError::Database(_))
+        ));
+        assert!(matches!(
+            inspect_cas_telemetry(&missing),
+            Err(InspectionError::Database(_))
+        ));
+        assert!(!missing.exists());
+
+        let (legacy_dir, legacy_conn) = database_at_version(LEGACY_SCHEMA_VERSION);
+        insert_entry(&legacy_conn);
+        legacy_conn
+            .execute(
+                "INSERT INTO key_breakdowns VALUES (?1, 'toolchain', 'sha256-v1', 'rabs.toolchain.v1', ?2)",
+                params![key(), [3_u8; 32].as_slice()],
+            )
+            .unwrap();
+        let legacy_path = legacy_dir.path().join("meta.sqlite");
+        let before = std::fs::read(&legacy_path).unwrap();
+        let window = inspect_fragmentation_window(&legacy_path, 10).unwrap();
+        assert_eq!(window.schema_version, LEGACY_SCHEMA_VERSION);
+        assert_eq!(window.total_action_entries, 1);
+        assert_eq!(window.total_actions_with_breakdowns, 1);
+        assert_eq!(window.sampled_actions.len(), 1);
+        assert!(window.sampled_actions[0].breakdown_header.is_none());
+        assert!(!window.truncated);
+
+        let telemetry = inspect_cas_telemetry(&legacy_path).unwrap();
+        assert_eq!(telemetry.schema_version, LEGACY_SCHEMA_VERSION);
+        assert_eq!(telemetry.action_entries, 1);
+        assert!(telemetry.action_key_headers.is_none());
+        assert_eq!(telemetry.actions_with_breakdowns, 1);
+        assert_eq!(before, std::fs::read(&legacy_path).unwrap());
+    }
+
+    #[test]
+    fn fragmentation_window_bounds_and_telemetry_counts_are_exact() {
+        let (directory, connection) = database();
+        let k1 = format!("{ACTION_DOMAIN}:{}", "11".repeat(32));
+        let k2 = format!("{ACTION_DOMAIN}:{}", "22".repeat(32));
+        let k3 = format!("{ACTION_DOMAIN}:{}", "33".repeat(32));
+        for (idx, action_key) in [&k1, &k2, &k3].into_iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO action_entries VALUES (?1, 'sha256-v1', ?2, ?3, 1, 1)",
+                    params![action_key, ACTION_DOMAIN, [idx as u8 + 1; 32].as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO action_key_headers VALUES (?1, 1, 1, 2)",
+                    [action_key],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO key_breakdowns VALUES (?1, 'toolchain', 'sha256-v1', 'rabs.toolchain-contract.v1', ?2)",
+                    params![action_key, [idx as u8 + 10; 32].as_slice()],
+                )
+                .unwrap();
+        }
+        insert_publication(&connection);
+        connection
+            .execute(
+                "INSERT INTO action_serving_states (action_key, disposition, version) VALUES (?1, 'servable', 1)",
+                [key()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quarantines VALUES ('action-entry', ?1, 'test quarantine')",
+                [&k1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO objects VALUES ('rabs.object.sha256.v1:aa', 'sha256-v1', 'rabs.object.sha256.v1', ?1, 4096)",
+                [[0xaa_u8; 32].as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO object_locations (object_key, store_path, encoding, quarantined, durable) \
+                 VALUES ('rabs.object.sha256.v1:aa', 'obj/aa', 'raw', 0, 1), \
+                        ('rabs.object.sha256.v1:aa', 'obj/aa.bad', 'raw', 1, 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO pins (id_hex, id, root_key, owner, class, released) VALUES \
+                 (?1, ?2, 'rabs.object.sha256.v1:aa', 'pub', 'publication', 0), \
+                 (?3, ?4, 'rabs.object.sha256.v1:aa', 'old', 'publication', 1)",
+                params![
+                    format!("{:032x}", 10),
+                    10_u128.to_be_bytes().as_slice(),
+                    format!("{:032x}", 11),
+                    11_u128.to_be_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO gc_receipts (seq, mode, planned, reclaimed, skipped, truncated) VALUES (1, 'normal', 5, 4, 1, 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO decision_receipts VALUES ('rabs-live-action-class-v1', ?1, 0, 'rustc-dependency-compile', 'admitted')",
+                [&k1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO worker_capabilities VALUES ('worker-a', 'canonical'), ('worker-a', 'rlib')",
+                [],
+            )
+            .unwrap();
+
+        let path = directory.path().join("meta.sqlite");
+        let window = inspect_fragmentation_window(&path, 2).unwrap();
+        assert_eq!(window.schema_version, HEADER_SCHEMA_VERSION);
+        assert_eq!(window.total_action_entries, 3);
+        assert_eq!(window.total_actions_with_breakdowns, 3);
+        assert_eq!(window.sampled_actions.len(), 2);
+        assert!(window.truncated);
+        assert_eq!(window.sampled_actions[0].action_key, k1);
+        assert_eq!(window.sampled_actions[1].action_key, k2);
+        assert!(window.sampled_actions[0].breakdown_header.is_some());
+
+        let telemetry = inspect_cas_telemetry(&path).unwrap();
+        assert_eq!(telemetry.schema_version, HEADER_SCHEMA_VERSION);
+        assert_eq!(telemetry.action_entries, 3);
+        assert_eq!(telemetry.action_key_headers, Some(3));
+        assert_eq!(telemetry.actions_with_breakdowns, 3);
+        assert_eq!(telemetry.publications_total, 1);
+        assert_eq!(
+            telemetry.publications_by_result_kind,
+            vec![LabelCount {
+                label: "success".to_owned(),
+                count: 1
+            }]
+        );
+        assert_eq!(
+            telemetry.serving_states_by_disposition,
+            vec![LabelCount {
+                label: "servable".to_owned(),
+                count: 1
+            }]
+        );
+        assert_eq!(
+            telemetry.quarantines_by_scope,
+            vec![LabelCount {
+                label: "action-entry".to_owned(),
+                count: 1
+            }]
+        );
+        assert_eq!(telemetry.objects_total, 1);
+        assert_eq!(telemetry.objects_logical_bytes, 4096);
+        assert_eq!(telemetry.object_locations_healthy, 1);
+        assert_eq!(telemetry.object_locations_quarantined, 1);
+        assert_eq!(telemetry.object_locations_durable, 1);
+        assert_eq!(telemetry.active_pins, 1);
+        assert_eq!(telemetry.released_pins, 1);
+        assert_eq!(telemetry.gc_receipts_total, 1);
+        assert_eq!(telemetry.gc_total_reclaimed, 4);
+        assert_eq!(
+            telemetry.runtime_classes,
+            vec![LabelCount {
+                label: "rustc-dependency-compile".to_owned(),
+                count: 1
+            }]
+        );
+        assert_eq!(telemetry.worker_capabilities_workers, 1);
     }
 }

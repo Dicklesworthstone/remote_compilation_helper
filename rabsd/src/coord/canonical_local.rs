@@ -10,9 +10,9 @@
 //! macros. Their presence, or a test/nextest/run/bench/Clippy command, disables local compiler-result authority for the whole
 //! operation; eligible dependency caching requires isolated workers. Pure check/build graphs
 //! retain the existing evidence-gated metadata lane; archive codegen requires an
-//! isolated worker. Selected workspace compilations can execute freshly on workers;
-//! unsupported rustc invocations compile normally in the namespace. Workspace
-//! results never gain action-cache publication or replay authority.
+//! isolated worker. Selected workspace library/DAG/terminal compilations can
+//! execute and cache on isolated remote workers (`workspace_library_cache`);
+//! local-only runs and workspace binaries keep `workspace_binary_cache: false`.
 
 mod remote_artifacts;
 pub(super) mod remote_operation;
@@ -73,7 +73,7 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -375,6 +375,7 @@ pub(super) struct SharedRuntime {
     remote: Option<Arc<RemoteDependencies>>,
     remote_executions: Option<Arc<SharedRemoteExecutions>>,
     roots: Arc<RootPermitBroker>,
+    root_sequence: AtomicU64,
     jobs_per_root: u32,
     target_cache_lock: Arc<Mutex<()>>,
     toolchains: ToolchainPool,
@@ -464,6 +465,14 @@ impl SharedRuntime {
             CoordLive::with_cas(cas)
                 .with_release_authorization(build_identity.clone(), release_mode),
         );
+        coord
+            .configure_cargo_root_broker(
+                u32::try_from(max_roots).unwrap_or(u32::MAX),
+                jobs_per_root,
+                16,
+                1_000,
+            )
+            .map_err(|error| io::Error::other(format!("configure cargo root broker: {error:?}")))?;
         let remote = remote(&state.root.join("shadow"))?;
         let remote_executions = remote
             .as_ref()
@@ -518,6 +527,7 @@ impl SharedRuntime {
             remote,
             remote_executions,
             roots: RootPermitBroker::new(max_roots),
+            root_sequence: AtomicU64::new(0),
             jobs_per_root,
             target_cache_lock: Arc::new(Mutex::new(())),
             toolchains,
@@ -541,6 +551,10 @@ impl SharedRuntime {
                         .is_some_and(|worker| !worker.is_finished())
                 })
             })
+    }
+
+    pub(super) fn remote_workers_configured(&self) -> bool {
+        self.remote.is_some()
     }
 
     /// The service first seals admission, cancels/joins operations and only
@@ -600,9 +614,33 @@ impl SharedRuntime {
             match waiter.wait_timeout(&mut obligations, remaining.min(Duration::from_millis(50))) {
                 Err(waiting) => waiter = waiting,
                 Ok(permit) => {
+                    let seq = self.root_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                    let term = self.coord.authority().map_or(0, |authority| authority.term);
+                    let root_id = format!("canonical-root-t{term}-s{seq}");
+                    let tenant = rabs_scheduler::fairness::TenantKey {
+                        agent: "canonical-service".to_owned(),
+                        project: self.parent.display().to_string(),
+                        ci: std::env::var_os("CI").is_some(),
+                    };
+                    let broker_root = match self.coord.enqueue_cargo_root_request(
+                        tenant,
+                        &root_id,
+                        u64::from(self.jobs_per_root),
+                        seq,
+                        None,
+                    ) {
+                        Ok(_) => match self.coord.admit_next_cargo_root(seq) {
+                            Ok(Some(receipt)) => {
+                                Some((Arc::clone(&self.coord), receipt.root_id, seq))
+                            }
+                            _ => None,
+                        },
+                        Err(_) => None,
+                    };
                     let admitted = RootAdmission {
                         permit: Some(permit),
                         obligations,
+                        broker_root,
                         _state: Arc::clone(&self.state),
                     };
                     if stopped.load(Ordering::Acquire) || !self.healthy() {
@@ -644,6 +682,7 @@ impl Drop for SharedRuntime {
 struct RootAdmission {
     permit: Option<RootPermit>,
     obligations: ObligationSet,
+    broker_root: Option<(Arc<CoordLive>, String, u64)>,
     // Failed cleanup retains the charge and this lock together. A new service
     // cannot acquire the same authority while an unresolved root still exists.
     _state: Arc<StateOwner>,
@@ -651,6 +690,12 @@ struct RootAdmission {
 
 impl Drop for RootAdmission {
     fn drop(&mut self) {
+        // Release the durable CoordLive root-broker grant BEFORE releasing the
+        // in-process RootPermit so a waking waiter always observes free broker
+        // capacity.
+        if let Some((coord, root_id, seq)) = self.broker_root.take() {
+            let _ = coord.complete_cargo_root(&root_id, seq);
+        }
         if let Some(permit) = self.permit.take() {
             let result = permit.release_into(&mut self.obligations);
             debug_assert!(
@@ -2102,11 +2147,20 @@ fn run_operation_owned(
         }
         None => 0,
     };
+    let workspace_library_cache = match &shared {
+        Some(runtime) => runtime.remote_workers_configured(),
+        None => RemoteDependencies::canonical_environment_configured()?,
+    };
+    let cache_scope = if workspace_library_cache {
+        "external-dependency-and-remote-workspace-library-cache"
+    } else {
+        "external-dependency-metadata-and-worker-rlib"
+    };
     preparation.checkpoint()?;
     output.event(
         json!({"kind":"canonical-compilation-started", "version":PROFILE_VERSION,
         "command":profile.command.as_str(), "namespace":"canonical",
-        "cache_scope":"external-dependency-metadata-and-worker-rlib",
+        "cache_scope":cache_scope,
         "private_target_state":private_target_state,
         "restored_committed_outputs":restored_committed_outputs,
         "test_execution":matches!(profile.command, CompilationCommand::Test | CompilationCommand::Nextest) && !profile.no_run(),
@@ -2116,7 +2170,10 @@ fn run_operation_owned(
         "program_result_cache":false, "benchmark_result_cache":false,
         "lint_execution":profile.command == CompilationCommand::Clippy,
         "lint_result_cache":false,
-        "workspace_cache":false, "source_sha256":request["source_manifest"]["manifest_sha256"],
+        "workspace_cache":workspace_library_cache,
+        "workspace_library_cache":workspace_library_cache,
+        "workspace_binary_cache":false,
+        "source_sha256":request["source_manifest"]["manifest_sha256"],
         "selected_units":graph.units, "selected_packages":graph.packages,
         "selected_roots":graph.roots, "shared_coordinator":shared.is_some()}),
     )?;
@@ -4721,6 +4778,13 @@ fn consume_current_input() {
         drop(second);
         drop(next);
         assert_eq!(runtime.roots.active(), 0);
+        let broker = runtime.coord.cargo_root_broker_telemetry().unwrap();
+        assert_eq!(broker.max_concurrent_cargo_roots, 2);
+        assert_eq!(broker.active_cargo_roots, 0);
+        assert_eq!(broker.peak_active_cargo_roots, 2);
+        assert_eq!(broker.total_enqueued, 3);
+        assert_eq!(broker.total_granted, 3);
+        assert_eq!(broker.total_completed, 3);
         runtime.shutdown().unwrap();
         assert!(!runtime.healthy());
         drop(runtime);
@@ -5340,13 +5404,13 @@ fn consume_current_input() {
             } else {
                 // This is the same owner path used when readiness, source
                 // verification or output fails before normal finalization.
-                let result = (|| -> io::Result<()> {
+                let result: io::Result<()> = {
                     let _owner = owner;
                     Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "cancelled before execution",
                     ))
-                })();
+                };
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
             }
             assert!(unconfirmed.load(Ordering::Acquire));
@@ -6388,5 +6452,23 @@ fn consume_current_input() {
         let mut edited = ReuseKeyFixture::with_captured_cache(b"edited workspace", b"dependency");
         edited.closed_dependency_execution = true;
         assert_ne!(edited.key(), before, "projected source remains exact too");
+    }
+
+    #[test]
+    fn shared_runtime_reports_workspace_cache_presence_from_remote_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        let runtime = SharedRuntime::start_with_remote(
+            &state,
+            ReleaseAuthorizationMode::Advisory,
+            "workspace-cache-test".to_owned(),
+            1,
+            1,
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert!(!runtime.remote_workers_configured());
+        runtime.shutdown().unwrap();
     }
 }

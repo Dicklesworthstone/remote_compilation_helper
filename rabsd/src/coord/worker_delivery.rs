@@ -265,9 +265,7 @@ fn execution_capabilities(
         hello,
         context.is_none_or(|selected| selected.mode.requires_canonical_namespace()),
     )?;
-    if let Some(slots) =
-        rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(request)?
-    {
+    if let Some(slots) = rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(request)? {
         require(
             supports(
                 hello,
@@ -1802,7 +1800,11 @@ mod tests {
         for (slots, version, expected) in [
             (4, json!([RUNTIME_ADMISSION_VERSION]), "worker capacity"),
             (8, Value::Null, "nextest-runtime-admission-v1"),
-            (8, json!(["nextest-runtime-admission-v0"]), "nextest-runtime-admission-v1"),
+            (
+                8,
+                json!(["nextest-runtime-admission-v0"]),
+                "nextest-runtime-admission-v1",
+            ),
         ] {
             let owner = tempfile::tempdir().unwrap();
             let destination = owner.path().join("never-admitted");

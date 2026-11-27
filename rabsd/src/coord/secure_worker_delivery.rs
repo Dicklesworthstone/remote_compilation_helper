@@ -858,6 +858,27 @@ impl StandbyLoad {
         (u128::from(self.load_x100) * u128::from(other.slots))
             .cmp(&(u128::from(other.load_x100) * u128::from(self.slots)))
     }
+
+    /// Normalized CPU utilization in permille (`0..=1000`), derived from
+    /// `load_x100 / slots`.
+    pub(crate) fn cpu_utilization_permille(self) -> u16 {
+        let permille = u128::from(self.load_x100)
+            .saturating_mul(10)
+            .checked_div(u128::from(self.slots.max(1)))
+            .unwrap_or(1_000)
+            .min(1_000);
+        u16::try_from(permille).unwrap_or(1_000)
+    }
+
+    /// Normalized excess queue-depth proxy (tenths of a slot above 100%
+    /// capacity), invariant across heterogeneous workers with equal normalized
+    /// pressure (`load_x100 / slots`).
+    pub(crate) fn queue_depth_proxy(self) -> u32 {
+        let capacity_x100 = u128::from(self.slots.max(1)) * 100;
+        let excess = u128::from(self.load_x100).saturating_sub(capacity_x100);
+        let normalized = excess.saturating_mul(10) / capacity_x100;
+        u32::try_from(normalized).unwrap_or(u32::MAX)
+    }
 }
 
 struct StandbyState {

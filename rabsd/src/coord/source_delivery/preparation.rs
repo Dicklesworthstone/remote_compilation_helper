@@ -351,11 +351,8 @@ mod tests {
                 "artifacts":{"unit":"cargo", "files":[], "tree":"tree-files-v1",
                     "cargo":contract},
             });
-            let result = SourcePreparation::parse(
-                base,
-                &request,
-                PreparationContext::RemoteRequest,
-            );
+            let result =
+                SourcePreparation::parse(base, &request, PreparationContext::RemoteRequest);
             if no_run {
                 result.unwrap();
             } else {

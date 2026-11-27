@@ -11192,7 +11192,10 @@ mod tests {
                         .find(|worker| worker.worker_id.as_str() == "worker1")
                         .unwrap();
                     assert!(
-                        detail.reason_codes.iter().any(|code| code == "project.source_fenced")
+                        detail
+                            .reason_codes
+                            .iter()
+                            .any(|code| code == "project.source_fenced")
                     );
                     assert!(detail.final_reason.contains(&format!(
                         "rch jobs recover {}",

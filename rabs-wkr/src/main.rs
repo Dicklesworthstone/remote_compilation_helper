@@ -4689,11 +4689,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn nextest_request(
-        id: u64,
-        test_threads: Option<u32>,
-        no_run: bool,
-    ) -> serde_json::Value {
+    fn nextest_request(id: u64, test_threads: Option<u32>, no_run: bool) -> serde_json::Value {
         use rabs_sandbox::cargo_artifacts::nextest::{NextestTree, PROGRAM};
         use rabs_sandbox::cargo_check::CompilationSelection;
         use serde_json::json;
@@ -4773,7 +4769,10 @@ mod tests {
         assert_eq!(replies[3]["status"], "unknown");
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         assert_eq!(journal.high_water(), Some(191));
-        assert_eq!(journal.status(191)["receipt"]["execution_may_have_run"], false);
+        assert_eq!(
+            journal.status(191)["receipt"]["execution_may_have_run"],
+            false
+        );
     }
 
     #[cfg(unix)]
@@ -6048,9 +6047,7 @@ mod tests {
 
         let root = private_root();
         let original = nextest_request(240, None, false);
-        assert!(
-            rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&original).is_err()
-        );
+        assert!(rabs_sandbox::cargo_artifacts::nextest::fresh_execution_slots(&original).is_err());
         assert!(rabs_sandbox::cargo_artifacts::requested(&original).is_ok());
         let mut journal = WorkerJournal::open(root.path(), "session-test", "coord").unwrap();
         assert_eq!(
@@ -6120,7 +6117,10 @@ mod tests {
             "total_bytes":offer["artifact_manifest"]["total_bytes"],
         }));
         wait(driver).unwrap();
-        assert_eq!(journal.status(240)["receipt"]["retained_result_released"], true);
+        assert_eq!(
+            journal.status(240)["receipt"]["retained_result_released"],
+            true
+        );
     }
 
     #[cfg(unix)]
