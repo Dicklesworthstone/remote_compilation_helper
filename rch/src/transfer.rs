@@ -2650,6 +2650,72 @@ fn first_path_component(pattern: &str) -> Option<&str> {
     }
 }
 
+/// A broad Cargo profile glob covers caller-owned outputs in deps/ and
+/// examples/. Keep source-upload hygiene from pruning those directories
+/// before rsync can enumerate the actual files. Explicit receipt-checked
+/// Cargo retrieval exclusions still apply after these optional filters.
+fn inherited_rule_hides_cargo_outputs(
+    pattern: &str,
+    exclude: &WindowsArtifactFilter,
+    artifacts: &[String],
+) -> bool {
+    let mut rule = pattern.trim_matches('/').rsplit('/');
+    let Some(name) = rule
+        .next()
+        .and_then(|part| WindowsArtifactFilter::new(part, true).ok())
+    else {
+        return true;
+    };
+    let outputs = ["deps", "examples"];
+    if !outputs.iter().any(|output| name.matches(output, true)) {
+        return false;
+    }
+    // These markers survive rebasing to a separate target directory and
+    // appear in existing durable recipes. Other build systems may have a
+    // private directory named deps that their policy should still exclude.
+    if !artifacts.iter().any(|entry| {
+        matches!(
+            entry.as_str(),
+            "target/.rustc_info.json" | ".rustc_info.json"
+        ) || artifact_pattern_exclude(entry).is_some_and(|path| path.ends_with("/incremental/"))
+    }) {
+        return false;
+    }
+    artifacts.iter().any(|entry| {
+        let Some(profile) = entry.strip_suffix("/**") else {
+            return false;
+        };
+        if artifact_pattern_exclude(entry).is_some() || artifact_pattern_priority(entry).is_some()
+        {
+            return false;
+        }
+        if !profile.split('/').any(|part| part == "*") {
+            return outputs
+                .iter()
+                .any(|output| exclude.matches(&format!("{profile}/{output}"), true));
+        }
+        // A cross-target glob can stand for any target triple. Compare from
+        // the leaf so unanchored rules can match a suffix. If a recursive
+        // wildcard can consume the remaining components, keep the outputs.
+        let mut parents = profile.trim_start_matches('/').rsplit('/');
+        for part in rule.clone() {
+            if part == "**" {
+                return true;
+            }
+            let Some(component) = parents.next() else {
+                return false;
+            };
+            if component != "*"
+                && WindowsArtifactFilter::new(part, true)
+                    .is_ok_and(|glob| !glob.matches(component, true))
+            {
+                return false;
+            }
+        }
+        !pattern.starts_with('/') || parents.next().is_none()
+    })
+}
+
 fn retrieval_exclude_can_block_artifacts(pattern: &str, artifact_patterns: &[String]) -> bool {
     let trimmed = pattern.trim();
     if !trimmed.ends_with('/') {
@@ -2666,6 +2732,9 @@ fn retrieval_exclude_can_block_artifacts(pattern: &str, artifact_patterns: &[Str
     let Ok(exclude) = WindowsArtifactFilter::new(trimmed, false) else {
         return true;
     };
+    if inherited_rule_hides_cargo_outputs(trimmed, &exclude, artifact_patterns) {
+        return true;
+    }
     artifact_patterns.iter().any(|artifact| {
         // Exact receipt-qualified outputs have includes (and ancestor includes)
         // before these optional excludes. They do not require returning every
@@ -18644,6 +18713,34 @@ Number of files transferred: 42
             &[],
         );
         assert_portable_rsync_archive_args(&command_args(&retrieve_streaming));
+    }
+
+    #[test]
+    fn inherited_directory_rules_preserve_cargo_profile_outputs() {
+        let artifacts = default_rust_artifact_patterns();
+        for rule in [
+            "deps/",
+            "/target/debug/examples/",
+            "release/deps/",
+            "/target/aarch64-unknown-linux-gnu/debug/deps/",
+            "target/**/x86*/**/deps/",
+            r"/target/debu\g/d\eps/",
+        ] {
+            assert!(
+                retrieval_exclude_can_block_artifacts(rule, &artifacts),
+                "{rule}"
+            );
+        }
+        for rule in ["vendor/deps/", "/deps/", "/target/debug/deps/private/"] {
+            assert!(
+                !retrieval_exclude_can_block_artifacts(rule, &artifacts),
+                "{rule}"
+            );
+        }
+        assert!(!retrieval_exclude_can_block_artifacts(
+            "deps/",
+            &["build/**".to_owned()],
+        ));
     }
 
     #[test]
