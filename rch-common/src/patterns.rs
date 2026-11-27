@@ -896,6 +896,23 @@ fn try_classify_benign_suffix_command(cmd: &str) -> Option<Classification> {
         return None;
     }
 
+    if matches!(boundary.kind, BoundaryKind::OutputRedirect)
+        && matches!(
+            leading_classification.kind,
+            Some(CompilationKind::CargoClippy | CompilationKind::CargoDoc)
+        )
+    {
+        // In `cargo clippy >log --fix`, --fix still belongs to Clippy.
+        // Only attach a literal log destination and optional descriptor dup.
+        let redirect = suffix
+            .strip_prefix(">>")
+            .or_else(|| suffix.strip_prefix('>'))?;
+        let (_, remaining) = split_wrapper_word(redirect)?;
+        if !matches!(remaining, "" | "2>&1" | "1>&2") {
+            return None;
+        }
+    }
+
     // Preserve the validated command verbatim. Rebuilding it with normalized
     // whitespace changes the meaning of adjacent file-descriptor redirects:
     // `cargo build 2>errors.txt` must not become `cargo build 2 >errors.txt`.
@@ -3177,6 +3194,11 @@ pub fn cargo_xwin_compilation_kind(command: &str) -> Option<CompilationKind> {
         "clippy" => CompilationKind::CargoClippy,
         _ => return None,
     };
+    if kind == CompilationKind::CargoClippy
+        && cargo_may_request_local_option(cmd, tokens.clone(), "--fix")
+    {
+        return None;
+    }
     if tokens.any(|token| matches!(token, "--help" | "-h" | "--version" | "-V")) {
         return None;
     }
@@ -3339,21 +3361,37 @@ fn cargo_single_file_package(cmd: &str) -> bool {
     false
 }
 
+/// An expanding shell argument can supply an otherwise invisible option.
+fn cargo_may_request_local_option<'a>(
+    command: &str,
+    args: impl Iterator<Item = &'a str>,
+    option: &str,
+) -> bool {
+    args.take_while(|arg| *arg != "--").any(|arg| arg == option)
+        || (command.contains(['$', '`', '*', '?', '[', '{', '~', '#'])
+            && literal_compiler_words(command).is_none())
+}
+
 /// Classify cargo subcommands.
 ///
-/// Performance: uses iterator `.nth()` to avoid Vec allocation on the hot path.
-/// We only need tokens 0-3 (cargo, [+toolchain], subcommand, [nextest-subcommand]).
+/// Plain commands use a borrowed iterator. Quoted words need shell tokenization
+/// so a config operand or a partially quoted option keeps its actual boundary.
 fn classify_cargo(cmd: &str) -> Classification {
     if cargo_single_file_package(cmd) {
         return Classification::not_compilation(
             "Cargo single-file Rust packages require local execution (remote manifest planning unsupported)",
         );
     }
-    let mut tokens = cmd.split_whitespace();
+    if cmd.contains(['\'', '"', '\\']) {
+        let Ok(words) = shell_words::split(cmd) else {
+            return Classification::not_compilation("ambiguous Cargo arguments");
+        };
+        return classify_cargo_args(cmd, words.iter().skip(1).map(String::as_str));
+    }
+    classify_cargo_args(cmd, cmd.split_whitespace().skip(1))
+}
 
-    // Token 0: "cargo" (already validated by caller)
-    let _cargo = tokens.next();
-
+fn classify_cargo_args<'a>(cmd: &str, mut tokens: impl Iterator<Item = &'a str>) -> Classification {
     // Skip an optional +toolchain override AND any leading global flags that can
     // precede the subcommand (e.g. `cargo --offline build`, `cargo -q test`,
     // `cargo --locked check`, `cargo --color never build`). Without this, a
@@ -3362,7 +3400,7 @@ fn classify_cargo(cmd: &str) -> Classification {
     // written without `=` consume their following value token.
     const CARGO_VALUE_FLAGS: &[&str] = &["--color", "-Z", "-C", "--config"];
     let subcommand = loop {
-        let Some(tok) = tokens.next().map(unquote_whole_word) else {
+        let Some(tok) = tokens.next() else {
             return Classification::not_compilation("bare cargo command");
         };
         if tok.starts_with('+') {
@@ -3378,6 +3416,16 @@ fn classify_cargo(cmd: &str) -> Classification {
         }
         break tok;
     };
+
+    // Clippy switches from check to source-editing fix mode. Cargo doc can
+    // open a browser on the executing host. Neither effect is returned by
+    // artifact retrieval. Inspect literal option words up to the compiler tail.
+    if subcommand == "clippy" && cargo_may_request_local_option(cmd, &mut tokens, "--fix") {
+        return Classification::not_compilation("cargo clippy may edit local sources");
+    }
+    if subcommand == "doc" && cargo_may_request_local_option(cmd, &mut tokens, "--open") {
+        return Classification::not_compilation("cargo doc may launch the local browser");
+    }
 
     match subcommand {
         "build" | "b" => {
@@ -4175,6 +4223,38 @@ mod tests {
         let result = classify_command("cargo test");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
+    }
+
+    #[test]
+    fn cargo_source_edits_and_browser_launch_stay_local() {
+        let _guard = test_guard!();
+        for command in [
+            "cargo clippy --fix --allow-dirty",
+            "cargo +nightly -q clippy --fi'x'",
+            "cargo --config 'build.target-dir = \"build\"' clippy '--fix'",
+            "cargo doc --workspace --open",
+            "cargo clippy $CLIPPY_ARGS",
+            "cd workspace && cargo clippy --fix",
+            "cargo clippy >clippy.log --fix",
+            "cargo doc > doc.log --open",
+            "cargo xwin clippy --fix --allow-dirty",
+            "cargo-xwin xwin clippy '--fix'",
+        ] {
+            assert!(!classify_command(command).is_compilation, "{command}");
+            assert!(
+                !classify_command_detailed(command).classification.is_compilation,
+                "{command}"
+            );
+        }
+        for (command, expected) in [
+            ("cargo clippy -- -Dwarnings --fix", CompilationKind::CargoClippy),
+            ("cargo clippy --config 'alias.fix = \"--fix\"'", CompilationKind::CargoClippy),
+            ("cargo doc --no-deps", CompilationKind::CargoDoc),
+            ("cargo clippy >clippy.log 2>&1", CompilationKind::CargoClippy),
+            ("cargo xwin clippy -- --fix", CompilationKind::CargoClippy),
+        ] {
+            assert_eq!(classify_command(command).kind, Some(expected), "{command}");
+        }
     }
 
     #[test]

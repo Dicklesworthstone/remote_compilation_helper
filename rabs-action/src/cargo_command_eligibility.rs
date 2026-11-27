@@ -347,7 +347,22 @@ fn classify_family(invocation: &ExpandedCargoInvocation) -> (CargoCommandFamily,
         return (CargoCommandFamily::Probe, BaseEligibility::TinyCachedProbe);
     }
 
+    // Cargo forwards arguments after its delimiter to the compiler. Only
+    // options belonging to the subcommand can request these local effects.
+    let has_option = |option: &str| {
+        args.iter()
+            .skip(1)
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == option)
+    };
     match first {
+        Some("clippy") if has_option("--fix") => (
+            CargoCommandFamily::Mutating,
+            BaseEligibility::SideEffectingWholeCommandOnly,
+        ),
+        Some("doc" | "rustdoc") if has_option("--open") => {
+            (CargoCommandFamily::Interactive, BaseEligibility::LocalOnly)
+        }
         Some("build") | Some("check") | Some("clippy") | Some("doc") | Some("rustdoc") => (
             CargoCommandFamily::CompilePhase,
             BaseEligibility::UnitDecompositionAccelerated,
@@ -431,6 +446,30 @@ mod tests {
                 d.action_class_hint(),
                 Some(ActionClass::CargoWholeCommandBounded)
             );
+        }
+    }
+
+    #[test]
+    fn source_fix_and_browser_launch_cannot_be_served() {
+        for (args, family) in [
+            (vec!["cargo", "clippy", "--fix", "--allow-dirty"], CargoCommandFamily::Mutating),
+            (vec!["cargo", "doc", "--open"], CargoCommandFamily::Interactive),
+            (vec!["cargo", "rustdoc", "--open"], CargoCommandFamily::Interactive),
+        ] {
+            let decision = enforce(&inv(&args));
+            assert_eq!(decision.family, family);
+            assert!(!decision.base.may_serve_results());
+            assert_eq!(decision.action_class_hint(), None);
+        }
+
+        for args in [
+            vec!["cargo", "clippy", "--", "--fix"],
+            vec!["cargo", "clippy", "--config=alias.fix=--fix"],
+            vec!["cargo", "rustdoc", "--", "--open"],
+        ] {
+            let decision = enforce(&inv(&args));
+            assert_eq!(decision.family, CargoCommandFamily::CompilePhase);
+            assert_eq!(decision.outcome, EnforcementOutcome::Admitted);
         }
     }
 

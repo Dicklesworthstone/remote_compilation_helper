@@ -90,7 +90,7 @@ use crate::ui::theme::StatusIndicator;
 ///
 /// `11` also recognizes the short manifest selector (`-m`), including attached
 /// paths and grouped short options, before sending a build to RCH.
-const SHIM_VERSION: &str = "12";
+const SHIM_VERSION: &str = "13";
 
 /// Marker line embedded in the generated shim, used to recognize an rch-managed
 /// file (vs. a hand-rolled or unrelated `cargo` on `PATH`) and read its version.
@@ -210,6 +210,35 @@ fi
     )
 }
 
+/// Shell prefilter shared by the Cargo and direct Clippy shims. It sees
+/// expanded argv starting at the subcommand. The shims use the caller's
+/// remote-only setting here, before installing their default for builds.
+const CARGO_LOCAL_EFFECT: &str = r#"cargo_needs_local_effect() {
+  case "${1:-}" in
+    clippy) rch_effect_option=--fix ;;
+    xwin)
+      [ "${2:-}" = clippy ] || return 1
+      shift
+      rch_effect_option=--fix ;;
+    doc|rustdoc) rch_effect_option=--open ;;
+    *) return 1 ;;
+  esac
+  shift
+  for rch_effect_arg in "$@"; do
+    case "$rch_effect_arg" in
+      --) break ;;
+      "$rch_effect_option")
+        case "${RCH_REQUIRE_REMOTE:-}" in
+          ""|0|false|FALSE|no|NO|off|OFF) return 0 ;;
+          *)
+            echo "rch shim: $rch_effect_option requires local execution, but RCH_REQUIRE_REMOTE is enabled" >&2
+            exit 1 ;;
+        esac ;;
+    esac
+  done
+  return 1
+}"#;
+
 /// Render the `cargo-clippy` shim.
 ///
 /// The `cargo` shim alone does not catch `cargo clippy`: build scripts, CI and
@@ -267,10 +296,18 @@ if [ "${{RCH_CARGO_WRAPPER_BYPASS:-}}" = "1" ]; then
 fi
 # Invoked BY cargo as a subcommand (`cargo-clippy clippy ...`): the outer cargo
 # already made the offload decision, so never re-enter rch here.
+{CARGO_LOCAL_EFFECT}
 if [ "${{1:-}}" = "clippy" ]; then
+  # Enforce explicit remote-only policy even for the delegated argv form.
+  cargo_needs_local_effect "$@"
   exec_local "$@"
 fi
 {script_routing}
+if cargo_needs_local_effect clippy "$@"; then
+  # cargo-clippy consumes argv[1] as the Cargo subcommand, including when
+  # the executable was invoked directly and needs that word supplied.
+  exec_local clippy "$@"
+fi
 # Direct invocation — normalize to `cargo clippy` and offload.
 {offload}
 "##,
@@ -479,8 +516,10 @@ package_verification() {{
 # Only the first argument can be rustup's +toolchain selector. Unknown options
 # stay local rather than guessing. Recognizing -C does not change cwd here:
 # RCH's source-closure preflight must still approve or refuse that request.
+{CARGO_LOCAL_EFFECT}
 find_subcommand() {{
   rch_subcommand=
+  rch_local_effect=0
   rch_packaging=0
   rch_packaging_globals=1
   case "${{1:-}}" in +?*) shift ;; esac
@@ -498,6 +537,7 @@ find_subcommand() {{
     esac
   done
   rch_subcommand="${{1:-}}"
+  cargo_needs_local_effect "$@" && rch_local_effect=1
   case "$rch_subcommand" in
     package|publish)
       if [ "$rch_packaging_globals" = 1 ] && package_verification "$@"; then
@@ -528,6 +568,7 @@ manifest_unreachable() {{
   return 1
 }}
 find_subcommand "$@"
+[ "$rch_local_effect" = 1 ] && exec_local "$@"
 case "$rch_subcommand" in
   build|b|test|t|check|c|clippy|bench|doc|nextest|run|r|zigbuild|xwin)
     manifest_unreachable "$@" && exec_local "$@"
@@ -2724,6 +2765,69 @@ exit "${STUB_RCH_EXIT:-0}"
                     assert_eq!(recorded_fields(&output)[0], b"LOCAL");
                 }
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_and_direct_clippy_shims_preserve_local_effects() {
+        for strict in [false, true] {
+            for (body, args, expected) in [
+                (
+                    cargo_shim_body(strict),
+                    vec!["+nightly", "-q", "clippy", "--fix"],
+                    vec!["-q", "clippy", "--fix"],
+                ),
+                (
+                    cargo_shim_body(strict),
+                    vec!["--config", "alias.x='doc'", "doc", "--open"],
+                    vec!["--config", "alias.x='doc'", "doc", "--open"],
+                ),
+                (
+                    cargo_shim_body(strict),
+                    vec!["xwin", "clippy", "--fix"],
+                    vec!["xwin", "clippy", "--fix"],
+                ),
+                (
+                    cargo_clippy_shim_body(strict),
+                    vec!["--fix", "--allow-dirty"],
+                    vec!["clippy", "--fix", "--allow-dirty"],
+                ),
+                (
+                    cargo_clippy_shim_body(strict),
+                    vec!["clippy", "--fix"],
+                    vec!["clippy", "--fix"],
+                ),
+            ] {
+                let args = argv_bytes(&args);
+                let output = record_shim(&body, &args, &[]);
+                assert!(output.status.success(), "{output:?}");
+                let fields = recorded_fields(&output);
+                assert_eq!(&fields[..2], &[b"LOCAL".as_slice(), b"8"]);
+                assert_eq!(
+                    &fields[2..],
+                    expected
+                        .iter()
+                        .map(|arg| arg.as_bytes())
+                        .collect::<Vec<_>>()
+                );
+
+                let output = record_shim(&body, &args, &[("RCH_REQUIRE_REMOTE", "1")]);
+                assert_eq!(output.status.code(), Some(1));
+                assert!(output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("requires local execution")
+                );
+            }
+        }
+        for (body, args) in [
+            (cargo_shim_body(true), vec!["clippy", "--", "--fix"]),
+            (cargo_shim_body(true), vec!["run", "--", "doc", "--open"]),
+            (cargo_clippy_shim_body(true), vec!["--", "--fix"]),
+        ] {
+            let output = record_shim(&body, &argv_bytes(&args), &[]);
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(recorded_fields(&output)[0], b"RCH");
         }
     }
 
