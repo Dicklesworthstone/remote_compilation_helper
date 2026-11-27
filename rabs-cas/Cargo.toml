@@ -14,6 +14,11 @@ description = "Durable RABS content-addressed storage, action-cache indexing, ob
 doctest = false
 
 [features]
+default = []
+# The reference engine remains the production default. Opt in to the
+# FrankenSQLite candidate and its differential/H024 qualification suite with
+# `cargo test -p rabs-cas --all-features`.
+fsqlite = ["dep:fsqlite"]
 # Public offer / ready-store builders for downstream LIVE commit tests
 # (bd-g900u). Off by default; never in a normal build. rabsd enables it as
 # a dev-dependency feature only.
@@ -30,7 +35,7 @@ rabs-protocol = { path = "../rabs-protocol", version = "2.1.0" }
 # reference/differential TRUTH engine; fsqlite (FrankenSQLite, pure Rust)
 # is the dogfood candidate gated by the identical suite (H024).
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-fsqlite = { version = "=0.4.4", default-features = false, features = ["async-api"] }
+fsqlite = { version = "=0.4.4", optional = true, default-features = false, features = ["async-api"] }
 # Reviewed pure digest crate (F034 pattern): independent recompute of
 # result-projection digests during publication admission (H011).
 sha2 = { workspace = true }

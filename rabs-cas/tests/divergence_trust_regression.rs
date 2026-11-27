@@ -9,9 +9,11 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "fsqlite")]
+use rabs_cas::metadata_store::FsqliteEngine;
 use rabs_cas::metadata_store::{
-    FsqliteEngine, QuarantineScope, RabsMetadataStore, RusqliteEngine, SqlEngine, SqlMetadataStore,
-    SqlValue, StoreError, digest_key,
+    QuarantineScope, RabsMetadataStore, RusqliteEngine, SqlEngine, SqlMetadataStore, SqlValue,
+    StoreError, digest_key,
 };
 use rabs_cas::publication::{
     CommitDurabilityProfile, DISPOSITION_PRESENTATION_QUARANTINED, DIVERGENCE_EVIDENCE_PIN_CLASS,
@@ -372,13 +374,17 @@ fn stale_serving_renewal_cannot_release_presentation_divergence() {
 fn publication_divergence_survives_reevaluation_and_reopen_differential() {
     for (presentation_only, stale_renewal) in [(false, false), (true, false), (true, true)] {
         let reference_path = fresh_path("ref");
+        #[cfg(feature = "fsqlite")]
         let candidate_path = fresh_path("fsq");
         let snapshot = {
             let reference_engine = RusqliteEngine::open(&reference_path).unwrap();
+            #[cfg(feature = "fsqlite")]
             let candidate_engine = FsqliteEngine::open(&candidate_path).unwrap();
             let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+            #[cfg(feature = "fsqlite")]
             let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
             let snapshot = divergence_scenario(&mut reference, presentation_only, stale_renewal);
+            #[cfg(feature = "fsqlite")]
             assert_eq!(
                 divergence_scenario(&mut candidate, presentation_only, stale_renewal),
                 snapshot
@@ -386,8 +392,10 @@ fn publication_divergence_survives_reevaluation_and_reopen_differential() {
             snapshot
         };
         let reference_engine = RusqliteEngine::open(&reference_path).unwrap();
+        #[cfg(feature = "fsqlite")]
         let candidate_engine = FsqliteEngine::open(&candidate_path).unwrap();
         let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        #[cfg(feature = "fsqlite")]
         let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
         let authority = authority_digest(&sample_coordinator_authority());
         let action = sample_action_key();
@@ -396,10 +404,7 @@ fn publication_divergence_survives_reevaluation_and_reopen_differential() {
             revoked: false,
             required_tier: TrustEvidenceTier::UnverifiedCandidate,
         }];
-        for store in [
-            &mut reference as &mut dyn RabsMetadataStore,
-            &mut candidate as &mut dyn RabsMetadataStore,
-        ] {
+        let check_reopened = |store: &mut dyn RabsMetadataStore| {
             assert_eq!(store.differential_snapshot().unwrap(), snapshot);
             let protected = protected_snapshot(store);
             let evaluation = reevaluate_action(store, &authority, &action, &policies, 60).unwrap();
@@ -409,7 +414,11 @@ fn publication_divergence_survives_reevaluation_and_reopen_differential() {
             );
             assert_serving_refused(store, presentation_only);
             assert_eq!(protected_snapshot(store), protected);
-        }
+        };
+        check_reopened(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        check_reopened(&mut candidate);
+        #[cfg(feature = "fsqlite")]
         assert_eq!(
             reference.differential_snapshot().unwrap(),
             candidate.differential_snapshot().unwrap()
@@ -579,11 +588,13 @@ fn failed_incident_scenario(engine: impl SqlEngine, presentation_only: bool) -> 
 fn failed_incident_diagnostic_keeps_stale_renewals_fenced_after_reopen_differential() {
     for presentation_only in [false, true] {
         let reference_path = fresh_path("failed-incident-ref");
+        #[cfg(feature = "fsqlite")]
         let candidate_path = fresh_path("failed-incident-fsq");
         let (snapshot, stale_revision) = failed_incident_scenario(
             RusqliteEngine::open(&reference_path).unwrap(),
             presentation_only,
         );
+        #[cfg(feature = "fsqlite")]
         assert_eq!(
             failed_incident_scenario(
                 FsqliteEngine::open(&candidate_path).unwrap(),
@@ -593,15 +604,13 @@ fn failed_incident_diagnostic_keeps_stale_renewals_fenced_after_reopen_different
         );
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
+        #[cfg(feature = "fsqlite")]
         let mut candidate =
             SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
         let authority = authority_digest(&sample_coordinator_authority());
         let action = sample_action_key();
         let key = digest_key(&action);
-        for store in [
-            &mut reference as &mut dyn RabsMetadataStore,
-            &mut candidate as &mut dyn RabsMetadataStore,
-        ] {
+        let check_reopened = |store: &mut dyn RabsMetadataStore| {
             assert_eq!(store.differential_snapshot().unwrap(), snapshot);
             assert!(store.list_divergence_incidents(&key).unwrap().is_empty());
             assert_serving_refused(store, presentation_only);
@@ -629,7 +638,11 @@ fn failed_incident_diagnostic_keeps_stale_renewals_fenced_after_reopen_different
                 expected_disposition(presentation_only)
             );
             assert_serving_refused(store, presentation_only);
-        }
+        };
+        check_reopened(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        check_reopened(&mut candidate);
+        #[cfg(feature = "fsqlite")]
         assert_eq!(
             reference.differential_snapshot().unwrap(),
             candidate.differential_snapshot().unwrap()
@@ -729,12 +742,15 @@ fn stale_trust_scenario<E: SqlEngine>(reader: E, writer: E) -> Vec<String> {
 #[test]
 fn stale_trust_evaluation_cannot_clear_quarantine_from_another_connection() {
     let reference_path = fresh_path("stale-trust-ref");
+    let _reference_snapshot = stale_trust_scenario(
+        RusqliteEngine::open(&reference_path).unwrap(),
+        RusqliteEngine::open(&reference_path).unwrap(),
+    );
+    #[cfg(feature = "fsqlite")]
     let candidate_path = fresh_path("stale-trust-fsq");
+    #[cfg(feature = "fsqlite")]
     assert_eq!(
-        stale_trust_scenario(
-            RusqliteEngine::open(&reference_path).unwrap(),
-            RusqliteEngine::open(&reference_path).unwrap(),
-        ),
+        _reference_snapshot,
         stale_trust_scenario(
             FsqliteEngine::open(&candidate_path).unwrap(),
             FsqliteEngine::open(&candidate_path).unwrap(),
@@ -787,8 +803,10 @@ fn durable_incident_blocks_legacy_servable_projection_differential() {
         );
         snapshot
     }
+    let _reference_snapshot = scenario(RusqliteEngine::open_in_memory().unwrap());
+    #[cfg(feature = "fsqlite")]
     assert_eq!(
-        scenario(RusqliteEngine::open_in_memory().unwrap()),
+        _reference_snapshot,
         scenario(FsqliteEngine::open(&fresh_path("legacy-projection-fsq")).unwrap())
     );
 }
@@ -950,13 +968,16 @@ fn serving_renewal_preserves_named_blockers_after_reopen_differential() {
         (QuarantineScope::ActionEntry, "action-entry"),
     ] {
         let reference_path = fresh_path("named-blocker-ref");
+        #[cfg(feature = "fsqlite")]
         let candidate_path = fresh_path("named-blocker-fsq");
         let snapshot = {
             let mut reference =
                 SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
+            #[cfg(feature = "fsqlite")]
             let mut candidate =
                 SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
             let snapshot = named_blocker_scenario(&mut reference, scope, scope_name);
+            #[cfg(feature = "fsqlite")]
             assert_eq!(
                 named_blocker_scenario(&mut candidate, scope, scope_name),
                 snapshot
@@ -965,13 +986,11 @@ fn serving_renewal_preserves_named_blockers_after_reopen_differential() {
         };
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
+        #[cfg(feature = "fsqlite")]
         let mut candidate =
             SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
         let key = digest_key(&sample_action_key());
-        for store in [
-            &mut reference as &mut dyn RabsMetadataStore,
-            &mut candidate as &mut dyn RabsMetadataStore,
-        ] {
+        let check_reopened = |store: &mut dyn RabsMetadataStore| {
             assert_eq!(store.differential_snapshot().unwrap(), snapshot);
             let record = store.serving_record(&key).unwrap().unwrap();
             assert_eq!(record.blocking.len(), 2);
@@ -993,6 +1012,9 @@ fn serving_renewal_preserves_named_blockers_after_reopen_differential() {
                 Err(StoreError::QuarantineRequiresRepair)
             );
             assert_eq!(store.differential_snapshot().unwrap(), snapshot);
-        }
+        };
+        check_reopened(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        check_reopened(&mut candidate);
     }
 }

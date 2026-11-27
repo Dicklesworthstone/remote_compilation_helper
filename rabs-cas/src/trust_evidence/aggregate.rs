@@ -97,8 +97,10 @@ pub(super) fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
     use crate::metadata_store::{ActionEntryRow, AuthorityRow};
-    use crate::metadata_store::{FsqliteEngine, RusqliteEngine, SqlEngine, SqlMetadataStore};
+    use crate::metadata_store::{RusqliteEngine, SqlEngine, SqlMetadataStore};
     use rabs_protocol::result_identity::DigestAlgorithm;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -243,23 +245,31 @@ mod tests {
             std::env::temp_dir().join(format!("rabs-aggregate-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
         let reference_path = directory.join("reference.db");
+        #[cfg(feature = "fsqlite")]
         let candidate_path = directory.join("candidate.db");
         {
             let mut reference =
                 SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
-            let mut candidate =
-                SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
-            assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+            let _reference_snapshot = scenario(&mut reference);
+            #[cfg(feature = "fsqlite")]
+            {
+                let mut candidate =
+                    SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
+                assert_eq!(_reference_snapshot, scenario(&mut candidate));
+            }
         }
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
-        let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
         assert_eq!(actual(&mut reference, &action(1)), [3, 2, 2, 3]);
-        assert_eq!(
-            actual(&mut reference, &action(1)),
-            actual(&mut candidate, &action(1))
-        );
+        #[cfg(feature = "fsqlite")]
+        {
+            let mut candidate =
+                SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
+            assert_eq!(
+                actual(&mut reference, &action(1)),
+                actual(&mut candidate, &action(1))
+            );
+        }
     }
 
     #[test]

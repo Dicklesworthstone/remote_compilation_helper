@@ -1437,9 +1437,10 @@ mod tests {
     use rabs_protocol::wire_time::PeerId;
     use rabs_protocol::worker_fence::WorkerSessionOffer;
 
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, FsqliteEngine, ProvisionalObligationInsert, RusqliteEngine,
-        SqlMetadataStore,
+        ActionEntryRow, AuthorityRow, ProvisionalObligationInsert, RusqliteEngine, SqlMetadataStore,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3553,10 +3554,14 @@ mod tests {
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("expiry-ref")).unwrap())
                 .unwrap();
-        let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("expiry-fsq")).unwrap())
-                .unwrap();
-        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+        let _reference_snapshot = scenario(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        {
+            let mut candidate =
+                SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("expiry-fsq")).unwrap())
+                    .unwrap();
+            assert_eq!(_reference_snapshot, scenario(&mut candidate));
+        }
     }
 
     #[test]
@@ -3606,10 +3611,15 @@ mod tests {
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("late-expiry-ref")).unwrap())
                 .unwrap();
-        let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("late-expiry-fsq")).unwrap())
-                .unwrap();
-        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+        let _reference_snapshot = scenario(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        {
+            let mut candidate = SqlMetadataStore::open(
+                FsqliteEngine::open(&fresh_path("late-expiry-fsq")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(_reference_snapshot, scenario(&mut candidate));
+        }
     }
 
     #[test]
@@ -3697,11 +3707,13 @@ mod tests {
         }
 
         for trigger in ["BEGIN", "INSERT INTO action_publications"] {
+            let _reference_snapshot = scenario(
+                RusqliteEngine::open(&fresh_path("txn-expiry-ref")).unwrap(),
+                trigger,
+            );
+            #[cfg(feature = "fsqlite")]
             assert_eq!(
-                scenario(
-                    RusqliteEngine::open(&fresh_path("txn-expiry-ref")).unwrap(),
-                    trigger,
-                ),
+                _reference_snapshot,
                 scenario(
                     FsqliteEngine::open(&fresh_path("txn-expiry-fsq")).unwrap(),
                     trigger,
@@ -3889,12 +3901,14 @@ mod tests {
                 "UPDATE action_serving_states",
             ),
         ] {
+            let _reference_snapshot = scenario(
+                RusqliteEngine::open(&fresh_path("same-key-expiry-ref")).unwrap(),
+                update,
+                trigger,
+            );
+            #[cfg(feature = "fsqlite")]
             assert_eq!(
-                scenario(
-                    RusqliteEngine::open(&fresh_path("same-key-expiry-ref")).unwrap(),
-                    update,
-                    trigger,
-                ),
+                _reference_snapshot,
                 scenario(
                     FsqliteEngine::open(&fresh_path("same-key-expiry-fsq")).unwrap(),
                     update,
@@ -3936,10 +3950,14 @@ mod tests {
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("live-lease-ref")).unwrap())
                 .unwrap();
-        let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("live-lease-fsq")).unwrap())
-                .unwrap();
-        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+        let _reference_snapshot = scenario(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        {
+            let mut candidate =
+                SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("live-lease-fsq")).unwrap())
+                    .unwrap();
+            assert_eq!(_reference_snapshot, scenario(&mut candidate));
+        }
     }
 
     #[test]
@@ -4007,23 +4025,31 @@ mod tests {
         }
 
         let reference_path = fresh_path("renewed-lease-ref");
+        #[cfg(feature = "fsqlite")]
         let candidate_path = fresh_path("renewed-lease-fsq");
         let prepared = {
             let mut reference =
                 SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
-            let mut candidate =
-                SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
             let prepared = prepare(&mut reference);
-            assert_eq!(prepared, prepare(&mut candidate));
+            #[cfg(feature = "fsqlite")]
+            {
+                let mut candidate =
+                    SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
+                assert_eq!(prepared, prepare(&mut candidate));
+            }
             prepared
         };
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open(&reference_path).unwrap()).unwrap();
-        let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
         assert_eq!(reference.differential_snapshot().unwrap(), prepared);
-        assert_eq!(candidate.differential_snapshot().unwrap(), prepared);
-        assert_eq!(publish(&mut reference), publish(&mut candidate));
+        let _reference_snapshot = publish(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        {
+            let mut candidate =
+                SqlMetadataStore::open(FsqliteEngine::open(&candidate_path).unwrap()).unwrap();
+            assert_eq!(candidate.differential_snapshot().unwrap(), prepared);
+            assert_eq!(_reference_snapshot, publish(&mut candidate));
+        }
     }
 
     #[test]
@@ -4856,6 +4882,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h026_differential_reference_vs_frankensqlite() {
         // Semantic divergence with escalation AND observable-only
         // divergence must leave both engines byte-identical.
@@ -4911,6 +4938,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h011_differential_full_pipeline_reference_vs_frankensqlite() {
         // The entire H011 scenario (commit, idempotent re-offer,
         // divergence quarantine, plus every refusal fence) must leave the
@@ -5088,6 +5116,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h034_differential_reference_vs_frankensqlite() {
         fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
             ready_store(store);

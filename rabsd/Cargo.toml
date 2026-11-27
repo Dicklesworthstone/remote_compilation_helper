@@ -50,7 +50,7 @@ rustix = { version = "1.1.5", features = ["fs", "process", "net", "event", "pty"
 tempfile = "3.25.0"
 # bd-g900u: the public offer / ready-store builders, so the live commit
 # tests (bd-epyez) can drive the real publication engine from out here.
-rabs-cas = { path = "../rabs-cas", features = ["test-support"] }
+rabs-cas = { path = "../rabs-cas", features = ["test-support", "fsqlite"] }
 # T011: the coord serving tests drive the REAL stock-differential release
 # gate, so what authorizes a serve here is a verdict an actual passing
 # corpus run minted — not a hand-built row that merely has its shape.

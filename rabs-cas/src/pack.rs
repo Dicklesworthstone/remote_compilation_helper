@@ -351,7 +351,9 @@ pub fn record_pack_member_locations(
 mod tests {
     use super::*;
     use crate::digest_set::{DigestRequest, digest_set};
-    use crate::metadata_store::{FsqliteEngine, RusqliteEngine, SqlMetadataStore};
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
+    use crate::metadata_store::{RusqliteEngine, SqlMetadataStore};
 
     fn id_of(bytes: &[u8]) -> TypedDigest {
         digest_set(bytes, DigestRequest::default(), None)
@@ -599,21 +601,25 @@ mod tests {
         let alternate_path = directory.path().join("verified.pack");
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-        let mut candidate = SqlMetadataStore::open(
-            FsqliteEngine::open(&directory.path().join("metadata.db")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            scenario(
-                &mut reference,
-                pack_path.to_str().unwrap(),
-                alternate_path.to_str().unwrap()
-            ),
-            scenario(
-                &mut candidate,
-                pack_path.to_str().unwrap(),
-                alternate_path.to_str().unwrap()
-            )
+        let _reference_snapshot = scenario(
+            &mut reference,
+            pack_path.to_str().unwrap(),
+            alternate_path.to_str().unwrap(),
         );
+        #[cfg(feature = "fsqlite")]
+        {
+            let mut candidate = SqlMetadataStore::open(
+                FsqliteEngine::open(&directory.path().join("metadata.db")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                _reference_snapshot,
+                scenario(
+                    &mut candidate,
+                    pack_path.to_str().unwrap(),
+                    alternate_path.to_str().unwrap()
+                )
+            );
+        }
     }
 }

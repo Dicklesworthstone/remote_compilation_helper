@@ -3,7 +3,8 @@
 //! FrankenSQLite becomes the AUTHORITATIVE metadata engine only after
 //! matching the reference SQLite backend under the gate's executed
 //! lanes; until then it is dogfood/differential only. The gate is a
-//! runtime chokepoint, not a report: [`open_authoritative_store`] is
+//! runtime chokepoint, not a report: `open_authoritative_store` (available
+//! with the `fsqlite` feature) is
 //! the way to obtain an authoritative store, and it opens FrankenSQLite
 //! only when every lane passed in THIS process against THIS build.
 //! A verdict is never persisted or trusted across restarts — a
@@ -48,10 +49,14 @@ use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
 use rabs_protocol::wire_time::PeerId;
 use rabs_protocol::worker_fence::WorkerSessionOffer;
 
+#[cfg(feature = "fsqlite")]
+use crate::metadata_store::FsqliteEngine;
+#[cfg(any(test, feature = "fsqlite"))]
+use crate::metadata_store::RusqliteEngine;
 use crate::metadata_store::{
-    ActionEntryRow, AuthorityRow, FsqliteEngine, GcReceiptRow, PublicationRow, RabsMetadataStore,
-    ResultKindTag, RusqliteEngine, SCHEMA_VERSION, SqlEngine, SqlMetadataStore, SqlValue,
-    StoreError, TrustEvaluationRow, digest_key,
+    ActionEntryRow, AuthorityRow, GcReceiptRow, PublicationRow, RabsMetadataStore, ResultKindTag,
+    SCHEMA_VERSION, SqlEngine, SqlMetadataStore, SqlValue, StoreError, TrustEvaluationRow,
+    digest_key,
 };
 
 impl SqlEngine for Box<dyn SqlEngine> {
@@ -1097,16 +1102,19 @@ pub fn evaluate_gate(
     }
 }
 
+#[cfg(any(test, feature = "fsqlite"))]
 fn reference_opener() -> impl Fn(&Path) -> Result<Box<dyn SqlEngine>, StoreError> {
     |path: &Path| RusqliteEngine::open(path).map(|engine| Box::new(engine) as Box<dyn SqlEngine>)
 }
 
+#[cfg(feature = "fsqlite")]
 fn frankensqlite_opener() -> impl Fn(&Path) -> Result<Box<dyn SqlEngine>, StoreError> {
     |path: &Path| FsqliteEngine::open(path).map(|engine| Box::new(engine) as Box<dyn SqlEngine>)
 }
 
 /// Run the gate for the real FrankenSQLite engine against the real
 /// reference engine.
+#[cfg(feature = "fsqlite")]
 pub fn frankensqlite_gate(root: &Path) -> GateVerdict {
     evaluate_gate(root, &reference_opener(), &frankensqlite_opener())
 }
@@ -1116,6 +1124,7 @@ pub fn frankensqlite_gate(root: &Path) -> GateVerdict {
 /// lane executed under `gate_root` in this process. Any lane failure —
 /// including any differential mismatch — keeps the reference engine
 /// authoritative; the refusal is carried in the returned selection.
+#[cfg(feature = "fsqlite")]
 pub fn open_authoritative_store(
     gate_root: &Path,
     db_path: &Path,
@@ -1243,6 +1252,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h024_frankensqlite_gate_runs_and_wires_selection() {
         // The REAL gate against the real FrankenSQLite engine. The
         // selection must branch exactly on the verdict — promotion if
@@ -1269,6 +1279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h024_frankensqlite_passes_differential_and_migration_lanes() {
         // Grounded expectation from H009–H041: the FrankenSQLite
         // engine matches the reference across the store surface and

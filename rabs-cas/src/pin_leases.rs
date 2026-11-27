@@ -235,8 +235,10 @@ pub fn release_expired_pin_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
     use crate::metadata_store::{
-        AuthorityRow, FsqliteEngine, RusqliteEngine, SqlEngine, SqlMetadataStore, StoreError,
+        AuthorityRow, RusqliteEngine, SqlEngine, SqlMetadataStore, StoreError,
     };
     use rabs_protocol::authority::{ClusterId, CoordinatorIncarnationId};
     use rabs_protocol::result_identity::DigestAlgorithm;
@@ -447,6 +449,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h041_differential_reference_vs_frankensqlite() {
         fn scenario<E: SqlEngine>(store: &mut SqlMetadataStore<E>) -> Vec<String> {
             install(store);

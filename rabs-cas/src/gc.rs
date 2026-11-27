@@ -462,9 +462,9 @@ pub fn unlink_due(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_store::{
-        FsqliteEngine, RabsMetadataStore, RusqliteEngine, SqlMetadataStore, digest_key,
-    };
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
+    use crate::metadata_store::{RabsMetadataStore, RusqliteEngine, SqlMetadataStore, digest_key};
     use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -736,6 +736,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h014_differential_reference_vs_frankensqlite() {
         fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
             install_world(store);
@@ -886,6 +887,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h014_stale_execution_differential_reference_vs_frankensqlite() {
         fn scenario(store: &mut dyn RabsMetadataStore, mode: GcMode) -> Vec<String> {
             let plan = late_pin_plan(store, mode);
@@ -1235,6 +1237,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h022_budgeted_unlink_differential_reference_vs_frankensqlite() {
         fn scenario(store: &mut dyn RabsMetadataStore, mode: GcMode) -> Vec<String> {
             install_unlink_backlog(store, mode);
@@ -1448,6 +1451,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h022_differential_mark_grace_unlink_reference_vs_frankensqlite() {
         fn scenario(store: &mut dyn RabsMetadataStore) -> Vec<String> {
             install_world(store);

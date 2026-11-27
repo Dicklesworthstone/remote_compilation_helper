@@ -554,9 +554,11 @@ pub fn apply_revalidation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow,
-        QuarantineScope, ResultKindTag, RusqliteEngine, SqlMetadataStore, digest_key,
+        ActionEntryRow, AuthorityRow, CommitOutcome, PublicationRow, QuarantineScope,
+        ResultKindTag, RusqliteEngine, SqlMetadataStore, digest_key,
     };
     use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -919,13 +921,19 @@ mod tests {
         }
         let mut reference =
             SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
-        let mut candidate =
-            SqlMetadataStore::open(FsqliteEngine::open(&fresh_path("revision-exhausted")).unwrap())
-                .unwrap();
-        assert_eq!(scenario(&mut reference), scenario(&mut candidate));
+        let _reference_snapshot = scenario(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        {
+            let mut candidate = SqlMetadataStore::open(
+                FsqliteEngine::open(&fresh_path("revision-exhausted")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(_reference_snapshot, scenario(&mut candidate));
+        }
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn t048_differential_reference_vs_frankensqlite() {
         let reference_engine = RusqliteEngine::open(&fresh_path("ref")).unwrap();
         let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
@@ -1391,6 +1399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn k007_failure_ttl_lifecycle_differential_reference_vs_frankensqlite() {
         let reference_engine = RusqliteEngine::open(&fresh_path("k007ref")).unwrap();
         let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
@@ -1580,6 +1589,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn k007_revalidation_fencing_differential() {
         let reference_engine = RusqliteEngine::open(&fresh_path("k007fence-ref")).unwrap();
         let candidate_engine = FsqliteEngine::open(&fresh_path("k007fence-fsq")).unwrap();

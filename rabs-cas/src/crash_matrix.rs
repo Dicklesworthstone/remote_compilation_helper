@@ -651,7 +651,9 @@ pub fn run_crash_matrix<E: SqlEngine>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_store::{FsqliteEngine, RusqliteEngine};
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
+    use crate::metadata_store::RusqliteEngine;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -689,6 +691,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h015_frankensqlite_matrix_matches_reference_at_every_kill_point() {
         let reference = run_crash_matrix(&fresh_root("d-ref"), &|path: &Path| {
             RusqliteEngine::open(path)

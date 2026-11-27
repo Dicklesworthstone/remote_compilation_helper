@@ -565,9 +565,11 @@ pub fn quarantine_served_divergence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow, ResultKindTag,
-        RusqliteEngine, SqlMetadataStore,
+        ActionEntryRow, AuthorityRow, CommitOutcome, PublicationRow, ResultKindTag, RusqliteEngine,
+        SqlMetadataStore,
     };
     use crate::serving_state::{ServeDecision, serving_gate};
     use rabs_protocol::result_identity::DigestAlgorithm;
@@ -991,6 +993,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn k008_differential_reference_vs_frankensqlite() {
         let reference_engine = RusqliteEngine::open(&fresh_path("ref")).unwrap();
         let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
@@ -1088,6 +1091,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn adverse_verification_is_a_safety_veto_differential() {
         let reference_engine = RusqliteEngine::open(&fresh_path("adverse-ref")).unwrap();
         let candidate_engine = FsqliteEngine::open(&fresh_path("adverse-fsq")).unwrap();

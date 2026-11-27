@@ -495,9 +495,11 @@ pub fn evaluate_subscriber_for_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, CommitOutcome, FsqliteEngine, PublicationRow, ResultKindTag,
-        RusqliteEngine, SqlMetadataStore, SqlValue,
+        ActionEntryRow, AuthorityRow, CommitOutcome, PublicationRow, ResultKindTag, RusqliteEngine,
+        SqlMetadataStore, SqlValue,
     };
     use crate::serving_state::{ServeDecision, serving_gate};
     use rabs_protocol::result_identity::DigestAlgorithm;
@@ -647,6 +649,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn t032_promotion_demotion_differential_reference_vs_frankensqlite() {
         let reference_engine = RusqliteEngine::open(&fresh_path("ref")).unwrap();
         let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
@@ -955,6 +958,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn independent_evidence_and_quarantine_differential() {
         let reference_engine = RusqliteEngine::open(&fresh_path("evidence-ref")).unwrap();
         let candidate_engine = FsqliteEngine::open(&fresh_path("evidence-fsq")).unwrap();
@@ -1085,6 +1089,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn compromise_without_policy_differential() {
         let reference_engine = RusqliteEngine::open(&fresh_path("compromise-ref")).unwrap();
         let candidate_engine = FsqliteEngine::open(&fresh_path("compromise-fsq")).unwrap();
@@ -1161,6 +1166,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn presentation_quarantine_survives_policy_changes_differential() {
         let reference_engine = RusqliteEngine::open(&fresh_path("presentation-ref")).unwrap();
         let candidate_engine = FsqliteEngine::open(&fresh_path("presentation-fsq")).unwrap();
@@ -1258,13 +1264,17 @@ mod tests {
     #[test]
     fn presentation_quarantine_survives_metadata_reopen_differential() {
         let reference_path = fresh_path("presentation-reopen-ref");
+        #[cfg(feature = "fsqlite")]
         let candidate_path = fresh_path("presentation-reopen-fsq");
         let snapshot = {
             let reference_engine = RusqliteEngine::open(&reference_path).unwrap();
+            #[cfg(feature = "fsqlite")]
             let candidate_engine = FsqliteEngine::open(&candidate_path).unwrap();
             let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+            #[cfg(feature = "fsqlite")]
             let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
             let snapshot = presentation_quarantine_policy_matrix(&mut reference);
+            #[cfg(feature = "fsqlite")]
             assert_eq!(
                 presentation_quarantine_policy_matrix(&mut candidate),
                 snapshot
@@ -1272,17 +1282,16 @@ mod tests {
             snapshot
         };
         let reference_engine = RusqliteEngine::open(&reference_path).unwrap();
+        #[cfg(feature = "fsqlite")]
         let candidate_engine = FsqliteEngine::open(&candidate_path).unwrap();
         let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
+        #[cfg(feature = "fsqlite")]
         let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
         let active = digest("rabs.authority.sha256.v1", 1);
         let action = digest("rabs.action-key.sha256.v1", 7);
         let action_key = digest_key(&action);
         let policies = [policy(5, false, TrustEvidenceTier::UnverifiedCandidate)];
-        for store in [
-            &mut reference as &mut dyn RabsMetadataStore,
-            &mut candidate as &mut dyn RabsMetadataStore,
-        ] {
+        let check_reopened = |store: &mut dyn RabsMetadataStore| {
             assert_eq!(store.differential_snapshot().unwrap(), snapshot);
             // Fresh readers declare their known domains before restoring
             // prior authority, just as coordinator startup does (R121).
@@ -1297,7 +1306,11 @@ mod tests {
                 }
             );
             assert!(!action_quarantine_present(store, &action_key).unwrap());
-        }
+        };
+        check_reopened(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        check_reopened(&mut candidate);
+        #[cfg(feature = "fsqlite")]
         assert_eq!(
             reference.differential_snapshot().unwrap(),
             candidate.differential_snapshot().unwrap()
@@ -1417,11 +1430,12 @@ mod tests {
     fn t032_s018_s021_compromised_worker_revocation_and_subscriber_reevaluation_flow() {
         let reference_engine = RusqliteEngine::open(&fresh_path("s018-s021-ref")).unwrap();
         let mut reference = SqlMetadataStore::open(reference_engine).unwrap();
-        let candidate_engine = FsqliteEngine::open(&fresh_path("s018-s021-fsq")).unwrap();
-        let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
-        assert_eq!(
-            run_t032_s018_s021_flow(&mut reference),
-            run_t032_s018_s021_flow(&mut candidate)
-        );
+        let _reference_snapshot = run_t032_s018_s021_flow(&mut reference);
+        #[cfg(feature = "fsqlite")]
+        {
+            let candidate_engine = FsqliteEngine::open(&fresh_path("s018-s021-fsq")).unwrap();
+            let mut candidate = SqlMetadataStore::open(candidate_engine).unwrap();
+            assert_eq!(_reference_snapshot, run_t032_s018_s021_flow(&mut candidate));
+        }
     }
 }

@@ -2,7 +2,9 @@
 //! These do not claim real compiler executions or a measured divergence rate.
 
 use super::*;
-use crate::metadata_store::{FsqliteEngine, RusqliteEngine, SqlMetadataStore};
+#[cfg(feature = "fsqlite")]
+use crate::metadata_store::FsqliteEngine;
+use crate::metadata_store::{RusqliteEngine, SqlMetadataStore};
 use crate::serving_sample_gate::tests::{action, fresh_path, published, samples};
 use crate::serving_sample_gate::{ActionClassRisk, SampleGateDecision, SamplingPolicy, decide};
 
@@ -146,6 +148,7 @@ fn only_attributed_independent_publication_comparisons_earn_credit() {
 }
 
 #[test]
+#[cfg(feature = "fsqlite")]
 fn reference_and_frankensqlite_fold_the_same_evidence() {
     let mut reference =
         SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("sprt-ref")).unwrap()).unwrap();
@@ -397,6 +400,7 @@ fn successive_checkpoint_generations_preserve_history_and_retry_idempotently() {
 }
 
 #[test]
+#[cfg(feature = "fsqlite")]
 fn reference_and_frankensqlite_append_identical_checkpoint_histories() {
     let mut reference =
         SqlMetadataStore::open(RusqliteEngine::open(&fresh_path("sprt-generations-ref")).unwrap())

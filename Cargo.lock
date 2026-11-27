@@ -5185,7 +5185,6 @@ name = "rabs-wkr"
 version = "2.1.36"
 dependencies = [
  "asupersync",
- "rabs-action",
  "rabs-asupersync",
  "rabs-cas",
  "rabs-key",

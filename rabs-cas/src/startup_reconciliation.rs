@@ -342,15 +342,20 @@ pub fn apply_operator_reset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
     use crate::metadata_store::{
-        ActionEntryRow, AuthorityRow, FsqliteEngine, PublicationRow, ResultKindTag, RusqliteEngine,
-        SqlEngine, SqlMetadataStore, digest_key,
+        ActionEntryRow, AuthorityRow, PublicationRow, ResultKindTag, RusqliteEngine, SqlEngine,
+        SqlMetadataStore, digest_key,
     };
     use rabs_protocol::result_identity::{DigestAlgorithm, TypedDigest};
+    #[cfg(feature = "fsqlite")]
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(feature = "fsqlite")]
     static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(feature = "fsqlite")]
     fn fresh_path(tag: &str) -> std::path::PathBuf {
         let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("rabs-h013-{}-{}-{}.db", std::process::id(), tag, n))
@@ -533,6 +538,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h013_differential_reference_vs_frankensqlite() {
         fn scenario<E: SqlEngine>(store: &mut SqlMetadataStore<E>) -> Vec<String> {
             healthy(store);
@@ -635,6 +641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h037_differential_reference_vs_frankensqlite() {
         fn scenario<E: SqlEngine>(store: &mut SqlMetadataStore<E>) -> Vec<String> {
             healthy(store);

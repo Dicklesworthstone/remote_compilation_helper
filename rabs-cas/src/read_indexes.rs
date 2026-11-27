@@ -44,9 +44,9 @@ fn install(engine: &mut impl SqlEngine) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_store::{
-        FsqliteEngine, RabsMetadataStore, RusqliteEngine, SqlMetadataStore, SqlValue,
-    };
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
+    use crate::metadata_store::{RabsMetadataStore, RusqliteEngine, SqlMetadataStore, SqlValue};
 
     const PROFILE: &str = "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_rabs_verification_outcome_action_v1', 'idx_rabs_serving_disposition_action_v1') ORDER BY name";
 
@@ -91,6 +91,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn both_metadata_engines_preserve_the_same_rows_and_predicates() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

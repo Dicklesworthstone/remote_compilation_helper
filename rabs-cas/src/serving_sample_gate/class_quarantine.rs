@@ -258,8 +258,10 @@ mod tests {
         ActionClassRisk, SampleGateDecision, SamplingPolicy, serving_sample_decision,
     };
     use super::*;
+    #[cfg(feature = "fsqlite")]
+    use crate::metadata_store::FsqliteEngine;
     use crate::metadata_store::{
-        DivergenceIncidentRow, FsqliteEngine, QuarantineScope, RusqliteEngine, SqlMetadataStore,
+        DivergenceIncidentRow, QuarantineScope, RusqliteEngine, SqlMetadataStore,
     };
 
     fn bind(store: &mut dyn RabsMetadataStore, key: &str, class: &str) {
@@ -424,6 +426,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn class_demotion_matches_the_frankensqlite_backend() {
         let reference_engine = RusqliteEngine::open(&fresh_path("class-ref")).unwrap();
         let candidate_engine = FsqliteEngine::open(&fresh_path("class-fsq")).unwrap();

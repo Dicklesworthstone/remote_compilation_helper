@@ -7945,10 +7945,12 @@ impl SqlEngine for RusqliteEngine {
 // ---------------------------------------------------------------------
 
 /// The FrankenSQLite engine (pure Rust).
+#[cfg(feature = "fsqlite")]
 pub struct FsqliteEngine {
     conn: fsqlite::AsyncConnection,
 }
 
+#[cfg(feature = "fsqlite")]
 impl FsqliteEngine {
     /// Open (or create) a database file.
     pub fn open(path: &std::path::Path) -> Result<Self, StoreError> {
@@ -7958,6 +7960,7 @@ impl FsqliteEngine {
     }
 }
 
+#[cfg(feature = "fsqlite")]
 impl Drop for FsqliteEngine {
     fn drop(&mut self) {
         // Join the engine worker before callers can reopen the database.
@@ -7970,6 +7973,7 @@ impl Drop for FsqliteEngine {
     }
 }
 
+#[cfg(feature = "fsqlite")]
 fn to_fsqlite(v: &SqlValue) -> fsqlite::SqliteValue {
     match v {
         SqlValue::Null => fsqlite::SqliteValue::Null,
@@ -7979,6 +7983,7 @@ fn to_fsqlite(v: &SqlValue) -> fsqlite::SqliteValue {
     }
 }
 
+#[cfg(feature = "fsqlite")]
 fn from_fsqlite(v: &fsqlite::SqliteValue) -> Result<SqlValue, StoreError> {
     match v {
         fsqlite::SqliteValue::Null => Ok(SqlValue::Null),
@@ -7991,6 +7996,7 @@ fn from_fsqlite(v: &fsqlite::SqliteValue) -> Result<SqlValue, StoreError> {
     }
 }
 
+#[cfg(feature = "fsqlite")]
 impl SqlEngine for FsqliteEngine {
     fn execute(&mut self, sql: &str, params: &[SqlValue]) -> Result<usize, StoreError> {
         if params.is_empty() {
@@ -8034,6 +8040,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn fsqlite_drop_finishes_rollback_before_immediate_reopen() {
         let path = fresh_path("fsqlite-drop-rollback");
         assert!(!path.exists());
@@ -8069,6 +8076,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn fsqlite_drop_preserves_committed_wal_before_reopen() {
         let path = fresh_path("fsqlite-drop-wal");
         assert!(!path.exists());
@@ -8254,6 +8262,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn pending_migrations_commit_once_and_rollback_frankensqlite() {
         migration_batch_behavior(FsqliteEngine::open);
     }
@@ -9100,6 +9109,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h009_frankensqlite_backend_full_behavioral_pass() {
         let engine = FsqliteEngine::open(&fresh_path("fsqlite-pass")).unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
@@ -9108,6 +9118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn h009_differential_harness_reference_vs_frankensqlite() {
         // THE H009 acceptance: the identical operation script runs on the
         // reference backend and on FrankenSQLite, and every table dumps
@@ -9253,6 +9264,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn boot_authority_recovery_frankensqlite() {
         boot_authority_recovery(FsqliteEngine::open, "boot-authority-frankensqlite");
     }
@@ -9324,6 +9336,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn boot_authority_corrupt_history_frankensqlite() {
         boot_authority_corrupt_history(FsqliteEngine::open, "boot-authority-corrupt-frankensqlite");
     }
@@ -9430,8 +9443,11 @@ mod tests {
     fn allocated_generations_enforce_fences_and_bounds_on_both_sql_engines() {
         let reference = RusqliteEngine::open_in_memory().unwrap();
         allocation_behavior(&mut SqlMetadataStore::open(reference).unwrap());
-        let candidate = FsqliteEngine::open(&fresh_path("allocation-fsq")).unwrap();
-        allocation_behavior(&mut SqlMetadataStore::open(candidate).unwrap());
+        #[cfg(feature = "fsqlite")]
+        {
+            let candidate = FsqliteEngine::open(&fresh_path("allocation-fsq")).unwrap();
+            allocation_behavior(&mut SqlMetadataStore::open(candidate).unwrap());
+        }
     }
 
     #[test]
@@ -9788,6 +9804,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn s022_migrates_populated_v19_worker_fence_frankensqlite() {
         let path = fresh_path("s022-v19-fsq");
         {
@@ -9812,6 +9829,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn t038_migrates_populated_v20_attempt_lease_fail_closed_frankensqlite() {
         let path = fresh_path("t038-v20-fsq");
         {
@@ -9837,6 +9855,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn s022_and_h038_fences_survive_reopen_frankensqlite() {
         let path = fresh_path("h038-fence-fsq");
         {
@@ -9898,6 +9917,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn s020_operator_reset_reopens_fenced_peer_frankensqlite() {
         s020_operator_reset_consumption(FsqliteEngine::open, "s020-reset-fsq");
     }
@@ -9988,9 +10008,12 @@ mod tests {
         let engine = RusqliteEngine::open_in_memory().unwrap();
         let mut store = SqlMetadataStore::open(engine).unwrap();
         assert_eq!(table_names(&mut store), expected);
-        let engine = FsqliteEngine::open(&fresh_path("h038-tables")).unwrap();
-        let mut store = SqlMetadataStore::open(engine).unwrap();
-        assert_eq!(table_names(&mut store), expected);
+        #[cfg(feature = "fsqlite")]
+        {
+            let engine = FsqliteEngine::open(&fresh_path("h038-tables")).unwrap();
+            let mut store = SqlMetadataStore::open(engine).unwrap();
+            assert_eq!(table_names(&mut store), expected);
+        }
     }
 
     #[test]
@@ -10012,10 +10035,11 @@ mod tests {
             },
         };
 
-        let stores: [Box<dyn RabsMetadataStore>; 2] = [
+        let stores: Vec<Box<dyn RabsMetadataStore>> = vec![
             Box::new(SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap()),
             // Both engines, because the A002 differential lanes must
             // agree on this table exactly as they do on every other.
+            #[cfg(feature = "fsqlite")]
             Box::new(
                 SqlMetadataStore::open(
                     FsqliteEngine::open(&fresh_path("t011-release-verdicts")).unwrap(),
@@ -10302,6 +10326,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn t042_authority_digest_mismatch_lexicographic_high_water_rollback_and_edge_handoff_overlap_frankensqlite()
      {
         t042_authority_digest_mismatch_high_water_rollback_and_edge_handoff_overlap(
@@ -10451,6 +10476,7 @@ mod object_location_tests {
     }
 
     #[test]
+    #[cfg(feature = "fsqlite")]
     fn atomic_record_matches_split_metadata_with_one_commit_frankensqlite() {
         atomic_record_reopen(FsqliteEngine::open);
     }
