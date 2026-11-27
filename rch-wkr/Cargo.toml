@@ -2,6 +2,7 @@
 name = "rch-wkr"
 version.workspace = true
 edition.workspace = true
+default-run = "rch-wkr"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -13,6 +14,16 @@ description = "Remote Compilation Helper - Worker agent for remote execution"
 [[bin]]
 name = "rch-wkr"
 path = "src/main.rs"
+
+# Optional, single-purpose Linux binary for non-root GC observers (bd-vajtd).
+# Ordinary worker builds and deployments do not install a privileged program.
+[features]
+gc-census-helper = []
+
+[[bin]]
+name = "rch-gc-proc-references"
+path = "src/gc_proc_references.rs"
+required-features = ["gc-census-helper"]
 
 [dependencies]
 rch-common = { workspace = true }

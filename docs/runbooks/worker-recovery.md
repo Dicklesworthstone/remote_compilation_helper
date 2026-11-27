@@ -370,6 +370,29 @@ do not kill unrelated compiler processes. Retain the failed log and target cache
 A retry can reuse completed dependencies, but the timed-out attempt is not a test
 pass and its absence from the dispatcher queue does not prove remote termination.
 
+### Abandoned GC claims on non-root Linux workers
+
+A worker can retire an abandoned claim only after checking every process's working directory, root, open descriptors and command line. `incomplete-handles` means the claim remains in place. On Linux, an ordinary login often cannot inspect descriptors held by other users, including root.
+
+For workers that need this census, an administrator can build the optional reader from the same revision as the worker:
+
+```sh
+cargo build --release -p rch-wkr --features gc-census-helper --bin rch-gc-proc-references
+```
+
+Install it under the fixed path below. Use a dedicated group containing only accounts authorized to see system-wide process pathnames. The example uses an existing group named `rch-census`. The binary and every directory above it must be administrator-owned and unwritable by the worker account or its groups. On the worker, as administrator, run:
+
+```sh
+install -d -o root -g root -m 0755 /usr/local/libexec/rch
+install -o root -g rch-census -m 0750 target/release/rch-gc-proc-references /usr/local/libexec/rch/gc-proc-references-v1
+setcap cap_sys_ptrace,cap_dac_read_search=ep /usr/local/libexec/rch/gc-proc-references-v1
+getcap /usr/local/libexec/rch/gc-proc-references-v1
+```
+
+Grant these capabilities only to this single-purpose reader. It accepts no arguments, reads procfs, and streams paths to the existing unprivileged snapshot writer. The ordinary worker controls claim retirement. Reapply and verify the file capabilities when replacing the reader. Filesystems that disable file capabilities, restricted procfs mounts, and security policies can still deny the census.
+
+As the worker login, run `/usr/local/libexec/rch/gc-proc-references-v1 >/dev/null` and check its exit status. Then use `rch gc --dry-run --workers <worker-id> --json` from the dispatcher to verify the claims report. An installed reader that fails, times out, or produces an empty snapshot leaves claims held.
+
 ### Inspecting Windows build and Cargo caches
 
 For a worker declared as Windows, both commands inspect the tar transport's

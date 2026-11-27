@@ -2454,7 +2454,12 @@ refs=$(rch_gc_mktemp) && args=$(rch_gc_mktemp) || exit 1;
 trap 'rm -f -- "$refs" "$args"' EXIT;
 # A nonempty prefix is not a complete inventory. Avoid pipelines that mask
 # producer errors and refuse retirement if either capture could be partial.
-if rch_wkr_locate && __proc_version=$("$RCH_WKR" control-capture proc-references-probe 8>&- 2>/dev/null) \
+# An operator may install the single-purpose census reader with file
+# capabilities on a non-root worker. Only this fixed system path is used.
+# The unprivileged snapshot writer still owns the file, deadline and flock boundary.
+if [ -e /usr/local/libexec/rch/gc-proc-references-v1 ]; then
+  __gc_capture "$refs" /usr/local/libexec/rch/gc-proc-references-v1 && __refs_ok=1 || __refs_ok=0;
+elif rch_wkr_locate && __proc_version=$("$RCH_WKR" control-capture proc-references-probe 8>&- 2>/dev/null) \
   && [ "$__proc_version" = 'rch-wkr proc-references v1' ]; then
   __gc_capture "$refs" "$RCH_WKR" control-capture proc-references && __refs_ok=1 || __refs_ok=0;
 else
@@ -5904,7 +5909,7 @@ flock -n "$__gc_source_registry/metadata.lock" true;
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn abandoned_claims_use_legacy_capture_only_without_native_census_support() {
+    fn abandoned_claims_require_complete_census_from_the_selected_reader() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
@@ -5925,6 +5930,13 @@ proc-references-probe)
 snapshot-probe) printf 'rch-wkr control-capture snapshot v1\n' ;;
 snapshot)
     case "$5" in
+    "$RCH_TEST_HELPER") printf 'helper\n' >> "$RCH_TEST_CAPTURE_LOG"
+          [ "$#" = 5 ] || exit 125
+          case "$RCH_TEST_CAPTURE_MODE" in
+          helper-held) printf '/fixture-owned-target/output\n' > "$4" ;;
+          helper-free) printf '/unrelated\n' > "$4" ;;
+          *) printf '/unrelated\n' > "$4"; exit 125 ;;
+          esac ;;
     "$0") printf 'native\n' >> "$RCH_TEST_CAPTURE_LOG"
           printf '/unrelated\n' > "$4"; exit 125 ;;
     find) printf 'legacy\n' >> "$RCH_TEST_CAPTURE_LOG"
@@ -5951,8 +5963,12 @@ esac
         let name = format!("fc-00000000-0000-4000-8000-000000000001.{digest}.claim");
         let claim = registry.join(&name);
         std::fs::rename(record, &claim).unwrap();
-        let command =
-            abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0);
+        let helper = tmp.path().join("system-reader");
+        let command = abandoned_gc_claims_command_with_registry(true, registry.to_str().unwrap(), 0)
+            .replace(
+                "/usr/local/libexec/rch/gc-proc-references-v1",
+                &shell_escape::escape(helper.to_str().unwrap().into()),
+            );
         let run = |mode: &str| {
             std::fs::write(&calls, "").unwrap();
             let output = Command::new("sh")
@@ -5961,6 +5977,7 @@ esac
                 .env("RCH_GC_SCRATCH", tmp.path())
                 .env("TMPDIR", tmp.path())
                 .env_remove("RCH_RECOVERY_GC_CLAIM")
+                .env("RCH_TEST_HELPER", &helper)
                 .env("RCH_TEST_CAPTURE_MODE", mode)
                 .env("RCH_TEST_CAPTURE_LOG", &calls)
                 .output()
@@ -5974,6 +5991,26 @@ esac
         assert!(reports.is_empty());
         assert!(claim.is_file());
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "native\n");
+
+        std::fs::write(&helper, "").unwrap();
+        let (status, reports) = run("helper-failed");
+        assert_eq!(status.as_deref(), Some("incomplete-handles"));
+        assert!(reports.is_empty());
+        assert!(claim.is_file());
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "helper\n");
+
+        let (status, reports) = run("helper-held");
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(reports[0].reason, "open-handle");
+        assert!(claim.is_file());
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "helper\nargs\n");
+
+        let (status, reports) = run("helper-free");
+        assert_eq!(status.as_deref(), Some("ok"));
+        assert_eq!(reports[0].verdict, "released");
+        let released = registry.join("released").join(&name);
+        std::fs::rename(released, &claim).unwrap();
+        std::fs::remove_file(&helper).unwrap();
 
         let (status, reports) = run("legacy");
         assert_eq!(status.as_deref(), Some("ok"));
