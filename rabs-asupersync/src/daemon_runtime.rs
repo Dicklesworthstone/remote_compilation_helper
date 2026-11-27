@@ -5,31 +5,32 @@
 //!
 //! The bridge plan's integration contract, held here:
 //!
-//! - **Regions own lifetimes.** Every subsystem is a region-owned task
-//!   spawned through `Cx::spawn`; there are no detached tasks. Dropping
-//!   the root cancels the tree (R90's no-orphans claim starts here).
-//! - **Cx is the only capability channel.** Subsystem bodies receive
-//!   their `Cx` from the runtime; nothing reaches for ambient state.
-//! - **Obligations are typed completions.** Each subsystem holds an
-//!   [`ObligationSet`] (the D/G-epic model); the shutdown receipt is
-//!   generated FROM that accounting — a subsystem that exits with an
-//!   open obligation is reported abandoned-with-reason, never silently
-//!   dropped. The model layer (`region_tree`) is asserted against the
-//!   live spawn ledger at boot: spec and implementation cannot drift
-//!   without a test failing.
-//! - **Crash evidence survives.** A boot marker (minimal
-//!   integrity/recovery control: it prevents the named evidence-loss
-//!   mode "kill -9 erases what was running") is written at boot and
-//!   removed on clean shutdown; a marker found at boot means the prior
-//!   incarnation died unclean, and the recovery report names it.
+//! - Regions own lifetimes. Every subsystem is a region-owned task
+//!   spawned through Cx::spawn; there are no detached tasks. The root
+//!   supervises terminal results while running and joins every owner
+//!   before returning, including after panic or partial startup failure.
+//! - Cx is the only capability channel. Subsystem bodies receive
+//!   their Cx from the runtime; nothing reaches for ambient state.
+//! - Obligations are typed completions. Each subsystem holds an
+//!   ObligationSet; an owner that exits without reporting completion is
+//!   attributed by name, never silently dropped. The region-tree model
+//!   is asserted against the live spawn ledger at boot.
+//! - Crash evidence survives. A boot marker prevents the evidence-loss
+//!   mode "kill -9 erases what was running". Named subsystem crashpacks
+//!   accompany nonclean shutdown receipts. A marker found at boot means
+//!   the prior incarnation died unclean.
 
+use crate::crashpack::{Crashpack, RedactedContext};
 use crate::obligations::{ObligationKind, ObligationSet};
-use crate::region_tree::RegionSpec;
+use crate::region_tree::{Attribution, RegionSpec};
 use asupersync::cx::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::signal::ShutdownController;
+use std::future::{Future, poll_fn};
 use std::io::Write;
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 /// The daemon's subsystem regions, in spawn order (plan §12).
@@ -41,12 +42,12 @@ pub const DAEMON_SUBSYSTEMS: [&str; 4] = ["edge", "coord", "telemetry", "janitor
 pub fn daemon_region_spec() -> RegionSpec {
     RegionSpec {
         name: "rabsd",
-        introduces: crate::region_tree::Attribution::default(),
+        introduces: Attribution::default(),
         children: DAEMON_SUBSYSTEMS
             .iter()
             .map(|name| RegionSpec {
                 name,
-                introduces: crate::region_tree::Attribution::default(),
+                introduces: Attribution::default(),
                 children: vec![],
             })
             .collect(),
@@ -62,6 +63,9 @@ pub struct SubsystemOutcome {
     pub obligations_clean: bool,
     /// Reasons for any abandoned obligations (empty when clean).
     pub abandoned: Vec<String>,
+    /// Evidence from this actual subsystem owner. A daemon failure does not
+    /// invent action/attempt identities, quarantine, or permission to retry.
+    pub crashpack: Option<Crashpack>,
 }
 
 /// The shutdown receipt, generated from runtime accounting.
@@ -94,14 +98,17 @@ impl ShutdownReceipt {
             .iter()
             .map(|s| {
                 format!(
-                    "{{\"name\":\"{}\",\"obligations_clean\":{},\"abandoned\":[{}]}}",
-                    s.name,
+                    "{{\"name\":{},\"obligations_clean\":{},\"abandoned\":[{}],\"crashpack\":{}}}",
+                    json_string(&s.name),
                     s.obligations_clean,
                     s.abandoned
                         .iter()
-                        .map(|r| format!("\"{}\"", r.replace('"', "'")))
+                        .map(|reason| json_string(reason))
                         .collect::<Vec<_>>()
-                        .join(",")
+                        .join(","),
+                    s.crashpack
+                        .as_ref()
+                        .map_or_else(|| "null".into(), crashpack_json)
                 )
             })
             .collect();
@@ -168,6 +175,7 @@ pub enum SubsystemBehavior {
 /// Real work mounted into a subsystem region: receives the region's Cx
 /// and a shutdown receiver, MUST return when shutdown fires, and its
 /// Err string becomes an abandoned-obligation reason in the receipt.
+/// Returning Ok before shutdown is also a service failure.
 pub type SubsystemWork = Box<
     dyn FnOnce(
             Cx,
@@ -190,13 +198,13 @@ pub struct DaemonRunOptions {
     pub boot_marker: Option<std::path::PathBuf>,
     /// Per-subsystem behavior override (lab); defaults to Clean.
     pub behavior: [SubsystemBehavior; 4],
-    /// Real work for the `edge` region (S3+: the UDS server). None =
+    /// Real work for the edge region (S3+: the UDS server). None =
     /// idle skeleton.
     pub edge_work: Option<SubsystemWork>,
-    /// Real work for the `coord` region (S6+: the live coordinator).
+    /// Real work for the coord region (S6+: the live coordinator).
     /// None = idle skeleton.
     pub coord_work: Option<SubsystemWork>,
-    /// Real work for the `janitor` region (W1/Phase 1: the on-disk
+    /// Real work for the janitor region (W1/Phase 1: the on-disk
     /// rabs-cas byte store + quota/GC owner). None = idle skeleton.
     pub janitor_work: Option<SubsystemWork>,
 }
@@ -229,10 +237,10 @@ impl Default for DaemonRunOptions {
     }
 }
 
-/// One JSON line announcing a subsystem whose work failed.
-fn failure_line(name: &str, reason: &str) -> String {
-    let mut escaped = String::with_capacity(reason.len());
-    for c in reason.chars() {
+fn json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for c in value.chars() {
         match c {
             '"' => escaped.push_str("\\\""),
             '\\' => escaped.push_str("\\\\"),
@@ -240,9 +248,86 @@ fn failure_line(name: &str, reason: &str) -> String {
             c => escaped.push(c),
         }
     }
+    escaped.push('"');
+    escaped
+}
+
+fn crashpack_json(pack: &Crashpack) -> String {
+    let attribution = [
+        ("coordinator_authority", &pack.attribution.coordinator_authority),
+        ("build_operation", &pack.attribution.build_operation),
+        ("action_key", &pack.attribution.action_key),
+        ("action_generation", &pack.attribution.action_generation),
+        ("attempt", &pack.attribution.attempt),
+        ("lease", &pack.attribution.lease),
+        ("worker_boot_generation", &pack.attribution.worker_boot_generation),
+    ]
+    .into_iter()
+    .map(|(name, value)| {
+        format!(
+            "{}:{}",
+            json_string(name),
+            value
+                .as_ref()
+                .map_or_else(|| "null".into(), |value| json_string(value))
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+    let obligations = pack
+        .outstanding_obligations
+        .iter()
+        .map(|kind| json_string(&format!("{kind:?}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let events = pack
+        .recent_events
+        .iter()
+        .map(|event| json_string(event))
+        .collect::<Vec<_>>()
+        .join(",");
+    let context = pack
+        .context
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{\"key\":{},\"value\":{}}}",
+                json_string(&entry.key),
+                json_string(&entry.value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "{{\"v\":1,\"kind\":\"rabsd-subsystem-failed\",\"subsystem\":\"{name}\",\"reason\":\"{escaped}\"}}"
+        "{{\"failure\":{},\"attribution\":{{{attribution}}},\"outstanding_obligations\":[{obligations}],\"recent_events\":[{events}],\"context\":[{context}]}}",
+        json_string(&pack.failure),
     )
+}
+
+/// One JSON line announcing a subsystem whose work failed.
+fn failure_line(name: &str, reason: &str) -> String {
+    format!(
+        "{{\"v\":1,\"kind\":\"rabsd-subsystem-failed\",\"subsystem\":{},\"reason\":{}}}",
+        json_string(name),
+        json_string(reason),
+    )
+}
+
+fn failure_evidence(name: &str, reason: &str, obligations: &ObligationSet) -> Crashpack {
+    let outstanding_obligations = match obligations.may_close_region() {
+        Err(crate::obligations::ObligationError::Unresolved(kinds)) => kinds,
+        _ => Vec::new(),
+    };
+    Crashpack {
+        failure: reason.to_owned(),
+        attribution: Attribution::default(),
+        outstanding_obligations,
+        recent_events: vec!["subsystem admitted".into(), "subsystem failed".into()],
+        context: vec![RedactedContext {
+            key: "region".into(),
+            value: format!("rabsd/{name}"),
+        }],
+    }
 }
 
 /// The obligation each subsystem region holds for its lifetime.
@@ -265,7 +350,8 @@ async fn subsystem_body(
     let mut obligations = ObligationSet::default();
     obligations.open(lifetime_obligation(name));
 
-    // Real work owns the shutdown wait; idle subsystems wait directly.
+    // Record early return at the owner boundary, before another subsystem or
+    // an external signal can race with the parent's observation of this join.
     let work_result = match work {
         Some(work) => work(cx.clone(), shutdown).await,
         None => {
@@ -273,14 +359,16 @@ async fn subsystem_body(
             Ok(())
         }
     };
+    let work_result = if work_result.is_ok() && !controller.is_shutting_down() {
+        Err("subsystem returned before shutdown".into())
+    } else {
+        work_result
+    };
     if let Err(reason) = &work_result {
-        // A region whose work failed (e.g. the edge refusing an unsafe socket
-        // directory) never serves again. Waiting for an external signal kept
-        // the process alive, silent and not listening; wrappers already fail
-        // open to local compilation, so say why now and stop the daemon. The
-        // receipt still records the failure as an abandoned obligation.
-        let _ = writeln!(std::io::stderr().lock(), "{}", failure_line(name, reason));
+        // Stop admission before reporting the failure. A dead listener or
+        // coordinator must not wait indefinitely for an external signal.
         controller.shutdown();
+        let _ = writeln!(std::io::stderr().lock(), "{}", failure_line(name, reason));
     }
 
     let _ = cx.checkpoint();
@@ -303,15 +391,45 @@ async fn subsystem_body(
     SubsystemOutcome {
         name: name.to_string(),
         obligations_clean,
+        crashpack: (!obligations_clean)
+            .then(|| failure_evidence(name, &abandoned.join("; "), &obligations)),
         abandoned,
     }
 }
 
-/// Drive a top-level future on a standalone current-thread runtime outside any
-/// active `asupersync` task.
+fn joined_subsystem(
+    name: &'static str,
+    joined: Result<SubsystemOutcome, asupersync::runtime::JoinError>,
+    controller: &ShutdownController,
+) -> SubsystemOutcome {
+    match joined {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The runtime contains the panic and publishes a typed terminal
+            // result. Do not replace the subsystem or infer retry authority.
+            // Stop new work and retain every sibling owner until its join.
+            controller.shutdown();
+            let reason = format!("subsystem join failed: {error}");
+            let mut obligations = ObligationSet::default();
+            // This owner never reported its lifetime obligation complete.
+            // The evidence does not infer which child effects are still live.
+            obligations.open(lifetime_obligation(name));
+            let _ = writeln!(std::io::stderr().lock(), "{}", failure_line(name, &reason));
+            SubsystemOutcome {
+                name: name.into(),
+                obligations_clean: false,
+                crashpack: Some(failure_evidence(name, &reason, &obligations)),
+                abandoned: vec![reason],
+            }
+        }
+    }
+}
+
+/// Drive a top-level future on a standalone runtime outside any active
+/// asupersync task.
 ///
 /// # Panics
-/// Panics if `Cx::current().is_some()`, enforcing the nested-runtime
+/// Panics if Cx::current().is_some(), enforcing the nested-runtime
 /// prohibition dynamically as well as statically.
 pub fn block_on_top_level<F: std::future::Future>(
     runtime: &asupersync::runtime::Runtime,
@@ -337,8 +455,8 @@ pub fn run_daemon(options: DaemonRunOptions) -> Result<ShutdownReceipt, DaemonEr
 /// Run an embedded daemon whose lifetime is owned by its caller. The caller
 /// retains the controller, requests shutdown after its operation ends, and
 /// joins this call before releasing any operation inputs or output directories.
-/// Signal handling is explicit: unlike [`run_daemon`], this entry point does
-/// not install a process-wide signal listener.
+/// Unlike run_daemon, this entry point does not install a process-wide signal
+/// listener. The optional timed shutdown is owned by the root future.
 pub fn run_daemon_controlled(
     options: DaemonRunOptions,
     controller: Arc<ShutdownController>,
@@ -363,14 +481,7 @@ pub fn run_daemon_controlled(
         .build()
         .map_err(|e| DaemonError::RuntimeBuild(format!("{e:?}")))?;
 
-    if let Some(run_for) = options.run_for {
-        let timed = Arc::clone(&controller);
-        std::thread::spawn(move || {
-            std::thread::sleep(run_for);
-            timed.shutdown();
-        });
-    }
-
+    let run_for = options.run_for;
     let behavior = options.behavior;
     let mut edge_work = options.edge_work;
     let mut coord_work = options.coord_work;
@@ -382,69 +493,127 @@ pub fn run_daemon_controlled(
             .spawn(async move {
                 let cx = Cx::current().expect("runtime task carries a Cx");
                 cx.trace("rabsd root region up");
+                // No sleeping OS thread retains this incarnation after an
+                // early failure or external shutdown. Dropping the root drops
+                // its timer registration as well.
+                let mut auto_shutdown = run_for.map(|delay| {
+                    Box::pin(asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        delay,
+                    ))
+                });
 
-                // Spawn the subsystem regions and keep the live ledger.
                 let mut handles = Vec::new();
                 let mut spawned: Vec<String> = Vec::new();
-                for (index, name) in DAEMON_SUBSYSTEMS.iter().enumerate() {
+                let mut boot_error = None;
+                for (index, &name) in DAEMON_SUBSYSTEMS.iter().enumerate() {
                     let shutdown = root_controller.subscribe();
                     let subsystem_behavior = behavior[index];
-                    let work = match *name {
+                    let work = match name {
                         "edge" => edge_work.take(),
                         "coord" => coord_work.take(),
                         "janitor" => janitor_work.take(),
                         _ => None,
                     };
                     let controller = Arc::clone(&root_controller);
-                    let handle = cx
-                        .spawn(move |cx| {
-                            subsystem_body(name, cx, shutdown, subsystem_behavior, work, controller)
-                        })
-                        .map_err(|e| DaemonError::SubsystemSpawn {
-                            name,
-                            error: format!("{e:?}"),
-                        })?;
-                    spawned.push((*name).to_string());
-                    handles.push(handle);
+                    match cx.spawn(move |cx| {
+                        subsystem_body(name, cx, shutdown, subsystem_behavior, work, controller)
+                    }) {
+                        Ok(handle) => {
+                            spawned.push(name.to_string());
+                            handles.push((name, handle));
+                        }
+                        Err(error) => {
+                            boot_error = Some(DaemonError::SubsystemSpawn {
+                                name,
+                                error: format!("{error:?}"),
+                            });
+                            root_controller.shutdown();
+                            break;
+                        }
+                    }
                 }
 
-                // Spec-vs-implementation assertion: the live ledger must
-                // match the region-tree model (bridge plan contract).
                 let expected: Vec<String> = daemon_region_spec()
                     .children
                     .iter()
                     .map(|c| c.name.to_string())
                     .collect();
-                if expected != spawned {
-                    return Err(DaemonError::ModelDivergence {
+                if boot_error.is_none() && expected != spawned {
+                    boot_error = Some(DaemonError::ModelDivergence {
                         expected,
                         actual: spawned,
                     });
+                    root_controller.shutdown();
                 }
 
                 let boot_ms = boot_start.elapsed().as_millis();
-                cx.trace("rabsd ready");
+                if boot_error.is_none() {
+                    cx.trace("rabsd ready");
+                }
 
-                // Wait for shutdown, then harvest every subsystem.
                 let mut shutdown_rx = root_controller.subscribe();
-                shutdown_rx.wait().await;
-                let shutdown_start = Instant::now();
-
-                let mut subsystems = Vec::new();
-                for mut handle in handles {
-                    match handle.join(&cx).await {
-                        Ok(outcome) => subsystems.push(outcome),
-                        Err(join_error) => subsystems.push(SubsystemOutcome {
-                            name: "<join-failed>".to_string(),
-                            obligations_clean: false,
-                            abandoned: vec![format!("join error: {join_error:?}")],
-                        }),
+                let mut shutdown = pin!(shutdown_rx.wait());
+                let mut shutdown_start = None;
+                let mut outcomes = vec![None; handles.len()];
+                // Observe terminal results while running, not only after
+                // shutdown. poll_join retains each wake registration; building
+                // and dropping a fresh join future per poll would cancel work
+                // or retire its only wake source.
+                poll_fn(|task| {
+                    if shutdown_start.is_none() {
+                        if shutdown.as_mut().poll(task).is_ready() {
+                            shutdown_start = Some(Instant::now());
+                        } else if auto_shutdown
+                            .as_mut()
+                            .is_some_and(|timer| timer.as_mut().poll(task).is_ready())
+                        {
+                            root_controller.shutdown();
+                            shutdown_start = Some(Instant::now());
+                        }
                     }
+
+                    let mut pending = false;
+                    for ((name, handle), outcome) in handles.iter_mut().zip(&mut outcomes) {
+                        if outcome.is_some() {
+                            continue;
+                        }
+                        match handle.poll_join(task) {
+                            Poll::Ready(joined) => {
+                                let terminal = joined_subsystem(name, joined, &root_controller);
+                                if !terminal.obligations_clean {
+                                    root_controller.shutdown();
+                                    shutdown_start.get_or_insert_with(Instant::now);
+                                }
+                                *outcome = Some(terminal);
+                            }
+                            Poll::Pending => pending = true,
+                        }
+                    }
+
+                    if shutdown_start.is_some() {
+                        auto_shutdown = None;
+                    }
+                    if pending {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    }
+                })
+                .await;
+
+                // This also runs after partial startup failure: all admitted
+                // owners were signalled and joined before returning the error.
+                if let Some(error) = boot_error {
+                    return Err(error);
                 }
                 Ok(ShutdownReceipt {
-                    subsystems,
+                    subsystems: outcomes
+                        .into_iter()
+                        .map(|outcome| outcome.expect("every subsystem joined"))
+                        .collect(),
                     boot_ms,
-                    shutdown_ms: shutdown_start.elapsed().as_millis(),
+                    shutdown_ms: shutdown_start.map_or(0, |started| started.elapsed().as_millis()),
                     recovered_from_unclean,
                 })
             })
@@ -459,8 +628,8 @@ pub fn run_daemon_controlled(
     {
         // Marker removal failure is loud in logs but not fatal.
         eprintln!(
-            "{{\"v\":1,\"kind\":\"rabsd-log\",\"warn\":\"boot marker not removable\",\"path\":\"{}\"}}",
-            marker.display()
+            "{{\"v\":1,\"kind\":\"rabsd-log\",\"warn\":\"boot marker not removable\",\"path\":{}}}",
+            json_string(&marker.display().to_string())
         );
     }
     result
@@ -469,6 +638,7 @@ pub fn run_daemon_controlled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn options(run_for_ms: u64) -> DaemonRunOptions {
         DaemonRunOptions {
@@ -480,6 +650,40 @@ mod tests {
             coord_work: None,
             janitor_work: None,
         }
+    }
+
+    fn failure_run(opts: DaemonRunOptions) -> ShutdownReceipt {
+        let controller = Arc::new(ShutdownController::new());
+        let owned_controller = Arc::clone(&controller);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let _ = sender.send(run_daemon_controlled(opts, owned_controller));
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(20));
+        if result.is_err() {
+            // A regression may wait forever for shutdown. Signal it so the
+            // test still owns and joins the runtime before failing.
+            controller.shutdown();
+        }
+        owner.join().expect("daemon owner returns without panicking");
+        result
+            .expect("subsystem failure must stop the daemon without an external signal")
+            .expect("daemon runs")
+    }
+
+    fn draining_work(drained: Arc<AtomicBool>) -> SubsystemWork {
+        Box::new(move |_cx, mut shutdown| {
+            Box::pin(async move {
+                shutdown.wait().await;
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(30),
+                )
+                .await;
+                drained.store(true, Ordering::Release);
+                Ok(())
+            })
+        })
     }
 
     #[test]
@@ -510,6 +714,7 @@ mod tests {
         );
         let names: Vec<&str> = receipt.subsystems.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, DAEMON_SUBSYSTEMS.to_vec(), "model order held live");
+        assert!(receipt.subsystems.iter().all(|s| s.crashpack.is_none()));
     }
 
     #[test]
@@ -521,17 +726,7 @@ mod tests {
         opts.edge_work = Some(Box::new(|_cx, _shutdown| {
             Box::pin(async { Err("endpoint /tmp/x.sock: unsafe \"parent\"\nmode 1777".to_owned()) })
         }));
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(run_daemon_controlled(
-                opts,
-                Arc::new(ShutdownController::new()),
-            ));
-        });
-        let receipt = receiver
-            .recv_timeout(Duration::from_secs(20))
-            .expect("a failed subsystem must end the daemon run")
-            .expect("daemon runs");
+        let receipt = failure_run(opts);
         assert!(!receipt.clean());
         let edge = &receipt.subsystems[0];
         assert_eq!(edge.name, "edge");
@@ -544,6 +739,162 @@ mod tests {
             "{\"v\":1,\"kind\":\"rabsd-subsystem-failed\",\"subsystem\":\"edge\",\
              \"reason\":\"a \\\"quoted\\\" \\\\ path\\u000anext\"}"
         );
+    }
+
+    #[test]
+    fn a_panicked_subsystem_stops_without_a_signal_and_drains_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("panicked.boot");
+        let drained = Arc::new(AtomicBool::new(false));
+        let mut opts = options(0);
+        opts.run_for = None;
+        opts.boot_marker = Some(marker.clone());
+        opts.edge_work = Some(Box::new(|_cx, _shutdown| {
+            Box::pin(async {
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(10),
+                )
+                .await;
+                panic!("deliberate subsystem panic");
+            })
+        }));
+        opts.coord_work = Some(draining_work(Arc::clone(&drained)));
+        let receipt = failure_run(opts);
+        assert!(drained.load(Ordering::Acquire), "sibling still owns its work");
+        assert!(!receipt.clean(), "{receipt:?}");
+        assert!(marker.exists(), "panic must preserve crash-recovery marker");
+        assert_eq!(receipt.subsystems.len(), DAEMON_SUBSYSTEMS.len());
+        let edge = &receipt.subsystems[0];
+        assert_eq!(edge.name, "edge");
+        assert!(edge.abandoned[0].contains("deliberate subsystem panic"));
+        let pack = edge.crashpack.as_ref().expect("actual panic evidence");
+        assert!(pack.failure.contains("deliberate subsystem panic"));
+        assert_eq!(pack.attribution, Attribution::default());
+        assert_eq!(
+            pack.outstanding_obligations,
+            vec![ObligationKind::ProcessGroupDrain]
+        );
+        assert_eq!(
+            pack.context,
+            vec![RedactedContext {
+                key: "region".into(),
+                value: "rabsd/edge".into(),
+            }]
+        );
+        assert!(receipt.subsystems[1..].iter().all(|s| s.obligations_clean));
+    }
+
+    #[test]
+    fn a_panicking_work_factory_is_also_supervised() {
+        let drained = Arc::new(AtomicBool::new(false));
+        let mut opts = options(0);
+        opts.run_for = None;
+        opts.coord_work = Some(Box::new(|_cx, _shutdown| {
+            panic!("work factory failed before returning its future");
+        }));
+        opts.janitor_work = Some(draining_work(Arc::clone(&drained)));
+        let receipt = failure_run(opts);
+        assert!(drained.load(Ordering::Acquire));
+        assert!(!receipt.clean());
+        let coord = &receipt.subsystems[1];
+        assert_eq!(coord.name, "coord");
+        assert!(coord.abandoned[0].contains("work factory failed"));
+        assert!(coord.crashpack.is_some());
+        for (index, outcome) in receipt.subsystems.iter().enumerate() {
+            assert_eq!(outcome.name, DAEMON_SUBSYSTEMS[index]);
+            assert_eq!(outcome.obligations_clean, index != 1);
+        }
+    }
+
+    #[test]
+    fn early_success_is_a_service_failure_not_a_silent_idle_daemon() {
+        let drained = Arc::new(AtomicBool::new(false));
+        let mut opts = options(0);
+        opts.run_for = None;
+        opts.edge_work = Some(Box::new(|_cx, _shutdown| Box::pin(async { Ok(()) })));
+        opts.coord_work = Some(draining_work(Arc::clone(&drained)));
+        let receipt = failure_run(opts);
+        assert!(drained.load(Ordering::Acquire));
+        assert!(!receipt.clean());
+        let edge = &receipt.subsystems[0];
+        assert_eq!(edge.name, "edge");
+        assert!(edge.abandoned[0].contains("returned before shutdown"));
+        assert!(receipt.subsystems[1..].iter().all(|s| s.obligations_clean));
+    }
+
+    #[test]
+    fn shutdown_panic_does_not_skip_later_sibling_drains() {
+        let drained = Arc::new(AtomicBool::new(false));
+        let mut opts = options(10);
+        opts.edge_work = Some(Box::new(|_cx, mut shutdown| {
+            Box::pin(async move {
+                shutdown.wait().await;
+                panic!("panic while closing listener");
+            })
+        }));
+        opts.janitor_work = Some(draining_work(Arc::clone(&drained)));
+        let receipt = failure_run(opts);
+        assert!(drained.load(Ordering::Acquire));
+        assert!(!receipt.clean());
+        assert_eq!(receipt.subsystems[0].name, "edge");
+        assert!(receipt.subsystems[0].abandoned[0].contains("closing listener"));
+        assert!(receipt.subsystems[1..].iter().all(|s| s.obligations_clean));
+    }
+
+    #[test]
+    fn independent_failures_are_all_named_before_return() {
+        let drained = Arc::new(AtomicBool::new(false));
+        let mut opts = options(0);
+        opts.run_for = None;
+        opts.edge_work = Some(Box::new(|_cx, mut shutdown| {
+            Box::pin(async move {
+                shutdown.wait().await;
+                panic!("edge drain failed");
+            })
+        }));
+        opts.coord_work = Some(Box::new(|_cx, _shutdown| {
+            Box::pin(async { Err("coordinator authority lost".into()) })
+        }));
+        opts.janitor_work = Some(draining_work(Arc::clone(&drained)));
+        let receipt = failure_run(opts);
+        assert!(drained.load(Ordering::Acquire));
+        assert!(!receipt.clean());
+        assert!(!receipt.subsystems[0].obligations_clean);
+        assert!(!receipt.subsystems[1].obligations_clean);
+        assert!(receipt.subsystems[0].abandoned[0].contains("edge drain failed"));
+        assert!(receipt.subsystems[1].abandoned[0].contains("authority lost"));
+        assert!(receipt.subsystems[2..].iter().all(|s| s.obligations_clean));
+    }
+
+    #[test]
+    fn early_failure_drops_the_owned_shutdown_timer_and_controller() {
+        let controller = Arc::new(ShutdownController::new());
+        let weak = Arc::downgrade(&controller);
+        let mut opts = options(86_400_000);
+        opts.edge_work = Some(Box::new(|_cx, _shutdown| {
+            Box::pin(async { Err("startup failed".into()) })
+        }));
+        let receipt =
+            run_daemon_controlled(opts, Arc::clone(&controller)).expect("daemon returns");
+        assert!(!receipt.clean());
+        drop(controller);
+        assert!(
+            weak.upgrade().is_none(),
+            "a detached timer must not retain an ended daemon for a day"
+        );
+    }
+
+    #[test]
+    fn external_shutdown_drops_a_later_timer_without_marking_clean_work_failed() {
+        let controller = Arc::new(ShutdownController::new());
+        let weak = Arc::downgrade(&controller);
+        controller.shutdown();
+        let receipt = run_daemon_controlled(options(86_400_000), Arc::clone(&controller))
+            .expect("already-requested shutdown");
+        assert!(receipt.clean(), "{receipt:?}");
+        drop(controller);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
@@ -601,6 +952,25 @@ mod tests {
         assert!(line.contains("\"name\":\"edge\""));
         assert!(line.contains("abandoned"));
         assert_eq!(line.lines().count(), 1, "one JSON line");
+    }
+
+    #[test]
+    fn failure_receipt_preserves_quotes_backslashes_and_control_characters() {
+        assert_eq!(
+            json_string("a \"quoted\" \\ path\n\t\0\rnext"),
+            "\"a \\\"quoted\\\" \\\\ path\\u000a\\u0009\\u0000\\u000dnext\""
+        );
+        let mut opts = options(0);
+        opts.run_for = None;
+        opts.edge_work = Some(Box::new(|_cx, _shutdown| {
+            Box::pin(async { Err("failure \"detail\" \\ path\nnext".into()) })
+        }));
+        let receipt = failure_run(opts);
+        let line = receipt.to_json_line();
+        assert_eq!(line.lines().count(), 1, "failure must stay one JSON record");
+        assert!(line.contains(r#""abandoned":["work failed: failure \"detail\" \\ path\u000anext"]"#));
+        assert!(line.contains(r#""failure":"work failed: failure \"detail\" \\ path\u000anext""#));
+        assert!(line.contains(r#""context":[{"key":"region","value":"rabsd/edge"}]"#));
     }
 
     #[test]
