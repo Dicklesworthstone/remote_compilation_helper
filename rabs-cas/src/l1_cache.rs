@@ -100,7 +100,8 @@ pub struct L1ActionCache {
     capacity: usize,
     ttl: Option<Duration>,
     entries: HashMap<TypedDigest, Entry>,
-    /// FIFO eviction order (front = oldest insertion still present).
+    /// Exactly one FIFO slot per live key (front = oldest insertion).
+    /// Replacing a live row refreshes its TTL without changing FIFO position.
     order: VecDeque<TypedDigest>,
     hits: u64,
     misses: u64,
@@ -160,7 +161,7 @@ impl L1ActionCache {
                 self.hit_latencies.record(start.elapsed().as_nanos());
                 return Some(entry.row.clone());
             }
-            self.entries.remove(key);
+            self.invalidate(key);
             self.expired += 1;
         }
         None
@@ -219,6 +220,13 @@ impl L1ActionCache {
     /// calls this AFTER the store write succeeds, so L1 can never be
     /// fresher than L2).
     pub fn insert(&mut self, key: TypedDigest, row: ActionEntryRow) {
+        // Repeated publication or read-through completion of one key must
+        // neither allocate another FIFO slot nor evict an unrelated hot row.
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.row = row;
+            entry.inserted_at = Instant::now();
+            return;
+        }
         while self.entries.len() >= self.capacity {
             // FIFO: drop the oldest insertion still present.
             while let Some(oldest) = self.order.pop_front() {
@@ -240,7 +248,14 @@ impl L1ActionCache {
 
     /// Drop one key (generation-fence / external-write hooks).
     pub fn invalidate(&mut self, key: &TypedDigest) -> bool {
-        self.entries.remove(key).is_some()
+        if self.entries.remove(key).is_some() {
+            // Expiry and explicit invalidation remove bookkeeping too. A
+            // historical slot must never evict a later insertion of this key.
+            self.order.retain(|queued| queued != key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Drop everything (authority change, lab reset).
@@ -436,6 +451,94 @@ mod tests {
         // FIFO: the two oldest (keys 0, 1) are gone; key 2 survives.
         assert!(cache.invalidate(&digest(2)), "key 2 should still live");
         assert!(!cache.invalidate(&digest(0)), "key 0 was evicted");
+    }
+
+    #[test]
+    fn repeated_publication_updates_one_slot_and_one_inventory_row() {
+        let mut cache = L1ActionCache::new(8, None);
+        for projection_epoch in 0..20_000 {
+            let mut updated = row(1);
+            updated.projection_epoch = projection_epoch;
+            cache.insert(digest(1), updated);
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.order.len(), 1, "FIFO bookkeeping must also be bounded");
+        assert_eq!(cache.evictions, 0);
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.len(), 1, "inventory must not duplicate a live key");
+        assert_eq!(snapshot[0].projection_epoch, 19_999);
+        assert_eq!(cache.try_get_hit(&digest(1)).unwrap().projection_epoch, 19_999);
+    }
+
+    #[test]
+    fn refreshing_a_full_cache_preserves_other_keys_and_fifo_order() {
+        let mut cache = L1ActionCache::new(2, None);
+        cache.insert(digest(1), row(1));
+        cache.insert(digest(2), row(2));
+        let mut updated = row(1);
+        updated.projection_epoch = 9;
+        cache.insert(digest(1), updated.clone());
+        assert_eq!(cache.evictions, 0, "replacement does not consume capacity");
+        assert_eq!(cache.try_get_hit(&digest(1)), Some(updated));
+        assert_eq!(cache.try_get_hit(&digest(2)), Some(row(2)));
+        assert_eq!(cache.order.len(), 2);
+        cache.insert(digest(3), row(3));
+        assert_eq!(cache.evictions, 1);
+        assert!(cache.try_get_hit(&digest(1)).is_none());
+        assert_eq!(cache.try_get_hit(&digest(2)), Some(row(2)));
+        assert_eq!(cache.try_get_hit(&digest(3)), Some(row(3)));
+        assert_eq!(
+            cache.snapshot().iter().map(|entry| entry.key.clone()).collect::<Vec<_>>(),
+            vec![digest_key(&digest(2)), digest_key(&digest(3))]
+        );
+    }
+
+    #[test]
+    fn invalidation_churn_reclaims_slots_and_cannot_evict_reinserted_keys_early() {
+        let mut cache = L1ActionCache::new(2, None);
+        cache.insert(digest(1), row(1));
+        for _ in 0..10_000 {
+            cache.insert(digest(2), row(2));
+            assert!(cache.invalidate(&digest(2)));
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.order.len(), 1);
+        }
+        assert_eq!(cache.evictions, 0);
+        assert!(cache.invalidate(&digest(1)));
+        assert!(!cache.invalidate(&digest(1)));
+        cache.insert(digest(2), row(2));
+        cache.insert(digest(1), row(1));
+        cache.insert(digest(3), row(3));
+        assert!(cache.try_get_hit(&digest(2)).is_none());
+        assert_eq!(cache.try_get_hit(&digest(1)), Some(row(1)));
+        assert_eq!(cache.try_get_hit(&digest(3)), Some(row(3)));
+        assert_eq!(cache.order.len(), 2);
+        assert_eq!(cache.evictions, 1);
+    }
+
+    #[test]
+    fn repeated_expiry_removes_fifo_slots_and_forces_backend_reads() {
+        let mut cache = L1ActionCache::new(4, Some(Duration::ZERO));
+        let mut backend_calls = 0;
+        for _ in 0..10_000 {
+            assert_eq!(
+                cache.lookup_through(&digest(1), |_| {
+                    backend_calls += 1;
+                    Ok::<_, StoreError>(Some(row(1)))
+                }).unwrap(),
+                Some(row(1))
+            );
+            assert_eq!(cache.order.len(), 1);
+            assert_eq!(cache.snapshot().len(), 1);
+        }
+        assert_eq!(backend_calls, 10_000);
+        assert_eq!(cache.misses, 10_000);
+        assert_eq!(cache.expired, 9_999);
+        assert_eq!(cache.evictions, 0);
+        assert!(cache.try_get_hit(&digest(1)).is_none());
+        assert!(cache.order.is_empty());
+        assert!(cache.is_empty());
+        assert!(cache.snapshot().is_empty());
     }
 
     #[test]
