@@ -91,6 +91,9 @@ impl JournalRecord {
         let mut parts = payload.splitn(3, '|');
         let kind = parts.next()?;
         let attempt_hex = parts.next()?.to_owned();
+        if !canonical_id(&attempt_hex) {
+            return None;
+        }
         match kind {
             "begin" => Some(Self::Begin {
                 attempt_hex,
@@ -190,6 +193,13 @@ fn op_staging_dir(layout: &BlobStoreLayout, op_hex: &str) -> PathBuf {
 
 fn u128_hex(v: u128) -> String {
     format!("{v:032x}")
+}
+
+fn canonical_id(name: &str) -> bool {
+    name.len() == 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Handle to one operation's staging + journal.
@@ -402,8 +412,13 @@ pub fn recover_operations(
     for path in journal_files {
         let op_hex = path
             .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .and_then(|s| s.to_str())
+            .filter(|s| canonical_id(s))
+            .ok_or_else(|| PutError::Io {
+                step: "recovery-operation-id",
+                error: format!("invalid operation journal name: {}", path.display()),
+            })?
+            .to_owned();
         let replay = replay_file(&path)?;
         if replay.torn_tail {
             report.torn_journals.push(op_hex.clone());
@@ -443,6 +458,22 @@ pub fn recover_operations(
 
         for (attempt_hex, declared_key, terminal) in &attempts {
             let attempt_dir = op_staging_dir(layout, &op_hex).join(attempt_hex);
+            // Older sparse transfers share this namespace and own their own
+            // range journal. A terminal raw record may predate their reuse of
+            // the directory. An open raw record is conflicting ownership.
+            if attempt_dir
+                .join("ranges.journal")
+                .try_exists()
+                .map_err(io_err("stat-ranges"))?
+            {
+                if *terminal {
+                    continue;
+                }
+                return Err(PutError::Io {
+                    step: "recovery-attempt-owner",
+                    error: format!("raw and sparse journals both name {op_hex}/{attempt_hex}"),
+                });
+            }
             if *terminal {
                 // Dead writer's leftovers (H003's deferred orphans).
                 remove_recovered_staging(&attempt_dir)?;
@@ -459,11 +490,45 @@ pub fn recover_operations(
         // Every attempt is now terminal: retire the journal and the
         // operation's staging directory. (Rewrite is unnecessary — the
         // resolved state is fully reflected in durable reality.)
-        remove_recovered_staging(&op_staging_dir(layout, &op_hex))?;
+        retire_operation_directory(&op_staging_dir(layout, &op_hex))?;
         fs::remove_file(&path).map_err(io_err("retire-journal"))?;
         report.retired_journals.push(op_hex);
     }
     Ok(report)
+}
+
+// Unjournaled, empty reservations can precede Begin. A nonempty sibling
+// may be a legacy sparse transfer with durable ranges of its own.
+fn retire_operation_directory(path: &Path) -> Result<(), PutError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_err("read-op-staging")(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_err("read-op-entry"))?;
+        if entry.file_name().to_str().is_some_and(canonical_id)
+            && entry.file_type().map_err(io_err("stat-op-entry"))?.is_dir()
+        {
+            remove_empty_directory(&entry.path())?;
+        }
+    }
+    remove_empty_directory(path)
+}
+
+fn remove_empty_directory(path: &Path) -> Result<(), PutError> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(io_err("remove-empty-staging")(error)),
+    }
 }
 
 fn remove_recovered_staging(path: &Path) -> Result<(), PutError> {
@@ -566,6 +631,26 @@ mod tests {
             [(_, _, RecoveryAction::Resumed { .. })]
         ));
         assert!(store.object_located(&declared).unwrap());
+    }
+
+    #[test]
+    fn retiring_raw_journal_preserves_resumable_sparse_siblings() {
+        let layout = fresh_layout("mixed-transfers");
+        let mut store = store();
+        let journal = StagingJournal::open(&layout, 20).unwrap();
+        let unused = journal.reserve_attempt(1).unwrap();
+        let sparse = journal.attempt_dir(2);
+        fs::create_dir(&sparse).unwrap();
+        fs::write(sparse.join("object"), b"partial object").unwrap();
+        fs::write(sparse.join("ranges.journal"), b"range receipts").unwrap();
+        let report = recover_operations(&layout, &mut store, DurabilityPolicy::FULL).unwrap();
+        assert_eq!(report.retired_journals, [u128_hex(20)]);
+        assert!(!unused.exists());
+        assert_eq!(fs::read(sparse.join("object")).unwrap(), b"partial object");
+        assert_eq!(
+            fs::read(sparse.join("ranges.journal")).unwrap(),
+            b"range receipts"
+        );
     }
 
     #[test]
