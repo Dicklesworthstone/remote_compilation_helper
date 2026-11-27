@@ -1767,6 +1767,18 @@ impl BuildHistory {
         project_id: &str,
         owns_source: impl Fn(&str) -> bool,
     ) -> HashSet<String> {
+        self.source_fence_owners(project_id, owns_source)
+            .into_keys()
+            .collect()
+    }
+
+    /// One still-owning wrapper per excluded worker, in fence creation order.
+    /// A recovery command for any one of these wrappers addresses a real hold.
+    pub fn source_fence_owners(
+        &self,
+        project_id: &str,
+        owns_source: impl Fn(&str) -> bool,
+    ) -> HashMap<String, String> {
         let candidates: Vec<SourceFence> = {
             let mut fences = self.source_fences.lock().unwrap_or_else(|e| e.into_inner());
             fences.retain(|fence| fence.created.elapsed() < SOURCE_FENCE_MAX_AGE);
@@ -1777,7 +1789,7 @@ impl BuildHistory {
                 .collect()
         };
         if candidates.is_empty() {
-            return HashSet::new();
+            return HashMap::new();
         }
         // Lease reads happen outside the lock.
         let (held, released): (Vec<_>, Vec<_>) = candidates
@@ -1795,7 +1807,11 @@ impl BuildHistory {
                     })
                 });
         }
-        held.into_iter().map(|fence| fence.worker_id).collect()
+        let mut owners = HashMap::new();
+        for fence in held {
+            owners.entry(fence.worker_id).or_insert(fence.wrapper);
+        }
+        owners
     }
 
     /// Keep `project_id` off `worker_id`: its live checkout refused a sync.

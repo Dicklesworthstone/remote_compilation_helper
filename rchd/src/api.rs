@@ -3193,7 +3193,9 @@ async fn handle_select_worker_mode(
             // Retry if admission evidence changes between selection and reservation.
             let mut reservation_attempts = 0;
             const MAX_ATTEMPTS: u32 = 3;
-            let mut excluded_worker_ids = project_excluded_workers(ctx, &request.project);
+            let mut project_holds = project_exclusions(ctx, &request.project);
+            let mut excluded_worker_ids: std::collections::HashSet<String> =
+                project_holds.keys().cloned().collect();
             // bd-decdd: a worker held for an older starving waiter is busy for
             // this request. Steer off it only when selection actually picks it,
             // so a request the worker would refuse anyway keeps its own reason.
@@ -3213,9 +3215,12 @@ async fn handle_select_worker_mode(
                     .await;
                 *queue_candidates = candidates;
                 let selection_reason = result.reason;
-                let selection_diagnostics = result.diagnostics;
+                let mut selection_diagnostics = result.diagnostics;
 
                 let Some(worker) = result.worker else {
+                    if let Some(diagnostics) = selection_diagnostics.as_mut() {
+                        describe_project_exclusions(diagnostics, &project_holds);
+                    }
                     if local_wrapper_id
                         .as_deref()
                         .is_some_and(|id| ctx.history.wrapper_cancelled(id))
@@ -3391,8 +3396,8 @@ async fn handle_select_worker_mode(
                                 // retired its source. Reconcile outside history
                                 // locks before deciding whether to exclude it,
                                 // preserving unrelated reservation/queue refusals.
-                                excluded_worker_ids
-                                    .extend(project_excluded_workers(ctx, &request.project));
+                                project_holds = project_exclusions(ctx, &request.project);
+                                excluded_worker_ids.extend(project_holds.keys().cloned());
                             } else {
                                 excluded_worker_ids.insert(id.as_str().to_string());
                             }
@@ -4362,6 +4367,7 @@ const DEAD_WRAPPER_HEARTBEAT_STALE_MS: u64 = 15 * 60 * 1000;
 /// source (their registry would refuse the same root, bd-jqhno), and workers
 /// whose live checkout of the project refused a recent sync (bd-fbtws), and
 /// workers where another owner recently kept the project's source (bd-p3kuz).
+#[cfg(test)]
 fn project_excluded_workers(
     ctx: &DaemonContext,
     project: &str,
@@ -4371,12 +4377,12 @@ fn project_excluded_workers(
 
 /// Why selection skips a worker for one project. Selection only needs the
 /// set; `rch diagnose` names the cause (GH #125).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectExclusion {
     /// Every project lane on the worker holds an active build of it.
     LanesFull,
     /// A failed build's client lease still owns the project's source there.
-    SourceFenced,
+    SourceFenced(String),
     /// The worker's live checkout of the project refused a source sync.
     LiveCheckout,
     /// Another owner held the project's source there past the admission wait.
@@ -4384,25 +4390,25 @@ enum ProjectExclusion {
 }
 
 impl ProjectExclusion {
-    fn reason_code(self) -> &'static str {
+    fn reason_code(&self) -> &'static str {
         match self {
             Self::LanesFull => "project.lanes_full",
-            Self::SourceFenced => "project.source_fenced",
+            Self::SourceFenced(_) => "project.source_fenced",
             Self::LiveCheckout => "project.live_checkout_fenced",
             Self::SourceBusy => "project.source_busy_fenced",
         }
     }
 
-    fn reason(self) -> &'static str {
+    fn reason(&self) -> String {
         match self {
-            Self::LanesFull => "every project lane on this worker holds an active build",
-            Self::SourceFenced => {
-                "a failed build's client lease still owns this project's source on this worker"
-            }
+            Self::LanesFull => "every project lane on this worker holds an active build".into(),
+            Self::SourceFenced(wrapper) => format!(
+                "a failed build's client lease has unresolved source on this worker; run `rch jobs recover {wrapper}`"
+            ),
             Self::LiveCheckout => {
-                "this worker's live checkout of the project refused a source sync"
+                "this worker's live checkout of the project refused a source sync".into()
             }
-            Self::SourceBusy => "another owner holds this project's source on this worker",
+            Self::SourceBusy => "another owner holds this project's source on this worker".into(),
         }
     }
 }
@@ -4421,13 +4427,15 @@ fn project_exclusions(
         .filter(|(worker, count)| *count >= ctx.pool.project_lanes(worker) as usize)
         .map(|(worker, _)| (worker, ProjectExclusion::LanesFull))
         .collect();
+    let owners = ctx.history.source_fence_owners(project, |wrapper| {
+        crate::cancellation::client_lease_owns_source(&ctx.client_lease_dir, wrapper)
+    });
+    for (worker, wrapper) in owners {
+        excluded
+            .entry(worker)
+            .or_insert(ProjectExclusion::SourceFenced(wrapper));
+    }
     let fences = [
-        (
-            ctx.history.source_fenced_workers(project, |wrapper| {
-                crate::cancellation::client_lease_owns_source(&ctx.client_lease_dir, wrapper)
-            }),
-            ProjectExclusion::SourceFenced,
-        ),
         (
             ctx.history.live_checkout_fenced_workers(project),
             ProjectExclusion::LiveCheckout,
@@ -4439,7 +4447,7 @@ fn project_exclusions(
     ];
     for (workers, cause) in fences {
         for worker in workers {
-            excluded.entry(worker).or_insert(cause);
+            excluded.entry(worker).or_insert_with(|| cause.clone());
         }
     }
     excluded
@@ -4461,7 +4469,7 @@ fn describe_project_exclusions(
             .iter()
             .any(|code| code == "active_project_exclusion")
         {
-            worker.final_reason = cause.reason().to_string();
+            worker.final_reason = cause.reason();
             worker.reason_codes.push(cause.reason_code().to_string());
         }
     }
@@ -11176,6 +11184,20 @@ mod tests {
                         denied.reason,
                         SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".into())
                     );
+                    let detail = denied
+                        .diagnostics
+                        .unwrap()
+                        .workers
+                        .into_iter()
+                        .find(|worker| worker.worker_id.as_str() == "worker1")
+                        .unwrap();
+                    assert!(
+                        detail.reason_codes.iter().any(|code| code == "project.source_fenced")
+                    );
+                    assert!(detail.final_reason.contains(&format!(
+                        "rch jobs recover {}",
+                        lease.identity.local_wrapper_id
+                    )));
                     // Ordinary cancellation reports the exact existing daemon
                     // receipt; it cannot settle the worker's source obligation.
                     let (result, response) = serve_socket_request(

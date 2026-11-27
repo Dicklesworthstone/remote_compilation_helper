@@ -5776,6 +5776,19 @@ pub async fn run_exec(
                 });
                 std::process::exit(EXIT_BUILD_ERROR);
             }
+            if let Some(hold) = response.diagnostics.as_ref().and_then(|diagnostics| {
+                diagnostics.workers.iter().find(|worker| {
+                    worker
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == "project.source_fenced")
+                })
+            }) {
+                reporter.summary_critical(&format!(
+                    "[RCH] {}: {}",
+                    hold.worker_id, hold.final_reason
+                ));
+            }
             let requested_refusal = requested_worker_refusal(&preferred_workers, &response);
             // A pin that could not be honored is the exact failure the allow-set fix
             // exists for; record a durable incident row so postmortems have a trace
