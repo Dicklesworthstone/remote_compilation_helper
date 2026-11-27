@@ -27,7 +27,8 @@ use crate::edge::live_facts::read_stable;
 use crate::edge::server::report_log_line;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::net::TcpListener;
-use asupersync::runtime::RuntimeBuilder;
+use asupersync::record::RegionLimits;
+use asupersync::runtime::{CheckedJoinHandle, Runtime, RuntimeBuilder};
 use asupersync::signal::ShutdownController;
 use input_cache_storage::InputCacheStorage;
 use operations::{Attachment, Claim, DiagnosticFrontier, Reaper, Registry};
@@ -54,7 +55,6 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use toolchain_inputs::{RemoteToolchainFileCache, ToolchainFileInput};
 use wire::{
@@ -69,6 +69,10 @@ const OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 const OUTPUT_TOTAL_BYTES: u64 = OUTPUT_BYTES + super::MAX_GRAPH_BYTES + 64 * 1024;
 const DELIVERY_BUDGET: Duration = Duration::from_secs(10 * 60);
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
+/// File imports and output verification still contain synchronous I/O. Keep
+/// them off the listener thread, with bounded concurrency independent of the
+/// number of idle, queued or reconnecting clients.
+const NETWORK_WORKERS: usize = 4;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -304,39 +308,94 @@ impl InputCaches {
 
 /// Bounded session slots cover authentication, waiting, upload and delivery.
 /// Unauthenticated connections cannot create input trees or grow a work queue.
-struct Session {
+struct Session<'runtime> {
     stopped: Arc<AtomicBool>,
-    thread: Option<JoinHandle<io::Result<()>>>,
+    task: Option<CheckedJoinHandle<io::Result<()>>>,
+    runtime: &'runtime Runtime,
 }
 
-impl Session {
+impl Session<'_> {
     fn finished(&self) -> bool {
-        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+        self.task
+            .as_ref()
+            .is_none_or(CheckedJoinHandle::is_finished)
     }
-}
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+    fn join(&mut self) -> Result<io::Result<()>, asupersync::runtime::JoinError> {
+        match self.task.take() {
+            Some(task) => block_on_top_level(self.runtime, task),
+            None => Ok(Ok(())),
         }
     }
 }
 
-struct Sessions {
-    connections: Vec<Session>,
+impl Drop for Session<'_> {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        // This owner lives on the synchronous service/listener thread, never
+        // inside a runtime task. Join before releasing input or writer custody,
+        // including during unwind; dropping a task handle alone would detach it.
+        let _ = self.join();
+    }
+}
+
+struct Sessions<'runtime> {
+    connections: Vec<Session<'runtime>>,
     // Fields drop in this order: all session-owned writers join before the
     // final reaper join. Drop first signals both sets of owners together.
     reaper: Reaper<RemoteBuild>,
+    runtime: &'runtime Runtime,
+    maximum: usize,
 }
 
-impl Sessions {
-    fn new(operations: Arc<Registry<RemoteBuild>>) -> io::Result<Self> {
+impl<'runtime> Sessions<'runtime> {
+    fn new(
+        operations: Arc<Registry<RemoteBuild>>,
+        runtime: &'runtime Runtime,
+        maximum: usize,
+    ) -> io::Result<Self> {
         Ok(Self {
             connections: Vec::new(),
             reaper: Reaper::start(operations)?,
+            runtime,
+            maximum,
         })
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.connections.len() < self.maximum
+    }
+
+    fn spawn(
+        &mut self,
+        stopped: Arc<AtomicBool>,
+        work: impl std::future::Future<Output = io::Result<()>> + Send + 'static,
+    ) -> io::Result<()> {
+        if !self.has_capacity() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote canonical session capacity exhausted",
+            ));
+        }
+        let task = self
+            .runtime
+            .handle()
+            .try_spawn_checked(work)
+            .map_err(|error| {
+                let kind = match error {
+                    asupersync::runtime::SpawnError::RegionAtCapacity { .. } => {
+                        io::ErrorKind::WouldBlock
+                    }
+                    _ => io::ErrorKind::Other,
+                };
+                io::Error::new(kind, format!("remote session admission: {error:?}"))
+            })?;
+        self.connections.push(Session {
+            stopped,
+            task: Some(task),
+            runtime: self.runtime,
+        });
+        Ok(())
     }
 
     fn cancel_all(&self) {
@@ -350,13 +409,13 @@ impl Sessions {
         while index < self.connections.len() {
             if self.connections[index].finished() {
                 let mut session = self.connections.swap_remove(index);
-                if let Some(thread) = session.thread.take() {
-                    match thread.join() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            report_log_line(&format!("remote canonical session: {error}"));
-                        }
-                        Err(_) => report_log_line("remote canonical session thread panicked"),
+                match session.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        report_log_line(&format!("remote canonical session: {error}"));
+                    }
+                    Err(error) => {
+                        report_log_line(&format!("remote canonical session task: {error:?}"));
                     }
                 }
             } else {
@@ -372,17 +431,47 @@ impl Sessions {
 
     fn shutdown(mut self) -> io::Result<()> {
         self.signal_shutdown();
-        self.connections.clear();
-        self.reaper.finish()
+        let mut joined = Ok(());
+        for mut session in self.connections.drain(..) {
+            if let Err(error) = session.join() {
+                joined = Err(io::Error::other(format!(
+                    "remote canonical session drain: {error:?}"
+                )));
+            }
+        }
+        // Evaluate both drains, even after a failed task join. Authority and
+        // operation admission remain owned until the detached writers finish.
+        let reaped = self.reaper.finish();
+        joined.and(reaped)
     }
 }
 
-impl Drop for Sessions {
+impl Drop for Sessions<'_> {
     fn drop(&mut self) {
         // Includes unwind: signal attached/pre-admission sessions and detached
         // operations before any field destructor joins an operation writer.
         self.signal_shutdown();
     }
+}
+
+fn session_runtime(maximum: usize) -> io::Result<Runtime> {
+    require(
+        maximum > 0,
+        "remote canonical session capacity must be nonzero",
+    )?;
+    RuntimeBuilder::new()
+        .worker_threads(maximum.min(NETWORK_WORKERS))
+        .thread_name_prefix("rabs-remote-network")
+        // Admission must reserve a root-region slot synchronously rather
+        // than enqueueing an unadmitted task in the spawn mailbox.
+        .spawn_admission(asupersync::runtime::config::SpawnAdmissionMode::Direct)
+        .global_queue_limit(maximum)
+        .root_region_limits(RegionLimits {
+            max_tasks: Some(maximum),
+            ..RegionLimits::UNLIMITED
+        })
+        .build()
+        .map_err(|error| io::Error::other(format!("remote listener runtime: {error:?}")))
 }
 
 /// Serve enrolled edge clients until SIGINT/SIGTERM or coordinator failure.
@@ -403,9 +492,10 @@ pub fn run_service_profile(
             .edge_coordinator_acceptor()
             .map_err(io::Error::other)?,
     );
-    let network = RuntimeBuilder::current_thread()
-        .build()
-        .map_err(|error| io::Error::other(format!("remote listener runtime: {error:?}")))?;
+    // One runtime owns every accepted session and its timers/reactor. Both the
+    // live owner set and runtime region reject excess tasks; there is no hidden
+    // unbounded executor queue and no runtime or OS thread per connection.
+    let network = session_runtime(config.max_sessions())?;
     let listener = block_on_top_level(&network, TcpListener::bind(config.listen))?;
     // Finish fallible cache setup before starting the coordinator's threads.
     let caches = Arc::new(InputCaches::new(&config)?);
@@ -437,7 +527,8 @@ pub fn run_service_profile(
     let config = Arc::new(config);
     let shutdown = Arc::new(ShutdownController::new());
     shutdown.listen_for_signals();
-    let mut sessions = match Sessions::new(Arc::clone(&operations)) {
+    let mut sessions = match Sessions::new(Arc::clone(&operations), &network, config.max_sessions())
+    {
         Ok(sessions) => sessions,
         Err(error) => {
             let _ = runtime.shutdown();
@@ -458,6 +549,8 @@ pub fn run_service_profile(
         "target_cache":config.target_cache.as_ref().map(|cache| json!({
             "runtime_epoch":cache.runtime_epoch,
             "max_bytes":cache.max_bytes, "max_families":cache.max_families})),
+        "network_workers":config.max_sessions().min(NETWORK_WORKERS),
+        "max_sessions":config.max_sessions(),
         "jobs_per_root":config.jobs_per_root, "build_identity":build_identity,
         "required_release":release_mode == ReleaseAuthorizationMode::Required,
         "transport":"mutual-tls-atp", "cargo_location":"coordinator"})
@@ -484,7 +577,7 @@ pub fn run_service_profile(
             Ok(Err(error)) => break Err(error),
             Ok(Ok((stream, _))) => stream,
         };
-        if sessions.connections.len() >= config.max_sessions() {
+        if !sessions.has_capacity() {
             // No plaintext rejection on an authenticated-only endpoint. No
             // admission took place. Only an already issued operation token
             // can reattach; a new command is never automatically replayed.
@@ -500,54 +593,53 @@ pub fn run_service_profile(
         let child_caches = Arc::clone(&caches);
         let child_acceptor = Arc::clone(&acceptor);
         let child_pins = Arc::clone(&pins);
-        // The accepted socket has not been polled. Its first I/O registration
-        // belongs to this session runtime, never the listener's reactor.
-        let thread = match std::thread::Builder::new()
-            .name("rabs-remote-session".into())
-            .spawn(move || {
-                let network = RuntimeBuilder::current_thread().build().map_err(|error| {
-                    io::Error::other(format!("remote session runtime: {error:?}"))
-                })?;
-                block_on_top_level(&network, async {
-                    let peer = accept_edge_peer(&child_acceptor, stream, &child_pins)
+        // The listener and accepted sockets stay on the same runtime/IO
+        // driver. Checked joins contain one session's panic without losing the
+        // remaining sessions or skipping their cancellation and writer drain.
+        if let Err(error) = sessions.spawn(stopped, async move {
+            let peer =
+                wire::controlled_future(&child_stop, Instant::now() + wire::IO_BUDGET, async {
+                    accept_edge_peer(&child_acceptor, stream, &child_pins)
                         .await
-                        .map_err(io::Error::other)?;
-                    // Namespace reuse by the key actually authenticated and
-                    // enrolled by TLS, never a client-supplied Hello field.
-                    let edge_pin = peer.identity.peer_id;
-                    let mut wire = Wire::new(peer.stream);
-                    let result = handle_session(
-                        &mut wire,
-                        child_runtime,
-                        &child_config,
-                        &child_admissions,
-                        &child_operations,
-                        &child_caches,
-                        edge_pin,
+                        .map_err(io::Error::other)
+                })
+                .await?;
+            // Namespace reuse by the key actually authenticated and
+            // enrolled by TLS, never a client-supplied Hello field.
+            let edge_pin = peer.identity.peer_id;
+            let mut wire = Wire::new(peer.stream);
+            let result = handle_session(
+                &mut wire,
+                child_runtime,
+                &child_config,
+                &child_admissions,
+                &child_operations,
+                &child_caches,
+                edge_pin,
+                &child_stop,
+            )
+            .await;
+            if let Err(error) = &result {
+                let _ = wire
+                    .send(
+                        &Message::Failure {
+                            message: error.to_string().chars().take(4096).collect(),
+                        },
                         &child_stop,
+                        Instant::now() + wire::IO_BUDGET,
                     )
                     .await;
-                    if let Err(error) = &result {
-                        let _ = wire
-                            .send(
-                                &Message::Failure {
-                                    message: error.to_string().chars().take(4096).collect(),
-                                },
-                                &child_stop,
-                                Instant::now() + wire::IO_BUDGET,
-                            )
-                            .await;
-                    }
-                    result
-                })
-            }) {
-            Ok(thread) => thread,
-            Err(error) => break Err(error),
-        };
-        sessions.connections.push(Session {
-            stopped,
-            thread: Some(thread),
-        });
+            }
+            result
+        }) {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                // A task can publish its checked result just before the
+                // scheduler retires the root-region slot. Refuse this socket
+                // without disturbing other clients or building a hidden queue.
+                continue;
+            }
+            break Err(error);
+        }
     };
     drop(listener);
     // Stop queued and pre-Ready sessions before releasing any retained permit.
@@ -1658,6 +1750,247 @@ mod tests {
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
 
+    #[test]
+    fn network_sessions_share_bounded_runtime_and_drain_silent_connections() {
+        use std::io::{BufRead, Write};
+        use std::sync::mpsc;
+
+        // More simultaneous live sockets than executor workers proves that
+        // waiting clients share the reactor rather than occupying one thread
+        // and runtime each. Exercise explicit shutdown and the Drop backstop.
+        let maximum = NETWORK_WORKERS + 2;
+        for explicit_shutdown in [false, true] {
+            let network = session_runtime(maximum).unwrap();
+            assert_eq!(network.config().worker_threads, NETWORK_WORKERS);
+            let authority = rabs_protocol::authority::CoordinatorAuthority {
+                cluster_id: rabs_protocol::authority::ClusterId("shared-network-test".into()),
+                credential_generation: 1,
+                term: 1,
+                incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(1),
+            };
+            let operations = Registry::new(authority, 1, Duration::from_secs(1)).unwrap();
+            let mut sessions = Sessions::new(operations, &network, maximum).unwrap();
+            let listener = block_on_top_level(&network, TcpListener::bind("127.0.0.1:0")).unwrap();
+            let address = listener.local_addr().unwrap();
+            let (started, starts) = mpsc::channel();
+            let (completed, completions) = mpsc::channel();
+            let mut clients = Vec::new();
+            let mut stops = Vec::new();
+            for index in 0..maximum {
+                let client = std::net::TcpStream::connect(address).unwrap();
+                client
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                client
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let (stream, _) = block_on_top_level(
+                    &network,
+                    asupersync::time::timeout(
+                        runtime_transport_now(),
+                        Duration::from_secs(3),
+                        listener.accept(),
+                    ),
+                )
+                .unwrap()
+                .unwrap();
+                let stopped = Arc::new(AtomicBool::new(false));
+                let child_stop = Arc::clone(&stopped);
+                let started = started.clone();
+                let completed = completed.clone();
+                sessions
+                    .spawn(Arc::clone(&stopped), async move {
+                        let cx = asupersync::cx::Cx::current().expect("session owns runtime Cx");
+                        started
+                            .send((cx.region_id(), std::thread::current().id()))
+                            .unwrap();
+                        let mut wire = Wire::new(stream);
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        let result = async {
+                            require(
+                                matches!(
+                                    wire.receive(&child_stop, deadline).await?,
+                                    Message::Poll {}
+                                ),
+                                "expected test poll",
+                            )?;
+                            wire.send(&Message::Queued {}, &child_stop, deadline).await
+                        }
+                        .await;
+                        completed
+                            .send((index, result.as_ref().err().map(io::Error::kind)))
+                            .unwrap();
+                        result
+                    })
+                    .unwrap();
+                clients.push(client);
+                stops.push(stopped);
+            }
+            let mut regions = Vec::new();
+            let mut threads = std::collections::HashSet::new();
+            for _ in 0..maximum {
+                let (region, thread) = starts.recv_timeout(Duration::from_secs(3)).unwrap();
+                regions.push(region);
+                threads.insert(thread);
+            }
+            assert!(regions.windows(2).all(|pair| pair[0] == pair[1]));
+            assert!(threads.len() <= NETWORK_WORKERS);
+            assert!(!sessions.has_capacity());
+            let polled = Arc::new(AtomicBool::new(false));
+            let rejected = Arc::clone(&polled);
+            assert_eq!(
+                sessions
+                    .spawn(Arc::new(AtomicBool::new(false)), async move {
+                        rejected.store(true, Ordering::Release);
+                        Ok(())
+                    })
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert!(!polled.load(Ordering::Acquire));
+            // The executor itself also refuses overflow: an accidental caller
+            // cannot bypass Sessions and create an unbounded pending-task lane.
+            assert!(matches!(
+                network.handle().try_spawn_checked(async {}),
+                Err(asupersync::runtime::SpawnError::RegionAtCapacity { .. })
+            ));
+
+            // One cancelled quiet peer must finish without waking or cancelling
+            // the other peers. A healthy peer still exchanges real socket data.
+            stops[0].store(true, Ordering::Release);
+            assert_eq!(
+                completions.recv_timeout(Duration::from_secs(3)).unwrap(),
+                (0, Some(io::ErrorKind::Interrupted))
+            );
+            clients[1].write_all(&record(&Message::Poll {})).unwrap();
+            let mut reply = String::new();
+            std::io::BufReader::new(&mut clients[1])
+                .read_line(&mut reply)
+                .unwrap();
+            assert_eq!(reply.as_bytes(), record(&Message::Queued {}));
+            assert_eq!(
+                completions.recv_timeout(Duration::from_secs(3)).unwrap(),
+                (1, None)
+            );
+            assert!(stops[2..].iter().all(|stop| !stop.load(Ordering::Acquire)));
+
+            if explicit_shutdown {
+                sessions.shutdown().unwrap();
+            } else {
+                drop(sessions);
+            }
+            assert!(stops.iter().all(|stop| stop.load(Ordering::Acquire)));
+            let mut drained = std::collections::BTreeSet::new();
+            for _ in 2..maximum {
+                let (index, error) = completions.recv_timeout(Duration::from_secs(3)).unwrap();
+                assert_eq!(error, Some(io::ErrorKind::Interrupted));
+                assert!(drained.insert(index));
+            }
+            assert_eq!(drained, (2..maximum).collect());
+            // A completed drain releases the region slots, not merely our
+            // local accounting. The same runtime remains usable afterwards.
+            let task = network.handle().try_spawn_checked(async { 42_u8 }).unwrap();
+            assert_eq!(block_on_top_level(&network, task).unwrap(), 42);
+        }
+    }
+
+    #[test]
+    fn network_listener_can_reach_shutdown_while_session_workers_are_busy() {
+        let network = session_runtime(NETWORK_WORKERS).unwrap();
+        let authority = rabs_protocol::authority::CoordinatorAuthority {
+            cluster_id: rabs_protocol::authority::ClusterId("busy-network-test".into()),
+            credential_generation: 1,
+            term: 1,
+            incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(1),
+        };
+        let operations = Registry::new(authority, 1, Duration::from_secs(1)).unwrap();
+        let mut sessions = Sessions::new(operations, &network, NETWORK_WORKERS).unwrap();
+        let listener = block_on_top_level(&network, TcpListener::bind("127.0.0.1:0")).unwrap();
+        let (started, starts) = std::sync::mpsc::channel();
+        let joined = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..NETWORK_WORKERS {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let child_stop = Arc::clone(&stopped);
+            let started = started.clone();
+            let joined = Arc::clone(&joined);
+            sessions
+                .spawn(stopped, async move {
+                    started.send(std::thread::current().id()).unwrap();
+                    // Synchronous import/hash paths do not yield to the
+                    // executor. Occupy every worker until shutdown signals
+                    // them; a listener on the worker pool would be stranded.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !child_stop.load(Ordering::Acquire) {
+                        if Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "listener did not reach shutdown while workers were busy",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    joined.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let mut threads = std::collections::HashSet::new();
+        for _ in 0..NETWORK_WORKERS {
+            threads.insert(starts.recv_timeout(Duration::from_secs(3)).unwrap());
+        }
+        assert_eq!(threads.len(), NETWORK_WORKERS);
+        let started = Instant::now();
+        assert!(
+            block_on_top_level(
+                &network,
+                asupersync::time::timeout(runtime_transport_now(), ACCEPT_POLL, listener.accept(),),
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        sessions.shutdown().unwrap();
+        assert_eq!(joined.load(Ordering::Acquire), NETWORK_WORKERS);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn network_session_shutdown_reports_panics_after_draining_other_owners() {
+        let network = session_runtime(2).unwrap();
+        let authority = rabs_protocol::authority::CoordinatorAuthority {
+            cluster_id: rabs_protocol::authority::ClusterId("network-panic-test".into()),
+            credential_generation: 1,
+            term: 1,
+            incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(1),
+        };
+        let operations = Registry::new(authority, 1, Duration::from_secs(1)).unwrap();
+        let mut sessions = Sessions::new(operations, &network, 2).unwrap();
+        sessions
+            .spawn(Arc::new(AtomicBool::new(false)), async {
+                std::panic::resume_unwind(Box::new("session panic during drain"));
+            })
+            .unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let child_stop = Arc::clone(&stopped);
+        let joined = Arc::new(AtomicBool::new(false));
+        let child_joined = Arc::clone(&joined);
+        sessions
+            .spawn(stopped, async move {
+                let result = wire::controlled_future(
+                    &child_stop,
+                    Instant::now() + Duration::from_secs(3),
+                    std::future::pending::<io::Result<()>>(),
+                )
+                .await;
+                child_joined.store(true, Ordering::Release);
+                result
+            })
+            .unwrap();
+        let error = sessions.shutdown().unwrap_err();
+        assert!(error.to_string().contains("session drain"), "{error}");
+        assert!(joined.load(Ordering::Acquire));
+    }
+
     #[cfg(panic = "unwind")]
     #[test]
     fn stalled_session_notices_allow_cancellation_join_and_admission_reuse() {
@@ -1675,24 +2008,23 @@ mod tests {
                         incarnation_id: rabs_protocol::authority::CoordinatorIncarnationId(1),
                     };
                     let operations = Registry::new(authority, 1, Duration::from_secs(1)).unwrap();
-                    let mut sessions = Sessions::new(operations).unwrap();
-                    let failed = std::thread::spawn(move || {
-                        if panicked {
-                            // Model the already-panicked session without its
-                            // panic hook itself writing to the full test pipe.
-                            std::panic::resume_unwind(Box::new("injected session failure"));
-                        }
-                        Err(io::Error::other("injected session error"))
-                    });
+                    let network = session_runtime(2).unwrap();
+                    let mut sessions = Sessions::new(operations, &network, 2).unwrap();
+                    sessions
+                        .spawn(Arc::new(AtomicBool::new(false)), async move {
+                            if panicked {
+                                // Model an already-panicked session without its
+                                // panic hook writing to the full test pipe.
+                                std::panic::resume_unwind(Box::new("injected session failure"));
+                            }
+                            Err(io::Error::other("injected session error"))
+                        })
+                        .unwrap();
                     let deadline = Instant::now() + Duration::from_secs(3);
-                    while !failed.is_finished() {
+                    while !sessions.connections[0].finished() {
                         assert!(Instant::now() < deadline);
                         std::thread::sleep(Duration::from_millis(1));
                     }
-                    sessions.connections.push(Session {
-                        stopped: Arc::new(AtomicBool::new(false)),
-                        thread: Some(failed),
-                    });
 
                     let admissions = OperationAdmissions::new(1, 1);
                     let admitted = admissions.enqueue().unwrap().try_start().unwrap().unwrap();
@@ -1700,17 +2032,20 @@ mod tests {
                     let child_stop = Arc::clone(&stopped);
                     let joined = Arc::new(AtomicBool::new(false));
                     let child_joined = Arc::clone(&joined);
-                    sessions.connections.push(Session {
-                        stopped: Arc::clone(&stopped),
-                        thread: Some(std::thread::spawn(move || {
+                    sessions
+                        .spawn(Arc::clone(&stopped), async move {
                             while !child_stop.load(Ordering::Acquire) {
-                                std::thread::sleep(Duration::from_millis(1));
+                                asupersync::time::sleep(
+                                    runtime_transport_now(),
+                                    Duration::from_millis(1),
+                                )
+                                .await;
                             }
                             drop(admitted);
                             child_joined.store(true, Ordering::Release);
                             Ok(())
-                        })),
-                    });
+                        })
+                        .unwrap();
                     let mut next = admissions.enqueue().unwrap();
                     assert!(next.try_start().unwrap().is_none());
                     assert!(!stopped.load(Ordering::Acquire));
