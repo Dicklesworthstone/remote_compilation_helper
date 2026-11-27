@@ -145,6 +145,48 @@ impl L1ActionCache {
         }
     }
 
+    /// Non-blocking L1 hit probe without holding a backend closure (K003).
+    ///
+    /// On a fresh hit: records hit count and hit latency and returns `Some(row)`.
+    /// On miss or TTL expiry: removes any expired entry (incrementing `expired`)
+    /// and returns `None` so the caller can release any cache lock before querying
+    /// L2 SQLite and then call [`Self::record_miss_result`].
+    pub fn try_get_hit(&mut self, key: &TypedDigest) -> Option<ActionEntryRow> {
+        let start = Instant::now();
+        if let Some(entry) = self.entries.get(key) {
+            let fresh = self.ttl.is_none_or(|ttl| entry.inserted_at.elapsed() < ttl);
+            if fresh {
+                self.hits += 1;
+                self.hit_latencies.record(start.elapsed().as_nanos());
+                return Some(entry.row.clone());
+            }
+            self.entries.remove(key);
+            self.expired += 1;
+        }
+        None
+    }
+
+    /// Complete a split read-through miss after querying L2 outside the cache lock.
+    pub fn record_miss_result(
+        &mut self,
+        key: &TypedDigest,
+        outcome: Option<ActionEntryRow>,
+        elapsed_nanos: u128,
+    ) -> Option<ActionEntryRow> {
+        self.misses += 1;
+        self.miss_latencies.record(elapsed_nanos);
+        match outcome {
+            Some(row) => {
+                self.insert(key.clone(), row.clone());
+                Some(row)
+            }
+            None => {
+                self.negatives += 1;
+                None
+            }
+        }
+    }
+
     /// Read-through lookup for one dependency action key.
     ///
     /// L1 hit: returns the cached row, backend closure NOT invoked,
@@ -158,29 +200,17 @@ impl L1ActionCache {
         mut backend: impl FnMut(&TypedDigest) -> Result<Option<ActionEntryRow>, E>,
     ) -> Result<Option<ActionEntryRow>, E> {
         let start = Instant::now();
-        // Expired entries are misses, not hits.
-        if let Some(entry) = self.entries.get(key) {
-            let fresh = self.ttl.is_none_or(|ttl| entry.inserted_at.elapsed() < ttl);
-            if fresh {
-                self.hits += 1;
-                self.hit_latencies.record(start.elapsed().as_nanos());
-                return Ok(Some(entry.row.clone()));
-            }
-            self.entries.remove(key);
-            self.expired += 1;
+        if let Some(row) = self.try_get_hit(key) {
+            return Ok(Some(row));
         }
-        self.misses += 1;
         let backend_result = backend(key);
         let nanos = start.elapsed().as_nanos();
-        self.miss_latencies.record(nanos);
-        match backend_result? {
-            Some(row) => {
-                self.insert(key.clone(), row.clone());
-                Ok(Some(row))
-            }
-            None => {
-                self.negatives += 1;
-                Ok(None)
+        match backend_result {
+            Ok(outcome) => Ok(self.record_miss_result(key, outcome, nanos)),
+            Err(err) => {
+                self.misses += 1;
+                self.miss_latencies.record(nanos);
+                Err(err)
             }
         }
     }

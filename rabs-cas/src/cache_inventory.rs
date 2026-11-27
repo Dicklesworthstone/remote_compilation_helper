@@ -102,10 +102,30 @@ pub struct CacheInventoryReport {
 pub struct L1Inventory {
     /// Configured capacity.
     pub capacity: usize,
-    /// Live entries, FIFO order (oldest first).
+    /// Total live entries in the cache (preserved accurately even when `entries`
+    /// is bounded in a persisted snapshot).
+    pub live_entries: usize,
+    /// Live entries, FIFO order (oldest first; bounded in persisted snapshots).
     pub entries: Vec<L1EntrySnapshot>,
     /// Lookup statistics.
     pub stats: LookupStats,
+}
+
+impl L1Inventory {
+    /// Capture an in-memory inventory snapshot from `cache` (bounded to at most
+    /// [`MAX_L1_SNAPSHOT_ENTRIES`] entry rows while preserving exact `live_entries`).
+    #[must_use]
+    pub fn from_cache(cache: &L1ActionCache) -> Self {
+        let mut entries = cache.snapshot();
+        let live_entries = cache.len();
+        entries.truncate(MAX_L1_SNAPSHOT_ENTRIES);
+        Self {
+            capacity: cache.capacity(),
+            live_entries,
+            entries,
+            stats: cache.stats(),
+        }
+    }
 }
 
 /// Enumerate L2 project caches under `l2_root` (`<project>/<hash>`).
@@ -191,13 +211,190 @@ fn worker_toolchains<E: SqlEngine>(
         .collect())
 }
 
-/// Build the full inventory.
+/// Filename under `cas_root` holding the daemon's read-only L1 inventory
+/// snapshot so out-of-process CLI commands (`rch rabs inventory`) can inspect
+/// live L1 cache capacity, entry count, and lookup stats without an RPC hop.
+pub const L1_SNAPSHOT_FILENAME: &str = "l1-inventory.snapshot";
+
+const L1_SNAPSHOT_HEADER: &str = "rabs-l1-snapshot-v1";
+const MAX_L1_SNAPSHOT_BYTES: u64 = 512 * 1024;
+const MAX_L1_SNAPSHOT_ENTRIES: usize = 256;
+
+static SNAPSHOT_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Atomically persist an already-captured [`L1Inventory`] under `cas_root`
+/// (`0600` on Unix) using a collision-free per-write temp file so callers can
+/// drop cache locks before performing disk I/O.
+///
+/// # Errors
+/// Standard filesystem I/O errors when writing or renaming the temp file.
+pub fn write_l1_inventory_snapshot(
+    cas_root: &Path,
+    inventory: &L1Inventory,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    use std::sync::atomic::Ordering;
+
+    std::fs::create_dir_all(cas_root)?;
+    let stats = &inventory.stats;
+    let mut body = String::new();
+    let _ = writeln!(body, "{L1_SNAPSHOT_HEADER}");
+    let _ = writeln!(body, "capacity={}", inventory.capacity);
+    let _ = writeln!(body, "live_entries={}", inventory.live_entries);
+    let _ = writeln!(body, "hits={}", stats.hits);
+    let _ = writeln!(body, "misses={}", stats.misses);
+    let _ = writeln!(body, "negatives={}", stats.negatives);
+    let _ = writeln!(body, "evictions={}", stats.evictions);
+    let _ = writeln!(body, "expired={}", stats.expired);
+    let _ = writeln!(body, "hit_p50_nanos={}", stats.hit_p50_nanos);
+    let _ = writeln!(body, "hit_p99_nanos={}", stats.hit_p99_nanos);
+    let _ = writeln!(body, "hit_max_nanos={}", stats.hit_max_nanos);
+    let _ = writeln!(body, "miss_p50_nanos={}", stats.miss_p50_nanos);
+    let _ = writeln!(body, "miss_p99_nanos={}", stats.miss_p99_nanos);
+    for entry in inventory.entries.iter().take(MAX_L1_SNAPSHOT_ENTRIES) {
+        let _ = writeln!(
+            body,
+            "entry={} {} {}",
+            entry.key, entry.key_epoch, entry.projection_epoch
+        );
+    }
+
+    let final_path = cas_root.join(L1_SNAPSHOT_FILENAME);
+    let (tmp_path, mut file) = loop {
+        let seq = SNAPSHOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = cas_root.join(format!(
+            ".{L1_SNAPSHOT_FILENAME}.tmp.{}.{seq}",
+            std::process::id()
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    let write_res = (|| -> std::io::Result<()> {
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(final_path)
+}
+
+/// Atomically persist a privacy-safe, bounded read-only snapshot of `cache`
+/// under `cas_root` (`0600` on Unix). Action keys are opaque cryptographic
+/// digests; no source paths or environment values ever appear here.
+///
+/// # Errors
+/// Standard filesystem I/O errors when writing or renaming the temp file.
+pub fn write_l1_snapshot(
+    cas_root: &Path,
+    cache: &L1ActionCache,
+) -> std::io::Result<std::path::PathBuf> {
+    let inventory = L1Inventory::from_cache(cache);
+    write_l1_inventory_snapshot(cas_root, &inventory)
+}
+
+/// Read-only loader for `<cas_root>/l1-inventory.snapshot`. Returns `None` if
+/// absent, non-regular, oversized, or malformed — never creates or mutates any
+/// file on disk.
+#[must_use]
+pub fn read_l1_snapshot(cas_root: &Path) -> Option<L1Inventory> {
+    use std::io::Read as _;
+
+    let path = cas_root.join(L1_SNAPSHOT_FILENAME);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
+        return None;
+    }
+    let file = std::fs::File::open(&path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_L1_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_L1_SNAPSHOT_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != L1_SNAPSHOT_HEADER {
+        return None;
+    }
+
+    let mut capacity: Option<usize> = None;
+    let mut live_entries: Option<usize> = None;
+    let mut stats = LookupStats::default();
+    let mut entries = Vec::new();
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("entry=") {
+            if entries.len() >= MAX_L1_SNAPSHOT_ENTRIES {
+                continue;
+            }
+            let mut parts = rest.split_whitespace();
+            let key = parts.next()?.to_owned();
+            let key_epoch = parts.next()?.parse::<u32>().ok()?;
+            let projection_epoch = parts.next()?.parse::<u32>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            entries.push(L1EntrySnapshot {
+                key,
+                key_epoch,
+                projection_epoch,
+            });
+            continue;
+        }
+        let (k, v) = line.split_once('=')?;
+        match k {
+            "capacity" => capacity = Some(v.parse().ok()?),
+            "live_entries" => live_entries = Some(v.parse().ok()?),
+            "hits" => stats.hits = v.parse().ok()?,
+            "misses" => stats.misses = v.parse().ok()?,
+            "negatives" => stats.negatives = v.parse().ok()?,
+            "evictions" => stats.evictions = v.parse().ok()?,
+            "expired" => stats.expired = v.parse().ok()?,
+            "hit_p50_nanos" => stats.hit_p50_nanos = v.parse().ok()?,
+            "hit_p99_nanos" => stats.hit_p99_nanos = v.parse().ok()?,
+            "hit_max_nanos" => stats.hit_max_nanos = v.parse().ok()?,
+            "miss_p50_nanos" => stats.miss_p50_nanos = v.parse().ok()?,
+            "miss_p99_nanos" => stats.miss_p99_nanos = v.parse().ok()?,
+            _ => return None,
+        }
+    }
+
+    let capacity = capacity?;
+    let live_entries = live_entries.unwrap_or(entries.len());
+    Some(L1Inventory {
+        capacity,
+        live_entries,
+        entries,
+        stats,
+    })
+}
+
+/// Build the full inventory from an optional already-extracted [`L1Inventory`]
+/// (either live in-process or read from [`read_l1_snapshot`]).
 ///
 /// # Errors
 /// Typed [`crate::metadata_store::StoreError`] from the store scans.
-pub fn build_report<E: SqlEngine>(
+pub fn build_report_with_l1<E: SqlEngine>(
     store: &mut SqlMetadataStore<E>,
-    l1: Option<&L1ActionCache>,
+    l1: Option<L1Inventory>,
     l2_root: &Path,
     policy: &NamespacePolicy,
 ) -> Result<CacheInventoryReport, crate::metadata_store::StoreError> {
@@ -214,12 +411,6 @@ pub fn build_report<E: SqlEngine>(
         }
     }
 
-    let l1 = l1.map(|cache| L1Inventory {
-        capacity: cache.capacity(),
-        entries: cache.snapshot(),
-        stats: cache.stats(),
-    });
-
     Ok(CacheInventoryReport {
         l1,
         l2_visible,
@@ -227,6 +418,25 @@ pub fn build_report<E: SqlEngine>(
         toolchains: worker_toolchains(store)?,
         store: store_facts(store)?,
     })
+}
+
+/// Build the full inventory.
+///
+/// # Errors
+/// Typed [`crate::metadata_store::StoreError`] from the store scans.
+pub fn build_report<E: SqlEngine>(
+    store: &mut SqlMetadataStore<E>,
+    l1: Option<&L1ActionCache>,
+    l2_root: &Path,
+    policy: &NamespacePolicy,
+) -> Result<CacheInventoryReport, crate::metadata_store::StoreError> {
+    let l1 = l1.map(|cache| L1Inventory {
+        capacity: cache.capacity(),
+        live_entries: cache.len(),
+        entries: cache.snapshot(),
+        stats: cache.stats(),
+    });
+    build_report_with_l1(store, l1, l2_root, policy)
 }
 
 #[cfg(test)]
@@ -311,5 +521,79 @@ mod tests {
         // Silence unused-import style lints for types used above only via
         // inference paths.
         let _: Option<LookupStats> = None;
+    }
+
+    #[test]
+    fn l1_snapshot_round_trips_and_rejects_corrupt_or_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_l1_snapshot(dir.path()), None);
+
+        let mut cache = L1ActionCache::new(16, None);
+        let key = rabs_protocol::result_identity::TypedDigest {
+            algorithm: rabs_protocol::result_identity::DigestAlgorithm::Sha256V1,
+            domain: "rabs.action-key.sha256.v1",
+            bytes: [9u8; 32],
+        };
+        cache.insert(
+            key.clone(),
+            crate::metadata_store::ActionEntryRow {
+                action_key: key.clone(),
+                key_epoch: 3,
+                projection_epoch: 7,
+            },
+        );
+        let _: Option<_> = cache
+            .lookup_through(&key, |_| Ok::<_, ()>(None))
+            .expect("hit");
+
+        let path = write_l1_snapshot(dir.path(), &cache).unwrap();
+        assert!(path.is_file());
+        let loaded = read_l1_snapshot(dir.path()).expect("snapshot must parse");
+        assert_eq!(loaded.capacity, 16);
+        assert_eq!(loaded.live_entries, 1);
+        assert_eq!(loaded.stats.hits, 1);
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].key_epoch, 3);
+        assert_eq!(loaded.entries[0].projection_epoch, 7);
+
+        // Corrupt header is refused cleanly without panicking.
+        std::fs::write(&path, "not-a-valid-snapshot\n").unwrap();
+        assert_eq!(read_l1_snapshot(dir.path()), None);
+
+        // Over-limit cache (> MAX_L1_SNAPSHOT_ENTRIES) preserves exact live_entries
+        // while bounding persisted entry lines, and concurrent writes never collide.
+        let mut big = L1ActionCache::new(512, None);
+        for i in 0..270_u16 {
+            let mut bytes = [0u8; 32];
+            bytes[0..2].copy_from_slice(&i.to_be_bytes());
+            let k = rabs_protocol::result_identity::TypedDigest {
+                algorithm: rabs_protocol::result_identity::DigestAlgorithm::Sha256V1,
+                domain: "rabs.action-key.sha256.v1",
+                bytes,
+            };
+            big.insert(
+                k.clone(),
+                crate::metadata_store::ActionEntryRow {
+                    action_key: k,
+                    key_epoch: 1,
+                    projection_epoch: 1,
+                },
+            );
+        }
+        let inv = L1Inventory::from_cache(&big);
+        assert_eq!(inv.live_entries, 270);
+        assert_eq!(inv.entries.len(), MAX_L1_SNAPSHOT_ENTRIES);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..8 {
+                        write_l1_inventory_snapshot(dir.path(), &inv).unwrap();
+                    }
+                });
+            }
+        });
+        let loaded_big = read_l1_snapshot(dir.path()).expect("concurrent snapshot readable");
+        assert_eq!(loaded_big.live_entries, 270);
+        assert_eq!(loaded_big.entries.len(), MAX_L1_SNAPSHOT_ENTRIES);
     }
 }

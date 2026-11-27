@@ -4,7 +4,7 @@
 
 use super::super::*;
 use crate::janitor::store::mount_and_reconcile;
-use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, put_if_absent};
+use rabs_cas::blob_store::{DurabilityPolicy, PutLimits, RAW_PROFILE_V1, put_if_absent};
 use rabs_cas::metadata_store::{RusqliteEngine, SqlEngine};
 use rabs_cas::test_support::{
     FixtureAttemptIds, install_admission_world, install_admission_world_with_ids,

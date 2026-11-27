@@ -1233,6 +1233,132 @@ pub fn record_verified_repair_receipt(
     store.record_decision_receipt(REPAIR_RECEIPT_KIND, subject, seq, repair_receipt_id, detail)
 }
 
+/// Verify one recorded location (`raw-v1`, `pack-v1`, or an encoded H030
+/// representation such as `deflate-v1`/`zstd-3`) against its expected digest.
+fn verify_location_matches_object_key(
+    path: &str,
+    encoding: &str,
+    expected_object_key: &str,
+) -> bool {
+    if encoding == RAW_PROFILE_V1 {
+        return verify_file_matches_object_key(path, expected_object_key);
+    }
+    if encoding == crate::pack::PACK_PROFILE_V1 {
+        let Some((pack_path, offset_str)) = path.rsplit_once('#') else {
+            return false;
+        };
+        let Ok(declared_offset) = offset_str.parse::<u64>() else {
+            return false;
+        };
+        let Some(hex) = expected_object_key
+            .strip_prefix(crate::digest_set::ATP_OBJECT_CONTENT_DOMAIN)
+            .and_then(|rest| rest.strip_prefix(':'))
+        else {
+            return false;
+        };
+        if hex.len() != 64 {
+            return false;
+        }
+        let mut digest_bytes = [0u8; 32];
+        for (i, slot) in digest_bytes.iter_mut().enumerate() {
+            let Ok(b) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) else {
+                return false;
+            };
+            *slot = b;
+        }
+        let expected = TypedDigest {
+            algorithm: rabs_protocol::result_identity::DigestAlgorithm::Sha256V1,
+            domain: crate::digest_set::ATP_OBJECT_CONTENT_DOMAIN,
+            bytes: digest_bytes,
+        };
+        let Ok(mut file) = open_cas_copy(pack_path) else {
+            return false;
+        };
+        let mut pack_bytes = Vec::new();
+        // Bound pack read against unbounded disk growth (128 MiB cap).
+        if file
+            .by_ref()
+            .take((128 << 20) + 1)
+            .read_to_end(&mut pack_bytes)
+            .is_err()
+            || pack_bytes.len() > (128 << 20)
+        {
+            return false;
+        }
+        let Ok(index) = crate::pack::PackIndex::parse(&pack_bytes) else {
+            return false;
+        };
+        let offset_matches = index
+            .members
+            .binary_search_by(|m| m.key.as_str().cmp(expected_object_key))
+            .ok()
+            .is_some_and(|i| index.members[i].offset == declared_offset);
+        if !offset_matches {
+            return false;
+        }
+        let Some(member) = index.member_bytes(&pack_bytes, &expected) else {
+            return false;
+        };
+        return crate::digest_set::digest_set(member, DigestRequest::default(), None)
+            .is_ok_and(|set| digest_key(&set.atp_content_id) == expected_object_key);
+    }
+    verify_encoded_file_matches_layout(path, encoding, expected_object_key)
+}
+
+/// Verify an H030 encoded representation file (`<logical_hex>.<profile>.<encoded_hex>`)
+/// against its own `ENCODED_REPRESENTATION_DOMAIN` digest so `scrub_and_repair_locations`
+/// detects on-disk bit-rot for compressed blobs without requiring codec dependencies
+/// or falsely quarantining healthy encoded replicas.
+fn verify_encoded_file_matches_layout(
+    path: &str,
+    encoding: &str,
+    expected_object_key: &str,
+) -> bool {
+    use sha2::{Digest as _, Sha256};
+
+    let Some(logical_hex) = expected_object_key
+        .strip_prefix(crate::digest_set::ATP_OBJECT_CONTENT_DOMAIN)
+        .and_then(|rest| rest.strip_prefix(':'))
+    else {
+        return false;
+    };
+    if logical_hex.len() != 64 {
+        return false;
+    }
+    let Some(file_name) = Path::new(path).file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let expected_prefix = format!("{logical_hex}.{encoding}.");
+    let Some(expected_encoded_hex) = file_name.strip_prefix(&expected_prefix) else {
+        return false;
+    };
+    if expected_encoded_hex.len() != 64
+        || !expected_encoded_hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let Ok(mut file) = open_cas_copy(path) else {
+        return false;
+    };
+    let domain = crate::blob_store::ENCODED_REPRESENTATION_DOMAIN;
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain.as_bytes());
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return false,
+        }
+    }
+    let actual_bytes: [u8; 32] = hasher.finalize().into();
+    let actual_hex = rabs_protocol::raw_bytes::encode_hex(&actual_bytes);
+    actual_hex == expected_encoded_hex
+}
+
 /// Compute the `ATP_OBJECT_CONTENT_DOMAIN` digest key of an on-disk regular file.
 fn verify_file_matches_object_key(path: &str, expected_object_key: &str) -> bool {
     let Ok(mut file) = open_cas_copy(path) else {
@@ -1281,14 +1407,13 @@ pub fn quarantine_corrupt_location(
         reason,
     )?;
 
-    // Check remaining non-quarantined locations and verify their bytes on disk.
+    // Check remaining non-quarantined locations (raw, pack, or encoded) and
+    // verify their bytes on disk before deciding whether to escalate.
     let remaining_locations = store.object_locations(object)?;
     let healthy_count = remaining_locations
         .iter()
         .filter(|(path, encoding, _)| {
-            encoding == RAW_PROFILE_V1
-                && path != bad_path
-                && verify_file_matches_object_key(path, &object_key)
+            path != bad_path && verify_location_matches_object_key(path, encoding, &object_key)
         })
         .count();
 
@@ -1335,36 +1460,40 @@ pub fn scrub_and_repair_locations(
     let mut report = ScrubReport::default();
 
     // Group non-quarantined locations by object_key so we can cross-check replicas.
-    let mut by_object: std::collections::BTreeMap<String, Vec<String>> =
+    let mut by_object: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
     for row in rows {
         if !row.quarantined {
             by_object
                 .entry(row.object_key)
                 .or_default()
-                .push(row.store_path);
+                .push((row.store_path, row.encoding));
         }
     }
 
     let mut receipt_seq = seq.max(1);
-    for (object_key, paths) in by_object {
-        let mut healthy_paths = Vec::new();
-        let mut corrupt_paths = Vec::new();
-        for path in &paths {
+    for (object_key, entries) in by_object {
+        let mut healthy_raw_paths = Vec::new();
+        let mut healthy_any = false;
+        let mut corrupt_entries = Vec::new();
+        for (path, encoding) in &entries {
             report.scanned_locations += 1;
-            if verify_file_matches_object_key(path, &object_key) {
+            if verify_location_matches_object_key(path, encoding, &object_key) {
                 report.healthy_locations += 1;
-                healthy_paths.push(path.clone());
+                healthy_any = true;
+                if encoding == RAW_PROFILE_V1 {
+                    healthy_raw_paths.push(path.clone());
+                }
             } else {
-                corrupt_paths.push(path.clone());
+                corrupt_entries.push((path.clone(), encoding.clone()));
             }
         }
 
-        if corrupt_paths.is_empty() {
+        if corrupt_entries.is_empty() {
             continue;
         }
 
-        for bad_path in &corrupt_paths {
+        for (bad_path, _) in &corrupt_entries {
             store.query(
                 "UPDATE object_locations SET quarantined = 1 WHERE object_key = ?1 AND store_path = ?2",
                 &[
@@ -1388,9 +1517,13 @@ pub fn scrub_and_repair_locations(
             report.quarantined_locations.push(bad_path.clone());
         }
 
-        if let Some(donor) = healthy_paths.first() {
-            // Repair each corrupt location from the verified donor replica.
-            for bad_path in &corrupt_paths {
+        if let Some(donor) = healthy_raw_paths.first() {
+            // Repair corrupt raw replicas from a verified raw donor replica.
+            // Never overwrite a shared pack file in place with a single member.
+            for (bad_path, bad_encoding) in &corrupt_entries {
+                if bad_encoding != RAW_PROFILE_V1 {
+                    continue;
+                }
                 let bad_dest = Path::new(bad_path);
                 let Some(parent) = bad_dest.parent() else {
                     continue;
@@ -1421,7 +1554,7 @@ pub fn scrub_and_repair_locations(
                     let _ = std::fs::remove_file(&staging);
                 }
             }
-        } else {
+        } else if !healthy_any {
             // All replicas of this object are corrupt: escalate to LogicalObject.
             store.add_quarantine(
                 QuarantineScope::LogicalObject,
@@ -3302,6 +3435,62 @@ mod tests {
                 true
             ),
             Err(FailureRefusal::NotDeterministic("transport-failure"))
+        );
+    }
+
+    #[test]
+    fn scrub_verifies_healthy_encoded_representation_and_catches_bitrot() {
+        use crate::blob_store::{
+            BlobStoreLayout, DurabilityPolicy, PutLimits, put_encoded_representation,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = BlobStoreLayout::open(&dir.path().join("blobs")).unwrap();
+        let mut store = SqlMetadataStore::open(RusqliteEngine::open_in_memory().unwrap()).unwrap();
+
+        let logical = b"encoded-scrub-payload-repeated-repeated-repeated";
+        let logical_id = crate::digest_set::digest_set(logical, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        // Invert every byte as a trivial deterministic encoding distinct from raw bytes.
+        let encoded: Vec<u8> = logical.iter().map(|b| !b).collect();
+        let decoder = |bytes: &[u8]| Ok::<Vec<u8>, String>(bytes.iter().map(|b| !b).collect());
+        let mut reader = encoded.as_slice();
+        let (rep, outcome) = put_encoded_representation(
+            &layout,
+            &mut store,
+            &logical_id,
+            "invert-test-v1",
+            &mut reader,
+            &decoder,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        assert_eq!(rep.storage_profile, "invert-test-v1");
+        let path = match outcome {
+            crate::blob_store::PutOutcome::Stored { path }
+            | crate::blob_store::PutOutcome::IdempotentDuplicate { path } => path,
+        };
+
+        // Healthy encoded replica must pass scrub without false quarantine.
+        let clean = scrub_and_repair_locations(&mut store, 1).unwrap();
+        assert_eq!(clean.scanned_locations, 1);
+        assert_eq!(clean.healthy_locations, 1);
+        assert!(clean.quarantined_locations.is_empty());
+        assert!(clean.escalated_logical_objects.is_empty());
+
+        // Flip a byte on disk: scrub must detect bit-rot, quarantine, and escalate.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 0x01;
+        fs::write(&path, &bytes).unwrap();
+        let corrupted = scrub_and_repair_locations(&mut store, 10).unwrap();
+        assert_eq!(corrupted.scanned_locations, 1);
+        assert_eq!(corrupted.healthy_locations, 0);
+        assert_eq!(corrupted.quarantined_locations, vec![path]);
+        assert_eq!(
+            corrupted.escalated_logical_objects,
+            vec![digest_key(&logical_id)]
         );
     }
 }

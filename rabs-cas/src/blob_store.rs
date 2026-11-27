@@ -889,6 +889,371 @@ fn handle_existing(
     })
 }
 
+/// Outcome of publishing one object under the H005 compression policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyPutOutcome {
+    /// Policy decision applied to this object.
+    pub decision: crate::compression_policy::CompressionDecision,
+    /// Resulting publish outcome (`Stored` or `IdempotentDuplicate`).
+    pub outcome: PutOutcome,
+    /// Logical (uncompressed) byte length.
+    pub logical_bytes: u64,
+    /// Stored (encoded or raw) byte length.
+    pub encoded_bytes: u64,
+    /// Storage profile recorded in `object_locations` (`raw-v1` or compressed profile).
+    pub storage_profile: String,
+}
+
+/// Outcome of publishing a deterministic H021 `RBSPACK1` small-object pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedPutOutcome {
+    /// Content digest of the published pack blob itself.
+    pub pack_digest: TypedDigest,
+    /// On-disk path of the published pack blob.
+    pub pack_path: String,
+    /// Number of deduplicated logical members indexed inside the pack.
+    pub member_count: usize,
+    /// Total byte length of the published pack blob.
+    pub pack_bytes: u64,
+}
+
+/// Result of attempting to decode a non-raw, non-pack encoded CAS object in
+/// [`read_verified_object`].
+///
+/// Separating [`Self::UnsupportedEncoding`] from [`Self::Corrupt`] guarantees
+/// that a reader lacking a codec for a valid representation (e.g. `zstd-3`)
+/// skips that replica instead of falsely quarantining healthy data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedObject {
+    /// Decoded logical bytes ready for content-digest verification.
+    Decoded(Vec<u8>),
+    /// Caller does not support this storage profile; do NOT quarantine.
+    UnsupportedEncoding,
+    /// Encoded payload is corrupt or exceeds bounds; quarantine this location.
+    Corrupt(String),
+}
+
+fn is_valid_encoded_profile_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 64
+        && tag != RAW_PROFILE_V1
+        && tag != crate::pack::PACK_PROFILE_V1
+        && !tag.contains("..")
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// H005 + H030 live write helper: decide raw vs encoded storage via
+/// [`crate::compression_policy::decide`], publish through
+/// [`put_if_absent`] or [`put_encoded_representation`] (falling back to raw if
+/// the encoded output is not strictly smaller than the logical bytes), and
+/// optionally meter the outcome into [`crate::compression_policy::CompressionMetrics`].
+///
+/// # Errors
+/// Typed [`PutError`]; refusals publish nothing and leave staging clean.
+#[allow(clippy::too_many_arguments)]
+pub fn put_with_compression_policy<E>(
+    layout: &BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    declared: &TypedDigest,
+    class: crate::compression_policy::ObjectClass,
+    pressure: crate::compression_policy::CpuPressure,
+    logical_bytes: &[u8],
+    encoder: E,
+    decoder: RepresentationDecoder<'_>,
+    limits: PutLimits,
+    durability: DurabilityPolicy,
+    metrics: Option<&mut crate::compression_policy::CompressionMetrics>,
+) -> Result<PolicyPutOutcome, PutError>
+where
+    E: FnOnce(
+        &[u8],
+        crate::compression_policy::CompressionProfile,
+    ) -> Result<(String, Vec<u8>), String>,
+{
+    use crate::compression_policy::{CompressionDecision, SkipReason};
+
+    let logical_len = logical_bytes.len() as u64;
+    if let Some(limit) = limits.max_logical_bytes
+        && logical_len > limit
+    {
+        return Err(PutError::LogicalLimitExceeded { limit });
+    }
+    if let Some(expected) = limits.expected_size
+        && expected != logical_len
+    {
+        return Err(PutError::Digest(DigestError::LogicalSizeMismatch {
+            expected,
+            actual: logical_len,
+        }));
+    }
+
+    let decision = crate::compression_policy::decide(class, logical_len, logical_bytes, pressure);
+    match decision {
+        CompressionDecision::Skip(_) => {
+            let mut slice = logical_bytes;
+            let outcome = put_if_absent(layout, store, declared, &mut slice, limits, durability)?;
+            if let Some(m) = metrics {
+                m.record(decision, logical_len, logical_len, 0);
+            }
+            Ok(PolicyPutOutcome {
+                decision,
+                outcome,
+                logical_bytes: logical_len,
+                encoded_bytes: logical_len,
+                storage_profile: RAW_PROFILE_V1.to_owned(),
+            })
+        }
+        CompressionDecision::Compress(profile) => {
+            let start = std::time::Instant::now();
+            let (profile_tag, encoded) = encoder(logical_bytes, profile).map_err(|error| {
+                PutError::EncodingDecodeFailed {
+                    profile: profile.name.to_owned(),
+                    error,
+                }
+            })?;
+            let cpu_micros = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if !is_valid_encoded_profile_tag(&profile_tag) {
+                return Err(PutError::EncodingDecodeFailed {
+                    profile: profile_tag,
+                    error: "invalid or reserved encoded storage profile tag".to_owned(),
+                });
+            }
+            // Economic guard: never store an encoded copy that is not strictly
+            // smaller than raw bytes.
+            if encoded.len() >= logical_bytes.len() {
+                let mut slice = logical_bytes;
+                let outcome =
+                    put_if_absent(layout, store, declared, &mut slice, limits, durability)?;
+                let fallback_decision = CompressionDecision::Skip(SkipReason::AlreadyCompressed);
+                if let Some(m) = metrics {
+                    m.record(fallback_decision, logical_len, logical_len, cpu_micros);
+                }
+                return Ok(PolicyPutOutcome {
+                    decision: fallback_decision,
+                    outcome,
+                    logical_bytes: logical_len,
+                    encoded_bytes: logical_len,
+                    storage_profile: RAW_PROFILE_V1.to_owned(),
+                });
+            }
+            let encoded_len = encoded.len() as u64;
+            let encoded_limits = PutLimits {
+                max_logical_bytes: limits.max_logical_bytes.or(Some(logical_len)),
+                expected_size: Some(encoded_len),
+            };
+            let mut slice = encoded.as_slice();
+            let (rep, outcome) = put_encoded_representation(
+                layout,
+                store,
+                declared,
+                &profile_tag,
+                &mut slice,
+                decoder,
+                encoded_limits,
+                durability,
+            )?;
+            if let Some(m) = metrics {
+                m.record(decision, logical_len, rep.encoded_size, cpu_micros);
+            }
+            Ok(PolicyPutOutcome {
+                decision,
+                outcome,
+                logical_bytes: logical_len,
+                encoded_bytes: rep.encoded_size,
+                storage_profile: rep.storage_profile,
+            })
+        }
+    }
+}
+
+/// H021 live write helper: build a deterministic canonical `RBSPACK1` pack from
+/// small logical objects, publish the pack blob atomically via [`put_if_absent`],
+/// and record `pack-v1` member location rows pointing into the published pack.
+///
+/// # Errors
+/// [`PutError::Io`] / [`PutError::Digest`] / [`PutError::Store`] if packing or
+/// publication fails.
+pub fn put_packed_members(
+    layout: &BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    members: &[(TypedDigest, &[u8])],
+    durability: DurabilityPolicy,
+) -> Result<PackedPutOutcome, PutError> {
+    let pack_bytes = crate::pack::build_pack(members).map_err(|error| PutError::Io {
+        step: "build-pack",
+        error: format!("{error:?}"),
+    })?;
+    let pack_index = crate::pack::PackIndex::parse(&pack_bytes).map_err(|error| PutError::Io {
+        step: "parse-pack",
+        error: format!("{error:?}"),
+    })?;
+    let pack_digest = crate::digest_set::digest_set(&pack_bytes, DigestRequest::default(), None)
+        .map_err(PutError::Digest)?
+        .atp_content_id;
+    let pack_len = pack_bytes.len() as u64;
+    let mut slice = pack_bytes.as_slice();
+    let outcome = put_if_absent(
+        layout,
+        store,
+        &pack_digest,
+        &mut slice,
+        PutLimits {
+            max_logical_bytes: Some(pack_len),
+            expected_size: Some(pack_len),
+        },
+        durability,
+    )?;
+    let pack_path = match outcome {
+        PutOutcome::Stored { path } | PutOutcome::IdempotentDuplicate { path } => path,
+    };
+    let mut seen_keys = std::collections::BTreeSet::new();
+    let member_digests: Vec<TypedDigest> = members
+        .iter()
+        .filter(|(d, _)| seen_keys.insert(digest_key(d)))
+        .map(|(d, _)| d.clone())
+        .collect();
+    crate::pack::record_pack_member_locations(
+        store,
+        &pack_path,
+        &pack_index,
+        &member_digests,
+        durability.is_full(),
+    )?;
+    Ok(PackedPutOutcome {
+        pack_digest,
+        pack_path,
+        member_count: pack_index.members.len(),
+        pack_bytes: pack_len,
+    })
+}
+
+/// Read and cryptographically verify one logical object across `raw-v1`,
+/// `pack-v1`, and encoded compression profiles.
+///
+/// Enforces logical-object quarantine up front; any regular file whose bytes do
+/// not decode/digest back to `object` is quarantined at the location scope
+/// before trying the next replica. Replicas whose encoding is unrecognized by
+/// `decode_encoded` (`DecodedObject::UnsupportedEncoding`) are skipped without
+/// quarantine. Never follows symlinks or opens FIFOs.
+///
+/// # Errors
+/// Store errors from reading quarantine/location rows or flagging a corrupt replica.
+pub fn read_verified_object<D>(
+    store: &mut dyn RabsMetadataStore,
+    object: &TypedDigest,
+    max_logical_bytes: u64,
+    mut decode_encoded: D,
+) -> Result<Option<Vec<u8>>, StoreError>
+where
+    D: FnMut(&str, &[u8]) -> DecodedObject,
+{
+    if !store
+        .query(
+            "SELECT 1 FROM quarantines WHERE scope = 'logical-object' AND subject = ?1 LIMIT 1",
+            &[crate::metadata_store::SqlValue::Text(digest_key(object))],
+        )?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    let locations = store.object_locations(object)?;
+    for (path, encoding, _) in locations {
+        if encoding == RAW_PROFILE_V1 {
+            let Some(bytes) = read_regular_bounded(&path, max_logical_bytes) else {
+                continue;
+            };
+            if verify_logical_bytes(&bytes, object) {
+                return Ok(Some(bytes));
+            }
+            store.set_location_quarantined(object, &path, true)?;
+            continue;
+        }
+        if encoding == crate::pack::PACK_PROFILE_V1 {
+            let Some((pack_path, offset_str)) = path.rsplit_once('#') else {
+                store.set_location_quarantined(object, &path, true)?;
+                continue;
+            };
+            let Ok(declared_offset) = offset_str.parse::<u64>() else {
+                store.set_location_quarantined(object, &path, true)?;
+                continue;
+            };
+            let max_pack_bytes = max_logical_bytes
+                .saturating_add(crate::pack::MAX_PACK_INDEX_BYTES)
+                .saturating_add(64 << 20);
+            let Some(pack_bytes) = read_regular_bounded(pack_path, max_pack_bytes) else {
+                continue;
+            };
+            let Ok(index) = crate::pack::PackIndex::parse(&pack_bytes) else {
+                store.set_location_quarantined(object, &path, true)?;
+                continue;
+            };
+            let key = digest_key(object);
+            let offset_matches = index
+                .members
+                .binary_search_by(|m| m.key.as_str().cmp(key.as_str()))
+                .ok()
+                .is_some_and(|i| index.members[i].offset == declared_offset);
+            if !offset_matches {
+                store.set_location_quarantined(object, &path, true)?;
+                continue;
+            }
+            let Some(member) = index.member_bytes(&pack_bytes, object) else {
+                store.set_location_quarantined(object, &path, true)?;
+                continue;
+            };
+            if member.len() as u64 <= max_logical_bytes && verify_logical_bytes(member, object) {
+                return Ok(Some(member.to_vec()));
+            }
+            store.set_location_quarantined(object, &path, true)?;
+            continue;
+        }
+        // Encoded representation (e.g. zstd-3, zstd-1, deflate-v1). Allow small
+        // framing headroom on disk while still enforcing `max_logical_bytes` on
+        // the decoded logical output.
+        let Some(encoded_bytes) =
+            read_regular_bounded(&path, max_logical_bytes.saturating_add(4096))
+        else {
+            continue;
+        };
+        match decode_encoded(&encoding, &encoded_bytes) {
+            DecodedObject::Decoded(decoded) => {
+                if decoded.len() as u64 <= max_logical_bytes
+                    && verify_logical_bytes(&decoded, object)
+                {
+                    return Ok(Some(decoded));
+                }
+                store.set_location_quarantined(object, &path, true)?;
+            }
+            DecodedObject::UnsupportedEncoding => {
+                continue;
+            }
+            DecodedObject::Corrupt(_) => {
+                store.set_location_quarantined(object, &path, true)?;
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn read_regular_bounded(path: &str, max_bytes: u64) -> Option<Vec<u8>> {
+    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()) {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
+}
+
+fn verify_logical_bytes(bytes: &[u8], expected: &TypedDigest) -> bool {
+    crate::digest_set::digest_set(bytes, DigestRequest::default(), None)
+        .is_ok_and(|digests| digests.atp_content_id == *expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,5 +1960,224 @@ mod tests {
         // Every loser cleaned its temp.
         assert_eq!(fs::read_dir(layout.staging_dir()).unwrap().count(), 0);
         assert_no_partial_published(&layout);
+    }
+
+    #[test]
+    fn h005_policy_put_skips_tiny_and_precompressed_and_round_trips_encoded() {
+        use crate::compression_policy::{
+            CompressionDecision, CompressionMetrics, CpuPressure, ObjectClass, SkipReason,
+        };
+
+        let layout = BlobStoreLayout::open(&fresh_root("policy-put")).unwrap();
+        let mut store = store();
+        let mut metrics = CompressionMetrics::default();
+
+        // Simple deterministic RLE-style test codec (shrinks repetitive data).
+        let encode = |input: &[u8], _profile: crate::compression_policy::CompressionProfile| {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < input.len() {
+                let b = input[i];
+                let mut run = 1u8;
+                while i + usize::from(run) < input.len()
+                    && input[i + usize::from(run)] == b
+                    && run < 255
+                {
+                    run += 1;
+                }
+                out.push(run);
+                out.push(b);
+                i += usize::from(run);
+            }
+            Ok(("rle-test-v1".to_owned(), out))
+        };
+        let decode = |encoded: &[u8]| -> Result<Vec<u8>, String> {
+            if !encoded.len().is_multiple_of(2) {
+                return Err("odd rle buffer".to_owned());
+            }
+            let mut out = Vec::new();
+            for pair in encoded.as_chunks::<2>().0 {
+                out.extend(std::iter::repeat_n(pair[1], usize::from(pair[0])));
+            }
+            Ok(out)
+        };
+
+        // 1. Tiny payload skips compression and stores raw.
+        let tiny = b"tiny dep-info";
+        let tiny_id = id_of(tiny);
+        let tiny_res = put_with_compression_policy(
+            &layout,
+            &mut store,
+            &tiny_id,
+            ObjectClass::DepInfo,
+            CpuPressure::Low,
+            tiny,
+            encode,
+            &decode,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+            Some(&mut metrics),
+        )
+        .unwrap();
+        assert_eq!(
+            tiny_res.decision,
+            CompressionDecision::Skip(SkipReason::Tiny)
+        );
+        assert_eq!(tiny_res.storage_profile, RAW_PROFILE_V1);
+
+        // 2. Large compressible payload compresses and verifies on read.
+        let big = vec![b'A'; 16 * 1024];
+        let big_id = id_of(&big);
+        let big_res = put_with_compression_policy(
+            &layout,
+            &mut store,
+            &big_id,
+            ObjectClass::CompilerArtifact,
+            CpuPressure::Low,
+            &big,
+            encode,
+            &decode,
+            PutLimits::default(),
+            DurabilityPolicy::FULL,
+            Some(&mut metrics),
+        )
+        .unwrap();
+        assert!(matches!(big_res.decision, CompressionDecision::Compress(_)));
+        assert_eq!(big_res.storage_profile, "rle-test-v1");
+        assert!(big_res.encoded_bytes < big_res.logical_bytes);
+
+        // Unsupported encoding must NOT quarantine the healthy encoded replica.
+        let skipped = read_verified_object(&mut store, &big_id, 32 * 1024, |_, _| {
+            DecodedObject::UnsupportedEncoding
+        })
+        .unwrap();
+        assert_eq!(skipped, None);
+        assert_eq!(
+            store.object_locations(&big_id).unwrap().len(),
+            1,
+            "unsupported encoding must leave healthy replica unquarantined"
+        );
+
+        let loaded = read_verified_object(&mut store, &big_id, 32 * 1024, |enc, bytes| {
+            if enc == "rle-test-v1" {
+                decode(bytes).map_or_else(DecodedObject::Corrupt, DecodedObject::Decoded)
+            } else {
+                DecodedObject::UnsupportedEncoding
+            }
+        })
+        .unwrap()
+        .expect("compressed object must read back verified");
+        assert_eq!(loaded, big);
+        assert_eq!(metrics.compressed_objects, 1);
+        assert_eq!(metrics.skipped_objects, 1);
+
+        // Regression: PutLimits must be enforced upfront on the Compress path,
+        // and reserved/unsafe profile tags must be refused.
+        assert!(matches!(
+            put_with_compression_policy(
+                &layout,
+                &mut store,
+                &big_id,
+                ObjectClass::CompilerArtifact,
+                CpuPressure::Low,
+                &big,
+                encode,
+                &decode,
+                PutLimits {
+                    max_logical_bytes: Some(1024),
+                    expected_size: None,
+                },
+                DurabilityPolicy::FULL,
+                None,
+            ),
+            Err(PutError::LogicalLimitExceeded { limit: 1024 })
+        ));
+        assert!(matches!(
+            put_with_compression_policy(
+                &layout,
+                &mut store,
+                &big_id,
+                ObjectClass::CompilerArtifact,
+                CpuPressure::Low,
+                &big,
+                encode,
+                &decode,
+                PutLimits {
+                    max_logical_bytes: None,
+                    expected_size: Some(123),
+                },
+                DurabilityPolicy::FULL,
+                None,
+            ),
+            Err(PutError::Digest(DigestError::LogicalSizeMismatch {
+                expected: 123,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            put_with_compression_policy(
+                &layout,
+                &mut store,
+                &big_id,
+                ObjectClass::CompilerArtifact,
+                CpuPressure::Low,
+                &big,
+                |_, _| Ok(("../escape".to_owned(), vec![1, 2, 3])),
+                &decode,
+                PutLimits::default(),
+                DurabilityPolicy::FULL,
+                None,
+            ),
+            Err(PutError::EncodingDecodeFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn h021_packed_members_put_read_and_quarantine_corrupt_pack_member() {
+        let layout = BlobStoreLayout::open(&fresh_root("pack-put")).unwrap();
+        let mut store = store();
+        let a = b"dep-info-a: src/lib.rs\n";
+        let b = b"dep-info-b: src/main.rs\n";
+        let a_id = id_of(a);
+        let b_id = id_of(b);
+
+        // Include duplicate `a` to verify deduplication in put_packed_members.
+        let packed = put_packed_members(
+            &layout,
+            &mut store,
+            &[
+                (a_id.clone(), a.as_slice()),
+                (b_id.clone(), b.as_slice()),
+                (a_id.clone(), a.as_slice()),
+            ],
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        assert_eq!(packed.member_count, 2);
+        assert!(Path::new(&packed.pack_path).is_file());
+
+        let got_a = read_verified_object(&mut store, &a_id, 4096, |_, _| {
+            DecodedObject::UnsupportedEncoding
+        })
+        .unwrap()
+        .expect("member a must load from pack");
+        let got_b = read_verified_object(&mut store, &b_id, 4096, |_, _| {
+            DecodedObject::UnsupportedEncoding
+        })
+        .unwrap()
+        .expect("member b must load from pack");
+        assert_eq!(got_a, a);
+        assert_eq!(got_b, b);
+
+        // Corrupt the pack payload on disk: reading refuses and quarantines the location.
+        let mut raw_pack = fs::read(&packed.pack_path).unwrap();
+        *raw_pack.last_mut().unwrap() ^= 0xff;
+        fs::write(&packed.pack_path, &raw_pack).unwrap();
+        let corrupt = read_verified_object(&mut store, &b_id, 4096, |_, _| {
+            DecodedObject::UnsupportedEncoding
+        })
+        .unwrap();
+        assert_eq!(corrupt, None);
+        assert!(store.object_locations(&b_id).unwrap().is_empty());
     }
 }

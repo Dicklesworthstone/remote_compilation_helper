@@ -734,7 +734,9 @@ pub async fn run_inventory(
     let mut store = open_store(&root)?;
     let l2 = l2_root.unwrap_or_else(default_l2_root);
     let policy = rabs_cas::cache_inventory::NamespacePolicy::allowing(allow_namespace.clone());
-    let report = rabs_cas::cache_inventory::build_report(&mut store, None, &l2, &policy)?;
+    let l1_snapshot = rabs_cas::cache_inventory::read_l1_snapshot(&root);
+    let report =
+        rabs_cas::cache_inventory::build_report_with_l1(&mut store, l1_snapshot, &l2, &policy)?;
 
     if ctx.is_json() || ctx.is_toon() {
         ctx.json(&ApiResponse::ok(
@@ -760,6 +762,9 @@ struct JsonInventory {
     l1_present: bool,
     l1_capacity: Option<usize>,
     l1_live_entries: Option<usize>,
+    l1_hits: Option<u64>,
+    l1_misses: Option<u64>,
+    l1_evictions: Option<u64>,
     restricted_project_count: u32,
     visible_projects: Vec<String>,
     toolchain_workers: Vec<String>,
@@ -771,7 +776,10 @@ impl JsonInventory {
         Self {
             l1_present: r.l1.is_some(),
             l1_capacity: r.l1.as_ref().map(|l| l.capacity),
-            l1_live_entries: r.l1.as_ref().map(|l| l.entries.len()),
+            l1_live_entries: r.l1.as_ref().map(|l| l.live_entries),
+            l1_hits: r.l1.as_ref().map(|l| l.stats.hits),
+            l1_misses: r.l1.as_ref().map(|l| l.stats.misses),
+            l1_evictions: r.l1.as_ref().map(|l| l.stats.evictions),
             restricted_project_count: r.restricted_project_count,
             visible_projects: r.l2_visible.iter().map(|p| p.project.clone()).collect(),
             toolchain_workers: r.toolchains.iter().map(|t| t.worker.clone()).collect(),
@@ -783,11 +791,10 @@ impl JsonInventory {
 fn print_inventory(report: &rabs_cas::cache_inventory::CacheInventoryReport) {
     match &report.l1 {
         Some(l1) => println!(
-            "L1 edge cache: capacity {}, live entries {}",
-            l1.capacity,
-            l1.entries.len()
+            "L1 edge cache: capacity {}, live entries {}, hits {}, misses {}, evictions {}",
+            l1.capacity, l1.live_entries, l1.stats.hits, l1.stats.misses, l1.stats.evictions
         ),
-        None => println!("L1 edge cache: not mounted in this process"),
+        None => println!("L1 edge cache: no live daemon snapshot found"),
     }
     for p in &report.l2_visible {
         println!("L2 project {}: {} result dir(s)", p.project, p.hash_dirs);
@@ -1307,7 +1314,14 @@ pub fn locate_object_receipt(
             SqlValue::Int(quarantined),
         ] = row.as_slice()
         {
-            let exists_on_disk = Path::new(store_path).exists();
+            let backing_path = if encoding_profile == rabs_cas::pack::PACK_PROFILE_V1 {
+                store_path
+                    .rsplit_once('#')
+                    .map_or(store_path.as_str(), |(pack_path, _)| pack_path)
+            } else {
+                store_path.as_str()
+            };
+            let exists_on_disk = Path::new(backing_path).exists();
             replicas.push(LocatedReplicaDto {
                 store_path: store_path.clone(),
                 encoding_profile: encoding_profile.clone(),
@@ -2487,5 +2501,89 @@ mod tests {
             before,
             std::fs::read(cas_root.join("meta.sqlite")).expect("read after")
         );
+    }
+
+    #[test]
+    fn pack_v1_locations_verify_and_locate_and_inventory_reads_l1_snapshot() {
+        use rabs_cas::blob_store::{BlobStoreLayout, DurabilityPolicy, put_packed_members};
+        use rabs_cas::cache_inventory::{
+            NamespacePolicy, build_report_with_l1, read_l1_snapshot, write_l1_snapshot,
+        };
+        use rabs_cas::digest_set::{DigestRequest, digest_set};
+        use rabs_cas::l1_cache::L1ActionCache;
+        use rabs_cas::metadata_store::{ActionEntryRow, digest_key};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cas_root = dir.path().join("cas");
+        let layout = BlobStoreLayout::open(&cas_root.join("blobs")).expect("layout");
+        let mut store = open_or_init_store(&cas_root).expect("store");
+
+        let alpha = b"dep-info-alpha: src/lib.rs\n";
+        let beta = b"dep-info-beta: src/main.rs\n";
+        let alpha_id = digest_set(alpha, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let beta_id = digest_set(beta, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+
+        let packed = put_packed_members(
+            &layout,
+            &mut store,
+            &[
+                (alpha_id.clone(), alpha.as_slice()),
+                (beta_id.clone(), beta.as_slice()),
+            ],
+            DurabilityPolicy::FULL,
+        )
+        .expect("pack put");
+        assert_eq!(packed.member_count, 2);
+
+        // Locate resolves the backing pack file cleanly (strips `#<offset>`).
+        let alpha_key = digest_key(&alpha_id);
+        let located = locate_object_receipt(&mut store, &alpha_key).expect("locate");
+        assert!(!located.logical_quarantined);
+        assert_eq!(located.replicas.len(), 1);
+        assert_eq!(
+            located.replicas[0].encoding_profile,
+            rabs_cas::pack::PACK_PROFILE_V1
+        );
+        assert!(located.replicas[0].exists_on_disk);
+        assert!(!located.replicas[0].quarantined);
+
+        // Verify scrubs both the pack blob and the two pack-v1 member locations cleanly.
+        let verified = verify_cas_receipt(&mut store, &cas_root).expect("verify");
+        assert_eq!(verified.scanned_locations, 3);
+        assert_eq!(verified.healthy_locations, 3);
+        assert!(verified.quarantined_locations.is_empty());
+
+        // Inventory loads the daemon's L1 snapshot instead of reporting None.
+        let mut l1 = L1ActionCache::new(64, None);
+        let action_key = rabs_key::typed_digest::compute("rabs.action-key.sha256.v1", b"action");
+        l1.insert(
+            action_key.clone(),
+            ActionEntryRow {
+                action_key: action_key.clone(),
+                key_epoch: 1,
+                projection_epoch: 2,
+            },
+        );
+        let _ = l1.lookup_through(&action_key, |_| Ok::<_, ()>(None));
+        write_l1_snapshot(&cas_root, &l1).expect("write snapshot");
+
+        let snapshot = read_l1_snapshot(&cas_root);
+        let report = build_report_with_l1(
+            &mut store,
+            snapshot,
+            dir.path(),
+            &NamespacePolicy::default(),
+        )
+        .expect("inventory report");
+        let json = JsonInventory::of(&report);
+        assert!(json.l1_present);
+        assert_eq!(json.l1_capacity, Some(64));
+        assert_eq!(json.l1_live_entries, Some(1));
+        assert_eq!(json.l1_hits, Some(1));
+        assert_eq!(json.l1_misses, Some(0));
     }
 }

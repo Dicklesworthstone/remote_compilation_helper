@@ -525,19 +525,10 @@ pub fn inspect_corpus(path: &Path, top: usize) -> Result<CorpusInspectReport, St
             malformed_lines += 1;
             continue;
         };
-        parsed_records += 1;
-        *tool_counts.entry(tool.to_owned()).or_insert(0) += 1;
-        if argv
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .any(|part| part.contains(REDACTED))
-        {
-            redacted_argv_records += 1;
-        }
-        if contains_secret_marker(&value) {
-            raw_secret_marker_hits += 1;
-        }
-        let code_i32 = i32::try_from(outcome_value).unwrap_or(-1);
+        let Ok(code_i32) = i32::try_from(outcome_value) else {
+            malformed_lines += 1;
+            continue;
+        };
         let is_zero = match outcome_kind {
             "exited" => {
                 *exit_codes.entry(code_i32).or_insert(0) += 1;
@@ -556,10 +547,21 @@ pub fn inspect_corpus(path: &Path, top: usize) -> Result<CorpusInspectReport, St
             }
             _ => {
                 malformed_lines += 1;
-                parsed_records -= 1;
                 continue;
             }
         };
+        parsed_records += 1;
+        *tool_counts.entry(tool.to_owned()).or_insert(0) += 1;
+        if argv
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|part| part.contains(REDACTED))
+        {
+            redacted_argv_records += 1;
+        }
+        if contains_secret_marker(&value) {
+            raw_secret_marker_hits += 1;
+        }
         if value
             .get("ci_env")
             .and_then(serde_json::Value::as_bool)
@@ -1012,10 +1014,7 @@ fn spread_pct(durations: &[u64]) -> u64 {
     ) else {
         return 0;
     };
-    if min == 0 {
-        return if max == 0 { 0 } else { 100 };
-    }
-    max.saturating_sub(min).saturating_mul(100) / min
+    max.saturating_sub(min).saturating_mul(100) / min.max(1)
 }
 
 /// Run interleaved paired stock-vs-candidate (or A/A) iterations with isolated
@@ -1398,6 +1397,31 @@ mod tests {
             strat_json["benchmark_report"]["first_diagnostic_latency"]["not_instrumented"]
                 .is_string()
         );
+
+        // Regression: unknown outcome_kind must not pollute tool/redaction/secret counts.
+        let dirty_path = scratch.path.join("dirty.ndjsonl");
+        let dirty_line = serde_json::json!({
+            "schema": "rabs.invocation-record",
+            "schema_version": 1,
+            "tool": "BogusTool",
+            "argv_redacted": [format!("cmd ghp_secret {REDACTED}")],
+            "cwd_redacted": "/work/dirty",
+            "outcome_kind": "unknown-kind",
+            "outcome_value": 1,
+            "duration_ms": 100_u64,
+            "recorded_at_unix_ms": 1_000_u64,
+            "ci_env": false,
+        })
+        .to_string();
+        fs::write(&dirty_path, dirty_line).unwrap();
+        let dirty = inspect_corpus(&dirty_path, 5).unwrap();
+        assert_eq!(dirty.parsed_records, 0);
+        assert_eq!(dirty.malformed_lines, 1);
+        assert!(dirty.tool_counts.is_empty());
+        assert_eq!(dirty.redacted_argv_records, 0);
+        assert_eq!(dirty.raw_secret_marker_hits, 0);
+        assert_eq!(spread_pct(&[0, 5]), 500);
+        assert_eq!(spread_pct(&[0, 0]), 0);
     }
 
     #[test]

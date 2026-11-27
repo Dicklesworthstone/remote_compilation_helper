@@ -375,7 +375,7 @@ pub(super) struct SharedRuntime {
     remote: Option<Arc<RemoteDependencies>>,
     remote_executions: Option<Arc<SharedRemoteExecutions>>,
     roots: Arc<RootPermitBroker>,
-    root_sequence: AtomicU64,
+    root_sequence: Arc<AtomicU64>,
     jobs_per_root: u32,
     target_cache_lock: Arc<Mutex<()>>,
     toolchains: ToolchainPool,
@@ -527,7 +527,7 @@ impl SharedRuntime {
             remote,
             remote_executions,
             roots: RootPermitBroker::new(max_roots),
-            root_sequence: AtomicU64::new(0),
+            root_sequence: Arc::new(AtomicU64::new(0)),
             jobs_per_root,
             target_cache_lock: Arc::new(Mutex::new(())),
             toolchains,
@@ -630,9 +630,11 @@ impl SharedRuntime {
                         None,
                     ) {
                         Ok(_) => match self.coord.admit_next_cargo_root(seq) {
-                            Ok(Some(receipt)) => {
-                                Some((Arc::clone(&self.coord), receipt.root_id, seq))
-                            }
+                            Ok(Some(receipt)) => Some((
+                                Arc::clone(&self.coord),
+                                receipt.root_id,
+                                Arc::clone(&self.root_sequence),
+                            )),
                             _ => None,
                         },
                         Err(_) => None,
@@ -682,7 +684,7 @@ impl Drop for SharedRuntime {
 struct RootAdmission {
     permit: Option<RootPermit>,
     obligations: ObligationSet,
-    broker_root: Option<(Arc<CoordLive>, String, u64)>,
+    broker_root: Option<(Arc<CoordLive>, String, Arc<AtomicU64>)>,
     // Failed cleanup retains the charge and this lock together. A new service
     // cannot acquire the same authority while an unresolved root still exists.
     _state: Arc<StateOwner>,
@@ -693,8 +695,9 @@ impl Drop for RootAdmission {
         // Release the durable CoordLive root-broker grant BEFORE releasing the
         // in-process RootPermit so a waking waiter always observes free broker
         // capacity.
-        if let Some((coord, root_id, seq)) = self.broker_root.take() {
-            let _ = coord.complete_cargo_root(&root_id, seq);
+        if let Some((coord, root_id, seq_counter)) = self.broker_root.take() {
+            let done_tick = seq_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = coord.complete_cargo_root(&root_id, done_tick);
         }
         if let Some(permit) = self.permit.take() {
             let result = permit.release_into(&mut self.obligations);

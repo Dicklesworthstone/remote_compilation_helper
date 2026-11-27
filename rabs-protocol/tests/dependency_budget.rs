@@ -44,7 +44,9 @@ const BUDGETS: &[(&str, usize, &str)] = &[
          rabs-key (H039: publication admission reuses F035's one \
          bundle-root implementation; pure sibling, protocol-only deps) + \
          rustix (H017: safe FICLONE, anonymous probes, and atomic no-clobber \
-         output publication on Linux/macOS without unsafe code)",
+         output publication on Linux/macOS without unsafe code; K004 mtime \
+         preservation uses std::fs::File::set_modified with no filetime crate; \
+         fsqlite is optional behind feature = \"fsqlite\")",
     ),
     (
         "rabs-sandbox",

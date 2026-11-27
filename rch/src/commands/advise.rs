@@ -727,11 +727,21 @@ fn is_test_invocation(tool: &str, command: &str) -> bool {
     let Some(cargo_pos) = tokens.iter().position(|t| *t == "cargo") else {
         return false;
     };
-    for token in tokens.iter().skip(cargo_pos + 1) {
-        if token.starts_with('+') || token.starts_with('-') {
+    let mut index = cargo_pos + 1;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if matches!(
+            token,
+            "-C" | "--color" | "--config" | "-Z" | "--manifest-path" | "--target-dir"
+        ) {
+            index += 2;
             continue;
         }
-        return matches!(*token, "test" | "t" | "nextest");
+        if token.starts_with('+') || token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return matches!(token, "test" | "t" | "nextest");
     }
     false
 }
@@ -745,7 +755,16 @@ fn suite_label_from_record(cwd: &str, command: &str) -> String {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut index = 0;
     while index < tokens.len() {
-        if matches!(tokens[index], "-p" | "--package" | "--test")
+        let token = tokens[index];
+        for prefix in ["--package=", "--test=", "-p="] {
+            if let Some(target) = token.strip_prefix(prefix)
+                && !target.is_empty()
+                && !target.starts_with('-')
+            {
+                return format!("{repo}::{target}");
+            }
+        }
+        if matches!(token, "-p" | "--package" | "--test")
             && let Some(target) = tokens.get(index + 1)
             && !target.starts_with('-')
         {
@@ -1602,5 +1621,23 @@ const CONCURRENCY_DATA = [];
         assert_eq!(cas_frag.verified_actions, 2);
         assert_eq!(cas_frag.fragmenters.len(), 1);
         assert_eq!(cas_frag.fragmenters[0].component, "toolchain");
+
+        // Regression: top-level cargo value-taking flags & `=`-joined package flags.
+        assert!(is_test_invocation(
+            "CargoWholeCommand",
+            "cargo --color always -C /tmp/work test --package=alpha"
+        ));
+        assert!(!is_test_invocation(
+            "CargoWholeCommand",
+            "cargo --manifest-path /tmp/Cargo.toml check"
+        ));
+        assert_eq!(
+            suite_label_from_record("/work/repo", "cargo test --package=core_lib"),
+            "repo::core_lib"
+        );
+        assert_eq!(
+            suite_label_from_record("/work/repo", "cargo test --test=integration_e2e"),
+            "repo::integration_e2e"
+        );
     }
 }

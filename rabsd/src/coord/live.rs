@@ -41,9 +41,15 @@ use crate::coord::action_actor::{
 use crate::coord::target_lease::TargetLeaseRegistry;
 use crate::edge::destination_arbiter::{BundleId, DestinationArbiter, reserve_scoped};
 use crate::janitor::store::LiveCas;
-use rabs_cas::blob_store::RAW_PROFILE_V1;
+use rabs_cas::blob_store::{
+    DecodedObject, DurabilityPolicy, PackedPutOutcome, PolicyPutOutcome, PutError, PutLimits,
+    put_packed_members, put_with_compression_policy, read_verified_object,
+};
+use rabs_cas::cache_inventory::{L1Inventory, write_l1_inventory_snapshot};
+use rabs_cas::compression_policy::{CompressionMetrics, CpuPressure, ObjectClass};
 use rabs_cas::digest_set::ATP_OBJECT_CONTENT_DOMAIN;
 use rabs_cas::digest_set::{DigestRequest, digest_set};
+use rabs_cas::l1_cache::{L1ActionCache, LookupStats};
 use rabs_cas::manifest_codec::{decode_manifest_v1, encode_manifest_v1};
 use rabs_cas::materialization::ActionMaterializeFailure;
 use rabs_cas::metadata_store::{
@@ -1952,6 +1958,21 @@ struct SpeculationGateState {
 }
 
 /// The live coordinator state shared edge↔coord in-process.
+/// Default L1 capacity + TTL wrapper so `CoordLive` retains `#[derive(Default)]`.
+struct CoordL1Cache(L1ActionCache);
+
+impl Default for CoordL1Cache {
+    fn default() -> Self {
+        Self(L1ActionCache::new(
+            4096,
+            Some(std::time::Duration::from_secs(60)),
+        ))
+    }
+}
+
+/// Live coordinator state (bead S6 / bridge plan Phase S): owns singleflight
+/// action flights, target leases, destination arbitration, root-permit brokering,
+/// bounded L1 action-entry caching, and the durable CAS publication lock.
 #[derive(Default)]
 pub struct CoordLive {
     available: AtomicBool,
@@ -1966,6 +1987,9 @@ pub struct CoordLive {
     speculation_gate: Mutex<SpeculationGateState>,
     prewarm_state: Mutex<PrewarmCoordinatorState>,
     cargo_root_broker: Mutex<CargoRootBrokerState>,
+    /// Bounded in-process L1 cache of immutable `ActionEntryRow`s (K003),
+    /// snapshotted read-only under `cas_root` for `rch rabs inventory`.
+    l1_cache: Mutex<CoordL1Cache>,
     /// The durable store, shared with the janitor region that mounted it.
     /// `None` when the mount failed: the daemon runs, but the coordinator
     /// refuses every commit rather than pretending to have one.
@@ -4153,7 +4177,68 @@ impl CoordLive {
             .authority
             .lock()
             .map_err(|_| "authority lock poisoned")? = Some(authority.clone());
+        let snapshot = if let Ok(mut l1) = self.l1_cache.lock() {
+            l1.0.invalidate_all();
+            Some(L1Inventory::from_cache(&l1.0))
+        } else {
+            None
+        };
+        if let Some(inv) = snapshot {
+            let _ = write_l1_inventory_snapshot(cas.cas_root(), &inv);
+        }
         Ok(authority)
+    }
+
+    /// Read-through L1 lookup for an immutable `ActionEntryRow` (K003).
+    ///
+    /// Never nests `l1_cache` and `cas.store()` locks (preventing ABBA
+    /// deadlocks with `commit_offer`), and L1 hits perform zero disk I/O so
+    /// sub-millisecond hot-hit latency is preserved. Misses populate L1 and
+    /// flush the read-only L1 inventory snapshot outside all locks.
+    pub fn lookup_action_entry_l1(
+        &self,
+        key: &TypedDigest,
+    ) -> Result<Option<rabs_cas::metadata_store::ActionEntryRow>, StoreError> {
+        let Some(cas) = self.cas.as_ref() else {
+            return Ok(None);
+        };
+        {
+            let mut l1 = self
+                .l1_cache
+                .lock()
+                .map_err(|_| StoreError::Backend("l1 cache lock poisoned".to_owned()))?;
+            if let Some(hit) = l1.0.try_get_hit(key) {
+                return Ok(Some(hit));
+            }
+        }
+        let miss_start = Instant::now();
+        let row = {
+            let mut store = cas
+                .store()
+                .lock()
+                .map_err(|_| StoreError::Backend("store lock poisoned".to_owned()))?;
+            store.lookup_action(key)?
+        };
+        let elapsed_nanos = miss_start.elapsed().as_nanos();
+        let (result, snapshot) = {
+            let mut l1 = self
+                .l1_cache
+                .lock()
+                .map_err(|_| StoreError::Backend("l1 cache lock poisoned".to_owned()))?;
+            let result = l1.0.record_miss_result(key, row, elapsed_nanos);
+            let snapshot = L1Inventory::from_cache(&l1.0);
+            (result, snapshot)
+        };
+        let _ = write_l1_inventory_snapshot(cas.cas_root(), &snapshot);
+        Ok(result)
+    }
+
+    /// Snapshot of live L1 action-entry lookup counters and latency percentiles.
+    #[must_use]
+    pub fn l1_stats(&self) -> LookupStats {
+        self.l1_cache
+            .lock()
+            .map_or_else(|_| LookupStats::default(), |l1| l1.0.stats())
     }
 
     /// The authority this incarnation holds, if it acquired one.
@@ -4396,6 +4481,26 @@ impl CoordLive {
                 })
                 .to_string(),
             );
+        }
+        let committed_entry = if matches!(outcome, PublicationOutcome::Committed(_)) {
+            store
+                .lookup_action(&offer.manifest.action_key)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        drop(store);
+        if let Some(entry) = committed_entry {
+            let snapshot = if let Ok(mut l1) = self.l1_cache.lock() {
+                l1.0.insert(offer.manifest.action_key.clone(), entry);
+                Some(L1Inventory::from_cache(&l1.0))
+            } else {
+                None
+            };
+            if let Some(inv) = snapshot {
+                let _ = write_l1_inventory_snapshot(cas.cas_root(), &inv);
+            }
         }
         Ok(outcome)
     }
@@ -5013,77 +5118,125 @@ pub fn declare_coordinator_domains(store: &mut dyn RabsMetadataStore) {
 /// manifests produce a conservative miss, not an unbounded daemon allocation.
 const MAX_LIVE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Load a canonical result manifest out of its CAS bytes, by object
-/// digest key (`domain:hex`, as stored on the publication row).
+/// Truthful encoding profile tag for `flate2` deflate-compressed CAS blobs.
+pub const DEFLATE_PROFILE_V1: &str = "deflate-v1";
+
+fn encode_deflate_v1(
+    logical: &[u8],
+    profile: rabs_cas::compression_policy::CompressionProfile,
+) -> Result<(String, Vec<u8>), String> {
+    use flate2::Compression;
+    use flate2::write::DeflateEncoder;
+    use std::io::Write as _;
+
+    let level = if profile.level <= 1 {
+        Compression::fast()
+    } else {
+        Compression::default()
+    };
+    let mut encoder = DeflateEncoder::new(Vec::new(), level);
+    encoder
+        .write_all(logical)
+        .map_err(|e| format!("deflate write: {e}"))?;
+    let bytes = encoder
+        .finish()
+        .map_err(|e| format!("deflate finish: {e}"))?;
+    Ok((DEFLATE_PROFILE_V1.to_owned(), bytes))
+}
+
+fn decode_deflate_v1(encoded: &[u8], max_logical_bytes: u64) -> Result<Vec<u8>, String> {
+    use flate2::read::DeflateDecoder;
+    use std::io::Read as _;
+
+    let mut decoder = DeflateDecoder::new(encoded);
+    let mut out = Vec::new();
+    decoder
+        .by_ref()
+        .take(max_logical_bytes.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| format!("deflate decode: {e}"))?;
+    if out.len() as u64 > max_logical_bytes {
+        return Err("deflate payload exceeded max logical bytes".to_owned());
+    }
+    Ok(out)
+}
+
+/// Publish one logical CAS object under the H005 compression policy using
+/// truthful `deflate-v1` encoding when compression pays, or `raw-v1` otherwise.
 ///
-/// `None` for every "cannot be sure" case — an unparsable key, a key
-/// that is not an object id, no non-quarantined raw copy, unreadable
-/// bytes, or bytes that do not decode. A caller that needs the manifest
-/// then refuses conservatively; a wrong manifest would mean a wrong
-/// divergence verdict, which is far worse than a refusal.
+/// # Errors
+/// Typed [`PutError`] on digest mismatch, collision, or I/O failure.
+#[allow(clippy::too_many_arguments)]
+pub fn store_blob_with_compression_policy(
+    layout: &rabs_cas::blob_store::BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    declared: &TypedDigest,
+    class: ObjectClass,
+    pressure: CpuPressure,
+    logical_bytes: &[u8],
+    durability: DurabilityPolicy,
+    metrics: Option<&mut CompressionMetrics>,
+) -> Result<PolicyPutOutcome, PutError> {
+    let max_logical = logical_bytes.len() as u64;
+    let decoder = |encoded: &[u8]| decode_deflate_v1(encoded, max_logical);
+    put_with_compression_policy(
+        layout,
+        store,
+        declared,
+        class,
+        pressure,
+        logical_bytes,
+        encode_deflate_v1,
+        &decoder,
+        PutLimits {
+            max_logical_bytes: Some(max_logical),
+            expected_size: Some(max_logical),
+        },
+        durability,
+        metrics,
+    )
+}
+
+/// Publish a batch of small logical sidecars (e.g. dep-info/metadata) as one
+/// deterministic canonical H021 `RBSPACK1` (`pack-v1`) blob.
+///
+/// # Errors
+/// Typed [`PutError`] on member verification or storage failure.
+pub fn store_small_blobs_packed(
+    layout: &rabs_cas::blob_store::BlobStoreLayout,
+    store: &mut dyn RabsMetadataStore,
+    members: &[(TypedDigest, &[u8])],
+    durability: DurabilityPolicy,
+) -> Result<PackedPutOutcome, PutError> {
+    put_packed_members(layout, store, members, durability)
+}
+
+/// Load a committed result manifest across `raw-v1`, `pack-v1`, and
+/// `deflate-v1` representations, verifying content identity and bundle-root
+/// integrity before returning. Returns `None` for quarantined objects, missing
+/// replicas, unreadable bytes, or invalid manifests.
 #[must_use]
 pub fn load_manifest(
     store: &mut dyn RabsMetadataStore,
     manifest_key: &str,
 ) -> Option<CanonicalActionResultManifest> {
-    use std::io::Read;
-
     let object = object_id_from_key(manifest_key)?;
-    // A quarantine of the logical object is stronger than selecting another
-    // physical copy. Do not infer release from an omitted serving reference.
-    if !store
-        .query(
-            "SELECT 1 FROM quarantines WHERE scope = 'logical-object' AND subject = ?1 LIMIT 1",
-            &[SqlValue::Text(digest_key(&object))],
-        )
-        .ok()?
-        .is_empty()
+    let bytes = read_verified_object(store, &object, MAX_LIVE_MANIFEST_BYTES, |encoding, raw| {
+        if encoding == DEFLATE_PROFILE_V1 {
+            decode_deflate_v1(raw, MAX_LIVE_MANIFEST_BYTES)
+                .map_or_else(DecodedObject::Corrupt, DecodedObject::Decoded)
+        } else {
+            DecodedObject::UnsupportedEncoding
+        }
+    })
+    .ok()??;
+    let manifest = decode_manifest_v1(&bytes).ok()?;
+    if rabs_key::logical_output_map::verify_manifest_bundle_root(&manifest).is_ok()
+        && rabs_cas::publication::semantic_result_digest_v1(&manifest)
+            == manifest.semantic_result_digest
+        && encode_manifest_v1(&manifest) == bytes
     {
-        return None;
-    }
-    let locations = store.object_locations(&object).ok()?;
-    for (path, encoding, _) in locations {
-        // Preserve the existing representation boundary: compressed/packed
-        // copies require their own decoders and are not raw manifests.
-        if encoding != RAW_PROFILE_V1 {
-            continue;
-        }
-        // Stored manifests are regular CAS files. In particular, do not open
-        // a recorded FIFO/device or follow a symlink before applying the byte
-        // bound. The content digest remains authoritative after opening.
-        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
-            continue;
-        }
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        let mut bytes = Vec::new();
-        if file
-            .take(MAX_LIVE_MANIFEST_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-            || u64::try_from(bytes.len()).ok()? > MAX_LIVE_MANIFEST_BYTES
-        {
-            continue;
-        }
-        let digests = digest_set(&bytes, DigestRequest::default(), None).ok()?;
-        if digests.atp_content_id != object {
-            // Decodable bytes are not necessarily the committed bytes. A bad
-            // location must never drive divergence comparison or installation.
-            // Quarantine just THIS copy, then try another verified replica.
-            store.set_location_quarantined(&object, &path, true).ok()?;
-            continue;
-        }
-        let Ok(manifest) = decode_manifest_v1(&bytes) else {
-            continue;
-        };
-        if rabs_key::logical_output_map::verify_manifest_bundle_root(&manifest).is_ok()
-            && rabs_cas::publication::semantic_result_digest_v1(&manifest)
-                == manifest.semantic_result_digest
-            && encode_manifest_v1(&manifest) == bytes
-        {
-            return Some(manifest);
-        }
+        return Some(manifest);
     }
     None
 }
@@ -8234,5 +8387,149 @@ mod tests {
         assert_eq!(enqueued_receipts, 90);
         assert_eq!(granted_receipts, 90);
         assert_eq!(completed_receipts, 90);
+    }
+
+    #[test]
+    fn coord_l1_cache_snapshots_to_disk_and_load_manifest_reads_packed_and_compressed() {
+        use rabs_cas::cache_inventory::read_l1_snapshot;
+        use rabs_cas::metadata_store::ActionEntryRow;
+
+        let dir = crate::test_util::private_tempdir();
+        let cas =
+            Arc::new(crate::janitor::store::mount_and_reconcile(dir.path()).expect("mount cas"));
+        let coord = CoordLive::with_cas(Arc::clone(&cas));
+        coord.acquire_boot_authority("l1-pack-test").unwrap();
+
+        // 1. Live L1 read-through miss -> hit + atomic snapshot readable out-of-process.
+        let action_key = TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: DOMAIN_ACTION_KEY,
+            bytes: [42u8; 32],
+        };
+        {
+            let mut store = cas.store().lock().unwrap();
+            store
+                .upsert_action_entry(&ActionEntryRow {
+                    action_key: action_key.clone(),
+                    key_epoch: 1,
+                    projection_epoch: 1,
+                })
+                .unwrap();
+        }
+        let first = coord.lookup_action_entry_l1(&action_key).unwrap();
+        assert!(first.is_some());
+        let second = coord.lookup_action_entry_l1(&action_key).unwrap();
+        assert_eq!(first, second);
+        let stats = coord.l1_stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
+        let snap = read_l1_snapshot(cas.cas_root()).expect("l1 snapshot written on miss");
+        assert_eq!(snap.capacity, 4096);
+        assert_eq!(snap.live_entries, 1);
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.stats.misses, 1);
+        // L1 hit did not flush to disk; next miss persists the accumulated hit counter too.
+        let absent_key = TypedDigest {
+            algorithm: DigestAlgorithm::Sha256V1,
+            domain: DOMAIN_ACTION_KEY,
+            bytes: [43u8; 32],
+        };
+        assert_eq!(coord.lookup_action_entry_l1(&absent_key).unwrap(), None);
+        let snap2 = read_l1_snapshot(cas.cas_root()).expect("l1 snapshot refreshed");
+        assert_eq!(snap2.stats.hits, 1);
+        assert_eq!(snap2.stats.misses, 2);
+        assert_eq!(snap2.stats.negatives, 1);
+
+        // 2. Policy-compressed (deflate-v1) & packed (pack-v1) manifests load verified.
+        let logical_outputs: Vec<rabs_protocol::result_identity::LogicalOutput> = (0..64)
+            .map(|idx| rabs_protocol::result_identity::LogicalOutput {
+                role: rabs_protocol::result_identity::OutputRole::ProvisionalMetadata,
+                virtual_path: rabs_protocol::raw_bytes::RawBytes::new(
+                    format!("deps/libcrate_{idx:03}_aaaaaaaaaaaaaaaa.rmeta").into_bytes(),
+                ),
+                object: ObjectId(TypedDigest {
+                    algorithm: DigestAlgorithm::Sha256V1,
+                    domain: ATP_OBJECT_CONTENT_DOMAIN,
+                    bytes: [idx as u8; 32],
+                }),
+            })
+            .collect();
+        let artifact_bundle_root =
+            rabs_key::logical_output_map::compute_bundle_root(&logical_outputs);
+        let mut manifest = CanonicalActionResultManifest {
+            action_key: action_key.clone(),
+            canonical_descriptor_digest: TypedDigest {
+                algorithm: DigestAlgorithm::Sha256V1,
+                domain: DOMAIN_DESCRIPTOR,
+                bytes: [7u8; 32],
+            },
+            key_epoch: 1,
+            projection_epoch: 1,
+            result_kind: rabs_protocol::result_identity::ResultKind::Success,
+            artifact_bundle_root,
+            logical_outputs,
+            semantic_result_digest: TypedDigest {
+                algorithm: DigestAlgorithm::Sha256V1,
+                domain: SEMANTIC_PROJECTION_DOMAIN,
+                bytes: [0u8; 32],
+            },
+            observable_result_digest: TypedDigest {
+                algorithm: DigestAlgorithm::Sha256V1,
+                domain: OBSERVABLE_PROJECTION_DOMAIN,
+                bytes: [9u8; 32],
+            },
+        };
+        manifest.semantic_result_digest =
+            rabs_cas::publication::semantic_result_digest_v1(&manifest);
+        let bytes = encode_manifest_v1(&manifest);
+        assert!(bytes.len() > 4096, "fixture must exceed MIN_COMPRESS_BYTES");
+        let manifest_id = digest_set(&bytes, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let manifest_key = digest_key(&manifest_id);
+
+        // Store via H005 compression policy (deflate-v1) and read back through load_manifest.
+        let mut metrics = CompressionMetrics::default();
+        {
+            let mut store = cas.store().lock().unwrap();
+            let put = store_blob_with_compression_policy(
+                cas.layout(),
+                &mut *store,
+                &manifest_id,
+                ObjectClass::CompilerArtifact,
+                CpuPressure::Low,
+                &bytes,
+                DurabilityPolicy::FULL,
+                Some(&mut metrics),
+            )
+            .unwrap();
+            assert_eq!(put.storage_profile, DEFLATE_PROFILE_V1);
+            assert!(put.encoded_bytes < put.logical_bytes);
+            assert_eq!(
+                load_manifest(&mut *store, &manifest_key),
+                Some(manifest.clone())
+            );
+        }
+
+        // Also verify H021 pack-v1 manifest storage round-trips through load_manifest on a fresh store.
+        let dir2 = crate::test_util::private_tempdir();
+        let cas2 = crate::janitor::store::mount_and_reconcile(dir2.path()).expect("mount cas2");
+        let mut store2 = cas2.store().lock().unwrap();
+        let sidecar = b"dep-info-sidecar: src/lib.rs\n";
+        let sidecar_id = digest_set(sidecar, DigestRequest::default(), None)
+            .unwrap()
+            .atp_content_id;
+        let packed = store_small_blobs_packed(
+            cas2.layout(),
+            &mut *store2,
+            &[
+                (manifest_id.clone(), bytes.as_slice()),
+                (sidecar_id, sidecar.as_slice()),
+            ],
+            DurabilityPolicy::FULL,
+        )
+        .unwrap();
+        assert_eq!(packed.member_count, 2);
+        assert_eq!(load_manifest(&mut *store2, &manifest_key), Some(manifest));
     }
 }
