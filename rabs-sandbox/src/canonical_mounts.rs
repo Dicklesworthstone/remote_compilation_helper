@@ -216,6 +216,9 @@ pub struct CanonicalMountPlan {
     /// attempt surfaces as an error inside the sandbox, never as silent
     /// divergence from the captured manifest.
     pub immutable_source: Option<SnapshotProvenance>,
+    /// Optional pinned host `/usr` runtime epoch digest propagated into the
+    /// compiled [`CanonicalNamespaceSpec`].
+    pub host_runtime_epoch_digest: Option<String>,
 }
 
 impl CanonicalMountPlan {
@@ -242,7 +245,15 @@ impl CanonicalMountPlan {
             secret_slots: Vec::new(),
             extra_env: Vec::new(),
             immutable_source: None,
+            host_runtime_epoch_digest: None,
         }
+    }
+
+    /// Pin the observed host `/usr` runtime epoch digest onto this mount plan.
+    #[must_use]
+    pub fn with_host_runtime_epoch(mut self, digest: impl Into<String>) -> Self {
+        self.host_runtime_epoch_digest = Some(digest.into());
+        self
     }
 
     /// Switch the workspace to an immutable D018 snapshot (D004): the
@@ -398,6 +409,7 @@ impl CanonicalMountPlan {
         spec.ro_binds = ro;
         spec.rw_binds = rw;
         spec.env = env;
+        spec.host_runtime_epoch_digest = self.host_runtime_epoch_digest.clone();
         Ok(spec)
     }
 
@@ -998,7 +1010,15 @@ mod tests {
             cgroup_v2: true,
             landlock: true,
         };
-        let spec = base_plan().to_spec().unwrap();
+        let unpinned = base_plan().to_spec().unwrap();
+        let unpinned_launch =
+            build_canonical_argv(&unpinned, &support, "cargo", &["build".into()]).unwrap();
+        assert!(!unpinned_launch.boundary.satisfies_strict_hermetic_linux());
+
+        let spec = base_plan()
+            .with_host_runtime_epoch("a".repeat(64))
+            .to_spec()
+            .unwrap();
         let launch = build_canonical_argv(&spec, &support, "cargo", &["build".into()]).unwrap();
         assert!(launch.boundary.satisfies_strict_hermetic_linux());
     }

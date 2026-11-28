@@ -11,7 +11,7 @@
 
 use rabs_sandbox::canonical_namespace::{
     ActionViewSpec, Bind, CanonicalNamespaceSpec, HostIsolationSupport, build_action_view_argv,
-    build_canonical_argv, command_for,
+    build_canonical_argv, command_for, observe_host_usr_epoch,
 };
 use rabs_sandbox::layout;
 
@@ -50,6 +50,7 @@ fn strict_hermetic_boundary_holds_from_inside() {
 
     let ws = tempfile::tempdir().unwrap();
     let mut spec = CanonicalNamespaceSpec::new();
+    spec.host_runtime_epoch_digest = observe_host_usr_epoch();
     spec.rw_binds.push(Bind::new(ws.path(), layout::WORKSPACE));
     spec.env = base_env();
     spec.env
@@ -145,6 +146,7 @@ fn canonical_namespace_boots_cargo_on_fixture_workspace() {
     let cargo_home_backing = tempfile::tempdir().unwrap();
 
     let mut spec = CanonicalNamespaceSpec::new();
+    spec.host_runtime_epoch_digest = observe_host_usr_epoch();
     spec.rw_binds.push(Bind::new(ws.path(), layout::WORKSPACE));
     spec.rw_binds.push(Bind::new(
         out_backing.path(),
@@ -210,6 +212,7 @@ fn action_view_hides_undeclared_inputs() {
         output_binds: vec![Bind::new(outdir.path(), format!("{}/unit", layout::OUT))],
         env: vec![("PATH".to_string(), "/usr/bin:/bin".to_string())],
         cwd: layout::WORKSPACE.into(),
+        host_runtime_epoch_digest: observe_host_usr_epoch(),
     };
     let script = format!(
         "[ -f /__rabs/workspace/input.txt ] && echo declared=present; \

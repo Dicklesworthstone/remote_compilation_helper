@@ -1372,12 +1372,27 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Unix domain socket paths are capped by kernel `SUN_LEN` (~108 bytes).
+    /// When `TMPDIR` points to a deep workspace/pool path, anchor socket test
+    /// fixtures under `/tmp` so `UnixListener::bind` and socket-path checks
+    /// never fail from an overly long ambient `TMPDIR`.
+    fn short_socket_tempdir(prefix: &str) -> PathBuf {
+        let mut builder = tempfile::Builder::new();
+        builder
+            .prefix(prefix)
+            .permissions(fs::Permissions::from_mode(0o700));
+        let dir = if std::env::temp_dir().as_os_str().len() > 60 && Path::new("/tmp").is_dir() {
+            builder.tempdir_in("/tmp")
+        } else {
+            builder.tempdir()
+        };
+        let path = dir.unwrap().keep();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
     fn retained_job_intent() -> JobIntent {
-        let parent = tempfile::Builder::new()
-            .prefix("rjob-intent-")
-            .tempdir()
-            .unwrap()
-            .keep();
+        let parent = short_socket_tempdir("rjob-intent-");
         let id = "0123456789abcdef0123456789abcdef";
         let root = parent.join(format!("cargo-{id}"));
         fs::create_dir(&root).unwrap();
@@ -1434,11 +1449,7 @@ mod tests {
 
     #[test]
     fn daemon_endpoint_identity_distinguishes_replacement_from_the_checked_owner() {
-        let root = tempfile::Builder::new()
-            .prefix("rjob-sock-")
-            .tempdir()
-            .unwrap()
-            .keep();
+        let root = short_socket_tempdir("rjob-sock-");
         let socket = root.join("socket");
         let _first = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();

@@ -660,7 +660,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn private() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        // Anchor under /tmp when ambient TMPDIR is deep so socket fixture
+        // paths inside the tree stay safely below kernel SUN_LEN.
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("rabs-atree-");
+        let dir = if std::env::temp_dir().as_os_str().len() > 60
+            && std::path::Path::new("/tmp").is_dir()
+        {
+            builder.tempdir_in("/tmp").unwrap()
+        } else {
+            builder.tempdir().unwrap()
+        };
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }

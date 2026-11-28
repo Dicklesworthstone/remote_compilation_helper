@@ -7,11 +7,11 @@
 //! fresh runtime per network connection defeats structured concurrency
 //! and region accounting.
 //!
-//! This gate scans non-test production source across every `rabs-*` crate
-//! and `rabsd` for BOTH direct `.block_on(` / `Runtime::new()` patterns AND
-//! Asupersync runtime-builder / top-level-entry calls
-//! (`RuntimeBuilder::current_thread`, `RuntimeBuilder::new(`,
-//! `block_on_top_level(`, `block_on_worker_runtime(`).
+//! This gate runs in CI alongside the A002/A004 dependency-direction gates and
+//! scans non-test production source across every `rabs-*` crate and `rabsd` for
+//! BOTH direct `.block_on(` / `Runtime::new()` patterns AND Asupersync
+//! runtime-builder / top-level-entry calls (`RuntimeBuilder::current_thread`,
+//! `RuntimeBuilder::new(`, `block_on_top_level(`, `block_on_worker_runtime(`).
 //!
 //! The allowlist is NOT a relaxation: every entry names a verified
 //! top-level daemon/service/CLI/listener entry (or caller-owned `&Runtime`
@@ -378,6 +378,38 @@ fn skip_cfg_test_target(bytes: &[u8], start: usize) -> usize {
     bytes.len()
 }
 
+/// True iff a whitespace-stripped attribute is strictly test-only:
+/// `cfg(test)` or `cfg(all(..., test, ...))` with `test` as a top-level term
+/// inside `all(...)`. Never matches `cfg(any(...))` or `cfg(not(test))`,
+/// because those can compile in production builds.
+fn is_cfg_test_attr(attr: &str) -> bool {
+    if attr == "cfg(test)" {
+        return true;
+    }
+    let Some(inner) = attr
+        .strip_prefix("cfg(all(")
+        .and_then(|s| s.strip_suffix("))"))
+    else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if &inner[start..idx] == "test" {
+                    return true;
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    depth == 0 && &inner[start..] == "test"
+}
+
 /// Extract production (non-comment, non-`#[cfg(test)]`) Rust source text.
 /// Preserves string literals verbatim so forbidden calls are never masked,
 /// while stripping comments and `#[cfg(test)]` items cleanly without skipping
@@ -421,7 +453,7 @@ fn production_code_only(source: &str) -> String {
             continue;
         }
         if let Some((is_inner, attr, next)) = parse_attribute(bytes, i)
-            && attr == "cfg(test)"
+            && is_cfg_test_attr(&attr)
         {
             if is_inner {
                 // File-level `#![cfg(test)]`: entire module is test-only.
@@ -608,11 +640,38 @@ mod tests {
         block_on_top_level(&rt, async {});
     }
 }
+#[cfg(all(test, unix))]
+mod unix_only_tests {
+    fn helper() {
+        let _ = RuntimeBuilder::current_thread().build();
+    }
+}
 "#;
     assert!(
         violations_in(safe_only).is_empty(),
         "comments and #[cfg(test)] items must not false-positive: {:?}",
         violations_in(safe_only)
+    );
+
+    // Non-strict cfg forms (any / not(test)) compile in production and MUST still be caught.
+    let non_strict_cfg = r#"
+#[cfg(any(test, unix))]
+fn runs_in_prod_too() {
+    let _ = RuntimeBuilder::current_thread().build();
+}
+#[cfg(all(not(test), unix))]
+fn runs_only_in_prod() {
+    let _ = RuntimeBuilder::new().build();
+}
+"#;
+    let non_strict_hits = violations_in(non_strict_cfg);
+    assert!(
+        non_strict_hits.contains(&"RuntimeBuilder::current_thread"),
+        "cfg(any(test, unix)) must be scanned as production: {non_strict_hits:?}"
+    );
+    assert!(
+        non_strict_hits.contains(&"RuntimeBuilder::new("),
+        "cfg(all(not(test), unix)) must be scanned as production: {non_strict_hits:?}"
     );
 }
 

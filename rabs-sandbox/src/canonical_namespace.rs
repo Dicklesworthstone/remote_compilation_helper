@@ -189,11 +189,18 @@ pub struct CanonicalNamespaceSpec {
     allow_network: bool,
     /// Working directory inside the namespace.
     pub cwd: PathBuf,
+    /// Pinned SHA-256 hex digest (64 lowercase hex chars) of the observed host
+    /// `/usr` runtime epoch when `host_usr_ro` is mounted. Required for
+    /// [`NamespaceBoundary::satisfies_strict_hermetic_linux`] while host `/usr`
+    /// remains mounted read-only; leaving it `None` truthfully downgrades the
+    /// boundary to non-strict (`host-sandbox-audit`).
+    pub host_runtime_epoch_digest: Option<String>,
 }
 
 impl CanonicalNamespaceSpec {
     /// A spec with the canonical defaults: deterministic hostname, closed
-    /// network, cwd at the fixed workspace root.
+    /// network, cwd at the fixed workspace root, and no pinned host runtime
+    /// epoch until explicitly observed/bound.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -203,7 +210,16 @@ impl CanonicalNamespaceSpec {
             hostname: "rabs".to_string(),
             allow_network: false,
             cwd: PathBuf::from(layout::WORKSPACE),
+            host_runtime_epoch_digest: None,
         }
+    }
+
+    /// Bind an observed host `/usr` runtime epoch digest (64 lowercase hex
+    /// chars, e.g. from [`observe_host_usr_epoch`]) into this namespace spec.
+    #[must_use]
+    pub fn with_host_runtime_epoch(mut self, digest: impl Into<String>) -> Self {
+        self.host_runtime_epoch_digest = Some(digest.into());
+        self
     }
 
     /// Whether this spec would share the host network. Public callers may
@@ -237,6 +253,9 @@ pub struct ActionViewSpec {
     pub env: Vec<(String, String)>,
     /// Working directory inside the view.
     pub cwd: PathBuf,
+    /// Optional pinned SHA-256 hex digest of the observed host `/usr` runtime
+    /// epoch (64 lowercase hex chars).
+    pub host_runtime_epoch_digest: Option<String>,
 }
 
 /// Typed refusals from the builder.
@@ -288,8 +307,13 @@ pub struct NamespaceBoundary {
     /// Environment fully cleared then explicitly set (I21).
     pub clearenv: bool,
     /// DOCUMENTED SOFTNESS: host `/usr` visible read-only (dynamic linker,
-    /// `/bin/sh`) until D005 pins toolchain/sysroot mounts.
+    /// `/bin/sh`) for canonical Cargo launches that have not yet moved onto a
+    /// sparse retained runtime. When `true`, `satisfies_strict_hermetic_linux`
+    /// requires `host_runtime_epoch_digest` to be explicitly pinned.
     pub host_usr_ro: bool,
+    /// Pinned SHA-256 hex digest of the host `/usr` runtime cohort when
+    /// `host_usr_ro` is `true`, or `None` when unpinned / not mounted.
+    pub host_runtime_epoch_digest: Option<String>,
     /// `/__rabs/tmp` is a private tmpfs.
     pub tmpfs_tmp: bool,
     /// Private procfs mounted at `/proc`.
@@ -299,11 +323,11 @@ pub struct NamespaceBoundary {
 }
 
 impl NamespaceBoundary {
-    /// Whether this boundary satisfies the documented
-    /// `IsolationProfile::StrictHermeticLinux` contract of this increment:
-    /// every namespace axis fresh, network closed, env explicit, closed
-    /// mount view — with `host_usr_ro` as the one named, recorded
-    /// exception.
+    /// Whether this boundary satisfies `IsolationProfile::StrictHermeticLinux`:
+    /// every namespace axis fresh, network closed, env explicit, closed mount
+    /// view, AND either no host `/usr` mount (`!host_usr_ro`) or an explicitly
+    /// pinned `host_runtime_epoch_digest`. An unpinned `host_usr_ro` mount
+    /// truthfully returns `false`.
     #[must_use]
     pub fn satisfies_strict_hermetic_linux(&self) -> bool {
         self.user_ns
@@ -313,10 +337,117 @@ impl NamespaceBoundary {
             && self.net_isolated
             && self.mounts_closed_view
             && self.clearenv
+            && (!self.host_usr_ro || self.host_runtime_epoch_digest.is_some())
             && self.tmpfs_tmp
             && self.proc_private
             && self.die_with_parent
     }
+
+    /// Whether this boundary satisfies pure hermetic Linux isolation with ZERO
+    /// host `/usr` mount (`!host_usr_ro`), such as sparse retained-runtime
+    /// launches.
+    #[must_use]
+    pub fn satisfies_pure_hermetic_linux(&self) -> bool {
+        !self.host_usr_ro && self.satisfies_strict_hermetic_linux()
+    }
+}
+
+/// Observe a deterministic SHA-256 runtime-epoch digest covering the host `/usr`
+/// and `/etc` runtime surfaces that [`push_host_usr`] exposes read-only inside
+/// a canonical namespace.
+///
+/// Returns `Some(64_lowercase_hex)` on Linux when `/usr` is present, and `None`
+/// on non-Linux hosts.
+#[must_use]
+pub fn observe_host_usr_epoch() -> Option<String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+
+        const MAX_HASHED_FILE_BYTES: u64 = 4 * 1024 * 1024;
+        if !Path::new("/usr").is_dir() {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"rabs.host-usr-epoch.v1\0");
+
+        // Small text/cache descriptors: hash exact bytes when bounded.
+        for file in ["/etc/os-release", "/etc/ld.so.cache"] {
+            hasher.update(b"file\0");
+            hasher.update(file.as_bytes());
+            hasher.update(b"\0");
+            match std::fs::metadata(file) {
+                Ok(meta) if meta.is_file() && meta.len() <= MAX_HASHED_FILE_BYTES => {
+                    if let Ok(bytes) = std::fs::read(file) {
+                        hasher.update(b"bytes\0");
+                        hasher.update((bytes.len() as u64).to_le_bytes());
+                        hasher.update(&bytes);
+                    } else {
+                        hasher.update(b"unreadable\0");
+                    }
+                }
+                Ok(meta) => {
+                    hasher.update(b"meta\0");
+                    hasher.update(meta.len().to_le_bytes());
+                    hasher.update(meta.mtime().to_le_bytes());
+                    hasher.update(meta.mtime_nsec().to_le_bytes());
+                    hasher.update(meta.dev().to_le_bytes());
+                    hasher.update(meta.ino().to_le_bytes());
+                }
+                Err(_) => {
+                    hasher.update(b"absent\0");
+                }
+            }
+        }
+
+        // Core runtime executables and dynamic loader / libc entries.
+        for probe in [
+            "/usr/bin/sh",
+            "/usr/bin/cc",
+            "/usr/bin/ld",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/ld-linux-aarch64.so.1",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/usr/lib/aarch64-linux-gnu/libc.so.6",
+            "/usr/lib64/libc.so.6",
+        ] {
+            hasher.update(b"probe\0");
+            hasher.update(probe.as_bytes());
+            hasher.update(b"\0");
+            match std::fs::canonicalize(probe) {
+                Ok(resolved) => {
+                    hasher.update(b"resolved\0");
+                    hasher.update(resolved.to_string_lossy().as_bytes());
+                    hasher.update(b"\0");
+                    if let Ok(meta) = std::fs::metadata(&resolved) {
+                        hasher.update(meta.len().to_le_bytes());
+                        hasher.update(meta.mtime().to_le_bytes());
+                        hasher.update(meta.mtime_nsec().to_le_bytes());
+                        hasher.update(meta.dev().to_le_bytes());
+                        hasher.update(meta.ino().to_le_bytes());
+                    }
+                }
+                Err(_) => {
+                    hasher.update(b"absent\0");
+                }
+            }
+        }
+
+        let digest = hasher.finalize();
+        Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+}
+
+fn is_valid_epoch_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// A constructed namespace launch: the argv to execute and the boundary it
@@ -451,6 +582,13 @@ fn build_canonical_os_argv(
             reason: "hostname must be non-empty ASCII".to_string(),
         });
     }
+    if let Some(digest) = &spec.host_runtime_epoch_digest
+        && !is_valid_epoch_digest(digest)
+    {
+        return Err(IsolationError::InvalidSpec {
+            reason: "host_runtime_epoch_digest must be 64 lowercase hex characters".to_string(),
+        });
+    }
     let ro = sorted_binds(&spec.ro_binds)?;
     let rw = sorted_binds(&spec.rw_binds)?;
 
@@ -487,6 +625,7 @@ fn build_canonical_os_argv(
         mounts_closed_view: true,
         clearenv: true,
         host_usr_ro: true,
+        host_runtime_epoch_digest: spec.host_runtime_epoch_digest.clone(),
         tmpfs_tmp: true,
         proc_private: true,
         die_with_parent: true,
@@ -558,6 +697,7 @@ pub fn build_action_view_argv(
         hostname: "rabs".to_string(),
         allow_network: false,
         cwd: spec.cwd.clone(),
+        host_runtime_epoch_digest: spec.host_runtime_epoch_digest.clone(),
     };
     build_canonical_argv(&canonical, support, program, args)
 }
@@ -615,6 +755,20 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Wait out any transient Linux ETXTBSY caused by concurrent test
+        // threads mid-fork inheriting the write FD before execve closes it.
+        for _ in 0..50 {
+            match std::process::Command::new(&executable)
+                .arg("--version")
+                .output()
+            {
+                Ok(_) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
         (owner, executable)
     }
 
@@ -737,7 +891,7 @@ mod tests {
 
     #[test]
     fn canonical_argv_is_deterministic_and_network_closed() {
-        let mut spec = CanonicalNamespaceSpec::new();
+        let mut spec = CanonicalNamespaceSpec::new().with_host_runtime_epoch("a".repeat(64));
         spec.rw_binds.push(Bind::new(
             "/data/rabs/backing/attempt-42/ws",
             layout::WORKSPACE,
@@ -757,6 +911,48 @@ mod tests {
         assert!(s.contains(&"--die-with-parent".to_string()));
         assert_eq!(s[0], "bwrap");
         assert!(a.boundary.satisfies_strict_hermetic_linux());
+        assert!(!a.boundary.satisfies_pure_hermetic_linux());
+    }
+
+    #[test]
+    fn unpinned_host_usr_ro_fails_strict_hermetic_and_rejects_malformed_epoch() {
+        let unpinned = CanonicalNamespaceSpec::new();
+        let launch =
+            build_canonical_argv(&unpinned, &full_support(), "cargo", &["build".into()]).unwrap();
+        assert!(launch.boundary.host_usr_ro);
+        assert!(launch.boundary.host_runtime_epoch_digest.is_none());
+        assert!(
+            !launch.boundary.satisfies_strict_hermetic_linux(),
+            "unpinned host /usr mount must not claim strict-hermetic-linux"
+        );
+        assert!(!launch.boundary.satisfies_pure_hermetic_linux());
+
+        // A boundary without host /usr satisfies BOTH strict and pure hermetic Linux.
+        let mut pure = launch.boundary.clone();
+        pure.host_usr_ro = false;
+        assert!(pure.satisfies_strict_hermetic_linux());
+        assert!(pure.satisfies_pure_hermetic_linux());
+
+        // Malformed epoch digests must be refused before launching.
+        for bad in ["short", &"A".repeat(64), &"g".repeat(64)] {
+            let spec = CanonicalNamespaceSpec::new().with_host_runtime_epoch(bad);
+            assert!(
+                matches!(
+                    build_canonical_argv(&spec, &full_support(), "cargo", &[]),
+                    Err(IsolationError::InvalidSpec { .. })
+                ),
+                "malformed epoch {bad:?} must refuse"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observe_host_usr_epoch_is_stable_64_lowercase_hex() {
+        let first = observe_host_usr_epoch().expect("linux host with /usr has an epoch digest");
+        let second = observe_host_usr_epoch().expect("second observation succeeds");
+        assert_eq!(first, second);
+        assert!(is_valid_epoch_digest(&first), "invalid digest: {first}");
     }
 
     #[cfg(unix)]
@@ -871,6 +1067,7 @@ mod tests {
             output_binds: vec![Bind::new("/b/out", format!("{}/unit1", layout::OUT))],
             env: vec![("PATH".into(), "/usr/bin".into())],
             cwd: PathBuf::from(layout::WORKSPACE),
+            host_runtime_epoch_digest: Some("b".repeat(64)),
         };
         let launch = build_action_view_argv(&view, &full_support(), "rustc", &[]).unwrap();
         let s = strs(&launch.argv);

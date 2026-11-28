@@ -19,6 +19,7 @@ use rabs_protocol::input_evidence::EnforcementState;
 use rabs_protocol::volatility::{EffectClass, classify};
 use rabs_sandbox::canonical_namespace::{
     Bind, CanonicalNamespaceSpec, HostIsolationSupport, build_canonical_argv, command_for,
+    observe_host_usr_epoch,
 };
 use rabs_sandbox::layout;
 use rabs_sandbox::network_isolation::{boundary_isolation_evidence, denied_attempt_observation};
@@ -89,6 +90,7 @@ fn network_attempt_inside_canonical_namespace_fails_and_is_recorded() {
     let ws = tempfile::tempdir().expect("workspace backing tempdir");
 
     let mut spec = CanonicalNamespaceSpec::new();
+    spec.host_runtime_epoch_digest = observe_host_usr_epoch();
     spec.rw_binds.push(Bind::new(ws.path(), layout::WORKSPACE));
     // The complete presented environment (I21): exactly the marker.
     spec.env = vec![("RABS_E002_PROBE".to_string(), "1".to_string())];

@@ -1502,6 +1502,7 @@ fn build_dependency_argv_with_package_anchor(
             mounts_closed_view: true,
             clearenv: true,
             host_usr_ro: false,
+            host_runtime_epoch_digest: None,
             tmpfs_tmp: true,
             proc_private: context.execution_mode() == DependencyExecutionMode::Metadata,
             die_with_parent: true,

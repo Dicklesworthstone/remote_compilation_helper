@@ -4,7 +4,15 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 fn directory() -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
+    // Anchor under /tmp when ambient TMPDIR is deep (e.g. worker-scoped pool
+    // paths) so Unix domain socket paths stay safely below kernel SUN_LEN.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("rabs-sock-");
+    let root = if std::env::temp_dir().as_os_str().len() > 60 && Path::new("/tmp").is_dir() {
+        builder.tempdir_in("/tmp").unwrap()
+    } else {
+        builder.tempdir().unwrap()
+    };
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     root
 }

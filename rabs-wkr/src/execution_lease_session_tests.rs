@@ -181,6 +181,7 @@ fn report() -> rabs_wkr::session::CapabilityReport {
         dependency_modes: vec![],
         missing: vec![],
         slots: 1,
+        ..rabs_wkr::session::CapabilityReport::default()
     }
 }
 

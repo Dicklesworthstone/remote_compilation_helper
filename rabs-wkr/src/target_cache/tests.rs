@@ -2949,15 +2949,17 @@ fn real_cargo_package_and_target_selections_reuse_dependencies_and_run_current_t
         "fn main() {}\n#[test]\nfn selected_failure() { panic!(\"current selected test actually ran\"); }\n",
     )
     .unwrap();
+    // Edited source cannot reuse prior codegen/executable seeds (b3496942):
+    // the changed selection starts cold, then exact-source reruns reuse it.
     let retained = cache.state.lock().unwrap().entries.len();
     let failed = fixture.command_with_status(
         &cache,
         "test",
         &["--package", "hot_fixture", "--bin", "hot_fixture"],
-        true,
+        false,
         101,
     );
-    failed.assert_fresh("hot_dep", false, true);
+    failed.assert_fresh("hot_dep", false, false);
     failed.assert_fresh("hot_fixture", true, false);
     failed.assert_output_contains("current selected test actually ran");
     failed.assert_output_contains("FAILED");

@@ -26,6 +26,10 @@ name = "rabs-install"
 path = "src/install_main.rs"
 required-features = ["installer"]
 
+[[bin]]
+name = "rabs-live-test"
+path = "src/live_test_main.rs"
+
 [features]
 installer = ["dep:flate2", "dep:tar"]
 

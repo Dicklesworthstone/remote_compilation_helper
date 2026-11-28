@@ -9,22 +9,28 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-const HELP: &str = "Install or inspect a complete, trusted RABS toolset on Linux.
+const HELP: &str = "Install, package, or inspect a complete, trusted RABS toolset on Linux.
 
 Usage: rabs-install (--from-build DIR | --from-bundle DIR | --from-archive TAR_GZ)
                     [--bin-dir ABSOLUTE_DIRECTORY] [--probe | --verify]
+       rabs-install (--from-build DIR | --from-bundle DIR)
+                    --package TAR_GZ --target TARGET
+                    [--require-source FULL_COMMIT]
        rabs-install --probe-installed [--bin-dir ABSOLUTE_DIRECTORY]
 
 Options:
   --from-build DIR      Split wrapper-release and daemon-release output directory
   --from-bundle DIR     Extracted, authenticated release bundle
   --from-archive FILE   Authenticated flat gzip release archive
-  --bin-dir DIR        Destination; defaults to $HOME/.local/bin
-  --probe              Check staged launchers before atomic activation
-  --verify             Read-only comparison against the selected trusted bytes
-  --probe-installed    Validate and launch-check the active managed generation
-  --version            Print version
-  -h, --help           Print help
+  --package FILE        Produce and self-verify a deterministic flat release archive
+  --target TARGET       Target triple for --package (x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu)
+  --require-source SHA  Verify all 9 native --rabs-build-info stamps match this 40-hex commit
+  --bin-dir DIR         Destination; defaults to $HOME/.local/bin
+  --probe               Check staged launchers before atomic activation
+  --verify              Read-only comparison against the selected trusted bytes
+  --probe-installed     Validate and launch-check the active managed generation
+  --version             Print version
+  -h, --help            Print help
 
 Verify publisher signatures/checksums before supplying a bundle or archive.
 Content hashes detect corruption; they do not authenticate a publisher.
@@ -33,8 +39,8 @@ Existing generations and failed installation stages are retained. Unmanaged
 entries are never replaced. No service is started and no Cargo configuration
 is changed. --verify never executes installed tools.
 Launch checks have a ten-second deadline per tool and clean up their owned
-process groups. Package production, retained SSH images and fleet transport are
-not implemented by this local installer; unsupported options fail explicitly.
+process groups. Retained SSH images and fleet --ssh transport are not
+implemented by this local installer; unsupported options fail explicitly.
 ";
 
 fn run(arguments: &[OsString]) -> Result<bool, String> {

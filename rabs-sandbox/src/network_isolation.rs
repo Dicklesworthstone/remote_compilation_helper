@@ -887,10 +887,11 @@ fn canonical_absolute_path(path: &[u8]) -> bool {
 /// record is derived from emitted facts, never asserted independently of
 /// them.
 ///
-/// The documented `host_usr_ro` softness is deliberately NOT a control
-/// row: it is an enforced read-only bind and a named exception of the
-/// strict-hermetic profile, already reflected in
-/// [`NamespaceBoundary::satisfies_strict_hermetic_linux`].
+/// The `host-runtime-epoch` control row explicitly records whether host `/usr`
+/// is absent (`no-host-usr-mount`), pinned by an observed digest
+/// (`pinned-host-usr-epoch`), or mounted unpinned (`host-usr-ro-unpinned`,
+/// which downgrades the evidence record from `strict-hermetic-linux` to
+/// `host-sandbox-audit`).
 #[must_use]
 pub fn boundary_isolation_evidence(boundary: &NamespaceBoundary) -> IsolationEvidenceRecord {
     let enforced = |mechanism| EnforcementState::Enforced { mechanism };
@@ -992,6 +993,18 @@ pub fn boundary_isolation_evidence(boundary: &NamespaceBoundary) -> IsolationEvi
             } else {
                 EnforcementState::NotEnforced {
                     reason: "orphans-possible",
+                }
+            },
+        ),
+        (
+            RawBytes::from("host-runtime-epoch"),
+            if !boundary.host_usr_ro {
+                enforced("no-host-usr-mount")
+            } else if boundary.host_runtime_epoch_digest.is_some() {
+                enforced("pinned-host-usr-epoch")
+            } else {
+                EnforcementState::NotEnforced {
+                    reason: "host-usr-ro-unpinned",
                 }
             },
         ),
@@ -1308,6 +1321,8 @@ mod tests {
         let receipt = finish_brokered_fetch(lease, authority_at(12, &[]))
             .expect("observed facts fit the installed policy");
 
+        let mut spec = spec.clone();
+        spec.host_runtime_epoch_digest = Some("c".repeat(64));
         let launch = build_canonical_argv(&spec, &full_support(), "cargo", &["metadata".into()])
             .expect("spec builds");
         let argv: Vec<String> = launch
@@ -1688,7 +1703,7 @@ mod tests {
 
     #[test]
     fn default_spec_stays_deny_and_evidence_fully_enforced() {
-        let mut spec = CanonicalNamespaceSpec::new();
+        let mut spec = CanonicalNamespaceSpec::new().with_host_runtime_epoch("d".repeat(64));
         spec.rw_binds
             .push(Bind::new("/data/rabs/ws", layout::WORKSPACE));
         let launch = build_canonical_argv(&spec, &full_support(), "cargo", &["build".into()])
@@ -1711,6 +1726,44 @@ mod tests {
         let network = &record.controls[0];
         assert_eq!(network.0.as_utf8(), Some("network-deny"));
         assert_eq!(network.1, EnforcementState::Enforced { mechanism: "netns" });
+        let epoch = record
+            .controls
+            .iter()
+            .find(|(name, _)| name.as_utf8() == Some("host-runtime-epoch"))
+            .expect("host-runtime-epoch control present");
+        assert_eq!(
+            epoch.1,
+            EnforcementState::Enforced {
+                mechanism: "pinned-host-usr-epoch"
+            }
+        );
+
+        // Unpinned host_usr_ro truthfully downgrades evidence instead of claiming strict.
+        let unpinned_launch = build_canonical_argv(
+            &CanonicalNamespaceSpec::new(),
+            &full_support(),
+            "cargo",
+            &["build".into()],
+        )
+        .expect("unpinned spec still builds");
+        assert!(!unpinned_launch.boundary.satisfies_strict_hermetic_linux());
+        let unpinned_record = boundary_isolation_evidence(&unpinned_launch.boundary);
+        assert!(!unpinned_record.fully_enforced());
+        assert_eq!(
+            unpinned_record.requested_profile.as_utf8(),
+            Some("host-sandbox-audit")
+        );
+        let unpinned_epoch = unpinned_record
+            .controls
+            .iter()
+            .find(|(name, _)| name.as_utf8() == Some("host-runtime-epoch"))
+            .expect("host-runtime-epoch control present");
+        assert_eq!(
+            unpinned_epoch.1,
+            EnforcementState::NotEnforced {
+                reason: "host-usr-ro-unpinned"
+            }
+        );
     }
 
     #[test]

@@ -2291,14 +2291,27 @@ fn rch_handoff_refuses_invalid_or_recursive_explicit_executables_without_fallbac
         } else {
             &selected
         };
-        fixture.refused(
-            fixture
-                .command_using(&frontend)
-                .env("CARGO_RABS_RCH", value)
-                .env("PATH", &fixture.root)
-                .output()
-                .unwrap(),
-        );
+        let mut command = fixture.command_using(&frontend);
+        command
+            .env("CARGO_RABS_RCH", value)
+            .env("PATH", &fixture.root);
+        // Freshly copied executables in a multi-threaded test process can
+        // transiently observe Linux ETXTBSY while a sibling test thread's
+        // fork() is still racing to execve() and close CLOEXEC descriptors.
+        let mut attempts = 0;
+        let output = loop {
+            match command.output() {
+                Ok(out) => break out,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("failed executing frontend fixture: {err}"),
+            }
+        };
+        fixture.refused(output);
     }
 }
 

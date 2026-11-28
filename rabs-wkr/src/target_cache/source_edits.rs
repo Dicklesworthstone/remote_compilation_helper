@@ -66,9 +66,8 @@ pub(super) fn metadata_context_identity(
         return None;
     }
     let family = identity(inputs)?;
-    let tree = TreeInventory::scan(
+    let tree = TreeInventory::scan_complete(
         &inputs.root,
-        &BTreeSet::new(),
         rabs_sandbox::source_transfer::MAX_SOURCE_BYTES,
         &|| false,
     )

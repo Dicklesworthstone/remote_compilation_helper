@@ -1258,7 +1258,7 @@ mod tests {
 
     #[test]
     fn wrap_inserts_tracer_after_separator_and_keeps_boundary() {
-        let mut spec = CanonicalNamespaceSpec::new();
+        let mut spec = CanonicalNamespaceSpec::new().with_host_runtime_epoch("e".repeat(64));
         spec.rw_binds
             .push(Bind::new("/data/rabs/ws", layout::WORKSPACE));
         let launch =
@@ -1301,6 +1301,7 @@ mod tests {
                 mounts_closed_view: false,
                 clearenv: false,
                 host_usr_ro: false,
+                host_runtime_epoch_digest: None,
                 tmpfs_tmp: false,
                 proc_private: false,
                 die_with_parent: false,

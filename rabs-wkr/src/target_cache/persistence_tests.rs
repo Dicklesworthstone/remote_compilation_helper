@@ -541,13 +541,14 @@ fn real_cargo_restart_reuses_targets_and_reruns_the_current_test_command() {
     );
     drop(cache);
 
-    // Source/data timestamps survive the restart too. Cargo must recompile the
-    // changed crate, retain the dependency, and return the new native failure.
+    // Edited inputs cannot reuse prior codegen/test seeds across restarts
+    // (b3496942): the changed tree starts cold, executes the current test and
+    // returns its native failure, then exact-source restarts reuse that target.
     fs::write(fixture.workspace.join("input.txt"), "41\n").unwrap();
     fixture.fresh_upload_timestamps();
     let cache = persistent(disk.path(), 128 * 1024 * 1024, "fixture-host-v1");
-    let failed = fixture.command_with_status(&cache, "test", &[], true, 101);
-    failed.assert_fresh("hot_dep", false, true);
+    let failed = fixture.command_with_status(&cache, "test", &[], false, 101);
+    failed.assert_fresh("hot_dep", false, false);
     failed.assert_fresh("hot_fixture", true, false);
     failed.assert_output_contains("actually_executes_each_time");
     drop(cache);
@@ -575,10 +576,25 @@ fn real_cargo_failed_compile_survives_restart_and_reuses_completed_dependencies(
         .command_with_status(&cache, "build", &[], false, 101)
         .assert_fresh("hot_dep", false, false);
     drop(cache);
+    // Exact-source rerun after restart reuses the persisted completed dependency.
+    fixture.fresh_upload_timestamps();
+    let cache = persistent(disk.path(), 128 * 1024 * 1024, "fixture-host-v1");
+    fixture
+        .command_with_status(&cache, "build", &[], true, 101)
+        .assert_fresh("hot_dep", false, true);
+    drop(cache);
+    // Fixing source codegen starts cold under b3496942, then exact-source
+    // restarts reuse the fixed build.
     fs::write(&source, original).unwrap();
     fixture.fresh_upload_timestamps();
     let cache = persistent(disk.path(), 128 * 1024 * 1024, "fixture-host-v1");
-    let fixed = fixture.command(&cache, "build", &[], true);
-    fixed.assert_fresh("hot_dep", false, true);
+    let fixed = fixture.command(&cache, "build", &[], false);
+    fixed.assert_fresh("hot_dep", false, false);
     fixed.assert_fresh("hot_fixture", false, false);
+    drop(cache);
+    fixture.fresh_upload_timestamps();
+    let cache = persistent(disk.path(), 128 * 1024 * 1024, "fixture-host-v1");
+    fixture
+        .command(&cache, "build", &[], true)
+        .assert_all_fresh();
 }

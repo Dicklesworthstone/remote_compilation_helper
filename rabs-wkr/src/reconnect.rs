@@ -648,6 +648,7 @@ mod tests {
             dependency_modes: vec![],
             missing: Vec::new(),
             slots: 1,
+            ..CapabilityReport::default()
         };
         assert_eq!(shutdown_exit(&report, &journal), 0);
         let request = serde_json::json!({"kind":"canonical-exec", "request_id":7});
@@ -769,6 +770,7 @@ mod tests {
                             dependency_modes: Vec::new(),
                             missing: Vec::new(),
                             slots: 1,
+                            ..CapabilityReport::default()
                         };
                         crate::drive_session(
                             &mut socket,
@@ -965,6 +967,7 @@ mod tests {
                 let report = CapabilityReport {
                     worker_id:"shutdown-test".to_owned(), canonical_namespace:true,
                     dependency_modes:Vec::new(), missing:Vec::new(), slots:1,
+                    ..CapabilityReport::default()
                 };
                 let driver = crate::drive_session(
                     &mut stream, &report, false, Some(&mut journal), false,

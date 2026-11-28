@@ -32,7 +32,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let build = temporary.path().join("target");
         let root = temporary.path().join("bin");
         let native_only_path = temporary.path().join("native-path");
@@ -386,4 +390,76 @@ fn unsupported_fleet_operations_are_explicit_refusals_without_mutation() {
     assert!(!output.status.success());
     assert!(!fixture.root.exists());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported local installer option"));
+}
+
+#[test]
+fn native_cli_packages_archive_then_installs_probes_and_verifies_end_to_end() {
+    let fixture = Fixture::new();
+    let archive = fixture.temporary.path().join("rabs-packaged.tar.gz");
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-unknown-linux-gnu",
+        "aarch64" => "aarch64-unknown-linux-gnu",
+        other => panic!("unsupported arch: {other}"),
+    };
+    let packaged = fixture
+        .native()
+        .arg("--from-build")
+        .arg(&fixture.build)
+        .arg("--package")
+        .arg(&archive)
+        .arg("--target")
+        .arg(target)
+        .output()
+        .unwrap();
+    success(&packaged);
+    let receipt: Value = serde_json::from_slice(&packaged.stdout).unwrap();
+    assert_eq!(receipt["kind"], "rabs-packaged");
+    assert_eq!(receipt["target"], target);
+    assert_eq!(receipt["bytes"], fs::metadata(&archive).unwrap().len());
+    assert_eq!(receipt["services_started"], false);
+    assert_eq!(receipt["cargo_config_changed"], false);
+
+    // Refuses to clobber the archive on repeat invocation.
+    let clobber = fixture
+        .native()
+        .arg("--from-build")
+        .arg(&fixture.build)
+        .arg("--package")
+        .arg(&archive)
+        .arg("--target")
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(!clobber.status.success());
+    assert!(
+        String::from_utf8_lossy(&clobber.stderr)
+            .contains("refusing to replace an existing archive")
+    );
+
+    // Install and verify straight from the freshly packaged native archive.
+    let installed = fixture
+        .native()
+        .arg("--from-archive")
+        .arg(&archive)
+        .arg("--bin-dir")
+        .arg(&fixture.root)
+        .arg("--probe")
+        .output()
+        .unwrap();
+    success(&installed);
+    let inst_receipt: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(inst_receipt["kind"], "rabs-installed");
+
+    let verified = fixture
+        .native()
+        .arg("--from-archive")
+        .arg(&archive)
+        .arg("--bin-dir")
+        .arg(&fixture.root)
+        .arg("--verify")
+        .output()
+        .unwrap();
+    success(&verified);
+    let ver_receipt: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(ver_receipt["state"], "verified");
 }

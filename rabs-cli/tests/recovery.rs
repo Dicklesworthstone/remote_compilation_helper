@@ -955,13 +955,26 @@ struct JobFixture {
     _listener: Option<std::os::unix::net::UnixListener>,
 }
 
+/// Keep Unix-socket fixture directories short enough for kernel `SUN_LEN`
+/// (~108 bytes) even when `TMPDIR` points to a deep worker-scoped path.
+fn short_socket_tempdir(prefix: &str) -> PathBuf {
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix(prefix)
+        .permissions(fs::Permissions::from_mode(0o700));
+    let dir = if std::env::temp_dir().as_os_str().len() > 60 && Path::new("/tmp").is_dir() {
+        builder.tempdir_in("/tmp")
+    } else {
+        builder.tempdir()
+    };
+    let path = dir.unwrap().keep();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
 impl JobFixture {
     fn new(pooled: bool, live_stderr: Option<bool>, online: bool) -> Self {
-        let root = tempfile::Builder::new()
-            .prefix("rjob-")
-            .tempdir()
-            .unwrap()
-            .keep();
+        let root = short_socket_tempdir("rjob-");
         let operation = root.join(format!("cargo-{JOB_ID}"));
         private_directory(&operation);
         let socket = root.join("owner/socket");
@@ -1252,11 +1265,7 @@ fn worker_submission_recovers(
     direct_live: bool,
     nextest: bool,
 ) {
-    let root = tempfile::Builder::new()
-        .prefix("rwrec-")
-        .tempdir()
-        .unwrap()
-        .keep();
+    let root = short_socket_tempdir("rwrec-");
     let source = root.join("source");
     let toolchain = root.join("sdk");
     let operations = root.join("operations");

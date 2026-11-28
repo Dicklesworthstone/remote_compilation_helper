@@ -117,7 +117,7 @@ fn extract_short_flag_values(argv: &[String], flag: &str) -> Vec<String> {
         } else if !argv[i].starts_with("--")
             && let Some(rest) = argv[i].strip_prefix(flag)
         {
-            out.push(rest.strip_prefix('=').unwrap_or(rest).to_owned());
+            out.push(rest.to_owned());
         }
         i += 1;
     }
@@ -202,9 +202,12 @@ pub fn shadow_descriptor(observation: &ConsultObservation) -> ActionDescriptor {
             .clone()
             .unwrap_or_else(|| format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS));
 
-        let has_wrapper_env = env_names
-            .iter()
-            .any(|name| name.starts_with("RUSTC_WRAPPER") || name.starts_with("CARGO_RABS_"));
+        let has_wrapper_env = env_names.iter().any(|name| {
+            name.starts_with("RUSTC_WRAPPER")
+                || name.starts_with("RUSTC_WORKSPACE_WRAPPER")
+                || *name == "CARGO_BUILD_RUSTC_WRAPPER"
+                || name.starts_with("CARGO_RABS_")
+        });
         let sandbox_policy = format!(
             "mode=shadow-pass-through|wrappers={}|wrapper_env={has_wrapper_env}",
             inv.wrapper_chain.join(",")
@@ -711,12 +714,30 @@ mod tests {
             ActionClass::BuildScriptCompile
         );
 
-        // Attached -o form mutates output_declarations.
+        // Attached -o form mutates output_declarations and preserves exact filename (e.g. -o=foo != -ofoo).
         let mut explicit_out = base.clone();
         explicit_out.argv.push("-o/tmp/out.rlib".into());
         assert_ne!(
             d_base.output_declarations,
             shadow_descriptor(&explicit_out).output_declarations
+        );
+        let mut eq_out = base.clone();
+        eq_out.argv.push("-o=foo".into());
+        let mut plain_out = base.clone();
+        plain_out.argv.push("-ofoo".into());
+        assert_ne!(
+            shadow_descriptor(&eq_out).output_declarations,
+            shadow_descriptor(&plain_out).output_declarations
+        );
+
+        // Wrapper env vars (including RUSTC_WORKSPACE_WRAPPER) mutate sandbox_semantic_policy.
+        let mut with_ws_wrapper = base.clone();
+        with_ws_wrapper
+            .env_names
+            .push("RUSTC_WORKSPACE_WRAPPER".into());
+        assert_ne!(
+            d_base.sandbox_semantic_policy,
+            shadow_descriptor(&with_ws_wrapper).sandbox_semantic_policy
         );
 
         // Changing --extern mutates dependency_inputs without touching output_declarations.

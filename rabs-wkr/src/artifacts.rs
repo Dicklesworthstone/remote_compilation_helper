@@ -363,7 +363,7 @@ impl PreparedArtifacts {
             // native execution status was checked before entering capture.
             let mut resolved = self.plan.clone();
             resolved.cargo = None;
-            let mut captured = self.capture_tree(&resolved, stopped)?;
+            let mut captured = self.capture_tree(&resolved, true, stopped)?;
             captured.plan = self.plan.clone();
             return Ok(captured);
         }
@@ -380,7 +380,7 @@ impl PreparedArtifacts {
         resolved.files.extend(report.files().map(str::to_owned));
         rabs_sandbox::artifact_tree::validate_tree_names(resolved.files())?;
         resolved.cargo = None;
-        let mut captured = self.capture_tree(&resolved, stopped)?;
+        let mut captured = self.capture_tree(&resolved, false, stopped)?;
         report.validate_outputs(
             captured
                 .files
@@ -433,7 +433,7 @@ impl PreparedArtifacts {
         if self.plan.tree {
             #[cfg(target_os = "linux")]
             {
-                let captured = self.capture_tree(&self.plan, stopped)?;
+                let captured = self.capture_tree(&self.plan, false, stopped)?;
                 if let Some(inputs) = dependency_inputs {
                     inputs.verify(self.backing())?;
                 }
@@ -538,6 +538,7 @@ impl PreparedArtifacts {
     fn capture_tree(
         &self,
         _plan: &ArtifactPlan,
+        _complete_without_required: bool,
         _stopped: impl Fn() -> bool,
     ) -> io::Result<CapturedArtifacts> {
         Err(io::Error::new(
@@ -550,6 +551,7 @@ impl PreparedArtifacts {
     fn capture_tree(
         &self,
         plan: &ArtifactPlan,
+        complete_without_required: bool,
         stopped: impl Fn() -> bool,
     ) -> io::Result<CapturedArtifacts> {
         use rabs_sandbox::artifact_tree::{
@@ -557,15 +559,27 @@ impl PreparedArtifacts {
         };
         use std::os::unix::fs::PermissionsExt;
 
-        let inventory = if plan.private_incremental_roots().is_some() {
-            TreeInventory::scan_private(
+        let inventory = match (
+            plan.private_incremental_roots().is_some(),
+            complete_without_required && plan.files.is_empty(),
+        ) {
+            (true, true) => TreeInventory::scan_complete_private(
+                self.backing(),
+                MAX_PRIVATE_TREE_BYTES,
+                &stopped,
+            )?,
+            (true, false) => TreeInventory::scan_private(
                 self.backing(),
                 &plan.files,
                 MAX_PRIVATE_TREE_BYTES,
                 &stopped,
-            )?
-        } else {
-            TreeInventory::scan(self.backing(), &plan.files, MAX_ARTIFACT_BYTES, &stopped)?
+            )?,
+            (false, true) => {
+                TreeInventory::scan_complete(self.backing(), MAX_ARTIFACT_BYTES, &stopped)?
+            }
+            (false, false) => {
+                TreeInventory::scan(self.backing(), &plan.files, MAX_ARTIFACT_BYTES, &stopped)?
+            }
         };
         // The complete private tree has its own inventory budget. Only the
         // independently derived compiler-state roots are omitted, and the

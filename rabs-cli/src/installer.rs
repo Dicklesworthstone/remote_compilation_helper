@@ -2,6 +2,7 @@
 //! under the same persistent lock used by previous installer generations.
 
 use flate2::read::MultiGzDecoder;
+use flate2::{Compression, GzBuilder};
 use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, Stat};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -12,7 +13,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -75,6 +76,56 @@ fn host_machine() -> io::Result<u16> {
         "aarch64" => Ok(183),
         _ => Err(invalid("unsupported Linux installation architecture")),
     }
+}
+
+fn target_machine(target: &str) -> io::Result<u16> {
+    match target {
+        "x86_64-unknown-linux-gnu" => Ok(62),
+        "aarch64-unknown-linux-gnu" => Ok(183),
+        _ => Err(invalid(
+            "packaging requires a supported Linux GNU --target (x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu)",
+        )),
+    }
+}
+
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_valid_semver(version: &str) -> bool {
+    if version.is_empty() || version.len() > 128 {
+        return false;
+    }
+    let (without_build, build) = match version.split_once('+') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (version, None),
+    };
+    let (core, pre) = match without_build.split_once('-') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (without_build, None),
+    };
+    let mut parts = core.split('.');
+    let valid_core = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None)
+            if !a.is_empty()
+                && !b.is_empty()
+                && !c.is_empty()
+                && a.bytes().all(|byte| byte.is_ascii_digit())
+                && b.bytes().all(|byte| byte.is_ascii_digit())
+                && c.bytes().all(|byte| byte.is_ascii_digit())
+    );
+    let valid_ext = |ext: Option<&str>| {
+        ext.is_none_or(|s| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        })
+    };
+    valid_core && valid_ext(pre) && valid_ext(build)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1169,12 +1220,426 @@ fn probe_installed(root: &Path) -> io::Result<Value> {
 }
 
 #[derive(Debug)]
+struct PackageOptions {
+    output: PathBuf,
+    target: String,
+    require_source: Option<String>,
+}
+
+#[derive(Debug)]
 struct Options {
     source: Option<Source>,
-    root: PathBuf,
+    root: Option<PathBuf>,
     verify: bool,
     probe: bool,
     probe_installed: bool,
+    package: Option<PackageOptions>,
+}
+
+fn probe_command_stdout(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    require_child_ownership()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("package source probe stdout pipe unavailable"))?;
+    let reader = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        (&mut stdout)
+            .take((max_bytes as u64) + 1)
+            .read_to_end(&mut buffer)?;
+        Ok(buffer)
+    });
+    let mut probe = ProbeChild { child, owned: true };
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if probe.waitable()? {
+            break probe.finish()?;
+        }
+        if Instant::now() >= deadline {
+            let _ = probe.finish();
+            let _ = reader.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "package source probe exceeded its deadline",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let output = reader
+        .join()
+        .map_err(|_| invalid("package source probe reader thread panicked"))??;
+    require(status.success(), "package source probe returned failure")?;
+    require(
+        output.len() <= max_bytes,
+        "package source probe exceeded its output byte limit",
+    )?;
+    Ok(output)
+}
+
+fn parse_unique_build_info(bytes: &[u8]) -> io::Result<BTreeMap<String, Value>> {
+    struct UniqueObject;
+    impl<'de> Visitor<'de> for UniqueObject {
+        type Value = BTreeMap<String, Value>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a JSON object with unique fields")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                if out.insert(key, value).is_some() {
+                    return Err(de::Error::custom("duplicate build-info JSON field"));
+                }
+            }
+            Ok(out)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let map = de
+        .deserialize_map(UniqueObject)
+        .map_err(|error| invalid(format!("invalid build-info JSON: {error}")))?;
+    de.end()
+        .map_err(|error| invalid(format!("trailing bytes after build-info JSON: {error}")))?;
+    Ok(map)
+}
+
+fn verify_package_source(snapshot_dir: &File, required_source: &str) -> io::Result<Value> {
+    use std::os::fd::AsRawFd;
+    require(
+        is_commit_sha(required_source),
+        "--require-source must be a full, clean, lowercase Git commit ID",
+    )?;
+    let expected_fields: BTreeSet<&str> = [
+        "schema",
+        "kind",
+        "tool",
+        "version",
+        "build_identity",
+        "compiled_source",
+    ]
+    .into_iter()
+    .collect();
+    let mut shared_version: Option<String> = None;
+    let mut shared_identity: Option<String> = None;
+    for name in TOOLS {
+        let executable =
+            PathBuf::from(format!("/proc/self/fd/{}", snapshot_dir.as_raw_fd())).join(name);
+        let mut command = Command::new(executable);
+        command.arg("--rabs-build-info");
+        let raw =
+            probe_command_stdout(&mut command, PROBE_TIMEOUT, 64 * 1024).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("package build-info probe failed for {name}: {error}"),
+                )
+            })?;
+        let fields = parse_unique_build_info(&raw)?;
+        let keys: BTreeSet<&str> = fields.keys().map(String::as_str).collect();
+        let schema_ok = fields.get("schema").and_then(Value::as_u64) == Some(1);
+        let kind_ok = fields.get("kind").and_then(Value::as_str) == Some("rabs-build-info");
+        let tool_ok = fields.get("tool").and_then(Value::as_str) == Some(name);
+        let version = fields
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|v| is_valid_semver(v))
+            .ok_or_else(|| invalid(format!("invalid package build-info report: {name}")))?;
+        let compiled_source = fields
+            .get("compiled_source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid(format!("invalid package build-info report: {name}")))?;
+        let build_identity = fields
+            .get("build_identity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid(format!("invalid package build-info report: {name}")))?;
+        require(
+            keys == expected_fields && schema_ok && kind_ok && tool_ok,
+            format!("invalid package build-info report: {name}"),
+        )?;
+        let expected_identity = format!("rabs-{version}+{required_source}");
+        require(
+            compiled_source == required_source && build_identity == expected_identity,
+            format!("package build identity differs from required source: {name}"),
+        )?;
+        if let Some(prev) = &shared_version {
+            require(prev == version, "package build-info versions differ")?;
+        }
+        shared_version = Some(version.to_owned());
+        shared_identity = Some(build_identity.to_owned());
+    }
+    Ok(json!({
+        "commit": required_source,
+        "version": shared_version.unwrap_or_default(),
+        "build_identity": shared_identity.unwrap_or_default(),
+    }))
+}
+
+fn copy_staged_tools(sources: &mut Sources, directory: &File) -> io::Result<()> {
+    sources.revalidate()?;
+    for (name, tool) in &mut sources.tools {
+        let mut output = File::from(rustix::fs::openat(
+            directory,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?);
+        tool.file.seek(SeekFrom::Start(0))?;
+        let identity = &sources.expected.files[name];
+        let count = io::copy(&mut (&mut tool.file).take(identity.bytes + 1), &mut output)?;
+        require(
+            count == identity.bytes,
+            "source changed length during packaging",
+        )?;
+        output.flush()?;
+        rustix::fs::fchmod(&output, Mode::from_raw_mode(0o555))?;
+        output.sync_all()?;
+        let (copied, machine) = inspect_bytes(name, &mut output, count)?;
+        require(
+            copied == *identity && machine == sources.expected.machine,
+            "staged package executable failed byte or ELF verification",
+        )?;
+    }
+    sources.revalidate()?;
+    directory.sync_all()
+}
+
+fn verify_staged_tools(directory: &File, expected: &Manifest) -> io::Result<()> {
+    for name in TOOLS {
+        let mut file = File::from(rustix::fs::openat(
+            directory,
+            name,
+            read_flags(),
+            Mode::empty(),
+        )?);
+        let metadata = rustix::fs::fstat(&file)?;
+        let size = executable_metadata(&metadata, true)?;
+        require(
+            size == expected.files[name].bytes,
+            format!("package snapshot size differs: {name}"),
+        )?;
+        let (identity, machine) = inspect_bytes(name, &mut file, size)?;
+        require(
+            identity == expected.files[name] && machine == expected.machine,
+            format!("package snapshot differs from captured toolset: {name}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn hash_regular_file(file: &mut File, expected_stamp: &Stamp) -> io::Result<(u64, String)> {
+    file.seek(SeekFrom::Start(0))?;
+    let size =
+        u64::try_from(expected_stamp.size).map_err(|_| invalid("invalid produced archive size"))?;
+    require(
+        (1..=MAX_ARCHIVE_BYTES).contains(&size),
+        "invalid produced archive size",
+    )?;
+    let mut hasher = Sha256::new();
+    let mut remaining = size;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..want])?;
+        require(read > 0, "produced archive was truncated")?;
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    require(
+        file.read(&mut buffer[..1])? == 0,
+        "produced archive grew during verification",
+    )?;
+    require(
+        Stamp::of(&rustix::fs::fstat(file)?) == *expected_stamp,
+        "produced archive changed during verification",
+    )?;
+    Ok((size, digest_hex(&hasher.finalize())))
+}
+
+fn package_archive(sources: &mut Sources, opts: &PackageOptions) -> io::Result<Value> {
+    let expected_machine = target_machine(&opts.target)?;
+    require(
+        sources.expected.machine == expected_machine,
+        "packaged executables do not match --target",
+    )?;
+    if let Some(required) = &opts.require_source {
+        require(
+            is_commit_sha(required),
+            "--require-source must be a full, clean, lowercase Git commit ID",
+        )?;
+        require(
+            sources.expected.machine == host_machine()?,
+            "--require-source probes native binaries; run packaging on the target architecture",
+        )?;
+    }
+    require(
+        !opts.output.to_string_lossy().ends_with('/'),
+        "package output path must name a file, not a directory",
+    )?;
+    let output = std::path::absolute(&opts.output)?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| invalid("package output path requires a parent directory"))?;
+    let file_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
+        .ok_or_else(|| invalid("package output path requires a valid UTF-8 file name"))?;
+
+    let parent_dir = File::from(rustix::fs::open(parent, directory_flags(), Mode::empty())?);
+    check_directory(&parent_dir, false)?;
+    match named(&parent_dir, file_name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Ok(_) => {
+            return Err(invalid(format!(
+                "refusing to replace an existing archive: {}",
+                output.display()
+            )));
+        }
+        Err(error) => return Err(error),
+    }
+
+    // Keep the private stage directory on the same filesystem as `output` so
+    // publication can use an atomic no-clobber hard link (`linkat`). Failed
+    // stages stay retained for inspection, matching `scripts/install-rabs`.
+    let stage_path = tempfile::Builder::new()
+        .prefix(".rabs-package-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?
+        .keep();
+    let result = (|| -> io::Result<Value> {
+        let stage_dir = File::from(rustix::fs::open(
+            &stage_path,
+            directory_flags(),
+            Mode::empty(),
+        )?);
+        check_directory(&stage_dir, true)?;
+
+        rustix::fs::mkdirat(&stage_dir, "inputs", Mode::from_raw_mode(0o700))?;
+        let inputs_dir = open_directory_at(&stage_dir, "inputs", true)?;
+        copy_staged_tools(sources, &inputs_dir)?;
+
+        let source_identity = if let Some(required) = &opts.require_source {
+            let identity = verify_package_source(&inputs_dir, required)?;
+            verify_staged_tools(&inputs_dir, &sources.expected)?;
+            Some(identity)
+        } else {
+            None
+        };
+
+        // Write deterministic flat USTAR tar.gz containing all 9 native tools.
+        let mut raw_archive = File::from(rustix::fs::openat(
+            &stage_dir,
+            "release.tar.gz",
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?);
+        {
+            let encoder = GzBuilder::new()
+                .mtime(0)
+                .write(&mut raw_archive, Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            for name in TOOLS {
+                let mut reader = File::from(rustix::fs::openat(
+                    &inputs_dir,
+                    name,
+                    read_flags(),
+                    Mode::empty(),
+                )?);
+                let size = executable_metadata(&rustix::fs::fstat(&reader)?, true)?;
+                require(
+                    size == sources.expected.files[name].bytes,
+                    format!("package input size changed before archiving: {name}"),
+                )?;
+                let mut header = tar::Header::new_ustar();
+                header.set_path(name)?;
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(size);
+                header.set_mode(0o755);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_mtime(0);
+                header.set_cksum();
+                archive.append(&header, &mut reader)?;
+            }
+            let encoder = archive.into_inner()?;
+            encoder.finish()?;
+        }
+        raw_archive.flush()?;
+        rustix::fs::fchmod(&raw_archive, Mode::from_raw_mode(0o444))?;
+        raw_archive.sync_all()?;
+
+        let archive_stamp = Stamp::of(&rustix::fs::fstat(&raw_archive)?);
+        require(
+            Stamp::of(&named(&stage_dir, "release.tar.gz")?) == archive_stamp,
+            "produced archive changed before verification",
+        )?;
+
+        // Self-verify through the installer's own bounded archive consumer.
+        rustix::fs::mkdirat(&stage_dir, "verified", Mode::from_raw_mode(0o700))?;
+        let verified_path = stage_path.join("verified");
+        let archive_path = stage_path.join("release.tar.gz");
+        unpack_archive(&archive_path, &verified_path, MAX_ARCHIVE_BYTES)?;
+        let verified = Sources::capture(source_paths(&verified_path, false))?;
+        require(
+            verified.expected == sources.expected,
+            "produced archive failed installer round-trip verification",
+        )?;
+
+        let (archive_bytes, archive_sha256) = hash_regular_file(&mut raw_archive, &archive_stamp)?;
+        require(
+            Stamp::of(&named(&stage_dir, "release.tar.gz")?) == archive_stamp,
+            "produced archive changed during verification",
+        )?;
+
+        check_directory(&parent_dir, false)?;
+        let parent_now = source_stat(parent)?;
+        require(
+            FileType::from_raw_mode(parent_now.st_mode) == FileType::Directory
+                && Stamp::of(&parent_now).same_inode(&Stamp::of(&rustix::fs::fstat(&parent_dir)?)),
+            "package output directory changed before publication",
+        )?;
+
+        // Atomic no-clobber publication on the same filesystem; refuses both
+        // existing regular files and dangling symlinks with EEXIST.
+        rustix::fs::linkat(
+            &stage_dir,
+            "release.tar.gz",
+            &parent_dir,
+            file_name,
+            AtFlags::empty(),
+        )?;
+        parent_dir.sync_all()?;
+
+        Ok(json!({
+            "kind": "rabs-packaged",
+            "archive": output,
+            "target": opts.target,
+            "bytes": archive_bytes,
+            "sha256": archive_sha256,
+            "toolset": sources.expected,
+            "staging_directory": stage_path,
+            "source_identity": source_identity,
+            "services_started": false,
+            "cargo_config_changed": false,
+        }))
+    })();
+    result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{error}; retained package stage: {}", stage_path.display()),
+        )
+    })
 }
 
 fn parse(arguments: &[OsString]) -> io::Result<Options> {
@@ -1183,6 +1648,9 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
     let mut verify = false;
     let mut probe = false;
     let mut probe_installed = false;
+    let mut package_output = None;
+    let mut target = None;
+    let mut require_source = None;
     let mut seen = BTreeSet::new();
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
@@ -1204,6 +1672,32 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
                     _ => Source::Archive(path),
                 });
             }
+            "--package" => {
+                let value = arguments
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid("--package requires a nonempty output path"))?;
+                package_output = Some(PathBuf::from(value));
+            }
+            "--target" => {
+                let value = arguments
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| invalid("--target requires a supported Linux GNU target"))?;
+                target_machine(value)?;
+                target = Some(value.to_owned());
+            }
+            "--require-source" => {
+                let value = arguments
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .filter(|v| is_commit_sha(v))
+                    .ok_or_else(|| {
+                        invalid("--require-source must be a full, clean, lowercase Git commit ID")
+                    })?;
+                require_source = Some(value.to_owned());
+            }
             "--bin-dir" => {
                 let value = arguments
                     .next()
@@ -1221,6 +1715,34 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
             _ => return Err(invalid("unsupported local installer option (see --help)")),
         }
     }
+    if let Some(output) = package_output {
+        let target = target.ok_or_else(|| invalid("--package requires --target"))?;
+        require(
+            !verify && !probe && !probe_installed && root.is_none(),
+            "--package accepts only --from-build/--from-bundle, --target and --require-source",
+        )?;
+        require(
+            matches!(source, Some(Source::Build(_) | Source::Bundle(_))),
+            "--package requires --from-build or --from-bundle",
+        )?;
+        return Ok(Options {
+            source,
+            root: None,
+            verify: false,
+            probe: false,
+            probe_installed: false,
+            package: Some(PackageOptions {
+                output,
+                target,
+                require_source,
+            }),
+        });
+    }
+    require(target.is_none(), "--target requires --package")?;
+    require(
+        require_source.is_none(),
+        "--require-source requires --package",
+    )?;
     require(
         !(verify && probe) && !(probe_installed && (verify || probe || source.is_some())),
         "verification, staged launch checks and installed launch checks are distinct operations",
@@ -1238,18 +1760,31 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
     )?;
     Ok(Options {
         source,
-        root,
+        root: Some(root),
         verify,
         probe,
         probe_installed,
+        package: None,
     })
 }
 
 pub(crate) fn run(arguments: &[OsString]) -> io::Result<(Value, bool)> {
     let options = parse(arguments)?;
+    if let Some(pkg) = &options.package {
+        let mut sources = options
+            .source
+            .as_ref()
+            .ok_or_else(|| invalid("source toolset is missing"))?
+            .capture()?;
+        return Ok((package_archive(&mut sources, pkg)?, true));
+    }
     host_machine()?;
+    let root = options
+        .root
+        .as_deref()
+        .ok_or_else(|| invalid("installation directory is missing"))?;
     if options.probe_installed {
-        return Ok((probe_installed(&options.root)?, true));
+        return Ok((probe_installed(root)?, true));
     }
     let mut sources = options
         .source
@@ -1257,10 +1792,10 @@ pub(crate) fn run(arguments: &[OsString]) -> io::Result<(Value, bool)> {
         .ok_or_else(|| invalid("source toolset is missing"))?
         .capture()?;
     if options.verify {
-        let receipt = match verify_installed(&sources.expected, &options.root) {
+        let receipt = match verify_installed(&sources.expected, root) {
             Ok(receipt) => receipt,
             Err(error) => json!({
-                "kind": "rabs-install-verification", "state": "unverified", "bin_dir": options.root,
+                "kind": "rabs-install-verification", "state": "unverified", "bin_dir": root,
                 "error": error.to_string(), "expected_toolset_sha256": sources.expected.digest()?,
                 "installation_changed": false, "services_started": false, "cargo_config_changed": false,
             }),
@@ -1268,7 +1803,7 @@ pub(crate) fn run(arguments: &[OsString]) -> io::Result<(Value, bool)> {
         let success = receipt["state"] == "verified";
         return Ok((receipt, success));
     }
-    Ok((install(&mut sources, &options.root, options.probe)?, true))
+    Ok((install(&mut sources, root, options.probe)?, true))
 }
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ pub use toolchain_pool::ToolchainReuseScope;
 
 /// What this worker can do (advertised at handshake; the scheduler gates
 /// placement on it). Each execution profile is measured on this host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilityReport {
     /// Worker id (stable per host).
     pub worker_id: String,
@@ -45,6 +45,18 @@ pub struct CapabilityReport {
     pub missing: Vec<String>,
     /// Advertised execution slots, bounded by CPUs and configured host capacity.
     pub slots: u32,
+    /// Measured Linux unified cgroup v2 availability (`/sys/fs/cgroup/cgroup.controllers`).
+    pub cgroup_v2: bool,
+    /// Measured writable, controller-capable delegated cgroup v2 ancestor for
+    /// per-attempt resource envelopes (`rabs_sandbox::cgroup_envelope::probe_delegation`).
+    pub cgroup_v2_delegated: bool,
+    /// Measured Linux Landlock LSM presence in `/sys/kernel/security/lsm`.
+    pub landlock: bool,
+    /// Measured OverlayFS kernel filesystem availability in `/proc/filesystems`.
+    pub overlayfs: bool,
+    /// Measured SHA-256 runtime-epoch digest of host `/usr` + `/etc` surfaces
+    /// exposed read-only into canonical Cargo namespaces on Linux.
+    pub host_runtime_epoch_sha256: Option<String>,
 }
 
 /// Optional host measurements (heartbeat payload). Missing or expired probes
@@ -804,12 +816,111 @@ pub fn probe_capability(worker_id: &str) -> CapabilityReport {
     .into_iter()
     .filter(|mode| DependencyIsolationSupport::probe(*mode).is_supported())
     .collect();
+    let cgroup_v2_delegated =
+        support.cgroup_v2 && rabs_sandbox::cgroup_envelope::probe_delegation().is_ok();
+    let host_runtime_epoch_sha256 = rabs_sandbox::canonical_namespace::observe_host_usr_epoch();
     CapabilityReport {
         worker_id: worker_id.to_string(),
         canonical_namespace: missing.is_empty(),
         dependency_modes,
         missing,
         slots,
+        cgroup_v2: support.cgroup_v2,
+        cgroup_v2_delegated,
+        landlock: support.landlock,
+        overlayfs: support.overlayfs,
+        host_runtime_epoch_sha256,
+    }
+}
+
+/// Minimum allowed `RABS_WORKER_MEMORY_MAX_BYTES` bound (1 MiB).
+const MIN_CGROUP_MEMORY_MAX_BYTES: u64 = 1024 * 1024;
+/// Minimum allowed `RABS_WORKER_CPU_WEIGHT` value (kernel cgroup v2 floor).
+const MIN_CGROUP_CPU_WEIGHT: u64 = 1;
+/// Maximum allowed `RABS_WORKER_CPU_WEIGHT` value (kernel cgroup v2 ceiling).
+const MAX_CGROUP_CPU_WEIGHT: u64 = 10_000;
+
+/// Parse optional worker cgroup v2 envelope configuration strictly.
+///
+/// Returns `Ok(None)` when neither bound is requested. Malformed or out-of-range
+/// values refuse explicitly instead of silently running unbounded.
+///
+/// # Errors
+/// Returns a human-readable diagnostic when either string is not a valid
+/// integer within kernel bounds.
+pub fn parse_cgroup_envelope_env(
+    memory_max: Option<&str>,
+    cpu_weight: Option<&str>,
+) -> Result<Option<rabs_sandbox::cgroup_envelope::ResourceEnvelope>, String> {
+    let memory_max_bytes = match memory_max.map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => {
+            let parsed = raw
+                .parse::<u64>()
+                .map_err(|_| format!("invalid RABS_WORKER_MEMORY_MAX_BYTES: {raw:?}"))?;
+            if parsed < MIN_CGROUP_MEMORY_MAX_BYTES {
+                return Err(format!(
+                    "RABS_WORKER_MEMORY_MAX_BYTES must be at least {MIN_CGROUP_MEMORY_MAX_BYTES} bytes, got {parsed}"
+                ));
+            }
+            Some(parsed)
+        }
+    };
+    let cpu_weight = match cpu_weight.map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => {
+            let parsed = raw
+                .parse::<u64>()
+                .map_err(|_| format!("invalid RABS_WORKER_CPU_WEIGHT: {raw:?}"))?;
+            if !(MIN_CGROUP_CPU_WEIGHT..=MAX_CGROUP_CPU_WEIGHT).contains(&parsed) {
+                return Err(format!(
+                    "RABS_WORKER_CPU_WEIGHT must be within {MIN_CGROUP_CPU_WEIGHT}..={MAX_CGROUP_CPU_WEIGHT}, got {parsed}"
+                ));
+            }
+            Some(parsed)
+        }
+    };
+    if memory_max_bytes.is_none() && cpu_weight.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(rabs_sandbox::cgroup_envelope::ResourceEnvelope {
+        memory_max_bytes,
+        // Pin swap to zero when a memory ceiling is requested so over-memory
+        // workloads trigger fast kernel OOM rather than thrashing swap; hosts
+        // lacking swap accounting record this cleanly as a skipped facet.
+        memory_swap_max_bytes: memory_max_bytes.map(|_| 0),
+        cpu_weight,
+        io_max: Vec::new(),
+    }))
+}
+
+fn configured_cgroup_envelope()
+-> Result<Option<rabs_sandbox::cgroup_envelope::ResourceEnvelope>, String> {
+    let memory_max = std::env::var("RABS_WORKER_MEMORY_MAX_BYTES").ok();
+    let cpu_weight = std::env::var("RABS_WORKER_CPU_WEIGHT").ok();
+    parse_cgroup_envelope_env(memory_max.as_deref(), cpu_weight.as_deref())
+}
+
+struct AttemptCgroupGuard {
+    envelope: rabs_sandbox::cgroup_envelope::AppliedEnvelope,
+    baseline_oom_kills: u64,
+    request_id: u64,
+}
+
+impl Drop for AttemptCgroupGuard {
+    fn drop(&mut self) {
+        let notes = rabs_sandbox::cgroup_envelope::cleanup_best_effort(&self.envelope);
+        if !notes.is_empty() {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "kind": "worker-cgroup-cleanup-notes",
+                    "request_id": self.request_id,
+                    "path": self.envelope.path.display().to_string(),
+                    "notes": notes,
+                })
+            );
+        }
     }
 }
 
@@ -1532,6 +1643,8 @@ fn execute_canonical_inner(
                 plan.out_units.push(artifacts.mount());
             }
             let mut spec = plan.to_spec().map_err(|error| error.to_string())?;
+            spec.host_runtime_epoch_digest =
+                rabs_sandbox::canonical_namespace::observe_host_usr_epoch();
             request
                 .command_context
                 .apply_to(&mut spec)
@@ -1876,8 +1989,81 @@ fn execute_canonical_inner(
         execution.refuse_unstarted();
         return exec_error(request.request_id);
     }
+    let mut attempt_cgroup = match configured_cgroup_envelope() {
+        Ok(None) => None,
+        Ok(Some(requested)) => {
+            let setup = rabs_sandbox::cgroup_envelope::probe_delegation()
+                .map_err(|error| error.to_string())
+                .and_then(|delegation| {
+                    let subgroup =
+                        format!("rabs-wkr-{}-req-{}", std::process::id(), request.request_id);
+                    rabs_sandbox::cgroup_envelope::create_envelope(
+                        &delegation,
+                        &subgroup,
+                        &requested,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .map(|applied| {
+                    let baseline_oom_kills =
+                        rabs_sandbox::cgroup_envelope::oom_kill_count(&applied).unwrap_or(0);
+                    AttemptCgroupGuard {
+                        envelope: applied,
+                        baseline_oom_kills,
+                        request_id: request.request_id,
+                    }
+                });
+            match setup {
+                Ok(guard) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "kind": "worker-cgroup-envelope-applied",
+                            "request_id": request.request_id,
+                            "path": guard.envelope.path.display().to_string(),
+                            "enforced": guard.envelope.enforced.iter()
+                                .map(|b| serde_json::json!({"file": b.file, "value": b.value}))
+                                .collect::<Vec<_>>(),
+                            "skipped": guard.envelope.skipped.iter()
+                                .map(|s| serde_json::json!({"facet": s.facet, "reason": s.reason}))
+                                .collect::<Vec<_>>(),
+                        })
+                    );
+                    Some(guard)
+                }
+                Err(error) => {
+                    if let Some(lease) = host_lease.take()
+                        && let Err(cleanup) = lease.abandon_unstarted()
+                    {
+                        let _ = control.retain_outputs(Err(format!(
+                            "cgroup v2 envelope refused ({error}); host lease cleanup: {cleanup}"
+                        )));
+                    } else {
+                        let _ = control
+                            .retain_outputs(Err(format!("cgroup v2 envelope refused: {error}")));
+                    }
+                    execution.refuse_unstarted();
+                    return exec_error(request.request_id);
+                }
+            }
+        }
+        Err(error) => {
+            if let Some(lease) = host_lease.take()
+                && let Err(cleanup) = lease.abandon_unstarted()
+            {
+                let _ = control.retain_outputs(Err(format!(
+                    "cgroup v2 configuration invalid ({error}); host lease cleanup: {cleanup}"
+                )));
+            } else {
+                let _ = control
+                    .retain_outputs(Err(format!("cgroup v2 configuration invalid: {error}")));
+            }
+            execution.refuse_unstarted();
+            return exec_error(request.request_id);
+        }
+    };
     execution.spawning();
-    let Ok(group) = ManagedProcessGroup::spawn_command(command, attribution) else {
+    let Ok(mut group) = ManagedProcessGroup::spawn_command(command, attribution) else {
         // The spawn adapter can fail after creating a child. Its error does not
         // carry complete cleanup evidence, so an armed host lease stays fenced.
         return exec_error(request.request_id);
@@ -1886,6 +2072,42 @@ fn execute_canonical_inner(
         resident_bound: EXEC_STREAM_RESIDENT_BOUND,
         spill_dir: spill_root.join(format!("attempt-{}", request.request_id)),
     };
+    if let Some(guard) = attempt_cgroup.as_ref()
+        && let Err(error) = rabs_sandbox::cgroup_envelope::attach(&guard.envelope, group.pgid())
+    {
+        let still_alive = group.leader_try_wait().ok().flatten().is_none();
+        if still_alive {
+            // Refusing to let a live process run outside an explicitly requested
+            // cgroup envelope: kill, drain, and fail closed.
+            let _ = group.signal_group(rabs_asupersync::process_groups::GroupSignal::Kill);
+            let _ = group.kill_leader();
+            let drained = group.wait_with_bounded_drain_preview(
+                &limits,
+                rabs_asupersync::stream_drain::DEFAULT_MAX_CAPTURE_BYTES,
+                None,
+                || true,
+            );
+            drop(bridge);
+            let residuals = drained.as_ref().map_or(0, |out| out.residual_group_members);
+            if let (Ok(_), Some(lease)) = (&drained, host_lease.take()) {
+                let _ = lease.finish(residuals);
+            }
+            let _ = control.retain_outputs(Err(format!(
+                "cgroup v2 attach failed on live workload: {error}"
+            )));
+            let mut result = exec_error(request.request_id);
+            result.residual_group_members = residuals;
+            return result;
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "kind": "worker-cgroup-attach-missed-fast-exit",
+                "request_id": request.request_id,
+                "error": error.to_string(),
+            })
+        );
+    }
     #[cfg(target_os = "linux")]
     let mut metadata_prefetch = artifacts.as_ref().and_then(|artifacts| {
         let visible = request.dependency_context.as_ref().map_or_else(
@@ -1929,6 +2151,47 @@ fn execute_canonical_inner(
                         "residual_group_members":0,
                     })
                 );
+            }
+            if let Some(guard) = attempt_cgroup.take() {
+                let oom_after = rabs_sandbox::cgroup_envelope::oom_kill_count(&guard.envelope)
+                    .unwrap_or(guard.baseline_oom_kills);
+                let oom_delta = oom_after.saturating_sub(guard.baseline_oom_kills);
+                #[cfg(unix)]
+                let status_signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    output.status.signal()
+                };
+                #[cfg(not(unix))]
+                let status_signal = None;
+                let termination = rabs_sandbox::cgroup_envelope::classify_termination(
+                    output.status.code(),
+                    status_signal,
+                    oom_delta,
+                );
+                drop(guard);
+                if matches!(
+                    termination,
+                    rabs_sandbox::cgroup_envelope::Termination::OomKilled
+                ) {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "kind": "worker-cgroup-oom-killed",
+                            "request_id": request.request_id,
+                            "oom_delta": oom_delta,
+                            "residual_group_members": output.residual_group_members,
+                        })
+                    );
+                    // Invariant I16: an envelope OOM kill is an environment
+                    // event, NEVER an admitted deterministic failure or
+                    // reusable artifact/target seed.
+                    let _ = control.retain_outputs(Err(
+                        "worker cgroup v2 memory envelope OOM-killed workload (I16)".to_owned(),
+                    ));
+                    let mut result = exec_error(request.request_id);
+                    result.residual_group_members = output.residual_group_members;
+                    return result;
+                }
             }
             // A same-credential host mutation is outside namespace isolation.
             // Detect retained backing changes before offering successful output;
@@ -2268,6 +2531,7 @@ mod tests {
             dependency_modes: vec![],
             missing: vec![],
             slots: 8,
+            ..CapabilityReport::default()
         };
         assert!(admit_worker(&token(), &[], 50, 7, 3, &report, true).is_ok());
         assert!(matches!(
@@ -2288,6 +2552,55 @@ mod tests {
             Err(HandshakeRefusal::NotCanonicalCapable)
         ));
         assert!(admit_worker(&token(), &[], 50, 7, 3, &weak, false).is_ok());
+    }
+
+    #[test]
+    fn parse_cgroup_envelope_env_validates_strictly_without_silent_fallback() {
+        assert_eq!(parse_cgroup_envelope_env(None, None), Ok(None));
+        assert_eq!(parse_cgroup_envelope_env(Some(""), Some("  ")), Ok(None));
+
+        let mem_only = parse_cgroup_envelope_env(Some("268435456"), None)
+            .unwrap()
+            .expect("memory envelope");
+        assert_eq!(mem_only.memory_max_bytes, Some(268_435_456));
+        assert_eq!(mem_only.memory_swap_max_bytes, Some(0));
+        assert_eq!(mem_only.cpu_weight, None);
+
+        let both = parse_cgroup_envelope_env(Some("1048576"), Some("500"))
+            .unwrap()
+            .expect("full envelope");
+        assert_eq!(both.memory_max_bytes, Some(1_048_576));
+        assert_eq!(both.cpu_weight, Some(500));
+
+        for (mem, cpu) in [
+            (Some("0"), None),
+            (Some("524288"), None),
+            (Some("not-a-number"), None),
+            (None, Some("0")),
+            (None, Some("10001")),
+            (None, Some("-5")),
+        ] {
+            assert!(
+                parse_cgroup_envelope_env(mem, cpu).is_err(),
+                "invalid envelope ({mem:?}, {cpu:?}) must fail closed"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_capability_surfaces_real_host_runtime_epoch_and_delegation_honesty() {
+        let report = probe_capability("probe-test");
+        assert_eq!(report.worker_id, "probe-test");
+        let epoch = report
+            .host_runtime_epoch_sha256
+            .as_deref()
+            .expect("linux worker observes host /usr runtime epoch");
+        assert_eq!(epoch.len(), 64);
+        assert!(
+            !report.cgroup_v2_delegated || report.cgroup_v2,
+            "delegation requires cgroup v2"
+        );
     }
 
     #[test]

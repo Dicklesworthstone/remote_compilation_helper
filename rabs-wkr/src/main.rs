@@ -1006,7 +1006,7 @@ fn main() {
         host_budget.as_ref().map(|budget| budget.capacity()),
     );
     eprintln!(
-        "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"dependency_execution_modes\":{}}}",
+        "{{\"v\":1,\"kind\":\"rabs-wkr-boot\",\"worker_id\":{},\"canonical\":{},\"slots\":{},\"dependency_execution_modes\":{},\"isolation_capabilities\":{}}}",
         json_string(&report.worker_id),
         report.canonical_namespace,
         report.slots,
@@ -1017,6 +1017,13 @@ fn main() {
                 .map(|mode| mode.as_str())
                 .collect::<Vec<_>>()
         ),
+        serde_json::json!({
+            "cgroup_v2": report.cgroup_v2,
+            "cgroup_v2_delegated": report.cgroup_v2_delegated,
+            "landlock": report.landlock,
+            "overlayfs": report.overlayfs,
+            "host_runtime_epoch_sha256": report.host_runtime_epoch_sha256,
+        }),
     );
     std::process::exit(reconnect::run(
         coordinator,
@@ -2333,6 +2340,13 @@ fn worker_hello(
         "request_high_water": journal.high_water(),
         "retained_result_available": journal.has_retained_result(),
         "request_id_policy": "worker-endpoint-monotonic",
+        "isolation_capabilities": {
+            "cgroup_v2": report.cgroup_v2,
+            "cgroup_v2_delegated": report.cgroup_v2_delegated,
+            "landlock": report.landlock,
+            "overlayfs": report.overlayfs,
+            "host_runtime_epoch_sha256": report.host_runtime_epoch_sha256,
+        },
     })
     .to_string()
 }
@@ -3483,6 +3497,7 @@ mod tests {
             dependency_modes: vec![],
             missing: vec![],
             slots: 4,
+            ..rabs_wkr::session::CapabilityReport::default()
         }
     }
     fn pressure() -> rabs_wkr::session::PressureSample {
@@ -5725,6 +5740,16 @@ mod tests {
         assert_eq!(
             hello["command_contexts"],
             serde_json::json!([rabs_sandbox::process_context::COMMAND_CONTEXT_VERSION])
+        );
+        assert_eq!(
+            hello["isolation_capabilities"],
+            serde_json::json!({
+                "cgroup_v2": false,
+                "cgroup_v2_delegated": false,
+                "landlock": false,
+                "overlayfs": false,
+                "host_runtime_epoch_sha256": null,
+            })
         );
         assert!(validate_recovery_selection(r#"{"kind":"session-ok"}"#).is_ok());
         assert!(

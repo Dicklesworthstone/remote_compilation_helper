@@ -236,6 +236,9 @@ fn target_key_description(
         "cargo_mode":format!("{:?}", plan.cargo_mode()),
         "runtime":"fresh-home+captured-or-empty-cargo-home+private-fifo-v1",
     });
+    if let Some(epoch) = &spec.host_runtime_epoch_digest {
+        value["host_runtime_epoch"] = serde_json::json!(epoch);
+    }
     if let Some(roots) = plan.private_incremental_roots() {
         // The private tree and the delivered tree have different contracts.
         // Preserve exact identity for existing full-tree requests, and bind

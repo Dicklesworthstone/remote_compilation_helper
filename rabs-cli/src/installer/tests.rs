@@ -12,7 +12,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let bundle = temporary.path().join("bundle");
         fs::create_dir(&bundle).unwrap();
         let native = fs::read(external_true().unwrap()).unwrap();
@@ -475,6 +479,7 @@ fn native_archive_install_preserves_core_tools_and_supports_read_only_verificati
     entries.push(("install-rabs", b'0', b"ignored legacy helper data"));
     archive(&path, &entries);
     fs::create_dir(&fixture.root).unwrap();
+    fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(fixture.root.join("rch"), b"existing core").unwrap();
     let mut sources = Source::Archive(path).capture().unwrap();
     install(&mut sources, &fixture.root, false).unwrap();
@@ -680,4 +685,167 @@ fn unsupported_or_conflicting_cli_options_fail_before_creating_an_installation()
         assert!(run(&arguments).is_err());
         assert!(!fixture.root.exists());
     }
+}
+
+fn host_target_triple() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64-unknown-linux-gnu",
+        "aarch64" => "aarch64-unknown-linux-gnu",
+        other => panic!("unsupported test arch: {other}"),
+    }
+}
+
+fn other_target_triple() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "aarch64-unknown-linux-gnu",
+        "aarch64" => "x86_64-unknown-linux-gnu",
+        other => panic!("unsupported test arch: {other}"),
+    }
+}
+
+#[test]
+fn package_archive_is_deterministic_and_round_trips_through_install_and_verify() {
+    let fixture = Fixture::new();
+    let archive_a = fixture.temporary.path().join("release-a.tar.gz");
+    let archive_b = fixture.temporary.path().join("release-b.tar.gz");
+    let target = host_target_triple();
+
+    let (receipt_a, ok_a) = run(&[
+        OsString::from("--from-bundle"),
+        fixture.bundle.as_os_str().to_owned(),
+        OsString::from("--package"),
+        archive_a.as_os_str().to_owned(),
+        OsString::from("--target"),
+        OsString::from(target),
+    ])
+    .unwrap();
+    assert!(ok_a);
+    assert_eq!(receipt_a["kind"], "rabs-packaged");
+    assert_eq!(receipt_a["target"], target);
+    assert_eq!(receipt_a["source_identity"], Value::Null);
+    assert_eq!(receipt_a["services_started"], false);
+    assert_eq!(receipt_a["cargo_config_changed"], false);
+    assert_eq!(
+        receipt_a["toolset"]["files"].as_object().unwrap().len(),
+        TOOLS.len()
+    );
+
+    let (receipt_b, ok_b) = run(&[
+        OsString::from("--from-bundle"),
+        fixture.bundle.as_os_str().to_owned(),
+        OsString::from("--package"),
+        archive_b.as_os_str().to_owned(),
+        OsString::from("--target"),
+        OsString::from(target),
+    ])
+    .unwrap();
+    assert!(ok_b);
+    // Deterministic USTAR + mtime=0 gzip produces byte-identical archives.
+    assert_eq!(receipt_a["sha256"], receipt_b["sha256"]);
+    assert_eq!(receipt_a["bytes"], receipt_b["bytes"]);
+    assert_eq!(fs::read(&archive_a).unwrap(), fs::read(&archive_b).unwrap());
+    assert_eq!(
+        digest_hex(&Sha256::digest(fs::read(&archive_a).unwrap())),
+        receipt_a["sha256"].as_str().unwrap()
+    );
+
+    // Produced archive installs and verifies cleanly via --from-archive.
+    let (installed, ok_inst) = run(&[
+        OsString::from("--from-archive"),
+        archive_a.as_os_str().to_owned(),
+        OsString::from("--bin-dir"),
+        fixture.root.as_os_str().to_owned(),
+    ])
+    .unwrap();
+    assert!(ok_inst);
+    assert_eq!(installed["kind"], "rabs-installed");
+
+    let (verified, ok_ver) = run(&[
+        OsString::from("--from-archive"),
+        archive_a.as_os_str().to_owned(),
+        OsString::from("--bin-dir"),
+        fixture.root.as_os_str().to_owned(),
+        OsString::from("--verify"),
+    ])
+    .unwrap();
+    assert!(ok_ver);
+    assert_eq!(verified["state"], "verified");
+}
+
+#[test]
+fn package_archive_refuses_target_mismatch_existing_file_and_dangling_symlink() {
+    let fixture = Fixture::new();
+    let out = fixture.temporary.path().join("mismatch.tar.gz");
+
+    // Wrong --target must refuse before publishing.
+    assert!(
+        run(&[
+            OsString::from("--from-bundle"),
+            fixture.bundle.as_os_str().to_owned(),
+            OsString::from("--package"),
+            out.as_os_str().to_owned(),
+            OsString::from("--target"),
+            OsString::from(other_target_triple()),
+        ])
+        .is_err()
+    );
+    assert!(!out.exists());
+
+    // Existing file must never be clobbered.
+    let existing = fixture.temporary.path().join("existing.tar.gz");
+    fs::write(&existing, b"keep-existing").unwrap();
+    assert!(
+        run(&[
+            OsString::from("--from-bundle"),
+            fixture.bundle.as_os_str().to_owned(),
+            OsString::from("--package"),
+            existing.as_os_str().to_owned(),
+            OsString::from("--target"),
+            OsString::from(host_target_triple()),
+        ])
+        .is_err()
+    );
+    assert_eq!(fs::read(&existing).unwrap(), b"keep-existing");
+
+    // Dangling symlink must never be followed or replaced.
+    let dangling = fixture.temporary.path().join("dangling.tar.gz");
+    symlink(fixture.temporary.path().join("nowhere"), &dangling).unwrap();
+    assert!(
+        run(&[
+            OsString::from("--from-bundle"),
+            fixture.bundle.as_os_str().to_owned(),
+            OsString::from("--package"),
+            dangling.as_os_str().to_owned(),
+            OsString::from("--target"),
+            OsString::from(host_target_triple()),
+        ])
+        .is_err()
+    );
+    assert!(!fixture.temporary.path().join("nowhere").exists());
+
+    // --target / --require-source without --package must refuse.
+    assert!(
+        run(&[
+            OsString::from("--from-bundle"),
+            fixture.bundle.as_os_str().to_owned(),
+            OsString::from("--bin-dir"),
+            fixture.root.as_os_str().to_owned(),
+            OsString::from("--target"),
+            OsString::from(host_target_triple()),
+        ])
+        .is_err()
+    );
+    assert!(
+        run(&[
+            OsString::from("--from-bundle"),
+            fixture.bundle.as_os_str().to_owned(),
+            OsString::from("--package"),
+            out.as_os_str().to_owned(),
+            OsString::from("--target"),
+            OsString::from(host_target_triple()),
+            OsString::from("--require-source"),
+            OsString::from("not-a-40-hex-commit"),
+        ])
+        .is_err()
+    );
 }
