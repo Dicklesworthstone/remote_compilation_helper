@@ -78,15 +78,164 @@ read_platforms() {
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  check_release_assets.sh --dir <artifacts-dir> --tag <tag>
+  check_release_assets.sh --dir <artifacts-dir> --tag <tag> [--require-rabs]
+  check_release_assets.sh --check-rabs-archive <tar.gz> --target <linux-gnu-triple> [--skip-unwind-check]
   check_release_assets.sh --gh-release <tag> [--repo <owner/name>]
   check_release_assets.sh --self-test
 
 Asserts every REQUIRED platform is installable from the release: some accepted
 archive name (triple or alias) plus a checksum (its .sha256 or a consolidated
 SHA256SUMS/checksums.txt) is present.
-Exit 0 = covered; exit 1 = a required platform is missing (or bad usage).
+With --check-rabs-archive (or --require-rabs in --dir mode), validates that a
+Linux GNU RABS release archive contains all 9 native ELF64 binaries for the
+declared target, with non-zero byte sizes and panic=unwind symbols on wrappers.
+Exit 0 = covered/valid; exit 1 = missing/invalid (or bad usage).
 EOF
+}
+
+# --- RABS Linux GNU archive verification (bead bd-n8qt3.1, pure bash/ELF) -------
+
+RABS_ALL_TOOLS=(
+    cargo-rabs
+    rabs-wrap
+    rabsd
+    rabs-wkr
+    rabs-cargo-root
+    rabs-delivery-cas
+    rabs-recover
+    rabs-cargo
+    rabs-install
+)
+
+RABS_WRAPPER_TOOLS=(
+    cargo-rabs
+    rabs-wrap
+    rabs-cargo
+    rabs-recover
+    rabs-install
+)
+
+rabs_target_elf_machine() {
+    case "$1" in
+        x86_64-unknown-linux-gnu)  printf '3e00' ;;
+        aarch64-unknown-linux-gnu) printf 'b700' ;;
+        *)
+            echo "RCH-GATE-RABS-ARCHIVE: unsupported Linux GNU target: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+# check_rabs_archive <archive.tar.gz> <target-triple> [skip_unwind:0|1]
+check_rabs_archive() {
+    local archive="$1" target="$2" skip_unwind="${3:-0}"
+    local expected_machine
+    expected_machine="$(rabs_target_elf_machine "$target")" || return 1
+
+    if [[ ! -f "$archive" || ! -s "$archive" ]]; then
+        echo "RCH-GATE-RABS-ARCHIVE: missing or empty archive: $archive" >&2
+        return 1
+    fi
+
+    local list_out
+    if ! list_out="$(tar -tzvf "$archive" 2>/dev/null)"; then
+        echo "RCH-GATE-RABS-ARCHIVE: failed to list tar.gz archive: $archive" >&2
+        return 1
+    fi
+
+    # Reject non-regular entries, duplicates, non-flat paths, or unexpected names.
+    local -A seen=()
+    local line mode name
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        mode="${line%% *}"
+        # Last whitespace-separated field is member path (links also contain " -> ").
+        if [[ "$mode" != -* ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: non-regular tar entry rejected: $line" >&2
+            return 1
+        fi
+        name="${line##* }"
+        if [[ "$name" == */* || "$name" == "." || "$name" == ".." ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: non-flat tar member path rejected: $name" >&2
+            return 1
+        fi
+        if [[ -n "${seen[$name]+x}" ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: duplicate tar member rejected: $name" >&2
+            return 1
+        fi
+        seen["$name"]=1
+    done <<<"$list_out"
+
+    local tool
+    for tool in "${RABS_ALL_TOOLS[@]}"; do
+        if [[ -z "${seen[$tool]+x}" ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: archive $archive is missing required RABS binary: $tool" >&2
+            return 1
+        fi
+    done
+
+    local unpack_dir
+    unpack_dir="$(mktemp -d)"
+    local rc=0
+    if ! tar -xzf "$archive" -C "$unpack_dir" "${RABS_ALL_TOOLS[@]}" 2>/dev/null; then
+        echo "RCH-GATE-RABS-ARCHIVE: failed to extract RABS binaries from $archive" >&2
+        rm -rf "$unpack_dir"
+        return 1
+    fi
+
+    for tool in "${RABS_ALL_TOOLS[@]}"; do
+        local bin="$unpack_dir/$tool"
+        if [[ ! -f "$bin" || -L "$bin" ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: extracted member is not a regular file: $tool" >&2
+            rc=1; break
+        fi
+        local size_bytes
+        size_bytes="$(wc -c < "$bin" | tr -d '[:space:]')"
+        if [[ -z "$size_bytes" || "$size_bytes" -lt 64 ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: binary $tool is empty or truncated (${size_bytes:-0} bytes)" >&2
+            rc=1; break
+        fi
+        # Verify ELF64 little-endian magic (7f 45 4c 46 02 01 01), e_type (ET_EXEC=0200 or ET_DYN=0300),
+        # and exact little-endian e_machine (3e00 for x86_64, b700 for aarch64).
+        local hdr magic etype emach
+        hdr="$(od -An -tx1 -N20 "$bin" | tr -d ' \t\n')"
+        magic="${hdr:0:14}"
+        etype="${hdr:32:4}"
+        emach="${hdr:36:4}"
+        if [[ "$magic" != "7f454c46020101" ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: $tool is not a Linux ELF64 little-endian binary (header=$magic)" >&2
+            rc=1; break
+        fi
+        if [[ "$etype" != "0200" && "$etype" != "0300" ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: $tool is not an ELF executable/PIE (e_type=$etype)" >&2
+            rc=1; break
+        fi
+        if [[ "$emach" != "$expected_machine" ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: $tool ELF machine mismatch for $target (got $emach, want $expected_machine)" >&2
+            rc=1; break
+        fi
+    done
+
+    if [[ "$rc" -eq 0 && "$skip_unwind" != "1" ]]; then
+        if ! command -v readelf >/dev/null 2>&1; then
+            echo "RCH-GATE-RABS-ARCHIVE: readelf is required to verify A021 panic=unwind posture on wrapper binaries" >&2
+            rc=1
+        else
+            for tool in "${RABS_WRAPPER_TOOLS[@]}"; do
+                local bin="$unpack_dir/$tool"
+                if ! readelf --dyn-syms --syms -W "$bin" 2>/dev/null | grep -Eq '\b(_Unwind_Resume|_Unwind_RaiseException|rust_eh_personality)(@|[[:space:]]|$)'; then
+                    echo "RCH-GATE-RABS-ARCHIVE: wrapper binary $tool lacks panic=unwind symbols (likely built with panic=abort, violating A021/I49)" >&2
+                    rc=1; break
+                fi
+            done
+        fi
+    fi
+
+    rm -rf "$unpack_dir"
+    if [[ "$rc" -eq 0 ]]; then
+        echo "check_release_assets: OK — RABS archive ${archive} verified (${#RABS_ALL_TOOLS[@]} ELF64 binaries for ${target})"
+    fi
+    return "$rc"
 }
 
 # --- core check ------------------------------------------------------------------
@@ -180,14 +329,31 @@ fmt_names() {
 # --- mode: directory -------------------------------------------------------------
 
 run_dir_mode() {
-    local dir="$1" tag="$2"
+    local dir="$1" tag="$2" require_rabs="${3:-0}" skip_unwind="${4:-0}"
     [[ -d "$dir" ]] || { echo "check_release_assets: artifacts dir not found: $dir" >&2; exit 1; }
     _have_in_dir() { [[ -f "$dir/$1" ]]; }
-    if check_platforms "$tag" _have_in_dir; then
-        echo "check_release_assets: OK — release ${tag} is installable on every required platform (${dir}/)"
-    else
+    if ! check_platforms "$tag" _have_in_dir; then
         exit 1
     fi
+    local has_consolidated=0
+    if [[ -f "$dir/SHA256SUMS" || -f "$dir/checksums.txt" ]]; then
+        has_consolidated=1
+    fi
+    local target rabs_archive
+    for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+        rabs_archive="$dir/rabs-${tag}-${target}.tar.gz"
+        if [[ -f "$rabs_archive" ]]; then
+            if [[ ! -f "${rabs_archive}.sha256" && "$has_consolidated" != "1" ]]; then
+                echo "RCH-GATE-RABS-ARCHIVE: missing checksum for ${rabs_archive}" >&2
+                exit 1
+            fi
+            check_rabs_archive "$rabs_archive" "$target" "$skip_unwind" || exit 1
+        elif [[ "$require_rabs" == "1" && "$target" == "x86_64-unknown-linux-gnu" ]]; then
+            echo "RCH-GATE-RABS-ARCHIVE: required RABS archive missing: ${rabs_archive}" >&2
+            exit 1
+        fi
+    done
+    echo "check_release_assets: OK — release ${tag} is installable on every required platform (${dir}/)"
 }
 
 # --- mode: live GitHub release ---------------------------------------------------
@@ -294,6 +460,81 @@ run_self_test() {
         echo "  self-test[6] absent optional platform passes .... FAIL" >&2; fails=1
     fi
 
+    # 7-11) RABS Linux GNU archive completeness, ELF arch, zero-byte, and panic=abort refusal
+    _make_fake_elf() {
+        local out="$1" mach_b0="$2" mach_b1="$3"
+        # 64-byte minimal ELF64 little-endian PIE header with requested e_machine.
+        printf '\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00'"$mach_b0$mach_b1" >"$out"
+        dd if=/dev/zero bs=1 count=44 >>"$out" 2>/dev/null
+        chmod 755 "$out"
+    }
+    local rabs_dir="$tmp/rabs-bins"
+    mkdir -p "$rabs_dir"
+    local t
+    for t in "${RABS_ALL_TOOLS[@]}"; do
+        _make_fake_elf "$rabs_dir/$t" '\x3e' '\x00'
+    done
+    tar -czf "$tmp/rabs-complete-x86_64.tar.gz" -C "$rabs_dir" "${RABS_ALL_TOOLS[@]}"
+
+    # 7) complete 9-binary x86_64 ELF64 archive passes (--skip-unwind-check for minimal synthetic headers)
+    if check_rabs_archive "$tmp/rabs-complete-x86_64.tar.gz" x86_64-unknown-linux-gnu 1 >/dev/null 2>&1; then
+        echo "  self-test[7] complete RABS ELF64 archive passes . OK"
+    else
+        echo "  self-test[7] complete RABS ELF64 archive passes . FAIL" >&2; fails=1
+    fi
+
+    # 8) missing rabs-wrap fails closed
+    tar -czf "$tmp/rabs-missing.tar.gz" -C "$rabs_dir" cargo-rabs rabsd rabs-wkr rabs-cargo-root rabs-delivery-cas rabs-recover rabs-cargo rabs-install
+    if check_rabs_archive "$tmp/rabs-missing.tar.gz" x86_64-unknown-linux-gnu 1 >/dev/null 2>&1; then
+        echo "  self-test[8] missing RABS binary fails .......... FAIL" >&2; fails=1
+    else
+        echo "  self-test[8] missing RABS binary fails .......... OK"
+    fi
+
+    # 9) wrong-arch ELF (aarch64 binary inside x86_64 archive) fails closed
+    _make_fake_elf "$rabs_dir/rabs-wrap" '\xb7' '\x00'
+    tar -czf "$tmp/rabs-wrong-arch.tar.gz" -C "$rabs_dir" "${RABS_ALL_TOOLS[@]}"
+    if check_rabs_archive "$tmp/rabs-wrong-arch.tar.gz" x86_64-unknown-linux-gnu 1 >/dev/null 2>&1; then
+        echo "  self-test[9] wrong-arch ELF fails ............... FAIL" >&2; fails=1
+    else
+        echo "  self-test[9] wrong-arch ELF fails ............... OK"
+    fi
+
+    # 10) zero-byte binary fails closed
+    : >"$rabs_dir/rabs-wrap"
+    chmod 755 "$rabs_dir/rabs-wrap"
+    tar -czf "$tmp/rabs-empty-bin.tar.gz" -C "$rabs_dir" "${RABS_ALL_TOOLS[@]}"
+    if check_rabs_archive "$tmp/rabs-empty-bin.tar.gz" x86_64-unknown-linux-gnu 1 >/dev/null 2>&1; then
+        echo "  self-test[10] zero-byte binary fails ............ FAIL" >&2; fails=1
+    else
+        echo "  self-test[10] zero-byte binary fails ............ OK"
+    fi
+
+    # 11) real host ELF without unwind symbols (simulating panic=abort wrapper) fails closed
+    local true_bin=""
+    for cand in /usr/bin/true /bin/true; do
+        if [[ -f "$cand" ]]; then true_bin="$cand"; break; fi
+    done
+    local host_triple=""
+    case "$(uname -m)" in
+        x86_64)  host_triple="x86_64-unknown-linux-gnu" ;;
+        aarch64) host_triple="aarch64-unknown-linux-gnu" ;;
+    esac
+    if [[ -n "$true_bin" && -n "$host_triple" ]] && command -v readelf >/dev/null 2>&1; then
+        local abort_dir="$tmp/rabs-abort"
+        mkdir -p "$abort_dir"
+        for t in "${RABS_ALL_TOOLS[@]}"; do
+            cp "$true_bin" "$abort_dir/$t"
+            chmod 755 "$abort_dir/$t"
+        done
+        tar -czf "$tmp/rabs-panic-abort.tar.gz" -C "$abort_dir" "${RABS_ALL_TOOLS[@]}"
+        if check_rabs_archive "$tmp/rabs-panic-abort.tar.gz" "$host_triple" 0 >/dev/null 2>&1; then
+            echo "  self-test[11] panic=abort wrapper fails ......... FAIL" >&2; fails=1
+        else
+            echo "  self-test[11] panic=abort wrapper fails ......... OK"
+        fi
+    fi
+
     if [[ "$fails" -ne 0 ]]; then
         echo "check_release_assets --self-test: FAILED" >&2
         exit 1
@@ -304,15 +545,19 @@ run_self_test() {
 # --- arg parsing -----------------------------------------------------------------
 
 main() {
-    local mode="" dir="" tag="" repo=""
+    local mode="" dir="" tag="" repo="" rabs_archive="" target="" require_rabs=0 skip_unwind=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --dir)        dir="${2:-}"; shift 2 ;;
-            --tag)        tag="${2:-}"; shift 2 ;;
-            --gh-release) mode="gh"; tag="${2:-}"; shift 2 ;;
-            --repo)       repo="${2:-}"; shift 2 ;;
-            --self-test)  mode="self-test"; shift ;;
-            -h|--help)    usage; exit 0 ;;
+            --dir)                 dir="${2:-}"; shift 2 ;;
+            --tag)                 tag="${2:-}"; shift 2 ;;
+            --gh-release)          mode="gh"; tag="${2:-}"; shift 2 ;;
+            --repo)                repo="${2:-}"; shift 2 ;;
+            --check-rabs-archive)  mode="rabs-archive"; rabs_archive="${2:-}"; shift 2 ;;
+            --target)              target="${2:-}"; shift 2 ;;
+            --require-rabs)        require_rabs=1; shift ;;
+            --skip-unwind-check)   skip_unwind=1; shift ;;
+            --self-test)           mode="self-test"; shift ;;
+            -h|--help)             usage; exit 0 ;;
             *) echo "check_release_assets: unknown argument: $1" >&2; usage; exit 1 ;;
         esac
     done
@@ -320,12 +565,19 @@ main() {
     if [[ "$mode" == "self-test" ]]; then
         run_self_test; return
     fi
+    if [[ "$mode" == "rabs-archive" ]]; then
+        [[ -n "$rabs_archive" && -n "$target" ]] || {
+            echo "check_release_assets: --check-rabs-archive requires --target" >&2
+            usage; exit 1
+        }
+        check_rabs_archive "$rabs_archive" "$target" "$skip_unwind"; return
+    fi
     if [[ "$mode" == "gh" ]]; then
         [[ -n "$tag" ]] || { echo "check_release_assets: --gh-release requires a tag" >&2; usage; exit 1; }
         run_gh_mode "$tag" "$repo"; return
     fi
     [[ -n "$dir" && -n "$tag" ]] || { echo "check_release_assets: --dir and --tag are required" >&2; usage; exit 1; }
-    run_dir_mode "$dir" "$tag"
+    run_dir_mode "$dir" "$tag" "$require_rabs" "$skip_unwind"
 }
 
 main "$@"

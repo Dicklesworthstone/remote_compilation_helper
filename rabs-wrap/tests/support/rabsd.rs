@@ -1,6 +1,6 @@
 //! Resolve the companion daemon from Cargo artifacts, never a guessed sibling.
 //!
-//! `scripts/test_rabs_live.py` builds both binaries once and supplies a private
+//! `rabs-live-test` builds both binaries once and supplies a private
 //! artifact manifest. Direct `cargo test` remains supported: one profile-matched
 //! build is performed per test process, rooted at THIS workspace and target
 //! directory rather than the test's ambient cwd/CARGO_TARGET_DIR. A failed or
@@ -202,10 +202,7 @@ fn build_layout(wrapper: &Path) -> Result<(&Path, &str), String> {
         .and_then(|name| name.to_str())
         .ok_or("wrapper profile directory is not UTF-8")?;
     if !wrapper.is_absolute() || profile.is_empty() || profile == "deps" {
-        return Err(
-            "wrapper has an unsupported Cargo artifact layout; use scripts/test_rabs_live.py"
-                .into(),
-        );
+        return Err("wrapper has an unsupported Cargo artifact layout; use rabs-live-test".into());
     }
     Ok((target_dir, if profile == "debug" { "dev" } else { profile }))
 }

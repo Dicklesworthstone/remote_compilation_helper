@@ -1,29 +1,41 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- S7 (bead bd-n8qt3): launchd unit for rabsd on macOS edge hosts (csd).
-     rabsd is the edge+coordinator daemon; it fails open, so a crash
-     never blocks builds. KeepAlive restarts it; the shutdown receipt
-     (its final stdout line) lands in the log for post-mortems. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- S7 (beads bd-n8qt3, bd-n8qt3.1): LaunchAgent template for rabsd on macOS edge hosts.
+
+     SECURITY & PRIVATE STATE POSTURE:
+     - Do NOT point RABS_STATE_DIR or logs at world-writable /tmp.
+     - RABS_STATE_DIR is intentionally omitted so rabsd defaults to private
+       0700 "$HOME/.cache/rch/rabs-state". If overriding, set an absolute
+       owner-only (0700) directory under the user's home.
+     - Launchd does not expand "~" or "$HOME" in StandardOutPath/StandardErrorPath;
+       replace /Users/REPLACE_WITH_USER before loading and pre-create the log
+       directory at mode 0700. Umask 63 (octal 0077) keeps log files private.
+
+     MACOS PLATFORM LIMITS (HONEST NON-CLAIM):
+     - macOS hosts operate ONLY as edge/coordinator/dispatcher nodes talking to
+       remote Linux workers.
+     - Canonical isolated execution (Linux user/mount/PID/network namespaces,
+       pivot_root, cgroup v2 memory.events enforcement, and native Linux ELF64
+       rabs-install generations) is Linux-only and is NOT available on macOS.
+     - rabsd fails open on crash; KeepAlive restarts it and the final stdout
+       shutdown receipt lands in the private log for post-mortems. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.rabs.rabsd</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/rabsd</string>
+    <string>/Users/REPLACE_WITH_USER/.local/bin/rabsd</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
-  <string>/tmp/rabsd.out.log</string>
+  <string>/Users/REPLACE_WITH_USER/Library/Logs/rabs/rabsd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/rabsd.err.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>RABS_STATE_DIR</key>
-    <string>/tmp/rabs-state</string>
-  </dict>
+  <string>/Users/REPLACE_WITH_USER/Library/Logs/rabs/rabsd.err.log</string>
 </dict>
 </plist>

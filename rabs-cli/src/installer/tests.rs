@@ -849,3 +849,204 @@ fn package_archive_refuses_target_mismatch_existing_file_and_dangling_symlink() 
         .is_err()
     );
 }
+
+#[test]
+fn semver_validation_enforces_strict_semver2_rules() {
+    for valid in [
+        "0.1.0",
+        "1.2.3",
+        "10.20.30-alpha.1",
+        "1.0.0-0.3.7+exp.sha.5114f85",
+        "2.1.37+build-01",
+    ] {
+        assert!(is_valid_semver(valid), "expected valid semver: {valid}");
+    }
+    for invalid_ver in [
+        "",
+        "1.2",
+        "1.2.3.4",
+        "01.2.3",
+        "1.02.3",
+        "1.2.03",
+        "1.2.3-",
+        "1.2.3+",
+        "1.2.3-alpha..1",
+        "1.2.3+build..1",
+        "1.2.3-.alpha",
+        "1.2.3+build_meta",
+    ] {
+        assert!(
+            !is_valid_semver(invalid_ver),
+            "expected invalid semver: {invalid_ver}"
+        );
+    }
+}
+
+#[test]
+fn ssh_host_and_target_spec_validation_rejects_shell_metacharacters_and_bad_targets() {
+    for good in [
+        "worker-1",
+        "ubuntu@192.168.1.10",
+        "root@ovh-a.example.com",
+        "user@[2001:db8::1]",
+    ] {
+        ssh::validate_host(good).unwrap_or_else(|e| panic!("expected valid host {good}: {e}"));
+    }
+    for bad in [
+        "",
+        "-oProxyCommand=id",
+        "host;id",
+        "host$(whoami)",
+        "host`id`",
+        "host name",
+        "host'quote",
+        "host|cat",
+    ] {
+        assert!(
+            ssh::validate_host(bad).is_err(),
+            "expected invalid host: {bad:?}"
+        );
+    }
+
+    assert!(ssh::parse_target_spec("x86_64-unknown-linux-gnu=/tmp/a.tar.gz").is_ok());
+    assert!(ssh::parse_target_spec("aarch64-unknown-linux-gnu=/tmp/b.tar.gz").is_ok());
+    assert!(ssh::parse_target_spec("no-equals-sign").is_err());
+    assert!(ssh::parse_target_spec("x86_64-apple-darwin=/tmp/c.tar.gz").is_err());
+    assert!(ssh::parse_target_spec("x86_64-unknown-linux-gnu=").is_err());
+}
+
+#[test]
+fn sealed_transfer_image_round_trips_and_detects_tampering_or_truncation() {
+    let fixture = Fixture::new();
+    let mut sources = fixture.sources();
+    let sealed = ssh::seal_transfer_image(
+        &mut sources,
+        Some(host_target_triple()),
+        Some(&fixture.root),
+        ssh::MIN_DEPLOY_RESERVE_MIB * 1024 * 1024,
+    )
+    .unwrap();
+    let meta = fs::metadata(&sealed.path).unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o400);
+    assert_eq!(
+        fs::metadata(sealed.path.parent().unwrap()).unwrap().mode() & 0o777,
+        0o700
+    );
+    // Only transfer.bin should be retained in the send directory (inputs/ cleaned up).
+    let retained_entries: Vec<_> = fs::read_dir(sealed.path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(retained_entries, vec![OsString::from("transfer.bin")]);
+
+    let loaded = ssh::load_transfer_image(&sealed.path).unwrap();
+    assert_eq!(loaded.target, host_target_triple());
+    assert_eq!(
+        loaded.bin_dir.as_deref(),
+        Some(fixture.root.to_str().unwrap())
+    );
+    assert_eq!(loaded.toolset, sources.expected);
+
+    // Flip a byte in the compressed payload -> digest mismatch must refuse.
+    let tampered = fixture.temporary.path().join("tampered.bin");
+    let mut bytes = fs::read(&sealed.path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x55;
+    fs::write(&tampered, &bytes).unwrap();
+    assert!(ssh::load_transfer_image(&tampered).is_err());
+
+    // Truncate payload -> length mismatch must refuse.
+    let truncated = fixture.temporary.path().join("truncated.bin");
+    fs::write(&truncated, &bytes[..bytes.len() - 8]).unwrap();
+    assert!(ssh::load_transfer_image(&truncated).is_err());
+
+    // Wrong declared target must refuse before sealing.
+    let mut sources_again = fixture.sources();
+    assert!(
+        ssh::seal_transfer_image(
+            &mut sources_again,
+            Some(other_target_triple()),
+            Some(&fixture.root),
+            ssh::MIN_DEPLOY_RESERVE_MIB * 1024 * 1024,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn ssh_option_matrix_refuses_invalid_combinations_and_bounds() {
+    let fixture = Fixture::new();
+    let bundle = fixture.bundle.as_os_str().to_owned();
+    let root = fixture.root.as_os_str().to_owned();
+    let cases: &[&[&str]] = &[
+        &["--ssh-jobs", "2", "--probe-installed"],
+        &["--ssh-timeout", "30", "--probe-installed"],
+        &["--ssh-reserve-mib", "128", "--probe-installed"],
+        &["--from-target", "x86_64-unknown-linux-gnu=/tmp/x.tar.gz"],
+        &["--from-image", "/tmp/transfer.bin"],
+        &["--from-image", "/tmp/transfer.bin", "--probe"],
+        &["--probe-installed", "--ssh", "worker-1"],
+        &["--ssh", "worker-1", "--ssh", "worker-1", "--verify"],
+        &["--ssh", "worker-1", "--ssh-jobs", "0"],
+        &["--ssh", "worker-1", "--ssh-jobs", "9"],
+        &["--ssh", "worker-1", "--ssh-timeout", "0"],
+        &["--ssh", "worker-1", "--ssh-timeout", "3601"],
+        &["--ssh", "worker-1", "--ssh-reserve-mib", "63"],
+        &["--ssh", "worker-1", "--ssh-reserve-mib", "65537"],
+    ];
+    for args in cases {
+        let mut full: Vec<OsString> = args.iter().map(OsString::from).collect();
+        if !args.contains(&"--probe-installed")
+            && !args.contains(&"--from-target")
+            && !args.contains(&"--from-image")
+        {
+            full.push(OsString::from("--from-bundle"));
+            full.push(bundle.clone());
+            full.push(OsString::from("--bin-dir"));
+            full.push(root.clone());
+        }
+        assert!(parse(&full).is_err(), "expected refusal for {args:?}");
+    }
+
+    // --verify + --ssh-reserve-mib must refuse.
+    assert!(
+        parse(&[
+            OsString::from("--from-bundle"),
+            bundle.clone(),
+            OsString::from("--ssh"),
+            OsString::from("worker-1"),
+            OsString::from("--verify"),
+            OsString::from("--ssh-reserve-mib"),
+            OsString::from("128"),
+        ])
+        .is_err()
+    );
+
+    // Duplicate --from-target architecture must refuse.
+    assert!(
+        parse(&[
+            OsString::from("--from-target"),
+            OsString::from("x86_64-unknown-linux-gnu=/tmp/a.tar.gz"),
+            OsString::from("--from-target"),
+            OsString::from("x86_64-unknown-linux-gnu=/tmp/b.tar.gz"),
+            OsString::from("--ssh"),
+            OsString::from("worker-1"),
+        ])
+        .is_err()
+    );
+
+    // --package + --ssh must refuse.
+    assert!(
+        parse(&[
+            OsString::from("--from-bundle"),
+            bundle,
+            OsString::from("--package"),
+            OsString::from("/tmp/out.tar.gz"),
+            OsString::from("--target"),
+            OsString::from(host_target_triple()),
+            OsString::from("--ssh"),
+            OsString::from("worker-1"),
+        ])
+        .is_err()
+    );
+}

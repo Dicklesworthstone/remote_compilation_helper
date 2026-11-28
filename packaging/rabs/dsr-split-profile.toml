@@ -1,0 +1,86 @@
+# RABS S7 / A021 DSR Split-Profile Release Packaging Recipe (bead bd-n8qt3.1).
+#
+# AGENTS.md mandates DSR exclusively for CI and releases (GitHub Actions is
+# prohibited). Register this manifest in `~/.config/dsr/repos.yaml` on the
+# release builder host and run both profiles per Linux GNU target with an
+# explicit clean 40-hex Git commit in `RCH_BUILD_SOURCE`.
+#
+# Invariant A021 (Cargo.toml):
+#   - `wrapper-release`: opt-level="z", strip=true,  panic="unwind", lto=false
+#     (I49 containment: wrappers never abort the caller's shell)
+#   - `daemon-release`:  opt-level=3,   strip=false, panic="unwind", lto="thin"
+#     (sustained throughput + retained symbols for crashpack triage)
+
+schema = 1
+kind = "rabs-dsr-split-profile-recipe"
+repository = "remote_compilation_helper"
+branch = "main"
+
+[profiles.wrapper_release]
+cargo_profile = "wrapper-release"
+panic = "unwind"
+opt_level = "z"
+strip = true
+lto = false
+binaries = [
+    "cargo-rabs",
+    "rabs-wrap",
+    "rabs-cargo",
+    "rabs-recover",
+    "rabs-install",
+]
+build_command = """
+RCH_BUILD_SOURCE="${COMMIT_SHA}" cargo build --profile wrapper-release --target "${TARGET}" \
+  -p rabs-wrap --bin rabs-wrap \
+  -p rabs-cli --features installer --bin cargo-rabs --bin rabs-cargo --bin rabs-recover --bin rabs-install
+"""
+
+[profiles.daemon_release]
+cargo_profile = "daemon-release"
+panic = "unwind"
+opt_level = 3
+strip = false
+lto = "thin"
+binaries = [
+    "rabsd",
+    "rabs-wkr",
+    "rabs-cargo-root",
+    "rabs-delivery-cas",
+]
+build_command = """
+RCH_BUILD_SOURCE="${COMMIT_SHA}" cargo build --profile daemon-release --target "${TARGET}" \
+  -p rabsd --bin rabsd \
+  -p rabs-wkr --bin rabs-wkr \
+  -p rabs-cli --bin rabs-cargo-root --bin rabs-delivery-cas
+"""
+
+[packaging]
+# Package and self-verify the deterministic flat USTAR+gzip archive using the
+# freshly built native rabs-install binary (Rule 0.75: Rust-only).
+package_command = """
+target/${TARGET}/wrapper-release/rabs-install \
+  --from-build "target/${TARGET}" \
+  --package "${DIST_DIR}/rabs-${TAG}-${TARGET}.tar.gz" \
+  --target "${TARGET}" \
+  --require-source "${COMMIT_SHA}"
+"""
+# Verify release archive completeness, ELF64 target match, non-zero sizes, and
+# wrapper-release panic=unwind posture before publishing.
+verify_command = """
+scripts/check_release_assets.sh \
+  --check-rabs-archive "${DIST_DIR}/rabs-${TAG}-${TARGET}.tar.gz" \
+  --target "${TARGET}"
+"""
+sha256_command = """
+(cd "${DIST_DIR}" && sha256sum "rabs-${TAG}-${TARGET}.tar.gz" > "rabs-${TAG}-${TARGET}.tar.gz.sha256")
+"""
+
+[[targets]]
+triple = "x86_64-unknown-linux-gnu"
+required = true
+elf_machine_hex_le = "3e00"
+
+[[targets]]
+triple = "aarch64-unknown-linux-gnu"
+required = false
+elf_machine_hex_le = "b700"

@@ -1995,8 +1995,16 @@ fn execute_canonical_inner(
             let setup = rabs_sandbox::cgroup_envelope::probe_delegation()
                 .map_err(|error| error.to_string())
                 .and_then(|delegation| {
-                    let subgroup =
-                        format!("rabs-wkr-{}-req-{}", std::process::id(), request.request_id);
+                    static NEXT_CGROUP_ATTEMPT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    let attempt_seq =
+                        NEXT_CGROUP_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let subgroup = format!(
+                        "rabs-wkr-{}-req-{}-a{}",
+                        std::process::id(),
+                        request.request_id,
+                        attempt_seq
+                    );
                     rabs_sandbox::cgroup_envelope::create_envelope(
                         &delegation,
                         &subgroup,
@@ -2169,22 +2177,27 @@ fn execute_canonical_inner(
                     oom_delta,
                 );
                 drop(guard);
+                // Invariant I16: ANY kernel OOM kill inside this dedicated
+                // per-attempt cgroup (including when a child compiler such as
+                // `rustc` is SIGKILLed while outer `cargo` exits 101) is an
+                // environment event, NEVER an admitted deterministic failure
+                // or reusable artifact/target seed.
                 if matches!(
                     termination,
                     rabs_sandbox::cgroup_envelope::Termination::OomKilled
-                ) {
+                ) || oom_delta > 0
+                {
                     eprintln!(
                         "{}",
                         serde_json::json!({
                             "kind": "worker-cgroup-oom-killed",
                             "request_id": request.request_id,
+                            "exit_code": output.status.code(),
+                            "signal": status_signal,
                             "oom_delta": oom_delta,
                             "residual_group_members": output.residual_group_members,
                         })
                     );
-                    // Invariant I16: an envelope OOM kill is an environment
-                    // event, NEVER an admitted deterministic failure or
-                    // reusable artifact/target seed.
                     let _ = control.retain_outputs(Err(
                         "worker cgroup v2 memory envelope OOM-killed workload (I16)".to_owned(),
                     ));

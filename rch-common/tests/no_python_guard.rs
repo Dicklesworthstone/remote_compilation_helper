@@ -31,15 +31,11 @@ const NAMED_ONLY: &[(&str, usize)] = &[
 ];
 
 /// `.py` files left in the workspace. Shrink only.
-const PY_FILES_DEBT: usize = 91;
+const PY_FILES_DEBT: usize = 78;
 
 /// Extensionless scripts whose shebang still invokes Python. Shrink only;
 /// never add an entry.
-const EXTENSIONLESS_PY_DEBT: &[&str] = &[
-    "scripts/cargo-rabs",
-    "scripts/install-rabs",
-    "scripts/rabs-recover",
-];
+const EXTENSIONLESS_PY_DEBT: &[&str] = &["scripts/install-rabs"];
 
 /// Sources that still run Python. Shrink only; never add or raise an entry.
 const PORT_DEBT: &[(&str, usize)] = &[

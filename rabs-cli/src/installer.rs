@@ -1,5 +1,8 @@
-//! The local generation owner. All namespace changes are descriptor-relative,
-//! under the same persistent lock used by previous installer generations.
+//! The local and SSH fleet generation owner. All local namespace changes are
+//! descriptor-relative, under the same persistent lock used by previous
+//! installer generations.
+
+mod ssh;
 
 use flate2::read::MultiGzDecoder;
 use flate2::{Compression, GzBuilder};
@@ -107,22 +110,25 @@ fn is_valid_semver(version: &str) -> bool {
         Some((head, tail)) => (head, Some(tail)),
         None => (without_build, None),
     };
+    let valid_num = |part: &str| {
+        !part.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && (part.len() == 1 || !part.starts_with('0'))
+    };
     let mut parts = core.split('.');
     let valid_core = matches!(
         (parts.next(), parts.next(), parts.next(), parts.next()),
-        (Some(a), Some(b), Some(c), None)
-            if !a.is_empty()
-                && !b.is_empty()
-                && !c.is_empty()
-                && a.bytes().all(|byte| byte.is_ascii_digit())
-                && b.bytes().all(|byte| byte.is_ascii_digit())
-                && c.bytes().all(|byte| byte.is_ascii_digit())
+        (Some(a), Some(b), Some(c), None) if valid_num(a) && valid_num(b) && valid_num(c)
     );
     let valid_ext = |ext: Option<&str>| {
         ext.is_none_or(|s| {
             !s.is_empty()
-                && s.bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+                && s.split('.').all(|ident| {
+                    !ident.is_empty()
+                        && ident
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
         })
     };
     valid_core && valid_ext(pre) && valid_ext(build)
@@ -1229,11 +1235,14 @@ struct PackageOptions {
 #[derive(Debug)]
 struct Options {
     source: Option<Source>,
+    from_targets: Vec<(String, PathBuf)>,
+    from_image: Option<PathBuf>,
     root: Option<PathBuf>,
     verify: bool,
     probe: bool,
     probe_installed: bool,
     package: Option<PackageOptions>,
+    ssh: Option<ssh::SshOptions>,
 }
 
 fn probe_command_stdout(
@@ -1286,7 +1295,7 @@ fn probe_command_stdout(
     Ok(output)
 }
 
-fn parse_unique_build_info(bytes: &[u8]) -> io::Result<BTreeMap<String, Value>> {
+fn parse_unique_json(bytes: &[u8]) -> io::Result<BTreeMap<String, Value>> {
     struct UniqueObject;
     impl<'de> Visitor<'de> for UniqueObject {
         type Value = BTreeMap<String, Value>;
@@ -1299,7 +1308,7 @@ fn parse_unique_build_info(bytes: &[u8]) -> io::Result<BTreeMap<String, Value>> 
             let mut out = BTreeMap::new();
             while let Some((key, value)) = map.next_entry::<String, Value>()? {
                 if out.insert(key, value).is_some() {
-                    return Err(de::Error::custom("duplicate build-info JSON field"));
+                    return Err(de::Error::custom("duplicate JSON field"));
                 }
             }
             Ok(out)
@@ -1308,9 +1317,9 @@ fn parse_unique_build_info(bytes: &[u8]) -> io::Result<BTreeMap<String, Value>> 
     let mut de = serde_json::Deserializer::from_slice(bytes);
     let map = de
         .deserialize_map(UniqueObject)
-        .map_err(|error| invalid(format!("invalid build-info JSON: {error}")))?;
+        .map_err(|error| invalid(format!("invalid JSON object: {error}")))?;
     de.end()
-        .map_err(|error| invalid(format!("trailing bytes after build-info JSON: {error}")))?;
+        .map_err(|error| invalid(format!("trailing bytes after JSON object: {error}")))?;
     Ok(map)
 }
 
@@ -1344,7 +1353,7 @@ fn verify_package_source(snapshot_dir: &File, required_source: &str) -> io::Resu
                     format!("package build-info probe failed for {name}: {error}"),
                 )
             })?;
-        let fields = parse_unique_build_info(&raw)?;
+        let fields = parse_unique_json(&raw)?;
         let keys: BTreeSet<&str> = fields.keys().map(String::as_str).collect();
         let schema_ok = fields.get("schema").and_then(Value::as_u64) == Some(1);
         let kind_ok = fields.get("kind").and_then(Value::as_str) == Some("rabs-build-info");
@@ -1547,6 +1556,7 @@ fn package_archive(sources: &mut Sources, opts: &PackageOptions) -> io::Result<V
         {
             let encoder = GzBuilder::new()
                 .mtime(0)
+                .operating_system(3)
                 .write(&mut raw_archive, Compression::default());
             let mut archive = tar::Builder::new(encoder);
             for name in TOOLS {
@@ -1642,8 +1652,52 @@ fn package_archive(sources: &mut Sources, opts: &PackageOptions) -> io::Result<V
     })
 }
 
+fn normalize_absolute_dir(path: &Path) -> io::Result<PathBuf> {
+    require(
+        path.is_absolute(),
+        "--bin-dir requires an absolute directory",
+    )?;
+    let abs = std::path::absolute(path)?;
+    let normalized: PathBuf = abs.components().collect();
+    require(
+        normalized.is_absolute() && normalized.to_str().is_some(),
+        "installation directory must be an absolute UTF-8 path",
+    )?;
+    Ok(normalized)
+}
+
+fn default_local_root() -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| invalid("--bin-dir is required when HOME is unavailable"))?;
+    normalize_absolute_dir(&PathBuf::from(home).join(".local/bin"))
+}
+
+fn reconcile_image_bin_dir(
+    cli_root: Option<&Path>,
+    image_bin_dir: Option<&str>,
+) -> io::Result<Option<PathBuf>> {
+    match (cli_root, image_bin_dir) {
+        (Some(cli), Some(img)) => {
+            let normalized_img = normalize_absolute_dir(Path::new(img))?;
+            require(
+                cli == normalized_img,
+                "--bin-dir disagrees with retained transfer image bin_dir",
+            )?;
+            Ok(Some(normalized_img))
+        }
+        (Some(_), None) => Err(invalid(
+            "--bin-dir disagrees with retained transfer image (sealed with default $HOME/.local/bin)",
+        )),
+        (None, Some(img)) => Ok(Some(normalize_absolute_dir(Path::new(img))?)),
+        (None, None) => Ok(None),
+    }
+}
+
 fn parse(arguments: &[OsString]) -> io::Result<Options> {
     let mut source = None;
+    let mut from_targets = Vec::new();
+    let mut seen_targets = BTreeSet::new();
+    let mut from_image = None;
     let mut root = None;
     let mut verify = false;
     let mut probe = false;
@@ -1651,13 +1705,20 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
     let mut package_output = None;
     let mut target = None;
     let mut require_source = None;
+    let mut ssh_hosts = Vec::new();
+    let mut seen_hosts = BTreeSet::new();
+    let mut ssh_timeout = None;
+    let mut ssh_jobs = None;
+    let mut ssh_reserve_mib = None;
     let mut seen = BTreeSet::new();
     let mut arguments = arguments.iter();
     while let Some(argument) = arguments.next() {
         let option = argument
             .to_str()
             .ok_or_else(|| invalid("non-UTF-8 installer option"))?;
-        require(seen.insert(option), "repeated installer option")?;
+        if !matches!(option, "--ssh" | "--from-target") {
+            require(seen.insert(option), "repeated installer option")?;
+        }
         match option {
             "--from-build" | "--from-bundle" | "--from-archive" => {
                 require(source.is_none(), "select exactly one source toolset")?;
@@ -1671,6 +1732,30 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
                     "--from-bundle" => Source::Bundle(path),
                     _ => Source::Archive(path),
                 });
+            }
+            "--from-target" => {
+                let value = arguments
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        invalid("--from-target requires TARGET=TAR_GZ with a supported Linux GNU target")
+                    })?;
+                let (arch, path) = ssh::parse_target_spec(value)?;
+                require(
+                    seen_targets.insert(arch.clone()),
+                    format!("duplicate --from-target architecture: {arch}"),
+                )?;
+                from_targets.push((arch, path));
+            }
+            "--from-image" => {
+                let value = arguments
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        invalid("--from-image requires a retained transfer image path")
+                    })?;
+                from_image = Some(std::path::absolute(value)?);
             }
             "--package" => {
                 let value = arguments
@@ -1703,22 +1788,88 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
                     .next()
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| invalid("--bin-dir requires an absolute directory"))?;
+                root = Some(normalize_absolute_dir(Path::new(value))?);
+            }
+            "--ssh" => {
+                let host = arguments
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .ok_or_else(|| invalid("--ssh requires a valid UTF-8 host specification"))?;
+                ssh::validate_host(host)?;
                 require(
-                    Path::new(value).is_absolute(),
-                    "--bin-dir requires an absolute directory",
+                    seen_hosts.insert(host.to_owned()),
+                    format!("duplicate --ssh host: {host}"),
                 )?;
-                root = Some(std::path::absolute(value)?);
+                ssh_hosts.push(host.to_owned());
+            }
+            "--ssh-timeout" => {
+                let raw = arguments.next().and_then(|v| v.to_str()).ok_or_else(|| {
+                    invalid("--ssh-timeout requires an integer number of seconds")
+                })?;
+                let secs: u64 = raw
+                    .parse()
+                    .map_err(|_| invalid("--ssh-timeout requires an integer number of seconds"))?;
+                require(
+                    (1..=ssh::MAX_SSH_TIMEOUT_SECS).contains(&secs),
+                    format!(
+                        "--ssh-timeout must be between 1 and {} seconds",
+                        ssh::MAX_SSH_TIMEOUT_SECS
+                    ),
+                )?;
+                ssh_timeout = Some(secs);
+            }
+            "--ssh-jobs" => {
+                let raw = arguments
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .ok_or_else(|| invalid("--ssh-jobs requires a positive integer"))?;
+                let jobs: usize = raw
+                    .parse()
+                    .map_err(|_| invalid("--ssh-jobs requires a positive integer"))?;
+                require(
+                    (1..=ssh::MAX_SSH_JOBS).contains(&jobs),
+                    format!("--ssh-jobs must be between 1 and {}", ssh::MAX_SSH_JOBS),
+                )?;
+                ssh_jobs = Some(jobs);
+            }
+            "--ssh-reserve-mib" => {
+                let raw = arguments
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .ok_or_else(|| invalid("--ssh-reserve-mib requires an integer MiB reserve"))?;
+                let mib: u64 = raw
+                    .parse()
+                    .map_err(|_| invalid("--ssh-reserve-mib requires an integer MiB reserve"))?;
+                require(
+                    (ssh::MIN_DEPLOY_RESERVE_MIB..=ssh::MAX_DEPLOY_RESERVE_MIB).contains(&mib),
+                    format!(
+                        "--ssh-reserve-mib must be between {} and {} MiB",
+                        ssh::MIN_DEPLOY_RESERVE_MIB,
+                        ssh::MAX_DEPLOY_RESERVE_MIB
+                    ),
+                )?;
+                ssh_reserve_mib = Some(mib);
             }
             "--verify" => verify = true,
             "--probe" => probe = true,
             "--probe-installed" => probe_installed = true,
-            _ => return Err(invalid("unsupported local installer option (see --help)")),
+            _ => return Err(invalid("unsupported installer option (see --help)")),
         }
     }
+
     if let Some(output) = package_output {
         let target = target.ok_or_else(|| invalid("--package requires --target"))?;
         require(
-            !verify && !probe && !probe_installed && root.is_none(),
+            !verify
+                && !probe
+                && !probe_installed
+                && root.is_none()
+                && ssh_hosts.is_empty()
+                && ssh_timeout.is_none()
+                && ssh_jobs.is_none()
+                && ssh_reserve_mib.is_none()
+                && from_targets.is_empty()
+                && from_image.is_none(),
             "--package accepts only --from-build/--from-bundle, --target and --require-source",
         )?;
         require(
@@ -1727,6 +1878,8 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
         )?;
         return Ok(Options {
             source,
+            from_targets: Vec::new(),
+            from_image: None,
             root: None,
             verify: false,
             probe: false,
@@ -1736,35 +1889,108 @@ fn parse(arguments: &[OsString]) -> io::Result<Options> {
                 target,
                 require_source,
             }),
+            ssh: None,
         });
     }
+
     require(target.is_none(), "--target requires --package")?;
     require(
         require_source.is_none(),
         "--require-source requires --package",
     )?;
+    let source_modes = usize::from(source.is_some())
+        + usize::from(!from_targets.is_empty())
+        + usize::from(from_image.is_some());
     require(
-        !(verify && probe) && !(probe_installed && (verify || probe || source.is_some())),
+        source_modes <= 1,
+        "select at most one source toolset, --from-target set, or --from-image",
+    )?;
+
+    if from_image.is_some() {
+        require(
+            verify && !probe && !probe_installed,
+            "--from-image requires --verify and cannot be combined with --probe or --probe-installed",
+        )?;
+        require(
+            ssh_reserve_mib.is_none(),
+            "--ssh-reserve-mib is only valid for --ssh deployment",
+        )?;
+    }
+
+    if !ssh_hosts.is_empty() {
+        require(
+            !probe_installed,
+            "--probe-installed is local only and cannot be combined with --ssh",
+        )?;
+        require(
+            !(verify && probe),
+            "verification and staged launch checks are distinct operations",
+        )?;
+        if verify {
+            require(
+                from_targets.is_empty(),
+                "--from-target cannot be combined with --verify",
+            )?;
+            require(
+                ssh_reserve_mib.is_none(),
+                "--ssh-reserve-mib is only valid for --ssh deployment",
+            )?;
+        }
+        require(
+            source_modes == 1,
+            "--ssh requires a source toolset, --from-target, or --from-image",
+        )?;
+        let reserve_mib = ssh_reserve_mib.unwrap_or(ssh::DEFAULT_DEPLOY_RESERVE_MIB);
+        return Ok(Options {
+            source,
+            from_targets,
+            from_image,
+            root,
+            verify,
+            probe,
+            probe_installed: false,
+            package: None,
+            ssh: Some(ssh::SshOptions {
+                hosts: ssh_hosts,
+                timeout_secs: ssh_timeout.unwrap_or(ssh::DEFAULT_SSH_TIMEOUT_SECS),
+                jobs: ssh_jobs.unwrap_or(1),
+                reserve_bytes: reserve_mib * 1024 * 1024,
+            }),
+        });
+    }
+
+    require(
+        ssh_timeout.is_none() && ssh_jobs.is_none() && ssh_reserve_mib.is_none(),
+        "--ssh-timeout, --ssh-jobs and --ssh-reserve-mib require --ssh",
+    )?;
+    require(from_targets.is_empty(), "--from-target requires --ssh")?;
+    require(
+        !(verify && probe)
+            && !(probe_installed && (verify || probe || source.is_some() || from_image.is_some())),
         "verification, staged launch checks and installed launch checks are distinct operations",
     )?;
     require(
-        source.is_some() || probe_installed,
-        "select a source toolset or --probe-installed",
+        source.is_some() || from_image.is_some() || probe_installed,
+        "select a source toolset, --from-image --verify, or --probe-installed",
     )?;
-    let root = root
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin")))
-        .ok_or_else(|| invalid("--bin-dir is required when HOME is unavailable"))?;
-    require(
-        root.is_absolute() && root.to_str().is_some(),
-        "installation directory must be an absolute UTF-8 path",
-    )?;
+    let root = if from_image.is_some() {
+        root
+    } else {
+        match root {
+            Some(path) => Some(path),
+            None => Some(default_local_root()?),
+        }
+    };
     Ok(Options {
         source,
-        root: Some(root),
+        from_targets: Vec::new(),
+        from_image,
+        root,
         verify,
         probe,
         probe_installed,
         package: None,
+        ssh: None,
     })
 }
 
@@ -1778,7 +2004,60 @@ pub(crate) fn run(arguments: &[OsString]) -> io::Result<(Value, bool)> {
             .capture()?;
         return Ok((package_archive(&mut sources, pkg)?, true));
     }
+    if let Some(ssh_opts) = &options.ssh {
+        if options.verify {
+            if let Some(image_path) = &options.from_image {
+                let header = ssh::load_transfer_image(image_path)?;
+                let bin_dir =
+                    reconcile_image_bin_dir(options.root.as_deref(), header.bin_dir.as_deref())?;
+                return ssh::verify_hosts(&header.toolset, bin_dir.as_deref(), ssh_opts);
+            }
+            let sources = options
+                .source
+                .as_ref()
+                .ok_or_else(|| invalid("source toolset is missing"))?
+                .capture()?;
+            return ssh::verify_hosts(&sources.expected, options.root.as_deref(), ssh_opts);
+        }
+        if !options.from_targets.is_empty() {
+            return ssh::deploy_targets(
+                &options.from_targets,
+                options.root.as_deref(),
+                ssh_opts,
+                options.probe,
+            );
+        }
+        let mut sources = options
+            .source
+            .as_ref()
+            .ok_or_else(|| invalid("source toolset is missing"))?
+            .capture()?;
+        return ssh::deploy_single(
+            &mut sources,
+            options.root.as_deref(),
+            ssh_opts,
+            options.probe,
+        );
+    }
     host_machine()?;
+    if let Some(image_path) = &options.from_image {
+        let header = ssh::load_transfer_image(image_path)?;
+        let effective_root =
+            match reconcile_image_bin_dir(options.root.as_deref(), header.bin_dir.as_deref())? {
+                Some(dir) => dir,
+                None => default_local_root()?,
+            };
+        let receipt = match verify_installed(&header.toolset, &effective_root) {
+            Ok(receipt) => receipt,
+            Err(error) => json!({
+                "kind": "rabs-install-verification", "state": "unverified", "bin_dir": effective_root,
+                "error": error.to_string(), "expected_toolset_sha256": header.toolset.digest()?,
+                "installation_changed": false, "services_started": false, "cargo_config_changed": false,
+            }),
+        };
+        let success = receipt["state"] == "verified";
+        return Ok((receipt, success));
+    }
     let root = options
         .root
         .as_deref()
