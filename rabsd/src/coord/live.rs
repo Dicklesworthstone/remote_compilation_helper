@@ -4501,6 +4501,16 @@ impl CoordLive {
             if let Some(inv) = snapshot {
                 let _ = write_l1_inventory_snapshot(cas.cas_root(), &inv);
             }
+        } else if matches!(outcome, PublicationOutcome::Quarantined(_)) {
+            let snapshot = if let Ok(mut l1) = self.l1_cache.lock() {
+                l1.0.invalidate(&offer.manifest.action_key)
+                    .then(|| L1Inventory::from_cache(&l1.0))
+            } else {
+                None
+            };
+            if let Some(inv) = snapshot {
+                let _ = write_l1_inventory_snapshot(cas.cas_root(), &inv);
+            }
         }
         Ok(outcome)
     }

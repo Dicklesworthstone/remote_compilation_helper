@@ -43,7 +43,6 @@ const EXTENSIONLESS_PY_DEBT: &[&str] = &[
 
 /// Sources that still run Python. Shrink only; never add or raise an entry.
 const PORT_DEBT: &[(&str, usize)] = &[
-    ("rabs-key/src/bin/layer0_render.rs", 5),
     ("rch-common/src/ssh.rs", 6),
     ("rch-common/tests/control_deadlines.rs", 2),
     ("rch-common/tests/isolated_staging.rs", 2),

@@ -324,23 +324,32 @@ mod tests {
                 assert!(run.status.success());
                 assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
                 // GDB launches only this owned inferior; no system ptrace policy
-                // change or attachment to another process is necessary.
+                // change or attachment to another process is necessary. Use pure
+                // native GDB CLI commands (no embedded interpreter — AGENTS.md RULE 0.75).
                 let mut debugger = Command::new("timeout");
-                debugger.args(["30s", "gdb", "--batch", "-nx", "-ex", "set debuginfod enabled off", "-ex", "set pagination off", "-ex", "break src/main.rs:5", "-ex", "run", "-ex", "python assert gdb.selected_frame().find_sal().line == 5", "-ex", "python assert gdb.selected_frame().find_sal().symtab.fullname().endswith('/src/main.rs')"]);
+                debugger.args([
+                    "30s",
+                    "gdb",
+                    "--batch",
+                    "-nx",
+                    "-ex",
+                    "set debuginfod enabled off",
+                    "-ex",
+                    "set pagination off",
+                    "-ex",
+                    "set filename-display absolute",
+                    "-ex",
+                    "break src/main.rs:5",
+                    "-ex",
+                    "run",
+                    "-ex",
+                    "info line *$pc",
+                ]);
                 if !lines {
-                    debugger.args([
-                        "-ex",
-                        "python assert int(gdb.parse_and_eval('answer')) == 42; print('GDB_VARIABLE_VERIFIED')",
-                    ]);
+                    debugger.args(["-ex", "print /d answer"]);
                 }
                 let debug = debugger
-                    .args([
-                        "-ex",
-                        "python print('GDB_PYTHON_AVAILABLE')",
-                        "-ex",
-                        "continue",
-                        "--args",
-                    ])
+                    .args(["-ex", "continue", "--args"])
                     .arg(&executable)
                     .current_dir(&project)
                     .output()
@@ -349,21 +358,18 @@ mod tests {
                 std::fs::write(project.join("gdb.stderr"), &debug.stderr).unwrap();
                 let stdout = String::from_utf8_lossy(&debug.stdout);
                 let stderr = String::from_utf8_lossy(&debug.stderr);
-                assert!(
-                    debug.status.success()
-                        && !stderr.contains("Traceback")
-                        && !stderr.contains("Error while executing Python"),
-                    "{label}: {stdout}\n{stderr}"
-                );
+                assert!(debug.status.success(), "{label}: {stdout}\n{stderr}");
                 assert!(
                     stdout.contains("Breakpoint 1,")
                         && stdout.contains("exited normally")
-                        && stdout.contains("GDB_PYTHON_AVAILABLE"),
+                        && stdout.lines().any(|line| {
+                            line.starts_with("Line 5 of ") && line.contains("/src/main.rs\"")
+                        }),
                     "{label}: {stdout}\n{stderr}"
                 );
                 if !lines {
                     assert!(
-                        stdout.contains("GDB_VARIABLE_VERIFIED"),
+                        stdout.lines().any(|line| line.trim() == "$1 = 42"),
                         "{label}: {stdout}\n{stderr}"
                     );
                 }

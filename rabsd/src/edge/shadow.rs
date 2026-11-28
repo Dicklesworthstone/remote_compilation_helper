@@ -7,19 +7,20 @@
 //!
 //! ## Shadow-grade honesty
 //!
-//! The full descriptor needs input CLOSURES that only exist once
-//! Phase 1 lands snapshot-backed execution. The shadow tier therefore
-//! fills the closure slots (`action_inputs`, `negative_dependencies`,
-//! `dependency_inputs`) with a CONSTANT typed marker digest, so the
-//! shadow key is a function of the OBSERVABLE components only: argv,
-//! cwd, toolchain identity, environment names, platform, class. A
-//! repeat lookup under that key is consequently an UPPER BOUND on
-//! would-have-hit — two invocations with identical argv but different
-//! file contents shadow-collide — and every receipt says so
-//! (`grade: shadow-upper-bound`). The number this plane reports is
-//! "at most this many would have hit", never more than the truth.
+//! Shadow consults extract all twelve [`ActionDescriptor`] slots from the
+//! observed compiler invocation, toolchain stat metadata, working directory,
+//! and environment-variable names (via `rabs_key::invocation::parse`) so
+//! shadow-mode key diffs and fragmentation diagnostics reflect real flags,
+//! `--extern` dependencies, `--emit`/`--crate-type` outputs, `--target`
+//! platforms, `-C`/`-Z` execution semantics, `--remap-path-prefix` path
+//! policy, and `--cfg` conditions. Because shadow pass-through does not hash
+//! transitive source or dependency file contents, `projection_epoch` stays `0`
+//! and every receipt declares `grade: shadow-upper-bound`: two invocations
+//! with identical arguments but modified file contents still shadow-collide,
+//! so the reported hit count remains an honest upper bound.
 
 use rabs_key::action_key::compute_action_key;
+use rabs_key::invocation::{SourceInput, parse as parse_rustc_invocation};
 use rabs_key::typed_digest::compute;
 use rabs_protocol::descriptor::{ActionClass, ActionDescriptor};
 use rabs_protocol::redaction::redact_argv;
@@ -53,10 +54,13 @@ pub struct ShadowDecision {
 /// Classify the invocation (shadow heuristics; F-epic classes).
 #[must_use]
 pub fn classify(argv: &[String]) -> ActionClass {
-    let crate_name = argv
-        .windows(2)
-        .find(|w| w[0] == "--crate-name")
-        .map(|w| w[1].as_str());
+    let crate_name = argv.iter().enumerate().find_map(|(idx, arg)| {
+        arg.strip_prefix("--crate-name=").or_else(|| {
+            (arg == "--crate-name")
+                .then(|| argv.get(idx + 1).map(String::as_str))
+                .flatten()
+        })
+    });
     if crate_name == Some("build_script_build") {
         return ActionClass::BuildScriptCompile;
     }
@@ -72,52 +76,291 @@ pub fn classify(argv: &[String]) -> ActionClass {
     }
 }
 
-fn constant_component(domain: &'static str) -> rabs_protocol::result_identity::TypedDigest {
-    compute(domain, b"shadow-v1:unresolved-until-phase-1")
+fn format_kv_list(items: &[(String, Option<String>)]) -> String {
+    items
+        .iter()
+        .map(|(k, v)| match v {
+            Some(val) => format!("{k}={val}"),
+            None => k.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
 }
 
-/// Build the shadow-grade descriptor from an observation. Toolchain
-/// identity is correlation-grade: the tool path plus its inode
-/// size/mtime (read HERE, by the daemon — the wrapper never stats).
+fn extract_flag_values(argv: &[String], flag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let prefix = format!("{flag}=");
+    let mut i = 0;
+    while i < argv.len() {
+        if let Some(val) = argv[i].strip_prefix(&prefix) {
+            out.push(val.to_owned());
+        } else if argv[i] == flag
+            && let Some(next) = argv.get(i + 1)
+        {
+            out.push(next.clone());
+            i += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn extract_short_flag_values(argv: &[String], flag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == flag {
+            if let Some(next) = argv.get(i + 1) {
+                out.push(next.clone());
+                i += 1;
+            }
+        } else if !argv[i].starts_with("--")
+            && let Some(rest) = argv[i].strip_prefix(flag)
+        {
+            out.push(rest.strip_prefix('=').unwrap_or(rest).to_owned());
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Build the shadow-grade descriptor from an observation. All twelve slots are
+/// derived from the real observed invocation, toolchain stat metadata, working
+/// directory, and environment-variable names (never hardcoded placeholders),
+/// while `projection_epoch = 0` keeps the shadow upper-bound contract explicit.
 #[must_use]
 pub fn shadow_descriptor(observation: &ConsultObservation) -> ActionDescriptor {
     let argv_joined = observation.argv.join("\u{1f}");
+    let parsed = parse_rustc_invocation(&observation.argv, None).ok();
+    let compiler_tool = parsed
+        .as_ref()
+        .map(|inv| inv.compiler_argv0.as_str())
+        .or_else(|| observation.argv.first().map(String::as_str));
     let toolchain_identity =
-        observation
-            .argv
-            .first()
-            .map_or_else(String::new, |tool| match std::fs::metadata(tool) {
-                Ok(meta) => format!("{tool}|len={}|mtime={:?}", meta.len(), meta.modified().ok()),
-                Err(_) => format!("{tool}|unstat"),
-            });
+        compiler_tool.map_or_else(String::new, |tool| match std::fs::metadata(tool) {
+            Ok(meta) => format!("{tool}|len={}|mtime={:?}", meta.len(), meta.modified().ok()),
+            Err(_) => format!("{tool}|unstat"),
+        });
+
+    let mut env_names: Vec<&str> = observation.env_names.iter().map(String::as_str).collect();
+    env_names.sort_unstable();
+    env_names.dedup();
+
+    let (
+        normalized_invocation_bytes,
+        action_inputs_payload,
+        negative_deps_payload,
+        dependency_inputs_payload,
+        output_platform_payload,
+        sandbox_policy_payload,
+        path_policy_payload,
+        exec_semantics_payload,
+        output_decls_payload,
+    ) = if let Some(inv) = &parsed {
+        let source_desc = match &inv.source {
+            Some(SourceInput::Path(path)) => format!("path:{path}"),
+            Some(SourceInput::Stdin(digest)) => format!("stdin:{}", hex(&digest.bytes)),
+            None => "none".to_owned(),
+        };
+        let extra_filename = inv
+            .codegen
+            .iter()
+            .filter(|(k, _)| k == "extra-filename" || k == "metadata")
+            .map(|(k, v)| format!("{k}={}", v.as_deref().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let action_inputs = format!(
+            "shadow-declared|source={source_desc}|crate={}|edition={}|id={extra_filename}",
+            inv.crate_name.as_deref().unwrap_or(""),
+            inv.edition.as_deref().unwrap_or(""),
+        );
+
+        let mut cfgs = inv.cfgs.clone();
+        cfgs.sort();
+        let mut features = inv.features.clone();
+        features.sort();
+        let mut check_cfgs = extract_flag_values(&inv.passthrough, "--check-cfg");
+        check_cfgs.sort();
+        let negative_deps = format!(
+            "cfgs={}|features={}|check_cfg={}",
+            cfgs.join("\u{1f}"),
+            features.join("\u{1f}"),
+            check_cfgs.join("\u{1f}"),
+        );
+
+        let mut externs = inv.externs.clone();
+        externs.sort();
+        let dependency_inputs = format!(
+            "externs={}|lib_search={}|native_libs={}",
+            format_kv_list(&externs),
+            inv.lib_search.join("\u{1f}"),
+            inv.native_libs.join("\u{1f}"),
+        );
+
+        let output_platform = inv
+            .target
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS));
+
+        let has_wrapper_env = env_names
+            .iter()
+            .any(|name| name.starts_with("RUSTC_WRAPPER") || name.starts_with("CARGO_RABS_"));
+        let sandbox_policy = format!(
+            "mode=shadow-pass-through|wrappers={}|wrapper_env={has_wrapper_env}",
+            inv.wrapper_chain.join(",")
+        );
+
+        let remaps = extract_flag_values(&inv.passthrough, "--remap-path-prefix");
+        let path_unstable: Vec<String> = inv
+            .unstable
+            .iter()
+            .filter(|(k, _)| k.contains("remap") || k.contains("trim-paths"))
+            .map(|(k, v)| match v {
+                Some(val) => format!("{k}={val}"),
+                None => k.clone(),
+            })
+            .collect();
+        let path_policy = format!(
+            "remap={}|unstable={}",
+            remaps.join("\u{1f}"),
+            path_unstable.join("\u{1f}"),
+        );
+
+        let lints: Vec<String> = inv
+            .lints
+            .iter()
+            .map(|l| format!("{}={}", l.level, l.name))
+            .collect();
+        let exec_semantics = format!(
+            "edition={}|cap_lints={}|codegen={}|unstable={}|lints={}",
+            inv.edition.as_deref().unwrap_or(""),
+            inv.cap_lints.as_deref().unwrap_or(""),
+            format_kv_list(&inv.codegen),
+            format_kv_list(&inv.unstable),
+            lints.join("\u{1f}"),
+        );
+
+        let explicit_out = extract_short_flag_values(&inv.passthrough, "-o");
+        let output_decls = format!(
+            "emit={}|crate_types={}|out_dir={}|output={}",
+            inv.emit.join(","),
+            inv.crate_types.join(","),
+            inv.out_dir.as_deref().unwrap_or(""),
+            explicit_out.join(","),
+        );
+
+        (
+            inv.canonical_bytes(),
+            action_inputs,
+            negative_deps,
+            dependency_inputs,
+            output_platform,
+            sandbox_policy,
+            path_policy,
+            exec_semantics,
+            output_decls,
+        )
+    } else {
+        // Unparsed / non-rustc fallback: still derive each slot from observed
+        // argv flags rather than a shared hardcoded constant.
+        let action_inputs = format!(
+            "unparsed-argv|len={}|cwd={}",
+            observation.argv.len(),
+            observation.cwd
+        );
+        let negative_deps = format!(
+            "cfgs={}|check_cfg={}",
+            extract_flag_values(&observation.argv, "--cfg").join("\u{1f}"),
+            extract_flag_values(&observation.argv, "--check-cfg").join("\u{1f}"),
+        );
+        let dependency_inputs = format!(
+            "externs={}|L={}",
+            extract_flag_values(&observation.argv, "--extern").join("\u{1f}"),
+            extract_short_flag_values(&observation.argv, "-L").join("\u{1f}"),
+        );
+        let output_platform = extract_flag_values(&observation.argv, "--target")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS));
+        let sandbox_policy = "mode=shadow-pass-through|unparsed=true".to_owned();
+        let path_policy = format!(
+            "remap={}",
+            extract_flag_values(&observation.argv, "--remap-path-prefix").join("\u{1f}")
+        );
+        let exec_semantics = format!(
+            "C={}|Z={}",
+            extract_short_flag_values(&observation.argv, "-C").join("\u{1f}"),
+            extract_short_flag_values(&observation.argv, "-Z").join("\u{1f}"),
+        );
+        let output_decls = format!(
+            "emit={}|crate_type={}|out_dir={}|o={}",
+            extract_flag_values(&observation.argv, "--emit").join(","),
+            extract_flag_values(&observation.argv, "--crate-type").join(","),
+            extract_flag_values(&observation.argv, "--out-dir").join(","),
+            extract_short_flag_values(&observation.argv, "-o").join(","),
+        );
+        (
+            argv_joined.into_bytes(),
+            action_inputs,
+            negative_deps,
+            dependency_inputs,
+            output_platform,
+            sandbox_policy,
+            path_policy,
+            exec_semantics,
+            output_decls,
+        )
+    };
+
     ActionDescriptor {
         key_epoch: 1,
         projection_epoch: 0, // 0 = shadow projection (upper bound)
         action_class: classify(&observation.argv),
         normalized_invocation: compute(
-            "rabs.shadow.normalized-invocation.v1",
-            argv_joined.as_bytes(),
+            "rabs.shadow.normalized-invocation.v2",
+            &normalized_invocation_bytes,
         ),
         virtual_working_directory: compute(
             "rabs.shadow.working-directory.v1",
             observation.cwd.as_bytes(),
         ),
-        action_inputs: constant_component("rabs.shadow.action-inputs.v1"),
-        negative_dependencies: constant_component("rabs.shadow.negative-deps.v1"),
-        dependency_inputs: constant_component("rabs.shadow.dependency-inputs.v1"),
+        action_inputs: compute(
+            "rabs.shadow.action-inputs.v2",
+            action_inputs_payload.as_bytes(),
+        ),
+        negative_dependencies: compute(
+            "rabs.shadow.negative-deps.v2",
+            negative_deps_payload.as_bytes(),
+        ),
+        dependency_inputs: compute(
+            "rabs.shadow.dependency-inputs.v2",
+            dependency_inputs_payload.as_bytes(),
+        ),
         toolchain: compute("rabs.shadow.toolchain.v1", toolchain_identity.as_bytes()),
         output_platform: compute(
-            "rabs.shadow.output-platform.v1",
-            format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS).as_bytes(),
+            "rabs.shadow.output-platform.v2",
+            output_platform_payload.as_bytes(),
         ),
         environment: compute(
-            "rabs.shadow.environment-names.v1",
-            observation.env_names.join("\u{1f}").as_bytes(),
+            "rabs.shadow.environment-names.v2",
+            env_names.join("\u{1f}").as_bytes(),
         ),
-        sandbox_semantic_policy: constant_component("rabs.shadow.sandbox-policy.v1"),
-        build_path_semantic_policy: constant_component("rabs.shadow.path-policy.v1"),
-        execution_semantics: constant_component("rabs.shadow.exec-semantics.v1"),
-        output_declarations: constant_component("rabs.shadow.output-decls.v1"),
+        sandbox_semantic_policy: compute(
+            "rabs.shadow.sandbox-policy.v2",
+            sandbox_policy_payload.as_bytes(),
+        ),
+        build_path_semantic_policy: compute(
+            "rabs.shadow.path-policy.v2",
+            path_policy_payload.as_bytes(),
+        ),
+        execution_semantics: compute(
+            "rabs.shadow.exec-semantics.v2",
+            exec_semantics_payload.as_bytes(),
+        ),
+        output_declarations: compute(
+            "rabs.shadow.output-decls.v2",
+            output_decls_payload.as_bytes(),
+        ),
     }
 }
 
@@ -413,5 +656,115 @@ mod tests {
         // The single line parses as valid JSON and round-trips argv0.
         let value: serde_json::Value = serde_json::from_str(receipts.trim()).unwrap();
         assert_eq!(value["argv0"], "/weird/rustc\"with\\quote\tand\ttab\n");
+    }
+
+    #[test]
+    fn shadow_descriptor_extracts_real_per_slot_components_without_placeholders() {
+        let base = ConsultObservation {
+            argv: vec![
+                "/tc/rustc".into(),
+                "--crate-name".into(),
+                "demo".into(),
+                "--crate-type".into(),
+                "lib".into(),
+                "--edition=2024".into(),
+                "--emit=dep-info,metadata".into(),
+                "--out-dir".into(),
+                "/work/target/debug/deps".into(),
+                "--extern".into(),
+                "serde=/work/target/debug/deps/libserde-1.rmeta".into(),
+                "--cfg".into(),
+                "feature=\"std\"".into(),
+                "--remap-path-prefix=/work=/rabs/src".into(),
+                "-C".into(),
+                "opt-level=0".into(),
+                "--target".into(),
+                "x86_64-unknown-linux-gnu".into(),
+                "src/lib.rs".into(),
+            ],
+            cwd: "/work".into(),
+            env_names: vec!["CARGO_PKG_NAME".into(), "CARGO_HOME".into()],
+        };
+        let d_base = shadow_descriptor(&base);
+
+        // Reordered env_names produce identical environment slot.
+        let mut reordered_env = base.clone();
+        reordered_env.env_names.reverse();
+        assert_eq!(
+            d_base.environment,
+            shadow_descriptor(&reordered_env).environment
+        );
+
+        // Volatile presentation flags (--color) do not fragment shadow keys.
+        let mut color_always = base.clone();
+        color_always.argv.push("--color=always".into());
+        let mut color_never = base.clone();
+        color_never.argv.push("--color=never".into());
+        assert_eq!(
+            shadow_descriptor(&color_always),
+            shadow_descriptor(&color_never)
+        );
+
+        // Equals-form --crate-name=build_script_build classifies truthfully.
+        assert_eq!(
+            classify(&observation(&["/tc/rustc", "--crate-name=build_script_build"]).argv),
+            ActionClass::BuildScriptCompile
+        );
+
+        // Attached -o form mutates output_declarations.
+        let mut explicit_out = base.clone();
+        explicit_out.argv.push("-o/tmp/out.rlib".into());
+        assert_ne!(
+            d_base.output_declarations,
+            shadow_descriptor(&explicit_out).output_declarations
+        );
+
+        // Changing --extern mutates dependency_inputs without touching output_declarations.
+        let mut diff_extern = base.clone();
+        diff_extern.argv[10] = "serde=/work/target/debug/deps/libserde-2.rmeta".into();
+        let d_extern = shadow_descriptor(&diff_extern);
+        assert_ne!(d_base.dependency_inputs, d_extern.dependency_inputs);
+        assert_eq!(d_base.output_declarations, d_extern.output_declarations);
+
+        // Changing --emit mutates output_declarations without touching execution_semantics.
+        let mut diff_emit = base.clone();
+        diff_emit.argv[6] = "--emit=dep-info,link".into();
+        let d_emit = shadow_descriptor(&diff_emit);
+        assert_ne!(d_base.output_declarations, d_emit.output_declarations);
+        assert_eq!(d_base.execution_semantics, d_emit.execution_semantics);
+
+        // Changing -C opt-level mutates execution_semantics without touching dependency_inputs.
+        let mut diff_opt = base.clone();
+        diff_opt.argv[15] = "opt-level=3".into();
+        let d_opt = shadow_descriptor(&diff_opt);
+        assert_ne!(d_base.execution_semantics, d_opt.execution_semantics);
+        assert_eq!(d_base.dependency_inputs, d_opt.dependency_inputs);
+
+        // Changing --remap-path-prefix mutates build_path_semantic_policy.
+        let mut diff_remap = base.clone();
+        diff_remap.argv[13] = "--remap-path-prefix=/other=/rabs/src".into();
+        let d_remap = shadow_descriptor(&diff_remap);
+        assert_ne!(
+            d_base.build_path_semantic_policy,
+            d_remap.build_path_semantic_policy
+        );
+
+        // Changing --cfg mutates negative_dependencies.
+        let mut diff_cfg = base.clone();
+        diff_cfg.argv[12] = "feature=\"alloc\"".into();
+        let d_cfg = shadow_descriptor(&diff_cfg);
+        assert_ne!(d_base.negative_dependencies, d_cfg.negative_dependencies);
+
+        // Changing --target mutates output_platform.
+        let mut diff_target = base.clone();
+        diff_target.argv[17] = "aarch64-unknown-linux-gnu".into();
+        let d_target = shadow_descriptor(&diff_target);
+        assert_ne!(d_base.output_platform, d_target.output_platform);
+
+        // Changing source path mutates action_inputs.
+        let mut diff_src = base.clone();
+        diff_src.argv[18] = "src/main.rs".into();
+        let d_src = shadow_descriptor(&diff_src);
+        assert_ne!(d_base.action_inputs, d_src.action_inputs);
     }
 }
